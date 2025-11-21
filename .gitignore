@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+.github/workflows/release.yml
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Internal documentation
+design-arch.md
+notes.md
+TODO.md
+publish.md
+
+# Cargo lock (library - not committed)
+Cargo.lock
+
+# Coverage reports
+*.profraw
+cobertura.xml
+tarpaulin-report.html
+lcov.info
+
+# OS files
+Thumbs.db
