@@ -1,4 +1,4 @@
-//! Error types surfaced by the MSPC actor runtime.
+//! Error types surfaced by the Tokio Actors runtime.
 
 use thiserror::Error;
 

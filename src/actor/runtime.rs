@@ -55,6 +55,52 @@ impl ActorConfig {
     }
 }
 
+/// Event sent to a parent actor when one of its children stops.
+///
+/// This is a pre-supervision primitive — it only notifies. Supervision
+/// policies (restart strategies, budgets) are v0.3 scope.
+#[derive(Debug, Clone)]
+pub struct ChildStoppedEvent {
+    /// The ID of the child actor that stopped.
+    pub child_id: ActorId,
+    /// The reason the child stopped.
+    pub reason: StopReason,
+}
+
+/// Type-erased parent notification channel.
+///
+/// When a child actor stops, the runtime calls this to inform the parent.
+pub(crate) trait ParentNotifier: Send + Sync {
+    /// Notify the parent that a child has stopped.
+    fn notify_child_stopped(&self, child_id: ActorId, reason: StopReason);
+}
+
+/// Typed implementation that sends `ChildStoppedEvent` to the parent's mailbox.
+#[allow(dead_code)]
+pub(crate) struct TypedParentNotifier<P: Actor> {
+    parent_handle: ActorHandle<P>,
+}
+
+#[allow(dead_code)]
+impl<P: Actor> TypedParentNotifier<P>
+where
+    P::Message: From<ChildStoppedEvent>,
+{
+    pub fn new(parent_handle: ActorHandle<P>) -> Self {
+        Self { parent_handle }
+    }
+}
+
+impl<P: Actor> ParentNotifier for TypedParentNotifier<P>
+where
+    P::Message: From<ChildStoppedEvent>,
+{
+    fn notify_child_stopped(&self, child_id: ActorId, reason: StopReason) {
+        let event = ChildStoppedEvent { child_id, reason };
+        let _ = self.parent_handle.try_notify(event.into());
+    }
+}
+
 pub(crate) fn into_actor<A: Actor>(
     id: impl Into<ActorId>,
     actor: A,
@@ -75,7 +121,7 @@ pub(crate) fn spawn_actor<A: Actor>(
 
     let context = ActorContext::new(id, actor_handle.clone(), handle.clone());
 
-    handle.spawn(run_actor(actor, context, rx));
+    handle.spawn(run_actor(actor, context, rx, None));
 
     Ok(actor_handle)
 }
@@ -84,7 +130,19 @@ async fn run_actor<A: Actor>(
     mut actor: A,
     mut ctx: ActorContext<A>,
     mut mailbox: mpsc::Receiver<ActorEnvelope<A>>,
+    parent_notifier: Option<Box<dyn ParentNotifier>>,
 ) {
+    // Phase 1: pre_start validation (fail-fast gate)
+    if let Err(err) = actor.pre_start(&mut ctx).await {
+        ctx.record_failure(err.clone());
+        ctx.set_status(ActorStatus::Stopped);
+        if let Some(notifier) = parent_notifier {
+            notifier.notify_child_stopped(ctx.actor_id().clone(), StopReason::Failure(err));
+        }
+        return;
+    }
+
+    // Phase 2: on_started initialization
     let mut stop_reason = match actor.on_started(&mut ctx).await {
         Ok(()) => {
             ctx.set_status(ActorStatus::Running);
@@ -93,25 +151,41 @@ async fn run_actor<A: Actor>(
         Err(err) => {
             ctx.record_failure(err.clone());
             ctx.set_status(ActorStatus::Stopped);
+            if let Some(notifier) = parent_notifier {
+                notifier.notify_child_stopped(ctx.actor_id().clone(), StopReason::Failure(err));
+            }
             return;
         }
     };
 
-    while let Some(envelope) = mailbox.recv().await {
+    // Phase 3: Message loop with pre_stop rejection
+    'msg: while let Some(envelope) = mailbox.recv().await {
         match dispatch(&mut actor, &mut ctx, envelope).await {
             ControlFlow::Continue(()) => {}
             ControlFlow::Break(reason) => {
+                // pre_stop gate: only for graceful/parent-requested stops
+                if matches!(reason, StopReason::Graceful | StopReason::ParentRequest)
+                    && !actor.pre_stop(&reason, &mut ctx).await
+                {
+                    continue 'msg; // Actor rejected the stop
+                }
                 stop_reason = reason;
                 break;
             }
         }
     }
 
+    // Phase 4: Shutdown
     ctx.set_status(ActorStatus::Stopping);
     if let Err(err) = actor.on_stopped(&stop_reason, &mut ctx).await {
         stop_reason = StopReason::Failure(err);
     }
     ctx.set_status(ActorStatus::Stopped);
+
+    // Phase 5: Notify parent
+    if let Some(notifier) = parent_notifier {
+        notifier.notify_child_stopped(ctx.actor_id().clone(), stop_reason.clone());
+    }
 
     #[cfg(feature = "tracing")]
     tracing::info!(

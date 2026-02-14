@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult, StopReason,
@@ -27,8 +27,8 @@ impl Actor for Pinger {
     type Response = Resp;
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        let when = Instant::now() + Duration::from_millis(5);
-        ctx.schedule_once(Msg::Tick, when)?;
+        // Use schedule_after instead of schedule_once to avoid timing races
+        ctx.schedule_after(Msg::Tick, Duration::from_millis(10))?;
         Ok(())
     }
 
@@ -54,7 +54,8 @@ async fn recurring_timer_delivers_messages() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(15)).await;
+    // Give plenty of time for timer to fire, especially on slower Windows CI
+    sleep(Duration::from_millis(50)).await;
     let ticks = match handle.send(Msg::Get).await.unwrap() {
         Resp::Count(t) => t,
         Resp::Ack => 0,

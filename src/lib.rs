@@ -70,7 +70,7 @@ pub mod types;
 pub use actor::{
     context::ActorContext,
     handle::ActorHandle,
-    runtime::{ActorConfig, MailboxConfig},
+    runtime::{ActorConfig, ChildStoppedEvent, MailboxConfig},
     Actor, ActorExt,
 };
 pub use error::{

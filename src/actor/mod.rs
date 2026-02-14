@@ -29,18 +29,18 @@ pub trait Actor: Sized + Send + 'static {
     type Response: Send + 'static;
 
     /// Phase 1: Validation gate — return Err to prevent actor from starting.
-    ///
-    /// Called before `on_started`. If this returns `Err`, the actor is immediately
-    /// stopped and `on_started`/`on_stopped` never run.
-    ///
     /// OTP equivalent: `init/1` returning `{stop, Reason}`.
+    ///
+    /// Implementations that acquire resources must clean up before returning `Err`
+    /// (self-cleaning pattern), as `on_stopped` will not be called on init failure.
     async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
 
-    /// Called when the actor is started, before processing any messages.
+    /// Phase 2: Post-init setup — schedule timers, spawn children, acquire resources.
+    /// OTP equivalent: `init/1` returning `{ok, State}`.
     ///
-    /// Use this to initialize state, schedule timers, or spawn child actors.
+    /// Called after `pre_start` succeeds, before the actor enters the message loop.
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
@@ -54,9 +54,16 @@ pub trait Actor: Sized + Send + 'static {
         ctx: &mut ActorContext<Self>,
     ) -> ActorResult<Self::Response>;
 
-    /// Called when the actor is stopping.
+    /// Phase 4a: Stop gate — return `false` to reject graceful/parent-requested stops.
+    /// Forced stops (`Failure`, `Cancelled`) bypass this hook entirely.
     ///
-    /// Use this to clean up resources, close connections, or notify other actors.
+    /// No retry limit is enforced at this level — retry budgets and
+    /// timeout policies belong in the supervision layer (v0.3).
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        true // allow stop by default
+    }
+
+    /// Phase 4b: Cleanup — release resources, notify peers.
     /// OTP equivalent: `terminate(Reason, State)`.
     async fn on_stopped(
         &mut self,
@@ -64,14 +71,6 @@ pub trait Actor: Sized + Send + 'static {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         Ok(())
-    }
-
-    /// Phase 4a: Stop gate — return false to reject graceful/parent-requested stops.
-    ///
-    /// Only called for `Graceful` and `ParentRequest` stops. Forced stops
-    /// (`Failure`, `Cancelled`) bypass this hook entirely.
-    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        true
     }
 
     /// Called when a child actor (spawned by this actor) stops.
