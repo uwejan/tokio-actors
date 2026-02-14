@@ -60,7 +60,11 @@ impl Actor for LifecycleActor {
         }
     }
 
-    async fn on_stopped(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
         self.stopped.store(true, Ordering::SeqCst);
         Ok(())
     }

@@ -108,7 +108,7 @@ async fn run_actor<A: Actor>(
     }
 
     ctx.set_status(ActorStatus::Stopping);
-    if let Err(err) = actor.on_stopped(&mut ctx).await {
+    if let Err(err) = actor.on_stopped(&stop_reason, &mut ctx).await {
         stop_reason = StopReason::Failure(err);
     }
     ctx.set_status(ActorStatus::Stopped);

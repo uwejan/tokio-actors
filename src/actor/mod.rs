@@ -28,6 +28,16 @@ pub trait Actor: Sized + Send + 'static {
     /// Use `()` if the actor does not return a response.
     type Response: Send + 'static;
 
+    /// Phase 1: Validation gate — return Err to prevent actor from starting.
+    ///
+    /// Called before `on_started`. If this returns `Err`, the actor is immediately
+    /// stopped and `on_started`/`on_stopped` never run.
+    ///
+    /// OTP equivalent: `init/1` returning `{stop, Reason}`.
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
     /// Called when the actor is started, before processing any messages.
     ///
     /// Use this to initialize state, schedule timers, or spawn child actors.
@@ -47,8 +57,21 @@ pub trait Actor: Sized + Send + 'static {
     /// Called when the actor is stopping.
     ///
     /// Use this to clean up resources, close connections, or notify other actors.
-    async fn on_stopped(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    /// OTP equivalent: `terminate(Reason, State)`.
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
         Ok(())
+    }
+
+    /// Phase 4a: Stop gate — return false to reject graceful/parent-requested stops.
+    ///
+    /// Only called for `Graceful` and `ParentRequest` stops. Forced stops
+    /// (`Failure`, `Cancelled`) bypass this hook entirely.
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        true
     }
 
     /// Called when a child actor (spawned by this actor) stops.
