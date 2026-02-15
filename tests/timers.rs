@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio::time::{sleep, Duration};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -21,7 +20,6 @@ enum Resp {
     Count(u32),
 }
 
-#[async_trait]
 impl Actor for Pinger {
     type Message = Msg;
     type Response = Resp;
@@ -84,7 +82,6 @@ async fn schedule_after_convenience_method() {
         Received(bool),
     }
 
-    #[async_trait]
     impl Actor for TimerActor {
         type Message = TimerMsg;
         type Response = TimerResp;
@@ -138,7 +135,6 @@ async fn timer_cancellation_apis() {
         Count(u64),
     }
 
-    #[async_trait]
     impl Actor for CancelActor {
         type Message = CancelMsg;
         type Response = CancelResp;

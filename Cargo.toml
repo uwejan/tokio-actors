@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Zero-ceremony, Tokio-native actors with strong typing and production-ready edge case handling"
 license = "MIT OR Apache-2.0"
@@ -22,7 +22,6 @@ default = []
 tracing = ["dep:tracing"]
 
 [dependencies]
-async-trait = "0.1"
 thiserror = "2.0.17"
 tokio = { version = "1", features = [
     "rt",

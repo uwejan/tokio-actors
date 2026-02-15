@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use tokio::runtime::Builder;
 use tokio_actors::{
@@ -20,7 +19,6 @@ enum Resp {
     Ack,
 }
 
-#[async_trait]
 impl Actor for CountingActor {
     type Message = Msg;
     type Response = Resp;

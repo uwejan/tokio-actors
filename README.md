@@ -57,7 +57,6 @@ cargo add tokio-actors
 ### Ping-Pong: Request-Response Pattern
 
 ```rust
-use async_trait::async_trait;
 use tokio_actors::{
     actor::{Actor, ActorExt, context::ActorContext, handle::ActorHandle},
     ActorResult,
@@ -79,7 +78,6 @@ enum PongResp {
     Pong,  // ← Response goes through send() automatically
 }
 
-#[async_trait]
 impl Actor for PongActor {
     type Message = PongMsg;
     type Response = PongResp;
@@ -111,7 +109,6 @@ enum PingResp {
     Ack,
 }
 
-#[async_trait]
 impl Actor for PingActor {
     type Message = PingMsg;
     type Response = PingResp;

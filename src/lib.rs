@@ -14,7 +14,6 @@
 //!     actor::{context::ActorContext, Actor, ActorExt},
 //!     ActorConfig, ActorResult, StopReason, ActorId,
 //! };
-//! use async_trait::async_trait;
 //!
 //! #[derive(Default)]
 //! struct Counter {
@@ -33,7 +32,6 @@
 //!     Value(i64),
 //! }
 //!
-//! #[async_trait]
 //! impl Actor for Counter {
 //!     type Message = Msg;
 //!     type Response = Resp;

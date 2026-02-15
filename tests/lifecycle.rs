@@ -4,7 +4,6 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::time::sleep;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -48,7 +47,6 @@ impl LifecycleActor {
     }
 }
 
-#[async_trait]
 impl Actor for LifecycleActor {
     type Message = Msg;
     type Response = Resp;
@@ -120,7 +118,6 @@ impl FailingPreStartActor {
     }
 }
 
-#[async_trait]
 impl Actor for FailingPreStartActor {
     type Message = Msg;
     type Response = Resp;
@@ -211,7 +208,6 @@ impl PreStopRejectActor {
     }
 }
 
-#[async_trait]
 impl Actor for PreStopRejectActor {
     type Message = Msg;
     type Response = Resp;
@@ -305,7 +301,6 @@ impl AlwaysRejectStopActor {
     }
 }
 
-#[async_trait]
 impl Actor for AlwaysRejectStopActor {
     type Message = Msg;
     type Response = Resp;

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult,
@@ -17,7 +16,6 @@ enum Resp {
     Ack,
 }
 
-#[async_trait]
 impl Actor for DummyActor {
     type Message = Msg;
     type Response = Resp;

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio::time::Duration;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -23,7 +22,6 @@ enum Resp {
     Value(i64),
 }
 
-#[async_trait]
 impl Actor for TestActor {
     type Message = Msg;
     type Response = Resp;

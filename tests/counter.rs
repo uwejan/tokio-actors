@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio_actors::{
     actor::context::ActorContext,
     actor::{Actor, ActorExt},
@@ -21,7 +20,6 @@ enum CounterResp {
     Value(i64),
 }
 
-#[async_trait]
 impl Actor for Counter {
     type Message = CounterMsg;
     type Response = CounterResp;

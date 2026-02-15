@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio::time::Duration;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -21,7 +20,6 @@ enum Resp {
     Count(u64),
 }
 
-#[async_trait]
 impl Actor for Heartbeat {
     type Message = Msg;
     type Response = Resp;

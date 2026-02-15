@@ -7,7 +7,7 @@ pub mod handle;
 /// Runtime configuration and spawning logic.
 pub mod runtime;
 
-use async_trait::async_trait;
+use std::future::Future;
 
 use crate::error::{ActorError, ActorResult};
 use crate::types::{ActorId, Envelope, StopReason};
@@ -18,7 +18,6 @@ use runtime::ActorConfig;
 ///
 /// An actor is a stateful entity that processes messages sequentially.
 /// Each actor runs in its own Tokio task.
-#[async_trait]
 pub trait Actor: Sized + Send + 'static {
     /// The type of message this actor receives.
     type Message: Send + 'static;
@@ -33,54 +32,64 @@ pub trait Actor: Sized + Send + 'static {
     ///
     /// Implementations that acquire resources must clean up before returning `Err`
     /// (self-cleaning pattern), as `on_stopped` will not be called on init failure.
-    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
+    fn pre_start(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Phase 2: Post-init setup — schedule timers, spawn children, acquire resources.
     /// OTP equivalent: `init/1` returning `{ok, State}`.
     ///
     /// Called after `pre_start` succeeds, before the actor enters the message loop.
-    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
+    fn on_started(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Handles a message sent to the actor.
     ///
     /// This method is called sequentially for each message in the mailbox.
-    async fn handle(
+    fn handle(
         &mut self,
         msg: Self::Message,
         ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<Self::Response>;
+    ) -> impl Future<Output = ActorResult<Self::Response>> + Send;
 
     /// Phase 4a: Stop gate — return `false` to reject graceful/parent-requested stops.
     /// Forced stops (`Failure`, `Cancelled`) bypass this hook entirely.
     ///
     /// No retry limit is enforced at this level — retry budgets and
     /// timeout policies belong in the supervision layer (v0.3).
-    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        true // allow stop by default
+    fn pre_stop(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
     }
 
     /// Phase 4b: Cleanup — release resources, notify peers.
     /// OTP equivalent: `terminate(Reason, State)`.
-    async fn on_stopped(
+    fn on_stopped(
         &mut self,
         _reason: &StopReason,
         _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        Ok(())
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Called when a child actor (spawned by this actor) stops.
-    async fn on_child_stopped(
+    fn on_child_stopped(
         &mut self,
         _child_id: &ActorId,
         _reason: &StopReason,
         _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        Ok(())
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        async { Ok(()) }
     }
 
     /// Called when a message handler returns an error during a `notify` (fire-and-forget) call.
@@ -126,7 +135,6 @@ impl IntoActorConfig for () {
 }
 
 /// Convenience trait for spawning actors directly from their implementations.
-#[async_trait]
 pub trait ActorExt: Actor + Sized {
     /// Consumes the actor, spawns it on the current Tokio runtime, and returns its handle.
     ///
@@ -136,24 +144,23 @@ pub trait ActorExt: Actor + Sized {
     /// ```no_run
     /// # use tokio_actors::*;
     /// # use tokio_actors::actor::*;
-    /// # use async_trait::async_trait;
     /// # struct MyActor;
-    /// # #[async_trait]
     /// # impl Actor for MyActor {
     /// #     type Message = ();
     /// #     type Response = ();
-    /// #     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> { Ok(()) }
+    /// #     fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> impl std::future::Future<Output = ActorResult<()>> + Send { async { Ok(()) } }
     /// # }
     /// # async fn run() {
     /// let handle = MyActor.spawn_actor("my-actor", ()).await.unwrap();
     /// # }
     /// ```
-    async fn spawn_actor(
+    fn spawn_actor(
         self,
         id: impl Into<ActorId> + Send,
         config: impl IntoActorConfig + Send,
-    ) -> Result<handle::ActorHandle<Self>, crate::error::SpawnError> {
-        runtime::into_actor(id, self, config.into_config())
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        async move { runtime::into_actor(id, self, config.into_config()) }
     }
 }
 

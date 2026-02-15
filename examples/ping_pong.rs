@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use tokio_actors::{
     actor::{context::ActorContext, handle::ActorHandle, Actor, ActorExt},
     ActorResult,
@@ -29,7 +28,6 @@ enum PongResp {
     Count(u64),
 }
 
-#[async_trait]
 impl Actor for PongActor {
     type Message = PongMsg;
     type Response = PongResp;
@@ -67,7 +65,6 @@ enum PingResp {
     Count(u64),
 }
 
-#[async_trait]
 impl Actor for PingActor {
     type Message = PingMsg;
     type Response = PingResp;
