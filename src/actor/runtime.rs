@@ -1,10 +1,12 @@
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::actor::{context::ActorContext, handle::ActorHandle, Actor, ActorEnvelope};
 use crate::error::SpawnError;
+use crate::system::{ActorSystem, RegistryGuard};
 use crate::types::{ActorId, ActorStatus, Envelope, StopReason};
 
 /// Configuration for the actor's mailbox.
@@ -33,6 +35,10 @@ impl MailboxConfig {
 pub struct ActorConfig {
     /// Mailbox configuration.
     pub mailbox: MailboxConfig,
+    /// Optional name for registry registration.
+    pub(crate) name: Option<String>,
+    /// Target system for registration.
+    pub(crate) system: Option<Arc<ActorSystem>>,
 }
 
 impl<'a> From<&'a ActorConfig> for ActorConfig {
@@ -51,6 +57,20 @@ impl ActorConfig {
     /// Sets the complete mailbox configuration.
     pub fn with_mailbox(mut self, mailbox: MailboxConfig) -> Self {
         self.mailbox = mailbox;
+        self
+    }
+
+    /// Sets the actor name for registry registration.
+    #[allow(dead_code)]
+    pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the target system for registration.
+    #[allow(dead_code)]
+    pub(crate) fn with_system(mut self, system: Arc<ActorSystem>) -> Self {
+        self.system = Some(system);
         self
     }
 }
@@ -119,9 +139,18 @@ pub(crate) fn spawn_actor<A: Actor>(
     let (tx, rx) = mpsc::channel(mailbox_capacity);
     let actor_handle = ActorHandle::new(id.clone(), tx, mailbox_capacity);
 
-    let context = ActorContext::new(id, actor_handle.clone(), handle.clone());
+    let context = ActorContext::new(id.clone(), actor_handle.clone(), handle.clone());
 
-    handle.spawn(run_actor(actor, context, rx, None));
+    // Register in the target system if a name is configured
+    let guard = if config.name.is_some() {
+        let system = config.system.unwrap_or_else(ActorSystem::default);
+        system.register_actor::<A>(&id, config.name.as_deref(), &actor_handle)?;
+        Some(RegistryGuard::new(system, id, config.name))
+    } else {
+        None
+    };
+
+    handle.spawn(run_actor(actor, context, rx, None, guard));
 
     Ok(actor_handle)
 }
@@ -131,6 +160,7 @@ async fn run_actor<A: Actor>(
     mut ctx: ActorContext<A>,
     mut mailbox: mpsc::Receiver<ActorEnvelope<A>>,
     parent_notifier: Option<Box<dyn ParentNotifier>>,
+    _registry_guard: Option<RegistryGuard>,
 ) {
     // Phase 1: pre_start validation (fail-fast gate)
     if let Err(err) = actor.pre_start(&mut ctx).await {
@@ -158,17 +188,26 @@ async fn run_actor<A: Actor>(
         }
     };
 
-    // Phase 3: Message loop with pre_stop rejection
+    // Phase 3: Message loop with 3-tier stop handling
     'msg: while let Some(envelope) = mailbox.recv().await {
         match dispatch(&mut actor, &mut ctx, envelope).await {
             ControlFlow::Continue(()) => {}
             ControlFlow::Break(reason) => {
-                // pre_stop gate: only for graceful/parent-requested stops
+                // Tier 3 (Kill): bypass ALL callbacks
+                if matches!(reason, StopReason::Kill) {
+                    ctx.set_status(ActorStatus::Stopped);
+                    if let Some(notifier) = parent_notifier {
+                        notifier.notify_child_stopped(ctx.actor_id().clone(), reason);
+                    }
+                    return; // Skip on_stopped entirely
+                }
+                // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable
                 if matches!(reason, StopReason::Graceful | StopReason::ParentRequest)
                     && !actor.pre_stop(&reason, &mut ctx).await
                 {
                     continue 'msg; // Actor rejected the stop
                 }
+                // Tier 2 (Failure/Cancelled): non-vetoable, on_stopped still runs
                 stop_reason = reason;
                 break;
             }

@@ -106,6 +106,10 @@ pub enum StopReason {
     Failure(ActorError),
     /// The actor was cancelled.
     Cancelled,
+    /// The actor was forcibly killed — bypasses ALL lifecycle hooks.
+    /// Only `RegistryGuard::drop` fires for cleanup.
+    /// OTP equivalent: `exit(Pid, kill)` (untrappable).
+    Kill,
 }
 
 impl Display for StopReason {
@@ -115,6 +119,7 @@ impl Display for StopReason {
             StopReason::ParentRequest => write!(f, "parent requested"),
             StopReason::Failure(err) => write!(f, "failure: {err}"),
             StopReason::Cancelled => write!(f, "cancelled"),
+            StopReason::Kill => write!(f, "killed"),
         }
     }
 }
