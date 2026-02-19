@@ -67,7 +67,7 @@ async fn ping_pong(iterations: usize) {
         actor.notify(Msg::Notify(1)).await.expect("notify");
     }
 
-    let _ = actor.stop(StopReason::Graceful).await.expect("stop");
+    actor.stop(StopReason::Graceful).await.expect("stop");
 }
 
 fn criterion_benchmarks(c: &mut Criterion) {

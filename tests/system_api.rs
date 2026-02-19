@@ -30,5 +30,8 @@ fn shutdown_policy_has_per_actor_timeout() {
 fn system_config_default() {
     let config = SystemConfig::default();
     assert_eq!(config.shutdown_policy.timeout, Duration::from_secs(30));
-    assert_eq!(config.shutdown_policy.per_actor_timeout, Duration::from_secs(5));
+    assert_eq!(
+        config.shutdown_policy.per_actor_timeout,
+        Duration::from_secs(5)
+    );
 }

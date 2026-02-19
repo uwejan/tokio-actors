@@ -148,7 +148,7 @@ async fn run_actor<A: Actor>(
     mut ctx: ActorContext<A>,
     mut mailbox: mpsc::Receiver<ActorEnvelope<A>>,
     parent_notifier: Option<Box<dyn ParentNotifier>>,
-    _registry_guard: Option<RegistryGuard>,
+    registry_guard: Option<RegistryGuard>,
 ) {
     // Phase 1: pre_start validation (fail-fast gate)
     if let Err(err) = actor.pre_start(&mut ctx).await {
@@ -223,6 +223,9 @@ async fn run_actor<A: Actor>(
 
     #[cfg(not(feature = "tracing"))]
     let _ = stop_reason;
+
+    // Held for its Drop impl — RegistryGuard::drop unregisters the actor.
+    drop(registry_guard);
 }
 
 async fn dispatch<A: Actor>(

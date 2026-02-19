@@ -2,8 +2,6 @@
 //!
 //! Internal module.
 
-#![allow(dead_code)]
-
 use std::any::{Any, TypeId};
 use std::future::Future;
 use std::pin::Pin;
@@ -59,18 +57,10 @@ impl Default for ShutdownPolicy {
 }
 
 /// Configuration for creating a new [`ActorSystem`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SystemConfig {
     /// Shutdown policy for this system.
     pub shutdown_policy: ShutdownPolicy,
-}
-
-impl Default for SystemConfig {
-    fn default() -> Self {
-        Self {
-            shutdown_policy: ShutdownPolicy::default(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +245,7 @@ impl ActorSystem {
     }
 
     /// Looks up an actor by ID.
+    #[allow(dead_code)]
     pub(crate) fn get_by_id<A: Actor>(&self, id: &ActorId) -> Option<ActorHandle<A>> {
         self.by_id.get(id).and_then(|e| e.downcast::<A>())
     }
@@ -263,7 +254,10 @@ impl ActorSystem {
     ///
     /// Returns [`SendError::Closed`] if no actor with the given name is registered.
     pub async fn stop(&self, name: &str) -> Result<(), crate::error::SendError> {
-        let entry = self.by_name.get(name).ok_or(crate::error::SendError::Closed)?;
+        let entry = self
+            .by_name
+            .get(name)
+            .ok_or(crate::error::SendError::Closed)?;
         entry.stop(StopReason::Graceful).await
     }
 
@@ -271,7 +265,10 @@ impl ActorSystem {
     ///
     /// Returns [`SendError::Closed`] if no actor with the given name is registered.
     pub async fn kill(&self, name: &str) -> Result<(), crate::error::SendError> {
-        let entry = self.by_name.get(name).ok_or(crate::error::SendError::Closed)?;
+        let entry = self
+            .by_name
+            .get(name)
+            .ok_or(crate::error::SendError::Closed)?;
         entry.stop(StopReason::Kill).await
     }
 
@@ -349,11 +346,9 @@ impl ActorSystem {
                 continue;
             }
 
-            let result = tokio::time::timeout(
-                policy.per_actor_timeout,
-                entry.stop(StopReason::Graceful),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(policy.per_actor_timeout, entry.stop(StopReason::Graceful))
+                    .await;
 
             if result.is_err() {
                 let _ = entry.stop(StopReason::Kill).await;

@@ -194,7 +194,7 @@ async fn timer_cancellation_apis() {
 
     if let CancelResp::Count(ticks) = actor.send(CancelMsg::GetTicks).await.unwrap() {
         assert!(
-            ticks >= 1 && ticks <= 3,
+            (1..=3).contains(&ticks),
             "Should have 1-3 ticks before cancellation, got {}",
             ticks
         );

@@ -20,11 +20,7 @@ impl Actor for StubActor {
     type Message = ();
     type Response = ();
 
-    async fn handle(
-        &mut self,
-        _msg: (),
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
 

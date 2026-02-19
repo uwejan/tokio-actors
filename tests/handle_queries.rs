@@ -120,6 +120,7 @@ async fn handle_can_be_used_in_hashset() {
         .unwrap();
     let actor1_clone = actor1.clone();
 
+    #[allow(clippy::mutable_key_type)]
     let mut set = HashSet::new();
     set.insert(actor1.clone());
     set.insert(actor2.clone());
