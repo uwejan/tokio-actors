@@ -151,18 +151,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Configuration is Completely Optional
+### Spawning Actors
 
 ```rust
-// No config needed - uses defaults
-actor.spawn_actor("my-actor", ()).await?;
+use tokio_actors::{actor::ActorExt, ActorConfig, ActorSystem};
 
-// Or customize with builder pattern
+// Anonymous (UUID auto-id)
+let h = my_actor.spawn().await?;
+
+// Named (registers in default system)
+let h = my_actor.spawn_named("worker-1").await?;
+
+// Named with custom mailbox
 let config = ActorConfig::default().with_mailbox_capacity(256);
-actor.spawn_actor("my-actor", config).await?;
+let h = my_actor.spawn_named_with("worker-1", &config).await?;
 
-// Reference to config works too
-actor.spawn_actor("my-actor", &config).await?;
+// On a specific system
+let sys = ActorSystem::create("my-system")?;
+let h = my_actor.spawn_on(&sys).await?;
+let h = my_actor.spawn_on_named(&sys, "worker-1").await?;
+
+// Legacy API still works
+let h = my_actor.spawn_actor("id", ()).await?;
+```
+
+### Actor Registry (ActorSystem)
+
+```rust
+use tokio_actors::{ActorSystem, ShutdownPolicy, SystemConfig};
+
+// Default system (lazy singleton)
+let sys = ActorSystem::default();
+
+// Custom system with config
+let sys = ActorSystem::create_with("game", SystemConfig {
+    shutdown_policy: ShutdownPolicy {
+        timeout: Duration::from_secs(60),
+        per_actor_timeout: Duration::from_secs(10),
+    },
+})?;
+
+// Named lookup (OTP whereis/1)
+let handle = sys.get::<MyActor>("worker-1");
+
+// Stop/kill by name
+sys.stop("worker-1").await?;   // Graceful (vetoable)
+sys.kill("worker-1").await?;   // Force (bypasses all hooks)
+
+// Coordinated shutdown with timeout escalation
+sys.shutdown().await;
 ```
 
 ---
@@ -204,6 +241,16 @@ ctx.schedule_recurring(
 ```
 
 **Edge Case**: Scheduling in the past? The message fires immediately. No panics, no silent failures.
+
+### 3-Tier Termination
+
+```rust
+use tokio_actors::StopReason;
+
+handle.stop(StopReason::Graceful).await?;   // Tier 1: pre_stop can veto
+handle.stop(StopReason::Cancelled).await?;  // Tier 2: non-vetoable, on_stopped runs
+handle.stop(StopReason::Kill).await?;       // Tier 3: bypasses ALL lifecycle hooks
+```
 
 ### Lifecycle Hooks
 
@@ -309,6 +356,31 @@ During timer catch-up (`MissPolicy::CatchUp`), we use `try_notify` to avoid bloc
 | `self_handle()` | Get handle to this actor |
 | `status()` | Current lifecycle status |
 
+### Spawn Methods (ActorExt)
+
+| Method | Description |
+|--------|-------------|
+| `spawn()` | Anonymous actor (UUID auto-id) |
+| `spawn_named(name)` | Named, registered in default system |
+| `spawn_named_with(name, &config)` | Named with custom mailbox config |
+| `spawn_on(&system)` | Anonymous on specific system |
+| `spawn_on_named(&system, name)` | Named on specific system |
+| `spawn_on_named_with(&system, name, &config)` | Full params |
+| `spawn_actor(id, config)` | Legacy API (still works) |
+
+### ActorSystem Methods
+
+| Method | Description |
+|--------|-------------|
+| `ActorSystem::default()` | Lazy default system singleton |
+| `ActorSystem::create(name)` | New named system |
+| `ActorSystem::create_with(name, config)` | New system with custom config |
+| `get::<A>(name)` | Typed actor lookup (OTP `whereis`) |
+| `stop(name)` | Graceful stop by name |
+| `kill(name)` | Force kill by name |
+| `shutdown()` | Coordinated shutdown with escalation |
+| `registered()` | List all registered actor names |
+
 ### ActorConfig Builder
 
 ```rust
@@ -329,8 +401,9 @@ Tests cover:
 - Timer drift policies
 - Mailbox backpressure
 - Handle equality and hashing
-- Lifecycle hooks
-- Error propagation
+- Lifecycle hooks and 3-tier termination (Kill bypass)
+- ActorSystem registry, spawn methods, and shutdown
+- Error propagation and type preservation
 
 ---
 
@@ -354,8 +427,6 @@ cargo run --example ping_pong
 
 ### Planned
 - **Supervision trees**: Declarative parent-child relationships
-- **Actor registry**: Named global actor lookup
-- **Graceful shutdown coordination**: Drain mailboxes before stopping
 - **Telemetry hooks**: Metrics and tracing integration
 
 ### Non-Goals
@@ -389,6 +460,5 @@ For implementation details and edge cases, see [`examples/`](examples/) and [`te
 
 - 🔗 [GitHub](https://github.com/uwejan)
 - 💼 [LinkedIn](https://www.linkedin.com/in/uwejan/)
-- 📧 saddamuwejan@gmail.com
 
 *Building high-performance, production-ready Rust libraries for real-world problems.*
