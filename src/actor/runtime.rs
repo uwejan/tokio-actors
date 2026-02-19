@@ -127,8 +127,10 @@ pub(crate) fn spawn_actor<A: Actor>(
 
     let context = ActorContext::new(id.clone(), actor_handle.clone(), handle.clone());
 
-    // Register in the target system if a name is provided
-    let guard = if name.is_some() {
+    // Register in the target system when a name or explicit system is provided.
+    // Named actors always register (in specified or default system).
+    // Anonymous actors only register when an explicit system is given.
+    let guard = if name.is_some() || system.is_some() {
         let target = system.unwrap_or_else(ActorSystem::default);
         target.register_actor::<A>(&id, name.as_deref(), &actor_handle)?;
         Some(RegistryGuard::new(target, id, name))

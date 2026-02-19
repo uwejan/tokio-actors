@@ -8,8 +8,10 @@ pub mod handle;
 pub mod runtime;
 
 use std::future::Future;
+use std::sync::Arc;
 
 use crate::error::{ActorError, ActorResult};
+use crate::system::ActorSystem;
 use crate::types::{ActorId, Envelope, StopReason};
 use context::ActorContext;
 use runtime::ActorConfig;
@@ -161,6 +163,95 @@ pub trait ActorExt: Actor + Sized {
     ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
     {
         async move { runtime::into_actor(id, self, config.into_config(), None, None) }
+    }
+
+    /// Anonymous spawn with auto-generated UUID as ActorId.
+    /// No registry registration. OTP equivalent: `spawn(Fun)`.
+    fn spawn(
+        self,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        async move {
+            let id = uuid::Uuid::new_v4().to_string();
+            runtime::into_actor(id, self, ActorConfig::default(), None, None)
+        }
+    }
+
+    /// Named spawn in the default system. The name serves as ActorId.
+    /// OTP equivalent: `gen_server:start_link({local, Name}, ...)`.
+    fn spawn_named(
+        self,
+        name: impl Into<String> + Send,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        async move {
+            let name = name.into();
+            runtime::into_actor(name.clone(), self, ActorConfig::default(), Some(name), None)
+        }
+    }
+
+    /// Named spawn with config in the default system.
+    fn spawn_named_with(
+        self,
+        name: impl Into<String> + Send,
+        config: &ActorConfig,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        let config = config.clone();
+        async move {
+            let name = name.into();
+            runtime::into_actor(name.clone(), self, config, Some(name), None)
+        }
+    }
+
+    /// Anonymous spawn targeting a specific system. Auto-generated UUID as ActorId.
+    /// Registered in the system's `by_id` map but NOT `by_name`.
+    fn spawn_on(
+        self,
+        system: &Arc<ActorSystem>,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        let system = Arc::clone(system);
+        async move {
+            let id = uuid::Uuid::new_v4().to_string();
+            runtime::into_actor(id, self, ActorConfig::default(), None, Some(system))
+        }
+    }
+
+    /// Named spawn targeting a specific system. The name serves as ActorId.
+    fn spawn_on_named(
+        self,
+        system: &Arc<ActorSystem>,
+        name: impl Into<String> + Send,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        let system = Arc::clone(system);
+        async move {
+            let name = name.into();
+            runtime::into_actor(
+                name.clone(),
+                self,
+                ActorConfig::default(),
+                Some(name),
+                Some(system),
+            )
+        }
+    }
+
+    /// Named spawn with config targeting a specific system.
+    fn spawn_on_named_with(
+        self,
+        system: &Arc<ActorSystem>,
+        name: impl Into<String> + Send,
+        config: &ActorConfig,
+    ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
+    {
+        let system = Arc::clone(system);
+        let config = config.clone();
+        async move {
+            let name = name.into();
+            runtime::into_actor(name.clone(), self, config, Some(name), Some(system))
+        }
     }
 }
 
