@@ -8,7 +8,6 @@ use crate::types::ActorId;
 pub type ActorResult<T> = Result<T, ActorError>;
 
 /// Errors returned from user-defined actor logic.
-/// Errors returned from user-defined actor logic.
 #[derive(Debug, Error, Clone)]
 pub enum ActorError {
     /// A custom error message from the actor.
@@ -20,6 +19,9 @@ pub enum ActorError {
     /// The actor panicked during execution.
     #[error("actor panicked: {0}")]
     Panic(String),
+    /// A spawn error occurred.
+    #[error(transparent)]
+    Spawn(#[from] SpawnError),
 }
 
 impl ActorError {
@@ -31,12 +33,6 @@ impl ActorError {
 
 impl From<TimerError> for ActorError {
     fn from(value: TimerError) -> Self {
-        ActorError::User(value.to_string())
-    }
-}
-
-impl From<SpawnError> for ActorError {
-    fn from(value: SpawnError) -> Self {
         ActorError::User(value.to_string())
     }
 }
@@ -83,6 +79,17 @@ pub enum SpawnError {
     /// A child with the same ID is already registered.
     #[error("child actor `{0}` already registered")]
     DuplicateChild(ActorId),
+    /// An actor with the given name is already registered in the system.
+    #[error("actor name `{name}` already taken in system `{system}`")]
+    NameTaken {
+        /// The actor name that was already taken.
+        name: String,
+        /// The system in which the collision occurred.
+        system: String,
+    },
+    /// An actor system with the given name already exists.
+    #[error("actor system `{0}` already exists")]
+    SystemNameTaken(String),
 }
 
 /// Errors emitted by the timer subsystem.
