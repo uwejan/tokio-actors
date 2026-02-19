@@ -35,10 +35,6 @@ impl MailboxConfig {
 pub struct ActorConfig {
     /// Mailbox configuration.
     pub mailbox: MailboxConfig,
-    /// Optional name for registry registration.
-    pub(crate) name: Option<String>,
-    /// Target system for registration.
-    pub(crate) system: Option<Arc<ActorSystem>>,
 }
 
 impl<'a> From<&'a ActorConfig> for ActorConfig {
@@ -57,20 +53,6 @@ impl ActorConfig {
     /// Sets the complete mailbox configuration.
     pub fn with_mailbox(mut self, mailbox: MailboxConfig) -> Self {
         self.mailbox = mailbox;
-        self
-    }
-
-    /// Sets the actor name for registry registration.
-    #[allow(dead_code)]
-    pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    /// Sets the target system for registration.
-    #[allow(dead_code)]
-    pub(crate) fn with_system(mut self, system: Arc<ActorSystem>) -> Self {
-        self.system = Some(system);
         self
     }
 }
@@ -125,14 +107,18 @@ pub(crate) fn into_actor<A: Actor>(
     id: impl Into<ActorId>,
     actor: A,
     config: impl Into<ActorConfig>,
+    name: Option<String>,
+    system: Option<Arc<ActorSystem>>,
 ) -> Result<ActorHandle<A>, SpawnError> {
-    spawn_actor(id.into(), actor, config.into())
+    spawn_actor(id.into(), actor, config.into(), name, system)
 }
 
 pub(crate) fn spawn_actor<A: Actor>(
     id: ActorId,
     actor: A,
     config: ActorConfig,
+    name: Option<String>,
+    system: Option<Arc<ActorSystem>>,
 ) -> Result<ActorHandle<A>, SpawnError> {
     let handle = Handle::try_current().map_err(|_| SpawnError::MissingRuntime)?;
     let mailbox_capacity = config.mailbox.capacity;
@@ -141,11 +127,11 @@ pub(crate) fn spawn_actor<A: Actor>(
 
     let context = ActorContext::new(id.clone(), actor_handle.clone(), handle.clone());
 
-    // Register in the target system if a name is configured
-    let guard = if config.name.is_some() {
-        let system = config.system.unwrap_or_else(ActorSystem::default);
-        system.register_actor::<A>(&id, config.name.as_deref(), &actor_handle)?;
-        Some(RegistryGuard::new(system, id, config.name))
+    // Register in the target system if a name is provided
+    let guard = if name.is_some() {
+        let target = system.unwrap_or_else(ActorSystem::default);
+        target.register_actor::<A>(&id, name.as_deref(), &actor_handle)?;
+        Some(RegistryGuard::new(target, id, name))
     } else {
         None
     };

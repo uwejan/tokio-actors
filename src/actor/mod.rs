@@ -160,7 +160,7 @@ pub trait ActorExt: Actor + Sized {
         config: impl IntoActorConfig + Send,
     ) -> impl Future<Output = Result<handle::ActorHandle<Self>, crate::error::SpawnError>> + Send
     {
-        async move { runtime::into_actor(id, self, config.into_config()) }
+        async move { runtime::into_actor(id, self, config.into_config(), None, None) }
     }
 }
 
