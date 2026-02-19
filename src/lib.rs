@@ -75,4 +75,5 @@ pub use actor::{
 pub use error::{
     ActorError, ActorResult, AskError, SendError, SpawnError, TimerError, TrySendError,
 };
+pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{ActorId, MissPolicy, RecurringId, SchedulePolicy, StopReason};
