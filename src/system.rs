@@ -182,17 +182,19 @@ impl ActorSystem {
     pub fn create(name: impl Into<String>) -> Result<Arc<ActorSystem>, SpawnError> {
         let name = name.into();
         let reg = systems();
-        if reg.contains_key(&name) {
-            return Err(SpawnError::SystemNameTaken(name));
+        match reg.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(SpawnError::SystemNameTaken(name)),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let system = Arc::new(ActorSystem {
+                    name,
+                    by_name: DashMap::new(),
+                    by_id: DashMap::new(),
+                    shutdown_policy: ShutdownPolicy::default(),
+                });
+                v.insert(system.clone());
+                Ok(system)
+            }
         }
-        let system = Arc::new(ActorSystem {
-            name: name.clone(),
-            by_name: DashMap::new(),
-            by_id: DashMap::new(),
-            shutdown_policy: ShutdownPolicy::default(),
-        });
-        reg.insert(name, system.clone());
-        Ok(system)
     }
 
     /// Creates a new named system with custom configuration.
@@ -205,17 +207,19 @@ impl ActorSystem {
     ) -> Result<Arc<ActorSystem>, SpawnError> {
         let name = name.into();
         let reg = systems();
-        if reg.contains_key(&name) {
-            return Err(SpawnError::SystemNameTaken(name));
+        match reg.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(SpawnError::SystemNameTaken(name)),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let system = Arc::new(ActorSystem {
+                    name,
+                    by_name: DashMap::new(),
+                    by_id: DashMap::new(),
+                    shutdown_policy: config.shutdown_policy,
+                });
+                v.insert(system.clone());
+                Ok(system)
+            }
         }
-        let system = Arc::new(ActorSystem {
-            name: name.clone(),
-            by_name: DashMap::new(),
-            by_id: DashMap::new(),
-            shutdown_policy: config.shutdown_policy,
-        });
-        reg.insert(name, system.clone());
-        Ok(system)
     }
 
     /// Looks up a named system. Returns `None` if no system with this name exists.

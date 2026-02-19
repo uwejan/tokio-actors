@@ -37,7 +37,6 @@ impl Display for ActorId {
 }
 
 /// Scheduling policies supported by actor timers.
-/// Scheduling policies supported by actor timers.
 #[derive(Debug, Clone, Copy)]
 pub enum SchedulePolicy {
     /// Fire once at the specified time.
@@ -95,7 +94,6 @@ impl RecurringIdGenerator {
 }
 
 /// Reason describing why an actor stopped processing messages.
-/// Reason describing why an actor stopped processing messages.
 #[derive(Debug, Clone)]
 pub enum StopReason {
     /// The actor stopped gracefully (e.g., finished its work).
@@ -125,7 +123,6 @@ impl Display for StopReason {
 }
 
 /// Lifecycle status for a running actor.
-/// Lifecycle status for a running actor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActorStatus {
     /// The actor is initializing (running `on_started`).
@@ -138,7 +135,6 @@ pub enum ActorStatus {
     Stopped,
 }
 
-/// Internal representation of actual payloads sent to actors.
 /// Internal representation of actual payloads sent to actors.
 #[derive(Debug)]
 pub enum Envelope<M, R> {
