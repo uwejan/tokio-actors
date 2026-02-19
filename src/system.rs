@@ -42,12 +42,33 @@ pub struct ShutdownPolicy {
     ///
     /// Default: 30 seconds.
     pub timeout: Duration,
+    /// Maximum time to wait for each individual actor to stop gracefully.
+    /// If an actor doesn't stop within this period, it receives `StopReason::Kill`.
+    ///
+    /// Default: 5 seconds.
+    pub per_actor_timeout: Duration,
 }
 
 impl Default for ShutdownPolicy {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            per_actor_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Configuration for creating a new [`ActorSystem`].
+#[derive(Debug, Clone)]
+pub struct SystemConfig {
+    /// Shutdown policy for this system.
+    pub shutdown_policy: ShutdownPolicy,
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_policy: ShutdownPolicy::default(),
         }
     }
 }
@@ -130,6 +151,7 @@ pub struct ActorSystem {
     name: String,
     by_name: DashMap<String, AnyActorHandle>,
     by_id: DashMap<ActorId, AnyActorHandle>,
+    shutdown_policy: ShutdownPolicy,
 }
 
 impl std::fmt::Debug for ActorSystem {
@@ -156,6 +178,7 @@ impl ActorSystem {
                     name: "default".to_string(),
                     by_name: DashMap::new(),
                     by_id: DashMap::new(),
+                    shutdown_policy: ShutdownPolicy::default(),
                 })
             })
             .value()
@@ -176,6 +199,30 @@ impl ActorSystem {
             name: name.clone(),
             by_name: DashMap::new(),
             by_id: DashMap::new(),
+            shutdown_policy: ShutdownPolicy::default(),
+        });
+        reg.insert(name, system.clone());
+        Ok(system)
+    }
+
+    /// Creates a new named system with custom configuration.
+    ///
+    /// Returns [`SpawnError::SystemNameTaken`] if a system with this name
+    /// already exists.
+    pub fn create_with(
+        name: impl Into<String>,
+        config: SystemConfig,
+    ) -> Result<Arc<ActorSystem>, SpawnError> {
+        let name = name.into();
+        let reg = systems();
+        if reg.contains_key(&name) {
+            return Err(SpawnError::SystemNameTaken(name));
+        }
+        let system = Arc::new(ActorSystem {
+            name: name.clone(),
+            by_name: DashMap::new(),
+            by_id: DashMap::new(),
+            shutdown_policy: config.shutdown_policy,
         });
         reg.insert(name, system.clone());
         Ok(system)
@@ -208,8 +255,24 @@ impl ActorSystem {
     }
 
     /// Looks up an actor by ID.
-    pub fn get_by_id<A: Actor>(&self, id: &ActorId) -> Option<ActorHandle<A>> {
+    pub(crate) fn get_by_id<A: Actor>(&self, id: &ActorId) -> Option<ActorHandle<A>> {
         self.by_id.get(id).and_then(|e| e.downcast::<A>())
+    }
+
+    /// Stops a named actor gracefully.
+    ///
+    /// Returns [`SendError::Closed`] if no actor with the given name is registered.
+    pub async fn stop(&self, name: &str) -> Result<(), crate::error::SendError> {
+        let entry = self.by_name.get(name).ok_or(crate::error::SendError::Closed)?;
+        entry.stop(StopReason::Graceful).await
+    }
+
+    /// Force-kills a named actor, bypassing all lifecycle callbacks.
+    ///
+    /// Returns [`SendError::Closed`] if no actor with the given name is registered.
+    pub async fn kill(&self, name: &str) -> Result<(), crate::error::SendError> {
+        let entry = self.by_name.get(name).ok_or(crate::error::SendError::Closed)?;
+        entry.stop(StopReason::Kill).await
     }
 
     /// Lists all registered actor names in this system.
@@ -226,14 +289,18 @@ impl ActorSystem {
         handle: &ActorHandle<A>,
     ) -> Result<(), SpawnError> {
         if let Some(n) = name {
-            if self.by_name.contains_key(n) {
-                return Err(SpawnError::NameTaken {
-                    name: n.to_string(),
-                    system: self.name.clone(),
-                });
+            let entry = self.by_name.entry(n.to_string());
+            match entry {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(SpawnError::NameTaken {
+                        name: n.to_string(),
+                        system: self.name.clone(),
+                    });
+                }
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    v.insert(AnyActorHandle::new(handle));
+                }
             }
-            self.by_name
-                .insert(n.to_string(), AnyActorHandle::new(handle));
         }
         self.by_id.insert(id.clone(), AnyActorHandle::new(handle));
         Ok(())
@@ -245,9 +312,9 @@ impl ActorSystem {
 
     // -- Shutdown -----------------------------------------------------------
 
-    /// Shuts down all registered actors with the default policy (30s timeout).
+    /// Shuts down all registered actors using the system's stored policy.
     pub async fn shutdown(&self) {
-        self.shutdown_with(ShutdownPolicy::default()).await;
+        self.shutdown_with(self.shutdown_policy.clone()).await;
     }
 
     /// Shuts down all registered actors with a custom policy.
@@ -255,6 +322,11 @@ impl ActorSystem {
     /// All entries are drained from the registry first (releasing locks),
     /// then stop signals are sent. This avoids deadlock with `RegistryGuard`
     /// drop handlers that also mutate the registry.
+    ///
+    /// Each actor is given up to `per_actor_timeout` to stop gracefully.
+    /// If it does not stop in time, it receives `StopReason::Kill`.
+    /// If the global `timeout` deadline is exceeded, all remaining actors
+    /// are immediately killed.
     pub async fn shutdown_with(&self, policy: ShutdownPolicy) {
         let deadline = Instant::now() + policy.timeout;
 
@@ -271,20 +343,21 @@ impl ActorSystem {
             .filter_map(|id| self.by_id.remove(&id))
             .collect();
 
-        // Phase 1: Graceful — stop each actor (no locks held).
-        let mut remaining = Vec::new();
-        for (i, (_, entry)) in entries.iter().enumerate() {
+        for (_id, entry) in &entries {
             if Instant::now() >= deadline {
-                remaining.push(i);
+                let _ = entry.stop(StopReason::Kill).await;
                 continue;
             }
-            let _ = entry.stop(StopReason::Graceful).await;
-            tokio::task::yield_now().await;
-        }
 
-        // Phase 2: Force remaining (deadline exceeded).
-        for &i in &remaining {
-            let _ = entries[i].1.stop(StopReason::Graceful).await;
+            let result = tokio::time::timeout(
+                policy.per_actor_timeout,
+                entry.stop(StopReason::Graceful),
+            )
+            .await;
+
+            if result.is_err() {
+                let _ = entry.stop(StopReason::Kill).await;
+            }
         }
     }
 }

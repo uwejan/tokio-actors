@@ -63,7 +63,7 @@
 
 pub mod actor;
 pub mod error;
-pub(crate) mod system;
+pub mod system;
 pub mod types;
 
 pub use actor::{
