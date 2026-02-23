@@ -8,23 +8,30 @@ use tokio::runtime::Handle;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{handle::ActorHandle, Actor};
-use crate::error::{ActorError, TimerError};
-use crate::types::{ActorId, ActorStatus, MissPolicy, RecurringId, RecurringIdGenerator};
+use futures_core::Stream;
+use tokio_stream::StreamExt;
 
-/// Actor execution context providing timers and runtime hooks.
+use crate::actor::{handle::ActorHandle, Actor};
+use crate::error::{ActorError, StreamError, TimerError};
+use crate::types::{
+    ActorId, ActorStatus, MissPolicy, RecurringId, RecurringIdGenerator, StreamEvent, StreamId,
+};
+
+/// Actor execution context providing timers, streams, and runtime hooks.
 ///
 /// The context is passed to every actor handler and provides access to:
 /// - The actor's unique ID
 /// - A handle to the actor itself (for sending messages to self)
 /// - Timer scheduling (one-shot and recurring)
+/// - Stream attachment (pipe external I/O into the mailbox)
 /// - Lifecycle status
 pub struct ActorContext<A: Actor> {
     actor_id: ActorId,
     self_handle: ActorHandle<A>,
     runtime: Handle,
     timers: HashMap<RecurringId, TimerRegistration>,
-    timer_ids: RecurringIdGenerator,
+    streams: HashMap<StreamId, StreamRegistration>,
+    id_gen: RecurringIdGenerator,
     last_error: Option<ActorError>,
     status: ActorStatus,
 }
@@ -36,7 +43,8 @@ impl<A: Actor> ActorContext<A> {
             self_handle: handle,
             runtime,
             timers: HashMap::new(),
-            timer_ids: RecurringIdGenerator::default(),
+            streams: HashMap::new(),
+            id_gen: RecurringIdGenerator::default(),
             last_error: None,
             status: ActorStatus::Initializing,
         }
@@ -96,7 +104,7 @@ impl<A: Actor> ActorContext<A> {
     where
         A::Message: Send + 'static,
     {
-        let id = self.timer_ids.next();
+        let id = self.id_gen.next();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
         let handle = self.self_handle.clone();
@@ -153,7 +161,7 @@ impl<A: Actor> ActorContext<A> {
     where
         F: Fn() -> A::Message + Send + Sync + 'static,
     {
-        let id = self.timer_ids.next();
+        let id = self.id_gen.next();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
         let handle = self.self_handle.clone();
@@ -219,6 +227,74 @@ impl<A: Actor> ActorContext<A> {
         self.timers.len()
     }
 
+    /// Attaches an external stream to this actor's mailbox.
+    ///
+    /// Each item yielded by the stream is wrapped in [`StreamEvent::Data`] and forwarded
+    /// to the actor's `handle` method via `notify`. When the stream is exhausted,
+    /// a [`StreamEvent::Finished`] message is sent. Backpressure is applied naturally:
+    /// if the mailbox is full, the forwarding task awaits capacity.
+    ///
+    /// Returns a [`StreamId`] that can be used to cancel the stream via
+    /// [`cancel_stream`](Self::cancel_stream).
+    ///
+    /// # Type Requirements
+    ///
+    /// The actor's `Message` type must implement `From<StreamEvent<S::Item>>` so the
+    /// framework can convert stream events into the actor's message enum.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use tokio_actors::*;
+    /// # use tokio_actors::actor::*;
+    /// # async fn example(ctx: &mut context::ActorContext<impl Actor<Message=StreamEvent<i32>, Response=()>>) {
+    /// use tokio_stream::wrappers::ReceiverStream;
+    /// let (tx, rx) = tokio::sync::mpsc::channel(16);
+    /// let stream_id = ctx.add_stream(ReceiverStream::new(rx));
+    /// # }
+    /// ```
+    pub fn add_stream<S>(&mut self, stream: S) -> StreamId
+    where
+        S: Stream + Send + Unpin + 'static,
+        S::Item: Send + 'static,
+        A::Message: From<StreamEvent<S::Item>>,
+    {
+        let id = self.id_gen.next_stream_id();
+        let token = CancellationToken::new();
+        let cancel_clone = token.clone();
+        let handle = self.self_handle.clone();
+        let fut = stream_forward::<A, S>(stream, handle, cancel_clone);
+        self.runtime.spawn(fut);
+        self.streams.insert(id, StreamRegistration { token });
+        id
+    }
+
+    /// Cancels a specific stream by its ID.
+    ///
+    /// Returns an error if the stream ID is not found (it may have already finished
+    /// or been cancelled).
+    pub fn cancel_stream(&mut self, id: StreamId) -> Result<(), StreamError> {
+        match self.streams.remove(&id) {
+            Some(entry) => {
+                entry.token.cancel();
+                Ok(())
+            }
+            None => Err(StreamError::NotFound),
+        }
+    }
+
+    /// Cancels all active streams.
+    pub fn cancel_all_streams(&mut self) {
+        for entry in self.streams.values() {
+            entry.token.cancel();
+        }
+        self.streams.clear();
+    }
+
+    /// Returns the number of active streams.
+    pub fn active_stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     pub(crate) fn set_status(&mut self, status: ActorStatus) {
         self.status = status;
     }
@@ -226,15 +302,23 @@ impl<A: Actor> ActorContext<A> {
 
 impl<A: Actor> Drop for ActorContext<A> {
     fn drop(&mut self) {
-        // Cancel all active timers to prevent them from firing after the actor stops.
-        // This cleanup ensures timer tasks don't attempt to send messages to a dead actor.
+        // Cancel all active timers and streams to prevent them from firing
+        // after the actor stops. This ensures forwarding tasks don't attempt
+        // to send messages to a dead actor.
         for entry in self.timers.values() {
+            entry.token.cancel();
+        }
+        for entry in self.streams.values() {
             entry.token.cancel();
         }
     }
 }
 
 struct TimerRegistration {
+    token: CancellationToken,
+}
+
+struct StreamRegistration {
     token: CancellationToken,
 }
 
@@ -255,6 +339,35 @@ async fn recurring_loop<A: Actor>(
                 let msg = (factory.as_ref())();
                 let _ = handle.notify(msg).await;
                 adjust_next(&mut next, interval, miss_policy, &token, &handle, &factory).await;
+            }
+        }
+    }
+}
+
+async fn stream_forward<A, S>(mut stream: S, handle: ActorHandle<A>, token: CancellationToken)
+where
+    A: Actor,
+    S: Stream + Send + Unpin + 'static,
+    S::Item: Send + 'static,
+    A::Message: From<StreamEvent<S::Item>>,
+{
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            item = StreamExt::next(&mut stream) => {
+                match item {
+                    Some(value) => {
+                        let msg: A::Message = StreamEvent::Data(value).into();
+                        if handle.notify(msg).await.is_err() {
+                            break; // actor dead
+                        }
+                    }
+                    None => {
+                        let msg: A::Message = StreamEvent::Finished.into();
+                        let _ = handle.notify(msg).await;
+                        break; // stream exhausted
+                    }
+                }
             }
         }
     }

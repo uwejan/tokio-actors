@@ -80,7 +80,7 @@ impl RecurringId {
     }
 }
 
-/// Incrementing ID source for timers.
+/// Incrementing ID source for timers and streams.
 #[derive(Default)]
 pub(crate) struct RecurringIdGenerator {
     next: AtomicU64,
@@ -90,6 +90,11 @@ impl RecurringIdGenerator {
     pub fn next(&self) -> RecurringId {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         RecurringId::new(id)
+    }
+
+    pub fn next_stream_id(&self) -> StreamId {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        StreamId::new(id)
     }
 }
 
@@ -133,6 +138,36 @@ pub enum ActorStatus {
     Stopping,
     /// The actor has stopped.
     Stopped,
+}
+
+/// Event wrapper for items received from a stream attached via
+/// [`ActorContext::add_stream`](crate::actor::context::ActorContext::add_stream).
+///
+/// Stream items are wrapped in `Data(T)` and delivered to the actor's `handle` method.
+/// When the stream is exhausted (yields `None`), a `Finished` event is sent.
+///
+/// For fallible streams (`Stream<Item = Result<V, E>>`), `T` is `Result<V, E>` —
+/// the actor handles errors in its `match` with full type information preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent<T> {
+    /// The stream yielded an item.
+    Data(T),
+    /// The stream is exhausted (yielded `None`).
+    Finished,
+}
+
+/// Identifier for a stream attached to an actor via
+/// [`ActorContext::add_stream`](crate::actor::context::ActorContext::add_stream).
+///
+/// Used with [`cancel_stream`](crate::actor::context::ActorContext::cancel_stream)
+/// to cancel a specific stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamId(u64);
+
+impl StreamId {
+    pub(crate) fn new(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 /// Internal representation of actual payloads sent to actors.

@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Zero-ceremony, Tokio-native actors with strong typing and production-ready edge case handling"
 license = "MIT OR Apache-2.0"
@@ -33,10 +33,13 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-util = { version = "0.7", features = ["full"] }
+futures-core = "0.3"
+tokio-stream = "0.1"
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
+tokio-stream = "0.1"
 
 [[bench]]
 name = "actor_bench"

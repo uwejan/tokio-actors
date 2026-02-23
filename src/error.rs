@@ -99,3 +99,17 @@ pub enum TimerError {
     #[error("timer id not found")]
     NotFound,
 }
+
+/// Errors emitted by the stream subsystem.
+#[derive(Debug, Error, Clone)]
+pub enum StreamError {
+    /// The specified stream ID was not found (already finished or cancelled).
+    #[error("stream id not found")]
+    NotFound,
+}
+
+impl From<StreamError> for ActorError {
+    fn from(value: StreamError) -> Self {
+        ActorError::User(value.to_string())
+    }
+}
