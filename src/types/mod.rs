@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ActorError;
 
@@ -109,7 +109,7 @@ pub enum StopReason {
     Failure(ActorError),
     /// The actor was cancelled.
     Cancelled,
-    /// The actor was forcibly killed — bypasses ALL lifecycle hooks.
+    /// The actor was forcibly killed. Bypasses ALL lifecycle hooks.
     /// Only `RegistryGuard::drop` fires for cleanup.
     /// OTP equivalent: `exit(Pid, kill)` (untrappable).
     Kill,
@@ -146,8 +146,8 @@ pub enum ActorStatus {
 /// Stream items are wrapped in `Data(T)` and delivered to the actor's `handle` method.
 /// When the stream is exhausted (yields `None`), a `Finished` event is sent.
 ///
-/// For fallible streams (`Stream<Item = Result<V, E>>`), `T` is `Result<V, E>` —
-/// the actor handles errors in its `match` with full type information preserved.
+/// For fallible streams (`Stream<Item = Result<V, E>>`), `T` is `Result<V, E>`.
+/// The actor handles errors in its `match` with full type information preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent<T> {
     /// The stream yielded an item.
@@ -170,6 +170,158 @@ impl StreamId {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Supervision types
+// ---------------------------------------------------------------------------
+
+/// Strategy used by a supervisor to handle child failures.
+///
+/// Maps 1:1 to OTP supervisor restart strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStrategy {
+    /// Restart only the failed child. Other children are unaffected.
+    OneForOne,
+    /// Restart all children when any one fails.
+    OneForAll,
+    /// Restart the failed child and all children started after it.
+    RestForOne,
+    /// Dynamic-only variant: same factory type, per-child restart, no ordering guarantees.
+    SimpleOneForOne,
+}
+
+/// Determines whether a child is restarted after stopping.
+///
+/// Maps to OTP `permanent`/`transient`/`temporary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartType {
+    /// Always restart, even after a graceful stop.
+    Permanent,
+    /// Restart on crash/cancel/kill, but stay down on [`StopReason::Graceful`].
+    Transient,
+    /// Never restart. Removed from the registry on any stop.
+    Temporary,
+}
+
+/// Policy for how long to wait when stopping a child.
+///
+/// Maps to OTP `brutal_kill`/`{timeout, T}`/`infinity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    /// Force-kill immediately (OTP `brutal_kill`).
+    Kill,
+    /// Wait up to `Duration` for graceful stop, then escalate to Kill.
+    Timeout(Duration),
+    /// Wait indefinitely for the child to stop.
+    Infinity,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Shutdown::Timeout(Duration::from_secs(5))
+    }
+}
+
+/// Event delivered to the parent actor when a supervised child stops.
+///
+/// Enriched with the `SupervisionAction` taken by the runtime.
+#[derive(Debug, Clone)]
+pub struct ChildEvent {
+    /// The ID of the child that stopped.
+    pub child_id: ActorId,
+    /// The registered name of the child, if any.
+    pub child_name: Option<String>,
+    /// The reason the child stopped.
+    pub reason: StopReason,
+    /// The action taken by the supervision runtime.
+    pub action: SupervisionAction,
+}
+
+/// Action taken by the supervision runtime in response to a child stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisionAction {
+    /// The child was restarted by the supervisor.
+    Restarted,
+    /// The child was removed (temporary or graceful transient).
+    Removed,
+    /// The child was not supervised (no supervision config).
+    NotSupervised,
+    /// The restart budget was exhausted. Supervisor is stopping.
+    BudgetExhausted,
+}
+
+/// Introspection snapshot of an actor's current state.
+#[derive(Debug, Clone)]
+pub struct ActorStatusInfo {
+    /// The actor's unique ID.
+    pub id: ActorId,
+    /// The actor's registered name, if any.
+    pub name: Option<String>,
+    /// Current lifecycle status.
+    pub status: ActorStatus,
+    /// Current number of messages in the mailbox.
+    pub mailbox_len: usize,
+    /// Total mailbox capacity.
+    pub mailbox_capacity: usize,
+    /// Number of supervised children.
+    pub child_count: usize,
+    /// Number of active timers.
+    pub timer_count: usize,
+    /// Number of active streams.
+    pub stream_count: usize,
+}
+
+/// Introspection snapshot of a supervised child.
+#[derive(Debug, Clone)]
+pub struct ChildInfo {
+    /// The child's unique ID.
+    pub id: ActorId,
+    /// The child's registered name, if any.
+    pub name: Option<String>,
+    /// How the child is restarted.
+    pub restart_type: RestartType,
+    /// How the child is shut down.
+    pub shutdown: Shutdown,
+    /// Whether the child is currently alive.
+    pub is_alive: bool,
+    /// Whether a restart is pending for this child.
+    pub restart_pending: bool,
+}
+
+/// Internal system-level messages sent via the system channel.
+///
+/// These have priority over user messages via `biased; select!`.
+#[derive(Debug)]
+pub(crate) enum SystemMessage {
+    /// Stop the actor.
+    Stop(StopReason),
+    /// Request a status snapshot.
+    GetStatus(oneshot::Sender<ActorStatusInfo>),
+    /// A child actor has stopped (raw event from runtime).
+    ChildStopped(ChildStoppedInternal),
+    /// A restart has completed (sent by the restart background task).
+    RestartComplete {
+        /// Monotonic sequence token to discard stale completions.
+        seq: u64,
+        /// The child that was restarted.
+        child_id: ActorId,
+        /// The new system channel sender for the restarted child.
+        new_system_tx: mpsc::Sender<SystemMessage>,
+        /// The new join handle for the restarted child's task.
+        new_join_handle: tokio::task::JoinHandle<()>,
+    },
+}
+
+/// Internal event sent from a child's runtime to its parent's system channel.
+#[derive(Debug, Clone)]
+pub(crate) struct ChildStoppedInternal {
+    pub child_id: ActorId,
+    pub reason: StopReason,
+}
+
+// ---------------------------------------------------------------------------
+// Envelope (user messages only - Stop moved to SystemMessage)
+// ---------------------------------------------------------------------------
+
 /// Internal representation of actual payloads sent to actors.
 #[derive(Debug)]
 pub enum Envelope<M, R> {
@@ -180,6 +332,4 @@ pub enum Envelope<M, R> {
         /// The channel to send the response to (if any).
         responder: Option<oneshot::Sender<Result<R, ActorError>>>,
     },
-    /// A signal to stop the actor.
-    Stop(StopReason),
 }

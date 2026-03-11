@@ -80,7 +80,9 @@ impl Actor for LifecycleActor {
 async fn lifecycle_hooks_fire_without_supervision() {
     let (actor, started_flag, stopped_flag) = LifecycleActor::new();
     let handle = actor
-        .spawn_actor("lifecycle", ActorConfig::default())
+        .spawn()
+        .named("lifecycle")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 
@@ -155,7 +157,9 @@ impl Actor for FailingPreStartActor {
 async fn pre_start_failure_prevents_startup() {
     let (actor, started_flag, stopped_flag) = FailingPreStartActor::new();
     let handle = actor
-        .spawn_actor("fail-pre-start", ActorConfig::default())
+        .spawn()
+        .named("fail-pre-start")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 
@@ -246,13 +250,15 @@ impl Actor for PreStopRejectActor {
 async fn pre_stop_rejection_keeps_actor_alive() {
     let (actor, reject_count, stopped_flag) = PreStopRejectActor::new(2);
     let handle = actor
-        .spawn_actor("pre-stop-reject", ActorConfig::default())
+        .spawn()
+        .named("pre-stop-reject")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 
     sleep(Duration::from_millis(10)).await;
 
-    // First stop attempt — should be rejected
+    // First stop attempt -- should be rejected
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(handle.is_alive(), "actor must survive first rejected stop");
@@ -261,13 +267,13 @@ async fn pre_stop_rejection_keeps_actor_alive() {
     // Actor can still process messages after rejected stop
     handle.notify(Msg::Ping).await.unwrap();
 
-    // Second stop attempt — should also be rejected
+    // Second stop attempt -- should also be rejected
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(handle.is_alive(), "actor must survive second rejected stop");
     assert_eq!(reject_count.load(Ordering::SeqCst), 2);
 
-    // Third stop attempt — should succeed (no rejections remaining)
+    // Third stop attempt -- should succeed (no rejections remaining)
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(
@@ -334,7 +340,9 @@ impl Actor for AlwaysRejectStopActor {
 async fn forced_stop_bypasses_pre_stop() {
     let (actor, reject_count, stopped_flag) = AlwaysRejectStopActor::new();
     let handle = actor
-        .spawn_actor("always-reject", ActorConfig::default())
+        .spawn()
+        .named("always-reject")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 

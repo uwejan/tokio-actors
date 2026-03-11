@@ -96,14 +96,15 @@ impl Actor for PingActor {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn pong first
-    let pong = PongActor::default().spawn_actor("pong", ()).await?;
+    let pong = PongActor::default().spawn().named("pong").await?;
 
     // Spawn ping with reference to pong
     let ping = PingActor {
         pong: pong.clone(),
         pongs_received: 0,
     }
-    .spawn_actor("ping", ())
+    .spawn()
+    .named("ping")
     .await?;
 
     // Send 10 pings

@@ -51,7 +51,9 @@ async fn kill_bypasses_all_callbacks() {
     };
 
     let handle = actor
-        .spawn_actor("kill-test", ActorConfig::default())
+        .spawn()
+        .named("kill-test")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 
@@ -80,7 +82,9 @@ async fn graceful_stop_calls_callbacks() {
     };
 
     let handle = actor
-        .spawn_actor("graceful-test", ActorConfig::default())
+        .spawn()
+        .named("graceful-test")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 

@@ -82,11 +82,15 @@ impl Actor for Sender {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actors_can_forward_messages_between_each_other() {
     let responder = Responder::default()
-        .spawn_actor("responder", ActorConfig::default())
+        .spawn()
+        .named("responder")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
     let sender = Sender::new(responder.clone())
-        .spawn_actor("sender", ActorConfig::default())
+        .spawn()
+        .named("sender")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 

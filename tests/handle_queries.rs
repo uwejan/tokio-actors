@@ -43,13 +43,21 @@ impl Actor for TestActor {
 
 #[tokio::test]
 async fn is_alive_returns_true_when_actor_running() {
-    let actor = TestActor::default().spawn_actor("test", ()).await.unwrap();
+    let actor = TestActor::default()
+        .spawn()
+        .named("hq-alive-true")
+        .await
+        .unwrap();
     assert!(actor.is_alive(), "Actor should be alive after spawning");
 }
 
 #[tokio::test]
 async fn is_alive_returns_false_after_stop() {
-    let actor = TestActor::default().spawn_actor("test", ()).await.unwrap();
+    let actor = TestActor::default()
+        .spawn()
+        .named("hq-alive-false")
+        .await
+        .unwrap();
     actor.stop(StopReason::Graceful).await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert!(
@@ -62,7 +70,9 @@ async fn is_alive_returns_false_after_stop() {
 async fn mailbox_queries_show_correct_capacity() {
     let config = ActorConfig::default().with_mailbox_capacity(10);
     let actor = TestActor::default()
-        .spawn_actor("test", config)
+        .spawn()
+        .named("hq-mailbox-cap")
+        .with_config(config)
         .await
         .unwrap();
 
@@ -75,7 +85,9 @@ async fn mailbox_queries_show_correct_capacity() {
 async fn mailbox_len_and_available_sum_to_capacity() {
     let config = ActorConfig::default().with_mailbox_capacity(10);
     let actor = TestActor::default()
-        .spawn_actor("test", config)
+        .spawn()
+        .named("hq-mailbox-sum")
+        .with_config(config)
         .await
         .unwrap();
 
@@ -92,14 +104,8 @@ async fn mailbox_len_and_available_sum_to_capacity() {
 
 #[tokio::test]
 async fn handle_equality_based_on_actor_id() {
-    let actor1 = TestActor::default()
-        .spawn_actor("actor1", ())
-        .await
-        .unwrap();
-    let actor2 = TestActor::default()
-        .spawn_actor("actor2", ())
-        .await
-        .unwrap();
+    let actor1 = TestActor::default().spawn().named("hq-eq-1").await.unwrap();
+    let actor2 = TestActor::default().spawn().named("hq-eq-2").await.unwrap();
     let actor1_clone = actor1.clone();
 
     assert_eq!(actor1, actor1_clone, "Handle should equal its clone");
@@ -111,11 +117,13 @@ async fn handle_can_be_used_in_hashset() {
     use std::collections::HashSet;
 
     let actor1 = TestActor::default()
-        .spawn_actor("actor1", ())
+        .spawn()
+        .named("hq-hash-1")
         .await
         .unwrap();
     let actor2 = TestActor::default()
-        .spawn_actor("actor2", ())
+        .spawn()
+        .named("hq-hash-2")
         .await
         .unwrap();
     let actor1_clone = actor1.clone();

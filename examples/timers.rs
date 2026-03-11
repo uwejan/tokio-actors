@@ -1,7 +1,7 @@
 use tokio::time::Duration;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, MissPolicy, StopReason,
+    ActorConfig, ActorResult, StopReason,
 };
 
 #[derive(Default)]
@@ -25,7 +25,9 @@ impl Actor for Heartbeat {
     type Response = Resp;
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        ctx.schedule_recurring(Msg::Tick, Duration::from_millis(200), MissPolicy::Skip)?;
+        ctx.schedule(Msg::Tick)
+            .every(Duration::from_millis(200))
+            .await?;
         Ok(())
     }
 
@@ -47,7 +49,9 @@ impl Actor for Heartbeat {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor = Heartbeat::default()
-        .spawn_actor("heartbeat", ActorConfig::default())
+        .spawn()
+        .named("heartbeat")
+        .with_config(ActorConfig::default())
         .await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     match actor.send(Msg::Get).await? {

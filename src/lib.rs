@@ -1,62 +1,34 @@
 #![warn(missing_docs)]
 //! Tokio Actors is a light-weight, Tokio-native actor framework for building
 //! hierarchical systems with strongly-typed mailboxes, timers, and supervision.
-//! Perfect for AI/LLM Applications.
 //!
 //! # Overview
 //! - Thread-safe actors that run as exclusive tasks on Tokio's multi-threaded runtime.
 //! - Typed request/response semantics through [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
 //! - Recurring timers, supervision hooks, and bounded mailboxes out of the box.
-//! - See `examples/simple_counter.rs` for a runnable end-to-end example.
 //!
 //! ```rust,no_run
-//! use tokio_actors::{
-//!     actor::{context::ActorContext, Actor, ActorExt},
-//!     ActorConfig, ActorResult, StopReason, ActorId,
-//! };
+//! use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult, StopReason};
 //!
 //! #[derive(Default)]
-//! struct Counter {
-//!     value: i64,
-//! }
-//!
-//! #[derive(Clone)]
-//! enum Msg {
-//!     Inc(i64),
-//!     Get,
-//! }
-//!
-//! #[derive(Clone)]
-//! enum Resp {
-//!     Ack,
-//!     Value(i64),
-//! }
+//! struct Counter(i64);
 //!
 //! impl Actor for Counter {
-//!     type Message = Msg;
-//!     type Response = Resp;
+//!     type Message = i64;
+//!     type Response = i64;
 //!
-//!     async fn handle(
-//!         &mut self,
-//!         msg: Self::Message,
-//!         ctx: &mut ActorContext<Self>,
-//!     ) -> ActorResult<Self::Response> {
-//!         match msg {
-//!             Msg::Inc(delta) => {
-//!                 self.value += delta;
-//!                 Ok(Resp::Ack)
-//!             }
-//!             Msg::Get => Ok(Resp::Value(self.value)),
-//!         }
+//!     async fn handle(&mut self, msg: i64, _ctx: &mut ActorContext<Self>) -> ActorResult<i64> {
+//!         self.0 += msg;
+//!         Ok(self.0)
 //!     }
 //! }
 //!
-//! #[tokio::main(flavor = "multi_thread")]
+//! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let handle = Counter::default().spawn_actor("counter", ActorConfig::default()).await?;
-//!     handle.notify(Msg::Inc(1)).await?;
-//!     let _value = handle.send(Msg::Get).await?;
-//!     handle.stop(StopReason::Graceful).await?;
+//!     let counter = Counter::default().spawn().named("counter").await?;
+//!     counter.notify(5).await?;          // fire-and-forget
+//!     let total = counter.send(3).await?; // request-response -> 8
+//!     counter.stop(StopReason::Graceful).await?;
 //!     Ok(())
 //! }
 //! ```
@@ -67,15 +39,18 @@ pub mod system;
 pub mod types;
 
 pub use actor::{
-    context::ActorContext,
+    context::{ActorContext, ChildSpawnBuilder, RecurringScheduleBuilder, ScheduleBuilder},
     handle::ActorHandle,
-    runtime::{ActorConfig, ChildStoppedEvent, MailboxConfig},
-    Actor, ActorExt,
+    runtime::{ActorConfig, MailboxConfig},
+    supervision::SupervisionConfig,
+    Actor, ActorExt, SpawnBuilder,
 };
 pub use error::{
-    ActorError, ActorResult, AskError, SendError, SpawnError, StreamError, TimerError, TrySendError,
+    ActorError, ActorResult, AskError, SendError, SpawnError, StreamError, SupervisionError,
+    TimerError, TrySendError,
 };
 pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{
-    ActorId, MissPolicy, RecurringId, SchedulePolicy, StopReason, StreamEvent, StreamId,
+    ActorId, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId, RestartStrategy,
+    RestartType, SchedulePolicy, Shutdown, StopReason, StreamEvent, StreamId, SupervisionAction,
 };

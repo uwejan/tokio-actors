@@ -83,10 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_config = ActorConfig::default();
 
     let responder = Responder::default()
-        .spawn_actor("responder", &actor_config)
+        .spawn()
+        .named("responder")
+        .with_config(actor_config.clone())
         .await?;
     let sender = Sender::new(responder.clone())
-        .spawn_actor("sender", &actor_config)
+        .spawn()
+        .named("sender")
+        .with_config(actor_config)
         .await?;
 
     sender.send(SenderMsg::Forward("hello".into())).await?;

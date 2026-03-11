@@ -42,7 +42,9 @@ impl Actor for Counter {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = Counter::default()
-        .spawn_actor("counter", ActorConfig::default())
+        .spawn()
+        .named("counter")
+        .with_config(ActorConfig::default())
         .await?;
     handle.notify(Msg::Increment(2)).await?;
     let _ = handle.send(Msg::Increment(2)).await?;

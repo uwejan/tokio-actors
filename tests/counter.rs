@@ -42,7 +42,9 @@ impl Actor for Counter {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simple_counter_handles_messages() {
     let handle = Counter::default()
-        .spawn_actor("counter", ActorConfig::default())
+        .spawn()
+        .named("counter")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 

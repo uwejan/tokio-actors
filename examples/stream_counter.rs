@@ -64,14 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rx: Some(rx),
         total: 0,
     }
-    .spawn_actor("summer", ActorConfig::default())
+    .spawn()
+    .named("summer")
+    .with_config(ActorConfig::default())
     .await?;
 
     // Feed numbers through the channel
     for n in 1..=5 {
         tx.send(n).await?;
     }
-    drop(tx); // close channel → stream sends Finished
+    drop(tx); // close channel -> stream sends Finished
 
     // Wait for all items to be processed
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

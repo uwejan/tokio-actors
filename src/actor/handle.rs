@@ -4,13 +4,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Actor, ActorEnvelope};
 use crate::error::{AskError, SendError, TrySendError};
-use crate::types::{ActorId, Envelope, StopReason};
+use crate::types::{ActorId, ActorStatusInfo, Envelope, StopReason, SystemMessage};
 
 /// Cloneable handle that callers use to communicate with an actor.
 #[derive(Debug)]
 pub struct ActorHandle<A: Actor> {
     id: ActorId,
     tx: mpsc::Sender<ActorEnvelope<A>>,
+    system_tx: mpsc::Sender<SystemMessage>,
     mailbox_capacity: usize,
 }
 
@@ -19,6 +20,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
         Self {
             id: self.id.clone(),
             tx: self.tx.clone(),
+            system_tx: self.system_tx.clone(),
             mailbox_capacity: self.mailbox_capacity,
         }
     }
@@ -42,13 +44,20 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn new(
         id: ActorId,
         tx: mpsc::Sender<ActorEnvelope<A>>,
+        system_tx: mpsc::Sender<SystemMessage>,
         mailbox_capacity: usize,
     ) -> Self {
         Self {
             id,
             tx,
+            system_tx,
             mailbox_capacity,
         }
+    }
+
+    /// Returns a clone of the system channel sender (for wiring child->parent notifications).
+    pub(crate) fn system_tx(&self) -> mpsc::Sender<SystemMessage> {
+        self.system_tx.clone()
     }
 
     /// Returns the unique identifier of the actor.
@@ -131,14 +140,27 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    /// Signals the actor to stop.
+    /// Signals the actor to stop via the system channel.
     ///
-    /// The actor will process any pending messages before stopping, unless the
-    /// stop reason implies an immediate halt (though currently all stops are processed in order).
+    /// The system channel has priority over the mailbox, so stop signals
+    /// are processed even when the mailbox is full.
     pub async fn stop(&self, reason: StopReason) -> Result<(), SendError> {
-        self.tx
-            .send(Envelope::Stop(reason))
+        self.system_tx
+            .send(SystemMessage::Stop(reason))
             .await
             .map_err(|_| SendError::Closed)
+    }
+
+    /// Requests a status snapshot from the actor.
+    ///
+    /// This bypasses the mailbox and uses the system channel, so it
+    /// responds even when the mailbox is full.
+    pub async fn get_status(&self) -> Result<ActorStatusInfo, AskError> {
+        let (tx, rx) = oneshot::channel();
+        self.system_tx
+            .send(SystemMessage::GetStatus(tx))
+            .await
+            .map_err(|_| SendError::Closed)?;
+        rx.await.map_err(|_| AskError::ResponseDropped)
     }
 }

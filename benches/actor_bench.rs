@@ -40,9 +40,10 @@ impl Actor for CountingActor {
 async fn spawn_many(total: usize) {
     let mut handles = Vec::with_capacity(total);
     for idx in 0..total {
-        let actor = CountingActor::default();
-        let handle = actor
-            .spawn_actor(format!("bench-{idx}"), ActorConfig::default())
+        let handle = CountingActor::default()
+            .spawn()
+            .named(format!("bench-{idx}"))
+            .with_config(ActorConfig::default())
             .await
             .expect("spawn");
         handles.push(handle);
@@ -59,7 +60,9 @@ async fn spawn_many(total: usize) {
 
 async fn ping_pong(iterations: usize) {
     let actor = CountingActor::default()
-        .spawn_actor("ping-pong", ActorConfig::default())
+        .spawn()
+        .named("ping-pong")
+        .with_config(ActorConfig::default())
         .await
         .expect("spawn");
 

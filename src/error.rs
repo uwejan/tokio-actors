@@ -113,3 +113,26 @@ impl From<StreamError> for ActorError {
         ActorError::User(value.to_string())
     }
 }
+
+/// Errors emitted by the supervision subsystem.
+#[derive(Debug, Error, Clone)]
+pub enum SupervisionError {
+    /// The specified child was not found.
+    #[error("child `{0}` not found")]
+    ChildNotFound(ActorId),
+    /// The restart budget has been exhausted.
+    #[error("restart budget exhausted")]
+    BudgetExhausted,
+    /// The factory closure failed during a restart attempt.
+    #[error("factory failed: {0}")]
+    FactoryFailed(String),
+    /// The actor is not configured as a supervisor.
+    #[error("actor is not configured as a supervisor")]
+    NotASupervisor,
+}
+
+impl From<SupervisionError> for ActorError {
+    fn from(value: SupervisionError) -> Self {
+        ActorError::User(value.to_string())
+    }
+}

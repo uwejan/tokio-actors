@@ -25,8 +25,9 @@ impl Actor for Pinger {
     type Response = Resp;
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        // Use schedule_after instead of schedule_once to avoid timing races
-        ctx.schedule_after(Msg::Tick, Duration::from_millis(10))?;
+        ctx.schedule(Msg::Tick)
+            .after(Duration::from_millis(10))
+            .await?;
         Ok(())
     }
 
@@ -48,7 +49,9 @@ impl Actor for Pinger {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recurring_timer_delivers_messages() {
     let handle = Pinger::default()
-        .spawn_actor("pinger", ActorConfig::default())
+        .spawn()
+        .named("pinger")
+        .with_config(ActorConfig::default())
         .await
         .unwrap();
 
@@ -87,8 +90,9 @@ async fn schedule_after_convenience_method() {
         type Response = TimerResp;
 
         async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-            // Use schedule_after instead of schedule_once
-            ctx.schedule_after(TimerMsg::Tick, Duration::from_millis(10))?;
+            ctx.schedule(TimerMsg::Tick)
+                .after(Duration::from_millis(10))
+                .await?;
             Ok(())
         }
 
@@ -107,7 +111,11 @@ async fn schedule_after_convenience_method() {
         }
     }
 
-    let actor = TimerActor::default().spawn_actor("test", ()).await.unwrap();
+    let actor = TimerActor::default()
+        .spawn()
+        .named("timer-recurring")
+        .await
+        .unwrap();
     sleep(Duration::from_millis(50)).await;
 
     if let TimerResp::Received(received) = actor.send(TimerMsg::Check).await.unwrap() {
@@ -117,8 +125,6 @@ async fn schedule_after_convenience_method() {
 
 #[tokio::test]
 async fn timer_cancellation_apis() {
-    use tokio_actors::MissPolicy;
-
     #[derive(Default)]
     struct CancelActor {
         ticks: u64,
@@ -141,21 +147,15 @@ async fn timer_cancellation_apis() {
 
         async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
             // Schedule 3 recurring timers
-            ctx.schedule_recurring(
-                CancelMsg::Tick,
-                Duration::from_millis(100),
-                MissPolicy::Skip,
-            )?;
-            ctx.schedule_recurring(
-                CancelMsg::Tick,
-                Duration::from_millis(100),
-                MissPolicy::Skip,
-            )?;
-            ctx.schedule_recurring(
-                CancelMsg::Tick,
-                Duration::from_millis(100),
-                MissPolicy::Skip,
-            )?;
+            ctx.schedule(CancelMsg::Tick)
+                .every(Duration::from_millis(100))
+                .await?;
+            ctx.schedule(CancelMsg::Tick)
+                .every(Duration::from_millis(100))
+                .await?;
+            ctx.schedule(CancelMsg::Tick)
+                .every(Duration::from_millis(100))
+                .await?;
 
             assert_eq!(ctx.active_timer_count(), 3);
             Ok(())
@@ -182,7 +182,8 @@ async fn timer_cancellation_apis() {
     }
 
     let actor = CancelActor::default()
-        .spawn_actor("cancel", ())
+        .spawn()
+        .named("cancel")
         .await
         .unwrap();
 
