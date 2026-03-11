@@ -1,6 +1,6 @@
 //! Actor system providing named actor registration and coordinated shutdown.
 //!
-//! Internal module.
+//! Internal module; the public pieces are re-exported at the crate root.
 
 use std::any::{Any, TypeId};
 use std::future::Future;
@@ -104,7 +104,7 @@ impl AnyActorHandle {
 }
 
 // ---------------------------------------------------------------------------
-// RegistryGuard — drop-based auto-unregister
+// RegistryGuard - drop-based auto-unregister
 // ---------------------------------------------------------------------------
 
 pub(crate) struct RegistryGuard {
@@ -135,7 +135,7 @@ impl Drop for RegistryGuard {
 /// A named actor registry with coordinated shutdown.
 ///
 /// `ActorSystem` is a phone book, not a runtime. It does not create or own a
-/// Tokio runtime — actors spawn on whatever runtime is current via
+/// Tokio runtime. Actors spawn on whatever runtime is current via
 /// `Handle::try_current()`.
 pub struct ActorSystem {
     name: String,
@@ -243,7 +243,7 @@ impl ActorSystem {
     ///
     /// Returns `None` if the name is not registered or if the registered actor
     /// is a different type (type mismatch is silent, matching OTP's
-    /// `whereis/1 → undefined` semantics).
+    /// `whereis/1 -> undefined` semantics).
     pub fn get<A: Actor>(&self, name: &str) -> Option<ActorHandle<A>> {
         self.by_name.get(name).and_then(|e| e.downcast::<A>())
     }
@@ -331,7 +331,7 @@ impl ActorSystem {
     pub async fn shutdown_with(&self, policy: ShutdownPolicy) {
         let deadline = Instant::now() + policy.timeout;
 
-        // Drain both maps — takes ownership and releases all DashMap locks
+        // Drain both maps, takes ownership and releases all DashMap locks
         // before we await the stop futures. This prevents deadlock with
         // RegistryGuard::drop which also mutates these maps.
         self.by_name.clear();
