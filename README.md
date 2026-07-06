@@ -8,47 +8,45 @@
 
 **The OTP-faithful actor runtime for Rust: supervision, lifecycle, and crash semantics traced to Erlang/OTP, running as zero-ceremony Tokio tasks.**
 
-Tokio Actors is a lightweight actor framework for Rust developers who want Erlang-grade failure handling without the ceremony. Every actor runs as a dedicated `tokio::task` on your runtime -- no custom schedulers, no macros, no hidden magic. What sets it apart is what happens when things go wrong: supervision, restarts, and cleanup follow Erlang/OTP's documented semantics, not an approximation of them.
+Tokio Actors is a lightweight actor framework for Rust developers who want Erlang-grade failure handling without the ceremony. Every actor runs as a dedicated `tokio::task` on your runtime. No custom schedulers, no macros, no hidden magic. What sets it apart is what happens when things go wrong: supervision, restarts, and cleanup follow Erlang/OTP's documented semantics, not an approximation of them.
 
 ---
 
 ## Why OTP Fidelity Matters
 
-The actor model's production value was never the mailbox API -- it is the failure semantics. Erlang/OTP's "let it crash" philosophy works because the runtime makes hard guarantees: every process death produces an exit signal that cannot be lost, supervisors stop and restart children in a documented order, cleanup (`terminate/2`) runs even when the process is dying from an exception, and a supervisor that exhausts its restart budget escalates with a reason its own parent knows how to interpret. Most Rust actor crates copy the API shape -- spawn, send, mailbox -- but not these failure semantics: panics slip past supervision, death notices ride best-effort channels, and restart logic is left as an exercise. Tokio Actors is built for OTP fidelity: every supervision and lifecycle semantic is traced to Erlang/OTP's documented behavior (`gen_server`, `supervisor`), and every deliberate deviation is documented as a deviation. When the docs here say a child restarts, that holds under a real crash -- a panicking handler, not just a polite `Err`.
+The actor model's production value was never the mailbox API. It is the failure semantics. Erlang/OTP's "let it crash" philosophy works because the runtime makes hard guarantees: every process death produces an exit signal that cannot be lost, supervisors stop and restart children in a documented order, cleanup (`terminate/2`) runs even when the process is dying from an exception, and a supervisor that exhausts its restart budget escalates with a reason its own parent knows how to interpret. Most actor libraries copy the API shape - spawn, send, mailbox. Tokio Actors is built for the failure semantics: every supervision and lifecycle behavior is traced to Erlang/OTP's documented behavior (`gen_server`, `supervisor`), and every deliberate deviation is documented as a deviation. When the docs here say a child restarts, that holds under a real crash - a panicking handler, not just a polite `Err`.
 
-## How It Compares
+## The Guarantees
 
-Three Rust actor frameworks, three different answers to "what happens when a handler panics?"
+What happens when things go wrong. Every row is exercised by the test suite (see [Testing](#testing)):
 
-| Failure semantic | tokio-actors | ractor | Actix |
-|---|---|---|---|
-| Panic in a handler | Caught at the callback boundary; the actor stops with `StopReason::Failure(ActorError::Panic)` and `on_stopped` still runs with that reason (gen_server terminate-on-exception parity) | Caught once around the whole message loop; the payload is stringified into `ActorErr::Failed` | Not caught; the panic unwinds the task and the actor dies silently (senders find out via send errors) |
-| Death notification | A runtime watcher on the child's task delivers `ChildStopped` through an awaited send -- the report cannot be silently dropped | The dying actor's own task notifies fire-and-forget over an unbounded port; the send result is discarded, so a dead receiver means a lost event | None; the actor's death is observable only through send errors |
-| Automatic restart | Runtime-managed: OneForOne, OneForAll, RestForOne, SimpleOneForOne | Not in core ("supervision is presently left to the implementor"); the default supervisor callback stops itself | `Supervisor` restarts only after a graceful stop; a panic kills the supervisor task too |
-| Group restart ordering | OTP ordering: affected children stop in reverse start order, then restart in start order | n/a | n/a |
-| Manual child management | `terminate_child` / `restart_child` / `delete_child` / `stop_child` with OTP semantics: spec kept, manual stops never charge the budget | n/a | n/a |
-| Restart budget escalation | Sliding-window budget; exhaustion stops the supervisor with the OTP `shutdown` reason (`StopReason::ParentRequest`), so a grandparent's Transient policy does not restart it | n/a | n/a |
-| Forced termination | `Shutdown::Timeout` -> `Kill` -> task abort ladder; every stop path is bounded except documented `Infinity` | n/a | n/a |
+| Failure semantic | tokio-actors guarantee |
+|---|---|
+| Panic in a handler | Caught at the callback boundary; the actor stops with `StopReason::Failure(ActorError::Panic)` and `on_stopped` still runs with that reason (gen_server terminate-on-exception parity) |
+| Death notification | A runtime watcher on the child's task delivers `ChildStopped` through an awaited send, so the report cannot be silently dropped |
+| Automatic restart | Runtime-managed: OneForOne, OneForAll, RestForOne, SimpleOneForOne |
+| Group restart ordering | OTP ordering: affected children stop in reverse start order, then restart in start order |
+| Manual child management | `terminate_child` / `restart_child` / `delete_child` / `stop_child` with OTP semantics: spec kept, manual stops never charge the budget |
+| Restart budget escalation | Sliding-window budget; exhaustion stops the supervisor with the OTP `shutdown` reason (`StopReason::ParentRequest`), so a grandparent's Transient policy does not restart it |
+| Forced termination | `Shutdown::Timeout` -> `Kill` -> task abort ladder; every stop path is bounded except documented `Infinity` |
 
-*Competitor cells come from a source-level review of ractor v0.15.13 and Actix master (2026-07). n/a means no counterpart exists in that framework's supervision core (ractor leaves restart to the implementor; Actix restarts only after graceful stops). Credit where due: ractor's in-task catch is the right skeleton, and tokio-actors adopts a per-callback version of it -- the watcher layer and the restart machinery are where the designs diverge. The behaviors in the tokio-actors column are exercised by the test suite (see [Testing](#testing)).*
-
-**Honest limits.** Panic capture requires unwinding: `panic = "abort"` builds have no in-process supervision (the process dies -- the same caveat ractor documents). A handler stuck at an `.await` point is force-killable, but a non-yielding busy loop is beyond even task abort; it surfaces as a typed `SupervisionError::ChildUnresponsive` after a bounded wait instead of hanging the supervisor. `Shutdown::Infinity` children can stall a group restart indefinitely, matching OTP's own infinity semantics. And there is no distribution layer by design: tokio-actors is local-first (see [Non-Goals](#non-goals)) -- in-process fidelity is the product, not a stepping stone to a cluster framework.
+**Honest limits.** Panic capture requires unwinding: `panic = "abort"` builds have no in-process supervision (the process dies). A handler stuck at an `.await` point is force-killable, but a non-yielding busy loop is beyond even task abort; it surfaces as a typed `SupervisionError::ChildUnresponsive` after a bounded wait instead of hanging the supervisor. `Shutdown::Infinity` children can stall a group restart indefinitely, matching OTP's own infinity semantics. And there is no distribution layer by design: tokio-actors is local-first (see [Non-Goals](#non-goals)). In-process fidelity is the product, not a stepping stone to a cluster framework.
 
 ---
 
 ## Feature Highlights
 
 ### OTP-Style Supervision
-Supervision is crash-visible. A panic in a handler or lifecycle hook is caught and becomes `StopReason::Failure(ActorError::Panic)`, and supervisors detect every child death through a runtime watcher on the child's task -- the death report cannot be silently dropped. Restart strategies come from Erlang/OTP:
+Supervision is crash-visible. A panic in a handler or lifecycle hook is caught and becomes `StopReason::Failure(ActorError::Panic)`, and supervisors detect every child death through a runtime watcher on the child's task, so the death report cannot be silently dropped. Restart strategies come from Erlang/OTP:
 - **OneForOne**: Restart only the failed child
 - **OneForAll**: Restart all children when any one fails
 - **RestForOne**: Restart the failed child and all children started after it
 - **SimpleOneForOne**: Dynamic children sharing a single factory
 
-Group strategies (OneForAll/RestForOne) follow OTP ordering: affected children are stopped in reverse start order, then restarted in start order. Children keep their `ActorId` and `ActorConfig` across restarts. Each child has a `RestartType` (Permanent/Transient/Temporary), and a sliding-window restart budget prevents restart storms. When the budget is exhausted, the supervisor stops with `StopReason::ParentRequest` -- its own supervisor's Transient policy will NOT restart it, matching OTP shutdown semantics.
+Group strategies (OneForAll/RestForOne) follow OTP ordering: affected children are stopped in reverse start order, then restarted in start order. Children keep their `ActorId` and `ActorConfig` across restarts. Each child has a `RestartType` (Permanent/Transient/Temporary), and a sliding-window restart budget prevents restart storms. When the budget is exhausted, the supervisor stops with `StopReason::ParentRequest`, and its own supervisor's Transient policy will NOT restart it, matching OTP shutdown semantics.
 
 ### Lifecycle Observability
-Query actor status anytime via the system channel -- even when the mailbox is full:
+Query actor status anytime via the system channel, even when the mailbox is full:
 
 ```rust
 let status = handle.get_status().await?;
@@ -66,7 +64,7 @@ impl Actor for MyActor {
 ```
 
 ### Bounded Mailboxes = Natural Backpressure
-Every actor has a bounded mailbox (default: 64). When full, senders wait automatically -- no OOM crashes from runaway queues.
+Every actor has a bounded mailbox (default: 64). When full, senders wait automatically - no OOM crashes from runaway queues.
 
 ### Timer Drift Handling (MissPolicy)
 Recurring timers have three drift strategies to handle system lag:
@@ -189,10 +187,10 @@ impl Actor for MySupervisor {
     type Response = ();
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        // Permanent -- always restarts, even after graceful stop
+        // Permanent - always restarts, even after graceful stop
         ctx.spawn_child(|| Worker::default()).named("worker").await?;
 
-        // Transient -- restarts on crash, stays down on graceful stop
+        // Transient - restarts on crash, stays down on graceful stop
         ctx.spawn_child(|| CacheActor::new())
             .named("cache")
             .restart_type(RestartType::Transient)
@@ -216,9 +214,9 @@ let sup = SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(3
 let handle = MySupervisor.spawn().named("my-sup").with_supervision(sup).await?;
 ```
 
-The runtime handles the restart loop: evaluate strategy, check budget, invoke the factory, wire the new child in -- all non-blocking. If the budget is exhausted, the supervisor itself stops with `StopReason::ParentRequest`.
+The runtime handles the restart loop: evaluate strategy, check budget, invoke the factory, wire the new child in, all non-blocking. If the budget is exhausted, the supervisor itself stops with `StopReason::ParentRequest`.
 
-When a child must be stopped (group restart, parent shutdown, or a manual stop), its `Shutdown` policy bounds the whole exchange: `Shutdown::Timeout(d)` requests a cooperative stop, escalates to `Kill` at expiry, and backs the `Kill` with a task abort after a short grace window. A child stuck at an `.await` point IS killable -- abort cancels it at the next yield, and its drops still run. Only a handler spinning in a non-yielding busy loop is beyond reach; the supervisor waits a bounded time, then returns a typed `SupervisionError::ChildUnresponsive` instead of hanging.
+When a child must be stopped (group restart, parent shutdown, or a manual stop), its `Shutdown` policy bounds the whole exchange: `Shutdown::Timeout(d)` requests a cooperative stop, escalates to `Kill` at expiry, and backs the `Kill` with a task abort after a short grace window. A child stuck at an `.await` point IS killable - abort cancels it at the next yield, and its drops still run. Only a handler spinning in a non-yielding busy loop is beyond reach; the supervisor waits a bounded time, then returns a typed `SupervisionError::ChildUnresponsive` instead of hanging.
 
 #### Managing Children
 
@@ -227,7 +225,7 @@ Supervisors can also drive child lifecycles manually, mirroring OTP's `superviso
 | Call | What it does |
 |------|--------------|
 | `ctx.terminate_child(id).await` | Stop WITHOUT restart (OTP `terminate_child`). The child spec is kept (unless Temporary) so the child can be revived later. Budget untouched. |
-| `ctx.restart_child(id)` | Revive a terminated child from its stored spec -- same `ActorId`, same config (OTP `restart_child`). Errors with `ChildRunning`/`ChildRestarting` if the child is not down. |
+| `ctx.restart_child(id)` | Revive a terminated child from its stored spec - same `ActorId`, same config (OTP `restart_child`). Errors with `ChildRunning`/`ChildRestarting` if the child is not down. |
 | `ctx.delete_child(id)` | Remove the child spec (OTP `delete_child`). The child must not be running or restarting. |
 | `ctx.stop_child(id).await` | Bounce per restart policy: Permanent children restart budget-free; Transient/Temporary stay down. |
 
@@ -256,7 +254,7 @@ match worker.send(job).await {
     Err(AskError::Actor(ActorError::Panic(msg))) => {
         // Handler panicked. The actor stopped with Failure(Panic) and its
         // supervisor is already restarting it. An immediate retry may hit
-        // Closed during the restart window -- re-lookup by name to retry.
+        // Closed during the restart window - re-lookup by name to retry.
         eprintln!("worker crashed: {msg}");
     }
     Err(AskError::Actor(err)) => eprintln!("handler returned Err: {err}"),
@@ -267,7 +265,7 @@ match worker.send(job).await {
 
 On the notify path, `Err` and panic are different animals: a handler that returns `Err` for a notify-dispatched message goes to `handle_failure()` and the actor **continues**; a handler that panics stops the actor and triggers a restart, exactly as on the send path.
 
-**Known limitations**: `panic = "abort"` builds have no unwinding, so panic capture cannot exist there (the process dies). The default panic hook still prints to stderr even when supervision handles the crash -- set your own hook to silence it. A child with `Shutdown::Infinity` that refuses to stop can stall a group restart, matching OTP infinity semantics -- Infinity is the single unbounded case; every other stop path is bounded by the Timeout -> Kill -> abort ladder. A handler stuck at an `.await` point IS force-killable (the abort backstop cancels the task after a short grace); only a non-yielding busy loop remains beyond reach, and it surfaces as a typed `ChildUnresponsive` error after a bounded wait instead of hanging the supervisor.
+**Known limitations**: `panic = "abort"` builds have no unwinding, so panic capture cannot exist there (the process dies). The default panic hook still prints to stderr even when supervision handles the crash. Set your own hook to silence it. A child with `Shutdown::Infinity` that refuses to stop can stall a group restart, matching OTP infinity semantics. Infinity is the single unbounded case; every other stop path is bounded by the Timeout -> Kill -> abort ladder. A handler stuck at an `.await` point IS force-killable (the abort backstop cancels the task after a short grace); only a non-yielding busy loop remains beyond reach, and it surfaces as a typed `ChildUnresponsive` error after a bounded wait instead of hanging the supervisor.
 
 ### 3-Tier Termination
 
@@ -324,7 +322,7 @@ use tokio_actors::MissPolicy;
 // One-shot after delay
 ctx.schedule(msg).after(Duration::from_secs(5)).await?;
 
-// Recurring -- default MissPolicy::Skip
+// Recurring - default MissPolicy::Skip
 ctx.schedule(msg).every(Duration::from_millis(100)).await?;
 
 // Recurring with explicit drift strategy
@@ -505,7 +503,7 @@ cargo run --example supervision
 
 ## A Foundation for Agentic Systems
 
-Multi-agent AI systems need exactly the guarantees described above. Each agent is an actor with isolated state: conversation history lives in one place, owned by one task, with no shared mutable state and no `Any` casting. Bounded mailboxes give token streams and API fan-out natural backpressure, so a slow consumer slows the producer instead of growing an unbounded queue. Tool calls map to type-safe request/response (`send`), and orchestration across multiple model APIs chains without callback hell. Flaky tool handlers become supervised children: a panic mid-call is a restart per strategy, not a silent death, and a crashed agent comes back with the same `ActorId` and configuration so the rest of the system can re-look it up and continue. None of this is a separate AI feature set -- it is what OTP fidelity buys you.
+Multi-agent AI systems need exactly the guarantees described above. Each agent is an actor with isolated state: conversation history lives in one place, owned by one task, with no shared mutable state and no `Any` casting. Bounded mailboxes give token streams and API fan-out natural backpressure, so a slow consumer slows the producer instead of growing an unbounded queue. Tool calls map to type-safe request/response (`send`), and orchestration across multiple model APIs chains without callback hell. Flaky tool handlers become supervised children: a panic mid-call is a restart per strategy, not a silent death, and a crashed agent comes back with the same `ActorId` and configuration so the rest of the system can re-look it up and continue. None of this is a separate AI feature set. It is what OTP fidelity buys you.
 
 ---
 

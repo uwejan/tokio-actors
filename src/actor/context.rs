@@ -68,7 +68,7 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    // -- Identity & status --------------------------------------------------
+    // - Identity & status --------------------------------------------------
 
     /// Returns the unique identifier of this actor.
     pub fn actor_id(&self) -> &ActorId {
@@ -104,7 +104,7 @@ impl<A: Actor> ActorContext<A> {
         self.status = status;
     }
 
-    // -- Supervision --------------------------------------------------------
+    // - Supervision --------------------------------------------------------
 
     pub(crate) fn supervision_mut(&mut self) -> Option<&mut SupervisionState> {
         self.supervision.as_mut()
@@ -505,7 +505,7 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    // -- Timers -------------------------------------------------------------
+    // - Timers -------------------------------------------------------------
 
     /// Creates a [`ScheduleBuilder`] for scheduling a message.
     ///
@@ -599,7 +599,7 @@ impl<A: Actor> ActorContext<A> {
         self.timers.len()
     }
 
-    // -- Streams ------------------------------------------------------------
+    // - Streams ------------------------------------------------------------
 
     /// Attaches an external stream to this actor's mailbox.
     pub fn add_stream<S>(&mut self, stream: S) -> StreamId

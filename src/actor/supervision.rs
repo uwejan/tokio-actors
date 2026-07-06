@@ -536,7 +536,7 @@ mod tests {
     use super::*;
     use crate::types::StopReason;
 
-    // -- RestartBudget -------------------------------------------------------
+    // - RestartBudget -------------------------------------------------------
 
     #[tokio::test]
     async fn budget_allows_within_limit() {
@@ -563,7 +563,7 @@ mod tests {
         assert!(budget.check_and_record());
     }
 
-    // -- ChildRegistry -------------------------------------------------------
+    // - ChildRegistry -------------------------------------------------------
 
     fn dummy_child_with(id: &str, restart_type: RestartType, alive: bool) -> ChildState {
         let (tx, _rx) = mpsc::channel(1);
@@ -689,7 +689,7 @@ mod tests {
         assert!(!child.accepts_incarnation(0));
     }
 
-    // -- evaluate_strategy ---------------------------------------------------
+    // - evaluate_strategy ---------------------------------------------------
 
     fn make_sup_state(strategy: RestartStrategy) -> SupervisionState {
         SupervisionState::new(SupervisionConfig {

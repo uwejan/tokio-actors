@@ -249,7 +249,7 @@ async fn test_stream_finished_on_drop() {
     .await
     .unwrap();
 
-    // Drop sender immediately -- stream should yield None -> Finished
+    // Drop sender immediately - stream should yield None -> Finished
     drop(tx);
 
     sleep(Duration::from_millis(50)).await;
@@ -340,7 +340,7 @@ async fn test_cancel_stream() {
     .await
     .unwrap();
 
-    // Send some items first -- these should arrive
+    // Send some items first - these should arrive
     tx.send(1).await.unwrap();
     tx.send(2).await.unwrap();
     sleep(Duration::from_millis(30)).await;
@@ -349,7 +349,7 @@ async fn test_cancel_stream() {
     handle.notify(Msg::DoCancel).await.unwrap();
     sleep(Duration::from_millis(20)).await;
 
-    // Send more items -- these should NOT arrive
+    // Send more items - these should NOT arrive
     let _ = tx.send(3).await;
     let _ = tx.send(4).await;
 
@@ -447,7 +447,7 @@ async fn test_cancel_all_streams() {
     .await
     .unwrap();
 
-    // Send items -- these arrive before cancel
+    // Send items - these arrive before cancel
     tx1.send(1).await.unwrap();
     tx2.send(2).await.unwrap();
     sleep(Duration::from_millis(30)).await;
@@ -456,7 +456,7 @@ async fn test_cancel_all_streams() {
     handle.notify(Msg::DoCancelAll).await.unwrap();
     sleep(Duration::from_millis(20)).await;
 
-    // Send more items -- should NOT arrive
+    // Send more items - should NOT arrive
     let _ = tx1.send(3).await;
     let _ = tx2.send(4).await;
     sleep(Duration::from_millis(50)).await;
@@ -693,10 +693,10 @@ async fn test_stream_cancelled_on_actor_stop() {
     // Give actor time to attach stream
     sleep(Duration::from_millis(20)).await;
 
-    // Stop the actor -- stream forwarding task should be cancelled via Drop
+    // Stop the actor - stream forwarding task should be cancelled via Drop
     handle.stop(StopReason::Graceful).await.unwrap();
 
-    // Try to send through channel -- should fail because receiver side is dropped
+    // Try to send through channel - should fail because receiver side is dropped
     // or the forwarding task exited (either way, no one is consuming).
     sleep(Duration::from_millis(20)).await;
 

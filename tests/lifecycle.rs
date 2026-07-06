@@ -258,7 +258,7 @@ async fn pre_stop_rejection_keeps_actor_alive() {
 
     sleep(Duration::from_millis(10)).await;
 
-    // First stop attempt -- should be rejected
+    // First stop attempt - should be rejected
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(handle.is_alive(), "actor must survive first rejected stop");
@@ -267,13 +267,13 @@ async fn pre_stop_rejection_keeps_actor_alive() {
     // Actor can still process messages after rejected stop
     handle.notify(Msg::Ping).await.unwrap();
 
-    // Second stop attempt -- should also be rejected
+    // Second stop attempt - should also be rejected
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(handle.is_alive(), "actor must survive second rejected stop");
     assert_eq!(reject_count.load(Ordering::SeqCst), 2);
 
-    // Third stop attempt -- should succeed (no rejections remaining)
+    // Third stop attempt - should succeed (no rejections remaining)
     handle.stop(StopReason::Graceful).await.unwrap();
     sleep(Duration::from_millis(10)).await;
     assert!(

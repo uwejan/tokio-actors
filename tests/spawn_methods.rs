@@ -18,7 +18,7 @@ impl Actor for Ping {
     }
 }
 
-/// spawn() -- anonymous, auto UUID id.
+/// spawn() - anonymous, auto UUID id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_anonymous() {
     let handle = Ping.spawn().await.unwrap();
@@ -27,7 +27,7 @@ async fn spawn_anonymous() {
     assert_eq!(id.len(), 36, "UUID should be 36 chars: {id}");
 }
 
-/// spawn().named("x") -- name == id, registered in default system.
+/// spawn().named("x") - name == id, registered in default system.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_named_registers_in_default() {
     let name = format!("named-{}", uuid::Uuid::new_v4());
@@ -41,7 +41,7 @@ async fn spawn_named_registers_in_default() {
     assert!(found.is_some(), "actor should be in default system");
 }
 
-/// spawn().named("x").with_config(config) -- name + custom config.
+/// spawn().named("x").with_config(config) - name + custom config.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_named_with_custom_config() {
     let name = format!("named-with-{}", uuid::Uuid::new_v4());
@@ -53,7 +53,7 @@ async fn spawn_named_with_custom_config() {
     assert_eq!(handle.id().as_str(), name);
 }
 
-/// spawn().on_system(&system) -- anonymous in specific system.
+/// spawn().on_system(&system) - anonymous in specific system.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_on_specific_system() {
     let sys_name = format!("spawn-on-{}", uuid::Uuid::new_v4());
@@ -65,7 +65,7 @@ async fn spawn_on_specific_system() {
     assert_eq!(id_str.len(), 36); // UUID
 }
 
-/// spawn().named("x").on_system(&system) -- named in specific system.
+/// spawn().named("x").on_system(&system) - named in specific system.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_on_named_in_system() {
     let sys_name = format!("on-named-{}", uuid::Uuid::new_v4());
@@ -79,7 +79,7 @@ async fn spawn_on_named_in_system() {
     assert!(found.is_some());
 }
 
-/// spawn().named("x").on_system(&system).with_config(config) -- full params.
+/// spawn().named("x").on_system(&system).with_config(config) - full params.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_on_named_with_full_params() {
     let sys_name = format!("on-named-with-{}", uuid::Uuid::new_v4());
@@ -144,7 +144,7 @@ async fn system_kill_named_actor() {
     assert!(!handle.is_alive());
 }
 
-/// Concurrent spawn_named with same name -- one succeeds, one fails (TOCTOU test).
+/// Concurrent spawn_named with same name - one succeeds, one fails (TOCTOU test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_spawn_named_no_race() {
     let sys_name = format!("toctou-{}", uuid::Uuid::new_v4());

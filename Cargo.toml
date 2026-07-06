@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "OTP-faithful actors for Tokio: panic-visible supervision, restart strategies, and Erlang-grade lifecycle semantics with zero ceremony"
 license = "MIT OR Apache-2.0"

@@ -153,7 +153,7 @@ impl std::fmt::Debug for ActorSystem {
 }
 
 impl ActorSystem {
-    // -- Construction -------------------------------------------------------
+    // - Construction -------------------------------------------------------
 
     /// Returns the default system (named `"default"`), creating it lazily.
     ///
@@ -237,7 +237,7 @@ impl ActorSystem {
         &self.name
     }
 
-    // -- Actor lookup -------------------------------------------------------
+    // - Actor lookup -------------------------------------------------------
 
     /// Looks up a named actor, returning a typed handle.
     ///
@@ -281,7 +281,7 @@ impl ActorSystem {
         self.by_name.iter().map(|e| e.key().clone()).collect()
     }
 
-    // -- Internal registration (used by spawn path) -------------------------
+    // - Internal registration (used by spawn path) -------------------------
 
     pub(crate) fn register_actor<A: Actor>(
         &self,
@@ -311,7 +311,7 @@ impl ActorSystem {
         self.by_id.remove(id);
     }
 
-    // -- Shutdown -----------------------------------------------------------
+    // - Shutdown -----------------------------------------------------------
 
     /// Shuts down all registered actors using the system's stored policy.
     pub async fn shutdown(&self) {
