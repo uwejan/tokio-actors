@@ -1,15 +1,15 @@
 [package]
 name = "tokio-actors"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-description = "Zero-ceremony, Tokio-native actors with strong typing and production-ready edge case handling"
+description = "OTP-faithful actors for Tokio: panic-visible supervision, restart strategies, and Erlang-grade lifecycle semantics with zero ceremony"
 license = "MIT OR Apache-2.0"
 authors = ["Saddam Uwejan (Sam) <saddamuwejan@gmail.com>"]
 repository = "https://github.com/uwejan/tokio-actors"
 readme = "README.md"
 homepage = "https://github.com/uwejan/tokio-actors"
 documentation = "https://docs.rs/tokio-actors"
-keywords = ["actors", "tokio", "async", "agents", "llm"]
+keywords = ["actors", "tokio", "otp", "supervision", "erlang"]
 categories = ["asynchronous", "concurrency", "rust-patterns"]
 exclude = [".github/"]
 

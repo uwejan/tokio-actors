@@ -57,15 +57,24 @@ pub enum TrySendError {
 }
 
 /// Errors reported when awaiting a response from an actor.
+///
+/// The three variants encode three distinct facts:
+/// - [`Closed`](AskError::Closed): the request was never enqueued - it was
+///   definitely NOT processed. Safe to retry unconditionally.
+/// - [`ResponseDropped`](AskError::ResponseDropped): the actor stopped after
+///   the request was enqueued but before replying - it MAY have been partially
+///   processed. Retry only if the operation is idempotent.
+/// - [`Actor`](AskError::Actor): the handler produced this error - either it
+///   returned `Err` or it panicked ([`ActorError::Panic`]).
 #[derive(Debug, Error, Clone)]
 pub enum AskError {
-    /// Failed to send the request.
-    #[error(transparent)]
-    Send(#[from] SendError),
+    /// The actor's mailbox was closed before the request could be enqueued.
+    #[error("mailbox closed before the request was sent")]
+    Closed,
     /// The actor dropped the response channel without sending a reply.
-    #[error("response channel dropped")]
+    #[error("actor stopped before replying")]
     ResponseDropped,
-    /// The actor returned an error.
+    /// The actor's handler returned an error or panicked.
     #[error("actor returned error: {0}")]
     Actor(ActorError),
 }
@@ -129,6 +138,18 @@ pub enum SupervisionError {
     /// The actor is not configured as a supervisor.
     #[error("actor is not configured as a supervisor")]
     NotASupervisor,
+    /// The operation requires the child to be stopped, but it is running.
+    #[error("child `{0}` is running")]
+    ChildRunning(ActorId),
+    /// The child has a restart in flight or is a member of a pending group
+    /// restart; manual operations must wait for it to settle.
+    #[error("child `{0}` is restarting")]
+    ChildRestarting(ActorId),
+    /// The child did not terminate within the kill grace even after its task
+    /// was aborted - it is stuck in a non-yielding loop (see the crate docs on
+    /// abort limits). The supervisor stops waiting instead of hanging.
+    #[error("child `{0}` is unresponsive to kill")]
+    ChildUnresponsive(ActorId),
 }
 
 impl From<SupervisionError> for ActorError {

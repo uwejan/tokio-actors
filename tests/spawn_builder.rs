@@ -85,8 +85,8 @@ async fn builder_chain_order_independent() {
 }
 
 #[tokio::test]
-async fn supervised_parent_default() {
-    let h = Noop.spawn().named("sb-sup").supervised().await.unwrap();
+async fn supervisor_parent_default() {
+    let h = Noop.spawn().named("sb-sup").supervisor().await.unwrap();
     assert!(h.is_alive());
 }
 

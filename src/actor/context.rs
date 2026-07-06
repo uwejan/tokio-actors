@@ -12,14 +12,17 @@ use tokio_util::sync::CancellationToken;
 use futures_core::Stream;
 use tokio_stream::StreamExt;
 
+use tokio::task::AbortHandle;
+
 use crate::actor::handle::ActorHandle;
-use crate::actor::supervision::{ChildSpec, ChildState, SupervisionState};
+use crate::actor::panic::{catch_sync, payload_into_string};
+use crate::actor::supervision::{ChildSpec, ChildState, ManualStop, SupervisionState, KILL_GRACE};
 use crate::actor::{runtime, Actor};
 use crate::error::{ActorError, StreamError, SupervisionError, TimerError};
 use crate::system::ActorSystem;
 use crate::types::{
-    ActorId, ActorStatus, ChildInfo, MissPolicy, RecurringId, RecurringIdGenerator, RestartType,
-    Shutdown, StreamEvent, StreamId, SystemMessage,
+    ActorId, ActorStatus, ChildInfo, ChildStoppedInternal, MissPolicy, RecurringId,
+    RecurringIdGenerator, RestartType, Shutdown, StopReason, StreamEvent, StreamId, SystemMessage,
 };
 
 /// Actor execution context providing timers, streams, supervision, and runtime hooks.
@@ -183,10 +186,9 @@ impl<A: Actor> ActorContext<A> {
         F: Fn() -> C + Send + Sync + 'static,
         C: Actor,
     {
-        let sup = self
-            .supervision
-            .as_mut()
-            .ok_or(SupervisionError::NotASupervisor)?;
+        if self.supervision.is_none() {
+            return Err(SupervisionError::NotASupervisor.into());
+        }
 
         let actor = factory();
         let child_config = config.unwrap_or_default();
@@ -198,76 +200,105 @@ impl<A: Actor> ActorContext<A> {
         let (child_handle, join_handle) = runtime::spawn_actor(
             child_id.clone(),
             actor,
-            child_config,
+            child_config.clone(),
             name.clone(),
             self.system.clone(),
-            Some(self.system_tx.clone()), // wire parent notification
         )?;
 
+        // The parent spawns and owns the watcher (initial incarnation 0).
+        // The watcher, not the child itself, delivers the death event, so a
+        // panicking child is just as visible as a polite one. The abort handle
+        // is taken first - the Kill escalation backstop.
+        let abort = join_handle.abort_handle();
+        let watcher =
+            runtime::spawn_watcher(child_id.clone(), 0, join_handle, self.system_tx.clone());
+
+        let parent_system_tx = self.system_tx.clone();
+        let system_clone = self.system.clone();
+
         let child_state = ChildState {
-            id: child_id,
-            name,
+            id: child_id.clone(),
+            name: name.clone(),
             spec: ChildSpec {
                 restart_type,
                 shutdown,
             },
-            join_handle,
+            watcher_handle: watcher,
+            abort,
             system_tx: child_handle.system_tx(),
             is_alive: true,
             pending_restart_seq: None,
+            current_incarnation: 0,
+            manual_stop: None,
         };
 
+        let sup = self
+            .supervision
+            .as_mut()
+            .expect("supervision presence checked above");
         sup.registry.register(child_state);
 
-        // Store the factory for restarts, captured in a restart closure
-        // that the runtime can invoke later.
-        let parent_system_tx = self.system_tx.clone();
-        let system_clone = self.system.clone();
+        // Restart closure: captures the child's spec BY VALUE (original id,
+        // name, resolved config) so every restart reuses it exactly - the
+        // Rust equivalent of OTP child-spec immutability. The child keeps its
+        // ActorId across restarts, named or anonymous.
         let factory = Arc::new(factory);
-        let child_id_for_restart = child_handle.id().clone();
+        let restart_id = child_id.clone();
+        let restart_name = name;
+        let restart_config = child_config;
 
         sup.restart_fns.insert(
-            child_id_for_restart,
-            Box::new(move |seq, child_name| {
+            child_id,
+            Box::new(move |seq| {
                 let factory = Arc::clone(&factory);
                 let parent_tx = parent_system_tx.clone();
                 let system = system_clone.clone();
+                let child_id = restart_id.clone();
+                let name = restart_name.clone();
+                let config = restart_config.clone();
                 Box::pin(async move {
-                    let actor = factory();
-                    let child_config = runtime::ActorConfig::default();
-                    let child_id: ActorId = child_name
-                        .clone()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-                        .into();
+                    // A panicking factory must not kill the restart task
+                    // silently: it surfaces as FactoryFailed and charges the
+                    // budget when the event re-enters strategy evaluation.
+                    let actor = match catch_sync(&*factory) {
+                        Ok(actor) => actor,
+                        Err(payload) => {
+                            let msg = payload_into_string(payload);
+                            let reason =
+                                StopReason::Failure(SupervisionError::FactoryFailed(msg).into());
+                            let _ = parent_tx
+                                .send(SystemMessage::ChildStopped(ChildStoppedInternal {
+                                    child_id,
+                                    reason,
+                                    incarnation: seq,
+                                }))
+                                .await;
+                            return;
+                        }
+                    };
 
-                    match runtime::spawn_actor(
-                        child_id.clone(),
-                        actor,
-                        child_config,
-                        child_name,
-                        system,
-                        Some(parent_tx.clone()),
-                    ) {
+                    match runtime::spawn_actor(child_id.clone(), actor, config, name, system) {
                         Ok((handle, join)) => {
+                            // The parent adopts the incarnation and spawns the
+                            // watcher itself on acceptance, so watcher events
+                            // can never outrun this message on the channel.
                             let _ = parent_tx
                                 .send(SystemMessage::RestartComplete {
                                     seq,
                                     child_id,
                                     new_system_tx: handle.system_tx(),
-                                    new_join_handle: join,
+                                    new_join: join,
                                 })
                                 .await;
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            let reason = StopReason::Failure(ActorError::Spawn(err));
                             let _ = parent_tx
-                                .send(SystemMessage::ChildStopped(
-                                    crate::types::ChildStoppedInternal {
-                                        child_id,
-                                        reason: crate::types::StopReason::Failure(
-                                            crate::error::ActorError::user("restart spawn failed"),
-                                        ),
-                                    },
-                                ))
+                                .send(SystemMessage::ChildStopped(ChildStoppedInternal {
+                                    child_id,
+                                    reason,
+                                    incarnation: seq,
+                                }))
                                 .await;
                         }
                     }
@@ -285,25 +316,193 @@ impl<A: Actor> ActorContext<A> {
             .map_or(Vec::new(), |s| s.registry.children_info())
     }
 
-    /// Manually stops a supervised child.
+    /// Manually stops a supervised child and lets its policy restart it
+    /// (a "bounce"): a Permanent child is restarted BUDGET-FREE ("a manual
+    /// stop is not a failure"), Transient and Temporary children stay down,
+    /// and a SimpleOneForOne child's dynamic spec is removed entirely.
+    ///
+    /// Honors the child's [`Shutdown`] policy: a vetoing or slow child is
+    /// escalated to Kill at the timeout, with a task-abort backstop behind
+    /// it. Returns once the child has stopped (idempotent `Ok` if it was
+    /// already stopped).
+    ///
+    /// To stop a child WITHOUT any restart, use
+    /// [`terminate_child`](Self::terminate_child).
+    ///
+    /// # Errors
+    /// - [`SupervisionError::NotASupervisor`] / [`SupervisionError::ChildNotFound`]
+    /// - [`SupervisionError::ChildRestarting`] while the child has a restart
+    ///   in flight or belongs to a pending group restart.
+    /// - [`SupervisionError::ChildUnresponsive`] if the child survives even
+    ///   the abort backstop (a non-yielding handler; see the crate docs).
     pub async fn stop_child(&mut self, child: impl Into<ActorId>) -> Result<(), SupervisionError> {
+        self.manual_stop_child(child.into(), ManualStop::Bounce)
+            .await
+    }
+
+    /// Stops a supervised child WITHOUT restarting it - the OTP
+    /// `terminate_child/2` equivalent. The child spec is kept (visible in
+    /// [`children`](Self::children) with `is_alive == false`) so the child can
+    /// later be revived with [`restart_child`](Self::restart_child) or removed
+    /// with [`delete_child`](Self::delete_child); a Temporary child's spec is
+    /// deleted immediately (OTP parity), as is a SimpleOneForOne child's.
+    ///
+    /// Blocking, escalation, and error semantics match
+    /// [`stop_child`](Self::stop_child).
+    pub async fn terminate_child(
+        &mut self,
+        child: impl Into<ActorId>,
+    ) -> Result<(), SupervisionError> {
+        self.manual_stop_child(child.into(), ManualStop::Terminate)
+            .await
+    }
+
+    /// Revives a child previously stopped with
+    /// [`terminate_child`](Self::terminate_child) - the OTP `restart_child/2`
+    /// equivalent. Initiates the restart from the stored child spec and
+    /// returns; completion is observable via a name lookup or
+    /// [`children`](Self::children).
+    ///
+    /// # Errors
+    /// - [`SupervisionError::NotASupervisor`] / [`SupervisionError::ChildNotFound`]
+    /// - [`SupervisionError::ChildRunning`] if the child is alive.
+    /// - [`SupervisionError::ChildRestarting`] if a restart is already in
+    ///   flight or the child belongs to a pending group restart.
+    pub fn restart_child(&mut self, child: impl Into<ActorId>) -> Result<(), SupervisionError> {
         let id = child.into();
+        let sup = self
+            .supervision
+            .as_mut()
+            .ok_or(SupervisionError::NotASupervisor)?;
+        if sup.in_pending_group(&id) {
+            return Err(SupervisionError::ChildRestarting(id));
+        }
+        match sup.registry.get(&id) {
+            None => return Err(SupervisionError::ChildNotFound(id)),
+            Some(c) if c.is_alive => return Err(SupervisionError::ChildRunning(id)),
+            Some(c) if c.pending_restart_seq.is_some() => {
+                return Err(SupervisionError::ChildRestarting(id))
+            }
+            Some(_) => {}
+        }
+        sup.initiate(&id);
+        Ok(())
+    }
+
+    /// Removes a stopped child's spec - the OTP `delete_child/2` equivalent.
+    /// The child must not be running or restarting; use
+    /// [`terminate_child`](Self::terminate_child) first.
+    ///
+    /// # Errors
+    /// Same set as [`restart_child`](Self::restart_child).
+    pub fn delete_child(&mut self, child: impl Into<ActorId>) -> Result<(), SupervisionError> {
+        let id = child.into();
+        let sup = self
+            .supervision
+            .as_mut()
+            .ok_or(SupervisionError::NotASupervisor)?;
+        if sup.in_pending_group(&id) {
+            return Err(SupervisionError::ChildRestarting(id));
+        }
+        match sup.registry.get(&id) {
+            None => return Err(SupervisionError::ChildNotFound(id)),
+            Some(c) if c.is_alive => return Err(SupervisionError::ChildRunning(id)),
+            Some(c) if c.pending_restart_seq.is_some() => {
+                return Err(SupervisionError::ChildRestarting(id))
+            }
+            Some(_) => {}
+        }
+        sup.registry.remove(&id);
+        sup.restart_fns.remove(&id);
+        Ok(())
+    }
+
+    /// Shared machinery for stop_child / terminate_child: marks the manual
+    /// stop (so the death event bypasses strategy evaluation), signals per the
+    /// child's Shutdown policy, and waits for the child's system channel to
+    /// close (the deadlock-free near-termination signal; awaiting the watcher
+    /// from inside the supervisor's own callback could park forever).
+    async fn manual_stop_child(
+        &mut self,
+        id: ActorId,
+        kind: ManualStop,
+    ) -> Result<(), SupervisionError> {
         let sup = self
             .supervision
             .as_ref()
             .ok_or(SupervisionError::NotASupervisor)?;
+        if sup.in_pending_group(&id) {
+            return Err(SupervisionError::ChildRestarting(id));
+        }
+        let (child_tx, shutdown, abort, alive, pending) = match sup.registry.get(&id) {
+            Some(child) => (
+                child.system_tx.clone(),
+                child.spec.shutdown,
+                child.abort.clone(),
+                child.is_alive,
+                child.pending_restart_seq.is_some(),
+            ),
+            None => return Err(SupervisionError::ChildNotFound(id)),
+        };
+        if pending {
+            return Err(SupervisionError::ChildRestarting(id));
+        }
+        if !alive {
+            // OTP terminate_child on an already-stopped child returns ok.
+            return Ok(());
+        }
 
-        let child = sup
-            .registry
-            .get(&id)
-            .ok_or(SupervisionError::ChildNotFound(id.clone()))?;
+        // Mark BEFORE signalling so the death event takes the manual path.
+        if let Some(sup) = self.supervision.as_mut() {
+            if let Some(child) = sup.registry.get_mut(&id) {
+                child.manual_stop = Some(kind);
+            }
+        }
 
-        let _ = child
-            .system_tx
-            .send(SystemMessage::Stop(crate::types::StopReason::ParentRequest))
-            .await;
+        match shutdown {
+            Shutdown::Kill => {
+                let _ = child_tx.send(SystemMessage::Stop(StopReason::Kill)).await;
+                Self::await_child_exit(&id, &child_tx, abort).await
+            }
+            Shutdown::Timeout(after) => {
+                let _ = child_tx
+                    .send(SystemMessage::Stop(StopReason::ParentRequest))
+                    .await;
+                if time::timeout(after, child_tx.closed()).await.is_ok() {
+                    return Ok(());
+                }
+                // Escalate: OTP exit(Child, kill) after the shutdown timeout.
+                let _ = child_tx.send(SystemMessage::Stop(StopReason::Kill)).await;
+                Self::await_child_exit(&id, &child_tx, abort).await
+            }
+            Shutdown::Infinity => {
+                let _ = child_tx
+                    .send(SystemMessage::Stop(StopReason::ParentRequest))
+                    .await;
+                child_tx.closed().await;
+                Ok(())
+            }
+        }
+    }
 
-        Ok(())
+    /// Post-Kill wait: grace for the cooperative Kill, then the abort()
+    /// backstop, then one final bounded wait. Only a non-yielding handler can
+    /// survive all three (tokio aborts at yield points only) - surfaced as a
+    /// typed error instead of hanging the supervisor.
+    async fn await_child_exit(
+        id: &ActorId,
+        child_tx: &mpsc::Sender<SystemMessage>,
+        abort: AbortHandle,
+    ) -> Result<(), SupervisionError> {
+        if time::timeout(KILL_GRACE, child_tx.closed()).await.is_ok() {
+            return Ok(());
+        }
+        abort.abort();
+        if time::timeout(KILL_GRACE, child_tx.closed()).await.is_ok() {
+            Ok(())
+        } else {
+            Err(SupervisionError::ChildUnresponsive(id.clone()))
+        }
     }
 
     // -- Timers -------------------------------------------------------------

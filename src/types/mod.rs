@@ -104,10 +104,15 @@ pub enum StopReason {
     /// The actor stopped gracefully (e.g., finished its work).
     Graceful,
     /// The parent actor requested this actor to stop.
+    ///
+    /// Also the exit reason of a supervisor whose restart budget was
+    /// exhausted (OTP parity: intensity-exceeded supervisors exit with
+    /// `shutdown`), so a grandparent's `Transient` policy does not restart it.
     ParentRequest,
-    /// The actor stopped due to a failure (panic or error).
+    /// The actor stopped due to a failure: the handler returned `Err` during a
+    /// `send`, or any callback panicked ([`ActorError::Panic`]).
     Failure(ActorError),
-    /// The actor was cancelled.
+    /// The actor's task was aborted (observed via `JoinError::is_cancelled`).
     Cancelled,
     /// The actor was forcibly killed. Bypasses ALL lifecycle hooks.
     /// Only `RegistryGuard::drop` fires for cleanup.
@@ -239,8 +244,11 @@ pub struct ChildEvent {
 /// Action taken by the supervision runtime in response to a child stopping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionAction {
-    /// The child was restarted by the supervisor.
-    Restarted,
+    /// A restart has been INITIATED for the child (it completes
+    /// asynchronously; the new incarnation may still be starting when the
+    /// parent observes this action). Renamed from `Restarted` in v0.7.0 for
+    /// honesty about the timing.
+    RestartInitiated,
     /// The child was removed (temporary or graceful transient).
     Removed,
     /// The child was not supervised (no supervision config).
@@ -296,9 +304,14 @@ pub(crate) enum SystemMessage {
     Stop(StopReason),
     /// Request a status snapshot.
     GetStatus(oneshot::Sender<ActorStatusInfo>),
-    /// A child actor has stopped (raw event from runtime).
+    /// A child actor has stopped (delivered by the child's watcher task, or
+    /// synthesized by the restart task on a restart failure).
     ChildStopped(ChildStoppedInternal),
-    /// A restart has completed (sent by the restart background task).
+    /// A restarted child has been spawned (sent by the restart background
+    /// task). The parent validates `seq`, spawns the new watcher itself (so
+    /// watcher events can never outrun this message on the channel), and
+    /// adopts the new incarnation; a stale completion is rejected and its
+    /// instance killed.
     RestartComplete {
         /// Monotonic sequence token to discard stale completions.
         seq: u64,
@@ -306,16 +319,23 @@ pub(crate) enum SystemMessage {
         child_id: ActorId,
         /// The new system channel sender for the restarted child.
         new_system_tx: mpsc::Sender<SystemMessage>,
-        /// The new join handle for the restarted child's task.
-        new_join_handle: tokio::task::JoinHandle<()>,
+        /// The join handle of the restarted child's task (the parent wraps it
+        /// in a watcher on acceptance).
+        new_join: tokio::task::JoinHandle<StopReason>,
     },
 }
 
-/// Internal event sent from a child's runtime to its parent's system channel.
+/// Internal event describing a child's death, delivered to the parent's
+/// system channel.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildStoppedInternal {
     pub child_id: ActorId,
     pub reason: StopReason,
+    /// Incarnation token: 0 for the initial spawn, the restart `seq` after an
+    /// accepted restart. Events whose incarnation matches neither the child's
+    /// current incarnation nor its pending restart seq are stale (a superseded
+    /// instance) and are ignored.
+    pub incarnation: u64,
 }
 
 // ---------------------------------------------------------------------------

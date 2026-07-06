@@ -130,7 +130,7 @@ async fn supervised_actor_responds_to_get_status() {
     }
     .spawn()
     .named("sup-o4o")
-    .with_config(ActorConfig::default().supervised())
+    .with_config(ActorConfig::default().supervisor())
     .await
     .unwrap();
 
@@ -175,7 +175,7 @@ async fn supervised_actor_has_zero_children_initially() {
     }
     .spawn()
     .named("sup-zero-children")
-    .supervised()
+    .supervisor()
     .await
     .unwrap();
 
@@ -232,7 +232,10 @@ async fn child_event_fields() {
 
 #[tokio::test]
 async fn supervision_action_variants() {
-    assert_eq!(SupervisionAction::Restarted, SupervisionAction::Restarted);
+    assert_eq!(
+        SupervisionAction::RestartInitiated,
+        SupervisionAction::RestartInitiated
+    );
     assert_eq!(SupervisionAction::Removed, SupervisionAction::Removed);
     assert_eq!(
         SupervisionAction::NotSupervised,
@@ -242,7 +245,10 @@ async fn supervision_action_variants() {
         SupervisionAction::BudgetExhausted,
         SupervisionAction::BudgetExhausted
     );
-    assert_ne!(SupervisionAction::Restarted, SupervisionAction::Removed);
+    assert_ne!(
+        SupervisionAction::RestartInitiated,
+        SupervisionAction::Removed
+    );
 }
 
 // ---------------------------------------------------------------------------

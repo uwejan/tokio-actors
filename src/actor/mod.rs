@@ -4,6 +4,8 @@
 pub mod context;
 /// Actor handle for external communication.
 pub mod handle;
+/// Panic capture for actor callbacks.
+pub(crate) mod panic;
 /// Runtime configuration and spawning logic.
 pub mod runtime;
 /// Supervision configuration and child management.
@@ -126,8 +128,8 @@ pub type ActorEnvelope<A> = Envelope<<A as Actor>::Message, <A as Actor>::Respon
 /// let h = MyActor.spawn().await.unwrap();
 /// // Named
 /// let h = MyActor.spawn().named("my-actor").await.unwrap();
-/// // Named + supervised
-/// let h = MyActor.spawn().named("my-actor").supervised().await.unwrap();
+/// // Named supervisor (can spawn supervised children via ctx.spawn_child)
+/// let h = MyActor.spawn().named("my-actor").supervisor().await.unwrap();
 /// # }
 /// ```
 pub struct SpawnBuilder<A: Actor> {
@@ -157,9 +159,14 @@ impl<A: Actor> SpawnBuilder<A> {
         self
     }
 
-    /// Enables supervision with default config (OneForOne, 3 restarts / 5s window).
-    pub fn supervised(mut self) -> Self {
-        self.config = self.config.supervised();
+    /// Makes this actor a SUPERVISOR with the default config (OneForOne,
+    /// 3 restarts / 5s window). A supervisor can spawn supervised children via
+    /// [`ActorContext::spawn_child`](crate::actor::context::ActorContext::spawn_child).
+    ///
+    /// Renamed from `supervised()` in v0.7.0: the actor takes the supervisor
+    /// role; its children are the supervised ones.
+    pub fn supervisor(mut self) -> Self {
+        self.config = self.config.supervisor();
         self
     }
 
@@ -194,7 +201,7 @@ pub trait ActorExt: Actor + Sized {
     /// Creates a [`SpawnBuilder`] for this actor.
     ///
     /// The builder implements [`IntoFuture`], so you can `.await` it directly
-    /// for an anonymous spawn, or chain `.named()`, `.on_system()`, `.supervised()`,
+    /// for an anonymous spawn, or chain `.named()`, `.on_system()`, `.supervisor()`,
     /// `.with_config()` before awaiting.
     fn spawn(self) -> SpawnBuilder<Self> {
         SpawnBuilder {

@@ -121,9 +121,15 @@ impl<A: Actor> ActorHandle<A> {
     /// Sends a message and waits for a response (request-response).
     ///
     /// # Errors
-    /// - `AskError::Send(Closed)` if the actor is stopped.
-    /// - `AskError::ResponseDropped` if the actor dropped the responder without replying.
-    /// - `AskError::Actor(err)` if the actor returned an error.
+    /// - `AskError::Closed` if the actor was already stopped (the message was
+    ///   NOT processed).
+    /// - `AskError::ResponseDropped` if the actor stopped after accepting the
+    ///   message but before replying (unknown whether it was processed).
+    /// - `AskError::Actor(err)` if the handler returned an error, or panicked
+    ///   (`ActorError::Panic`). A handler error or panic also stops the actor;
+    ///   if it is supervised, its supervisor restarts it per policy, so an
+    ///   immediate retry may still see `Closed` during the restart window -
+    ///   re-look the actor up by name.
     pub async fn send(&self, msg: A::Message) -> Result<A::Response, AskError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -132,7 +138,7 @@ impl<A: Actor> ActorHandle<A> {
                 responder: Some(tx),
             })
             .await
-            .map_err(|_| SendError::Closed)?;
+            .map_err(|_| AskError::Closed)?;
 
         match rx.await.map_err(|_| AskError::ResponseDropped)? {
             Ok(resp) => Ok(resp),
@@ -160,7 +166,7 @@ impl<A: Actor> ActorHandle<A> {
         self.system_tx
             .send(SystemMessage::GetStatus(tx))
             .await
-            .map_err(|_| SendError::Closed)?;
+            .map_err(|_| AskError::Closed)?;
         rx.await.map_err(|_| AskError::ResponseDropped)
     }
 }

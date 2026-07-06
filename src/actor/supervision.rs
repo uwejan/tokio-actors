@@ -1,22 +1,43 @@
 //! Supervision configuration, restart budgets, and child registry.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
-use crate::types::{ActorId, ChildInfo, RestartStrategy, RestartType, Shutdown, SystemMessage};
+use crate::types::{
+    ActorId, ChildInfo, ChildStoppedInternal, RestartStrategy, RestartType, Shutdown, SystemMessage,
+};
 
 /// Type-erased restart function stored per child.
 ///
-/// Given a sequence token and optional name, spawns a new instance of the child
-/// and sends `RestartComplete` back to the parent's system channel.
+/// The closure captures the child's original [`ActorId`], name, and the full
+/// resolved [`ActorConfig`](crate::actor::runtime::ActorConfig) by value at
+/// `spawn_child` time (OTP child-spec immutability), so every restart reuses
+/// the exact spec. Given the restart sequence token, it spawns a new instance
+/// and reports back to the parent's system channel: `RestartComplete` on
+/// success, a synthesized `ChildStopped` on factory panic or spawn failure.
 pub(crate) type RestartFn =
-    Box<dyn Fn(u64, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    Box<dyn Fn(u64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Grace given to a cooperative Kill signal before the abort() backstop fires.
+/// Kill is processed with biased priority, so a responsive actor dies in
+/// microseconds; the grace exists only for an actor mid-callback.
+pub(crate) const KILL_GRACE: Duration = Duration::from_millis(100);
+
+/// How a manual stop was requested, recorded on the child so its death event
+/// bypasses strategy evaluation (manual stops are never failures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualStop {
+    /// `stop_child`: restart per policy afterwards, budget-free.
+    Bounce,
+    /// `terminate_child`: stay down until restart_child/delete_child (OTP).
+    Terminate,
+}
 
 // ---------------------------------------------------------------------------
 // SupervisionConfig
@@ -111,14 +132,16 @@ impl RestartBudget {
     /// If the budget is exhausted, returns `false`.
     pub fn check_and_record(&mut self) -> bool {
         let now = Instant::now();
-        let cutoff = now - self.restart_window;
+        let cutoff = now.checked_sub(self.restart_window);
 
         // Prune expired entries
-        while let Some(&front) = self.timestamps.front() {
-            if front < cutoff {
-                self.timestamps.pop_front();
-            } else {
-                break;
+        if let Some(cutoff) = cutoff {
+            while let Some(&front) = self.timestamps.front() {
+                if front < cutoff {
+                    self.timestamps.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
@@ -150,10 +173,32 @@ pub(crate) struct ChildState {
     pub id: ActorId,
     pub name: Option<String>,
     pub spec: ChildSpec,
-    pub join_handle: JoinHandle<()>,
+    /// Handle of the child's WATCHER task. The watcher owns the child's real
+    /// `JoinHandle<StopReason>`; watcher completion therefore implies the
+    /// child task has fully terminated (all its drops have run).
+    pub watcher_handle: JoinHandle<()>,
+    /// Abort handle of the child's OWN task (taken before the watcher consumed
+    /// the JoinHandle). The Kill -> abort escalation backstop. Never exposed
+    /// outside the supervision tree.
+    pub abort: AbortHandle,
     pub system_tx: mpsc::Sender<SystemMessage>,
     pub is_alive: bool,
     pub pending_restart_seq: Option<u64>,
+    /// Incarnation token of the instance currently owning this spec:
+    /// 0 for the initial spawn, the restart seq after each accepted restart.
+    /// Death events from superseded incarnations are ignored.
+    pub current_incarnation: u64,
+    /// Set while a manual stop (stop_child / terminate_child) is in flight;
+    /// the resulting death event bypasses strategy evaluation.
+    pub manual_stop: Option<ManualStop>,
+}
+
+impl ChildState {
+    /// True if a death event with this incarnation belongs to the instance
+    /// the registry currently tracks (current, or the in-flight restart).
+    pub fn accepts_incarnation(&self, incarnation: u64) -> bool {
+        self.current_incarnation == incarnation || self.pending_restart_seq == Some(incarnation)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,15 +266,11 @@ impl ChildRegistry {
             .collect()
     }
 
+    /// Sequence tokens start at 1 so that 0 is reserved for the initial
+    /// incarnation of every child.
     pub fn next_seq(&mut self) -> u64 {
         self.restart_seq += 1;
         self.restart_seq
-    }
-
-    /// Returns children in reverse insertion order (for shutdown).
-    #[allow(dead_code)]
-    pub fn iter_reverse(&self) -> impl Iterator<Item = &ChildState> {
-        self.children.iter().rev()
     }
 
     /// Returns IDs of children started after the given child (for RestForOne).
@@ -259,25 +300,58 @@ impl ChildRegistry {
         std::mem::take(&mut self.children)
     }
 
-    /// Updates a child entry after a successful restart.
+    /// Adopts a restarted child instance after the parent accepted its
+    /// `RestartComplete` (seq matches the pending restart).
     pub fn update_restarted(
         &mut self,
         child_id: &ActorId,
         seq: u64,
         new_system_tx: mpsc::Sender<SystemMessage>,
-        new_join_handle: JoinHandle<()>,
+        new_watcher_handle: JoinHandle<()>,
+        new_abort: AbortHandle,
     ) -> bool {
         if let Some(child) = self.get_mut(child_id) {
             if child.pending_restart_seq == Some(seq) {
                 child.system_tx = new_system_tx;
-                child.join_handle = new_join_handle;
+                child.watcher_handle = new_watcher_handle;
+                child.abort = new_abort;
                 child.is_alive = true;
                 child.pending_restart_seq = None;
+                child.current_incarnation = seq;
+                child.manual_stop = None;
                 return true;
             }
         }
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Group restart state (OneForAll / RestForOne)
+// ---------------------------------------------------------------------------
+
+/// In-flight group restart: the affected live members have been told to stop
+/// (reverse start order); once every awaited death arrives, the members are
+/// restarted SEQUENTIALLY in start order. The supervisor's loop never blocks
+/// on this; deaths arrive through the ordinary watcher channel.
+pub(crate) struct GroupRestart {
+    /// Members whose deaths we are still waiting for.
+    pub awaiting: HashSet<ActorId>,
+    /// Members to restart (start order) once `awaiting` empties. Excludes
+    /// Temporary children (OTP: terminated with the group, never restarted).
+    pub restart_order: Vec<ActorId>,
+}
+
+/// Phase of an in-flight OneForAll/RestForOne group restart.
+pub(crate) enum GroupPhase {
+    /// Affected members told to stop; awaiting their deaths.
+    Stopping(GroupRestart),
+    /// Restarting members one at a time in start order (OTP left-to-right).
+    /// The FRONT of the queue is the member whose restart is in flight; the
+    /// next member is initiated only when the front's `RestartComplete` is
+    /// adopted, giving sequential registration. (Sequential init COMPLETION
+    /// would additionally need a start acknowledgment protocol.)
+    Restarting(VecDeque<ActorId>),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +365,11 @@ pub(crate) struct SupervisionState {
     pub budget: RestartBudget,
     /// Type-erased restart functions keyed by child ID.
     pub restart_fns: HashMap<ActorId, RestartFn>,
+    /// In-flight OneForAll/RestForOne group restart, if any.
+    pub pending_group: Option<GroupPhase>,
+    /// Failure events that arrived while a group restart was pending;
+    /// evaluated FIFO after the group completes.
+    pub queued_triggers: VecDeque<ChildStoppedInternal>,
 }
 
 impl SupervisionState {
@@ -301,6 +380,42 @@ impl SupervisionState {
             registry: ChildRegistry::new(),
             budget,
             restart_fns: HashMap::new(),
+            pending_group: None,
+            queued_triggers: VecDeque::new(),
+        }
+    }
+
+    /// Initiates a restart for a child using its stored restart closure:
+    /// bumps the seq, marks the pending restart, and spawns the closure.
+    /// Does NOT touch the budget (callers decide whether the restart is
+    /// budget-charged - strategy restarts are, manual bounces are not).
+    pub fn initiate(&mut self, child_id: &ActorId) -> bool {
+        let seq = self.registry.next_seq();
+        match self.registry.get_mut(child_id) {
+            Some(child) => {
+                child.pending_restart_seq = Some(seq);
+                child.is_alive = false;
+            }
+            None => return false,
+        }
+        if let Some(restart_fn) = self.restart_fns.get(child_id) {
+            let fut = restart_fn(seq);
+            tokio::spawn(fut);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if the child is a member of the in-flight group restart (either
+    /// phase). Manual child-management APIs refuse to touch such members.
+    pub fn in_pending_group(&self, child_id: &ActorId) -> bool {
+        match self.pending_group.as_ref() {
+            Some(GroupPhase::Stopping(group)) => {
+                group.awaiting.contains(child_id) || group.restart_order.contains(child_id)
+            }
+            Some(GroupPhase::Restarting(queue)) => queue.contains(child_id),
+            None => false,
         }
     }
 }
@@ -309,17 +424,30 @@ impl SupervisionState {
 // Strategy helpers (used by runtime)
 // ---------------------------------------------------------------------------
 
-/// Result of applying a supervision strategy.
+/// Result of applying a supervision strategy to a child's death.
 pub(crate) enum StrategyOutcome {
-    /// The child should be restarted. Contains IDs of children to restart.
-    Restart(Vec<ActorId>),
-    /// The child should be removed (temporary/transient-graceful).
+    /// Restart exactly this child (OneForOne / SimpleOneForOne).
+    RestartOne(ActorId),
+    /// Group restart (OneForAll / RestForOne): stop the live members in
+    /// `stop_reverse` (already in reverse start order), await their deaths,
+    /// then restart `restart_order` in start order.
+    RestartGroup {
+        /// Live members to stop, reverse start order. Excludes the failed
+        /// child (already dead).
+        stop_reverse: Vec<ActorId>,
+        /// Members to restart in start order (Temporary members excluded).
+        restart_order: Vec<ActorId>,
+    },
+    /// The child is not restarted (temporary, or transient after a clean stop).
     Remove,
-    /// The restart budget is exhausted, supervisor must stop.
+    /// The restart budget is exhausted; the supervisor must stop.
     BudgetExhausted,
 }
 
 /// Determines the supervision action for a stopped child.
+///
+/// Charges the budget ONCE per triggering failure regardless of group size
+/// (OTP counts supervisor restarts, not per-child spawns).
 pub(crate) fn evaluate_strategy(
     sup: &mut SupervisionState,
     failed_child_id: &ActorId,
@@ -333,7 +461,14 @@ pub(crate) fn evaluate_strategy(
     let restart_type = child.spec.restart_type;
     let should_restart = match restart_type {
         RestartType::Permanent => true,
-        RestartType::Transient => !matches!(reason, crate::types::StopReason::Graceful),
+        // OTP transient parity: restart only on ABNORMAL exits. The clean
+        // reasons are normal and shutdown - our Graceful and ParentRequest
+        // (which is also the exit reason of a budget-exhausted supervisor).
+        // Kill (OTP `killed`) is abnormal and does restart.
+        RestartType::Transient => !matches!(
+            reason,
+            crate::types::StopReason::Graceful | crate::types::StopReason::ParentRequest
+        ),
         RestartType::Temporary => false,
     };
 
@@ -346,20 +481,50 @@ pub(crate) fn evaluate_strategy(
         return StrategyOutcome::BudgetExhausted;
     }
 
-    // Determine which children to restart based on strategy
-    let to_restart = match sup.config.strategy {
+    // Determine the affected set based on strategy
+    match sup.config.strategy {
         RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => {
-            vec![failed_child_id.clone()]
+            StrategyOutcome::RestartOne(failed_child_id.clone())
         }
-        RestartStrategy::OneForAll => sup.registry.all_ids(),
+        RestartStrategy::OneForAll => {
+            let members = sup.registry.all_ids();
+            group_outcome(&sup.registry, members, failed_child_id)
+        }
         RestartStrategy::RestForOne => {
-            let mut ids = vec![failed_child_id.clone()];
-            ids.extend(sup.registry.children_after(failed_child_id));
-            ids
+            let mut members = vec![failed_child_id.clone()];
+            members.extend(sup.registry.children_after(failed_child_id));
+            group_outcome(&sup.registry, members, failed_child_id)
         }
-    };
+    }
+}
 
-    StrategyOutcome::Restart(to_restart)
+/// Builds the group outcome from the affected member set (start order).
+fn group_outcome(
+    registry: &ChildRegistry,
+    members: Vec<ActorId>,
+    failed: &ActorId,
+) -> StrategyOutcome {
+    let stop_reverse: Vec<ActorId> = members
+        .iter()
+        .rev()
+        .filter(|id| *id != failed)
+        .filter(|id| registry.get(id).map(|c| c.is_alive).unwrap_or(false))
+        .cloned()
+        .collect();
+    // OTP: temporary siblings are terminated with the group but never restarted.
+    let restart_order: Vec<ActorId> = members
+        .into_iter()
+        .filter(|id| {
+            registry
+                .get(id)
+                .map(|c| !matches!(c.spec.restart_type, RestartType::Temporary))
+                .unwrap_or(false)
+        })
+        .collect();
+    StrategyOutcome::RestartGroup {
+        stop_reverse,
+        restart_order,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,20 +565,27 @@ mod tests {
 
     // -- ChildRegistry -------------------------------------------------------
 
-    fn dummy_child(id: &str) -> ChildState {
+    fn dummy_child_with(id: &str, restart_type: RestartType, alive: bool) -> ChildState {
         let (tx, _rx) = mpsc::channel(1);
         ChildState {
             id: ActorId::from(id),
             name: Some(id.to_string()),
             spec: ChildSpec {
-                restart_type: RestartType::Permanent,
+                restart_type,
                 shutdown: Shutdown::default(),
             },
-            join_handle: tokio::spawn(async {}),
+            watcher_handle: tokio::spawn(async {}),
+            abort: tokio::spawn(async {}).abort_handle(),
             system_tx: tx,
-            is_alive: true,
+            is_alive: alive,
             pending_restart_seq: None,
+            current_incarnation: 0,
+            manual_stop: None,
         }
+    }
+
+    fn dummy_child(id: &str) -> ChildState {
+        dummy_child_with(id, RestartType::Permanent, true)
     }
 
     #[tokio::test]
@@ -480,6 +652,43 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
+    #[tokio::test]
+    async fn registry_update_restarted_accepts_pending_seq_only() {
+        let mut reg = ChildRegistry::new();
+        reg.register(dummy_child("a"));
+        let seq = reg.next_seq();
+        reg.get_mut(&ActorId::from("a"))
+            .unwrap()
+            .pending_restart_seq = Some(seq);
+        reg.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
+
+        // Stale seq rejected
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(!reg.update_restarted(
+            &ActorId::from("a"),
+            seq + 99,
+            tx,
+            tokio::spawn(async {}),
+            tokio::spawn(async {}).abort_handle()
+        ));
+
+        // Matching seq accepted; incarnation adopted
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(reg.update_restarted(
+            &ActorId::from("a"),
+            seq,
+            tx,
+            tokio::spawn(async {}),
+            tokio::spawn(async {}).abort_handle()
+        ));
+        let child = reg.get(&ActorId::from("a")).unwrap();
+        assert!(child.is_alive);
+        assert_eq!(child.current_incarnation, seq);
+        assert_eq!(child.pending_restart_seq, None);
+        assert!(child.accepts_incarnation(seq));
+        assert!(!child.accepts_incarnation(0));
+    }
+
     // -- evaluate_strategy ---------------------------------------------------
 
     fn make_sup_state(strategy: RestartStrategy) -> SupervisionState {
@@ -495,49 +704,38 @@ mod tests {
         let mut sup = make_sup_state(RestartStrategy::OneForOne);
         sup.registry.register(dummy_child("child"));
         match evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Graceful) {
-            StrategyOutcome::Restart(ids) => assert_eq!(ids.len(), 1),
-            other => panic!("expected Restart, got {:?}", std::mem::discriminant(&other)),
+            StrategyOutcome::RestartOne(id) => assert_eq!(id.as_str(), "child"),
+            _ => panic!("expected RestartOne"),
         }
     }
 
     #[tokio::test]
-    async fn strategy_transient_removes_on_graceful() {
+    async fn strategy_transient_removes_on_clean_reasons_restarts_on_abnormal() {
         let mut sup = make_sup_state(RestartStrategy::OneForOne);
-        let (tx, _rx) = mpsc::channel(1);
-        sup.registry.register(ChildState {
-            id: ActorId::from("child"),
-            name: None,
-            spec: ChildSpec {
-                restart_type: RestartType::Transient,
-                shutdown: Shutdown::default(),
-            },
-            join_handle: tokio::spawn(async {}),
-            system_tx: tx,
-            is_alive: true,
-            pending_restart_seq: None,
-        });
+        sup.registry
+            .register(dummy_child_with("child", RestartType::Transient, true));
+        let id = ActorId::from("child");
+        // Clean: normal (Graceful) and shutdown (ParentRequest) stay down.
         assert!(matches!(
-            evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Graceful),
+            evaluate_strategy(&mut sup, &id, &StopReason::Graceful),
             StrategyOutcome::Remove
+        ));
+        assert!(matches!(
+            evaluate_strategy(&mut sup, &id, &StopReason::ParentRequest),
+            StrategyOutcome::Remove
+        ));
+        // Abnormal: killed restarts (OTP `killed` is abnormal).
+        assert!(matches!(
+            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
+            StrategyOutcome::RestartOne(_)
         ));
     }
 
     #[tokio::test]
     async fn strategy_temporary_always_removes() {
         let mut sup = make_sup_state(RestartStrategy::OneForOne);
-        let (tx, _rx) = mpsc::channel(1);
-        sup.registry.register(ChildState {
-            id: ActorId::from("child"),
-            name: None,
-            spec: ChildSpec {
-                restart_type: RestartType::Temporary,
-                shutdown: Shutdown::default(),
-            },
-            join_handle: tokio::spawn(async {}),
-            system_tx: tx,
-            is_alive: true,
-            pending_restart_seq: None,
-        });
+        sup.registry
+            .register(dummy_child_with("child", RestartType::Temporary, true));
         assert!(matches!(
             evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
             StrategyOutcome::Remove
@@ -545,29 +743,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strategy_one_for_all_restarts_all() {
+    async fn strategy_one_for_all_stops_live_reverse_restarts_forward() {
         let mut sup = make_sup_state(RestartStrategy::OneForAll);
         sup.registry.register(dummy_child("a"));
         sup.registry.register(dummy_child("b"));
         sup.registry.register(dummy_child("c"));
+        // b failed (already dead)
+        sup.registry.get_mut(&ActorId::from("b")).unwrap().is_alive = false;
         match evaluate_strategy(&mut sup, &ActorId::from("b"), &StopReason::Kill) {
-            StrategyOutcome::Restart(ids) => assert_eq!(ids.len(), 3),
-            other => panic!("expected Restart, got {:?}", std::mem::discriminant(&other)),
+            StrategyOutcome::RestartGroup {
+                stop_reverse,
+                restart_order,
+            } => {
+                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
+                assert_eq!(stops, vec!["c", "a"], "live members, reverse start order");
+                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
+                assert_eq!(restarts, vec!["a", "b", "c"], "all members, start order");
+            }
+            _ => panic!("expected RestartGroup"),
         }
     }
 
     #[tokio::test]
-    async fn strategy_rest_for_one_restarts_after() {
+    async fn strategy_rest_for_one_affects_failed_and_later() {
         let mut sup = make_sup_state(RestartStrategy::RestForOne);
         sup.registry.register(dummy_child("a"));
         sup.registry.register(dummy_child("b"));
         sup.registry.register(dummy_child("c"));
+        sup.registry.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
         match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
-            StrategyOutcome::Restart(ids) => {
-                let names: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
-                assert_eq!(names, vec!["a", "b", "c"]);
+            StrategyOutcome::RestartGroup {
+                stop_reverse,
+                restart_order,
+            } => {
+                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
+                assert_eq!(stops, vec!["c", "b"]);
+                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
+                assert_eq!(restarts, vec!["a", "b", "c"]);
             }
-            other => panic!("expected Restart, got {:?}", std::mem::discriminant(&other)),
+            _ => panic!("expected RestartGroup"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_group_excludes_temporary_from_restart_but_stops_it() {
+        let mut sup = make_sup_state(RestartStrategy::OneForAll);
+        sup.registry.register(dummy_child("a"));
+        sup.registry
+            .register(dummy_child_with("tmp", RestartType::Temporary, true));
+        sup.registry.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
+        match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
+            StrategyOutcome::RestartGroup {
+                stop_reverse,
+                restart_order,
+            } => {
+                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
+                assert_eq!(stops, vec!["tmp"], "temporary sibling is stopped");
+                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
+                assert_eq!(restarts, vec!["a"], "temporary sibling is not restarted");
+            }
+            _ => panic!("expected RestartGroup"),
         }
     }
 
@@ -582,7 +817,7 @@ mod tests {
         // First restart - uses the budget
         assert!(matches!(
             evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
-            StrategyOutcome::Restart(_)
+            StrategyOutcome::RestartOne(_)
         ));
         // Second restart - budget exhausted
         assert!(matches!(
