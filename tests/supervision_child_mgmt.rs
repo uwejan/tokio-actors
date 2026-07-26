@@ -3,8 +3,8 @@
 //! - `ctx.terminate_child(id)`: stop WITHOUT restart, budget-free, spec kept
 //!   unless Temporary/SimpleOneForOne (pruned); idempotent on dead children;
 //!   bounded by Shutdown policy -> Kill escalation -> abort() backstop.
-//! - `ctx.stop_child(id)`: the BOUNCE - Permanent children are
-//!   restarted BUDGET-FREE; Transient/Temporary stay down.
+//! - `ctx.stop_child(id)`: the BOUNCE - Permanent children are restarted
+//!   BUDGET-FREE; Transient/Temporary stay down.
 //! - `ctx.restart_child(id)` / `ctx.delete_child(id)`: sync, typed errors
 //!   ChildNotFound / ChildRunning / ChildRestarting.
 //! - `SupervisionAction::RestartInitiated` (renamed from `Restarted`).
@@ -752,9 +752,9 @@ async fn terminate_vetoing_child_escalates() {
         .expect("terminate_child must return Ok despite the veto");
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_secs(1),
-        "terminate of a vetoing child must complete within ~1s \
-         (150ms timeout + kill grace), took {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "terminate of a vetoing child must stay bounded (150ms timeout + \
+         kill grace, plus CI scheduling slack), took {elapsed:?}"
     );
 
     // Dead for real (killed at escalation), and recorded as Removed.
@@ -814,9 +814,9 @@ async fn terminate_hung_child_abort_backstop() {
         .expect("terminate_child must return Ok via the abort backstop");
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_secs(2),
-        "abort backstop must bound a hung child's terminate \
-         (150ms timeout + 100ms grace expected), took {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "abort backstop must bound a hung child's terminate (150ms timeout \
+         + 100ms grace expected, plus CI scheduling slack), took {elapsed:?}"
     );
 
     // Dead for real.

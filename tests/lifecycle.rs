@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorResult, StopReason,
+    ActorConfig, ActorError, ActorResult, ActorSystem, SpawnError, StopReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -156,15 +156,21 @@ impl Actor for FailingPreStartActor {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_start_failure_prevents_startup() {
     let (actor, started_flag, stopped_flag) = FailingPreStartActor::new();
-    let handle = actor
+    let name = "fail-pre-start";
+    let result = actor
         .spawn()
-        .named("fail-pre-start")
+        .named(name)
         .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        .await;
 
-    // Give the actor time to fail
-    sleep(Duration::from_millis(50)).await;
+    // v0.8: the failed pre_start surfaces synchronously to the caller as the
+    // spawn ack, instead of dying silently in the background. By the time
+    // `.await` resolves, teardown has already fully run (no sleep needed).
+    match result {
+        Err(SpawnError::Init(_)) => {}
+        Ok(_) => panic!("pre_start failure must prevent startup, but spawn succeeded"),
+        Err(other) => panic!("expected SpawnError::Init, got: {other}"),
+    }
 
     // on_started should never have fired
     assert!(
@@ -178,10 +184,12 @@ async fn pre_start_failure_prevents_startup() {
         "on_stopped must NOT fire when pre_start fails"
     );
 
-    // Actor should be dead
+    // The name is released: a failed init never leaves a registered actor behind.
     assert!(
-        !handle.is_alive(),
-        "actor must be dead after pre_start failure"
+        ActorSystem::default()
+            .get::<FailingPreStartActor>(name)
+            .is_none(),
+        "actor name must not remain registered after a pre_start failure"
     );
 }
 

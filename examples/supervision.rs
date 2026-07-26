@@ -9,9 +9,11 @@ use tokio_actors::{
 
 /// A worker that crashes on the 3rd message.
 ///
-/// Uses `send()` (request-response) so that returning `Err` from `handle`
-/// actually stops the actor, triggering the supervisor's restart logic.
-/// (With `notify`, errors are routed to `handle_failure` and the actor continues.)
+/// Returning `Err` from `handle` stops the actor and triggers the
+/// supervisor's restart logic, on the `notify` path exactly as on the `send`
+/// path (cast-exception parity). This example uses `send()` so the call site
+/// also gets to see the failure come back as a response, not just the
+/// restart.
 #[derive(Default)]
 struct UnstableWorker {
     processed: u32,

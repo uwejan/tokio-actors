@@ -1,9 +1,12 @@
-//! Behavioral suite for crash-visible supervision.
+//! Behavioral suite for crash-visible supervision, including
+//! Err-cast-exception parity on the notify path.
 //!
 //! Written against the v0.7.0 target API:
 //! - `.supervisor()` replaces `.supervised()` on `SpawnBuilder` and `ActorConfig`.
 //! - A panic in `handle` stops the actor with `StopReason::Failure(ActorError::Panic)`
 //!   on BOTH the notify and send paths; supervised children restart per policy.
+//! - A returned `Err` (no panic) stops the actor identically on BOTH paths too:
+//!   `Actor::handle_failure` is gone, there is no notify-path limp mode.
 //! - `send()` surfaces a mid-request handler panic as `AskError::Actor(ActorError::Panic)`.
 //! - Budget exhaustion stops the supervisor with `StopReason::ParentRequest`.
 //! - `ActorId` is stable across restarts, anonymous children included.
@@ -860,5 +863,184 @@ async fn forwarders_exit_after_panic() {
     assert!(
         handle.notify(TickMsg::Tick).await.is_err(),
         "messages to the dead actor must fail"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+/// Shared slot a `PoisonWorker`'s `on_stopped` writes into, so a test can
+/// inspect the `StopReason` the actor itself observed.
+type StopLog = Arc<tokio::sync::Mutex<Option<StopReason>>>;
+
+/// A worker with a counter (fresh-state probe) that returns `Err` (not a
+/// panic) from `handle` on command, and records every `on_stopped` reason.
+struct PoisonWorker {
+    count: u32,
+    stopped: StopLog,
+}
+
+#[derive(Clone)]
+enum PoisonMsg {
+    Bump,
+    Count,
+    /// Returns `Err` from `handle` (no panic): exercises the Err path of
+    /// cast-exception parity, distinct from the panic path covered above.
+    Poison,
+}
+
+impl Actor for PoisonWorker {
+    type Message = PoisonMsg;
+    type Response = u32;
+
+    async fn handle(&mut self, msg: PoisonMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        match msg {
+            PoisonMsg::Bump => {
+                self.count += 1;
+                Ok(self.count)
+            }
+            PoisonMsg::Count => Ok(self.count),
+            PoisonMsg::Poison => Err(ActorError::user("poisoned message")),
+        }
+    }
+
+    async fn on_stopped(
+        &mut self,
+        reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        *self.stopped.lock().await = Some(reason.clone());
+        Ok(())
+    }
+}
+
+/// Spawns a single named Permanent `PoisonWorker` child in `on_started` and
+/// records every `ChildEvent`. A standalone supervisor type (rather than a
+/// new `SupCmd` variant on `RecordingSup`) keeps the addition self-contained.
+struct PoisonSupervisor {
+    events: EventLog,
+    child_name: String,
+}
+
+impl Actor for PoisonSupervisor {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(|| PoisonWorker {
+            count: 0,
+            stopped: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+        .named(self.child_name.clone())
+        .restart_type(RestartType::Permanent)
+        .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().await.push(event.clone());
+        Ok(())
+    }
+}
+
+/// Re-looks a named `PoisonWorker` up until a FRESH instance responds (counter == 0).
+async fn wait_poison_ready(name: &str, timeout_ms: u64) -> Option<ActorHandle<PoisonWorker>> {
+    let sys = ActorSystem::default();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some(handle) = sys.get::<PoisonWorker>(name) {
+            if let Ok(0) = handle.send(PoisonMsg::Count).await {
+                return Some(handle);
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+fn is_err_restart(event: &ChildEvent) -> bool {
+    matches!(event.reason, StopReason::Failure(ActorError::User(_)))
+        && event.action == SupervisionAction::RestartInitiated
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn err_from_handle_notify_path_stops_actor_like_send() {
+    let stopped: StopLog = Arc::new(tokio::sync::Mutex::new(None));
+    let handle = PoisonWorker {
+        count: 0,
+        stopped: stopped.clone(),
+    }
+    .spawn()
+    .await
+    .unwrap();
+
+    // notify (fire-and-forget): under the removed `handle_failure` limp mode
+    // this would have continued running. v0.8.0 makes a returned `Err`
+    // stop the actor identically on the notify and send paths.
+    handle.notify(PoisonMsg::Poison).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+        .await
+        .expect("wait_stopped must resolve after a notify-path Err (cast-exception parity)");
+    // wait_stopped resolves on the status plane's terminal state; is_alive
+    // (mailbox closure) can lag it by one teardown beat under heavy
+    // instrumentation, so poll briefly instead of asserting instantly.
+    assert!(
+        wait_until(2_000, || !handle.is_alive()).await,
+        "actor must be dead after the poison notify"
+    );
+
+    let observed = stopped.lock().await.take();
+    match observed {
+        Some(StopReason::Failure(ActorError::User(msg))) => {
+            assert!(msg.contains("poisoned"), "unexpected message: {msg}");
+        }
+        other => panic!("expected on_stopped to observe StopReason::Failure(User), got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn err_from_handle_notify_path_restarts_supervised_twin() {
+    let events = recorder();
+    let name = uname("poison-worker");
+    let sup = PoisonSupervisor {
+        events: events.clone(),
+        child_name: name.clone(),
+    }
+    .spawn()
+    .named(uname("sup-poison"))
+    .supervisor()
+    .await
+    .unwrap();
+
+    let worker = wait_poison_ready(&name, 5_000).await.expect("worker up");
+    assert_eq!(worker.send(PoisonMsg::Bump).await.unwrap(), 1);
+
+    // The same kind of poison notify as the unsupervised twin above: proves
+    // the supervision path observes the Err-stop and restarts per policy.
+    worker.notify(PoisonMsg::Poison).await.unwrap();
+
+    let evs = wait_for_events(&events, 10_000, |e| e.iter().any(is_err_restart)).await;
+    assert!(
+        evs.iter().any(is_err_restart),
+        "expected Failure(User) + RestartInitiated, got {evs:?}"
+    );
+
+    let fresh = wait_poison_ready(&name, 10_000)
+        .await
+        .expect("restarted worker should re-register under the same name");
+    assert_eq!(fresh.send(PoisonMsg::Count).await.unwrap(), 0);
+
+    assert!(
+        sup.is_alive(),
+        "supervisor must survive the child's Err-stop"
     );
 }

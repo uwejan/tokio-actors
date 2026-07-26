@@ -1,7 +1,8 @@
 [package]
 name = "tokio-actors"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
+rust-version = "1.75"
 description = "OTP-faithful actors for Tokio: panic-visible supervision, restart strategies, and Erlang-grade lifecycle semantics with zero ceremony"
 license = "MIT OR Apache-2.0"
 authors = ["Saddam Uwejan (Sam) <saddamuwejan@gmail.com>"]
@@ -32,14 +33,13 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["full"] }
+tokio-util = "0.7"
 futures-core = "0.3"
 tokio-stream = "0.1"
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
-tokio-stream = "0.1"
 
 [[bench]]
 name = "actor_bench"

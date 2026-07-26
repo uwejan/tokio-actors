@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +18,7 @@ use crate::actor::handle::ActorHandle;
 use crate::actor::panic::{catch_sync, payload_into_string};
 use crate::actor::supervision::{ChildSpec, ChildState, ManualStop, SupervisionState, KILL_GRACE};
 use crate::actor::{runtime, Actor};
-use crate::error::{ActorError, StreamError, SupervisionError, TimerError};
+use crate::error::{ActorError, SpawnError, StreamError, SupervisionError, TimerError};
 use crate::system::ActorSystem;
 use crate::types::{
     ActorId, ActorStatus, ChildInfo, ChildStoppedInternal, MissPolicy, RecurringId,
@@ -34,7 +34,11 @@ pub struct ActorContext<A: Actor> {
     streams: HashMap<StreamId, StreamRegistration>,
     id_gen: RecurringIdGenerator,
     last_error: Option<ActorError>,
-    status: ActorStatus,
+    /// Runtime status plane (`process_info`-style, see the `handle` module
+    /// docs). Every write goes through `send_replace`, which always succeeds
+    /// even if every `ActorHandle` (and therefore every receiver) has been
+    /// dropped - a plain `send` would error at zero receivers.
+    status_tx: watch::Sender<ActorStatus>,
     // Supervision fields
     system_tx: mpsc::Sender<SystemMessage>,
     system: Option<Arc<ActorSystem>>,
@@ -43,10 +47,15 @@ pub struct ActorContext<A: Actor> {
 }
 
 impl<A: Actor> ActorContext<A> {
+    // Internal constructor, called from exactly one spawn site with every
+    // field already resolved; a params-object would only move the count
+    // around, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         actor_id: ActorId,
         handle: ActorHandle<A>,
         runtime: Handle,
+        status_tx: watch::Sender<ActorStatus>,
         system_tx: mpsc::Sender<SystemMessage>,
         system: Option<Arc<ActorSystem>>,
         name: Option<String>,
@@ -60,7 +69,7 @@ impl<A: Actor> ActorContext<A> {
             streams: HashMap::new(),
             id_gen: RecurringIdGenerator::default(),
             last_error: None,
-            status: ActorStatus::Initializing,
+            status_tx,
             system_tx,
             system,
             name,
@@ -97,11 +106,14 @@ impl<A: Actor> ActorContext<A> {
 
     /// Returns the current lifecycle status of the actor.
     pub fn status(&self) -> ActorStatus {
-        self.status
+        *self.status_tx.borrow()
     }
 
     pub(crate) fn set_status(&mut self, status: ActorStatus) {
-        self.status = status;
+        // `send_replace`, not `send`: this must succeed even if every
+        // `ActorHandle` (and therefore every watch receiver) has already been
+        // dropped, which a plain `send` would treat as an error.
+        self.status_tx.send_replace(status);
     }
 
     // - Supervision --------------------------------------------------------
@@ -116,9 +128,17 @@ impl<A: Actor> ActorContext<A> {
 
     /// Creates a [`ChildSpawnBuilder`] for spawning a supervised child actor.
     ///
-    /// The factory is called immediately to create the initial instance, and stored
-    /// for future restarts. Chain `.named()`, `.restart_type()`, `.shutdown()`,
+    /// The factory is called to create the initial instance, and stored for
+    /// future restarts. Chain `.named()`, `.restart_type()`, `.shutdown()`,
     /// `.with_config()` before `.await`ing to customize.
+    ///
+    /// Unlike the top-level [`ActorExt::spawn`](crate::actor::ActorExt::spawn),
+    /// this never awaits the child's `pre_start`/`on_started` ack: the
+    /// watcher and restart budget already give the supervisor full,
+    /// asynchronous visibility into a child's init failure, and synchronously
+    /// awaiting that ack from inside the parent's own callback would invite
+    /// the same self-call deadlock documented on
+    /// [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
     ///
     /// # Examples
     /// ```rust,no_run
@@ -155,8 +175,16 @@ impl<A: Actor> ActorContext<A> {
     /// ```
     ///
     /// # Errors
-    /// - [`SupervisionError::NotASupervisor`] if this actor has no supervision config.
-    /// - [`SpawnError`](crate::error::SpawnError) variants if the child fails to spawn.
+    /// - [`SpawnError::NotASupervisor`]
+    ///   if this actor has no supervision config.
+    /// - [`SpawnError::DuplicateChild`]
+    ///   if a live child or a kept spec (a child previously stopped with
+    ///   [`terminate_child`](Self::terminate_child)) already occupies this
+    ///   name - the factory is never called (OTP `already_present` parity).
+    ///   [`delete_child`](Self::delete_child) the old spec first to reuse the
+    ///   name.
+    /// - other [`SpawnError`] variants if the child
+    ///   fails to spawn.
     pub fn spawn_child<F, C>(&mut self, factory: F) -> ChildSpawnBuilder<'_, A, F, C>
     where
         F: Fn() -> C + Send + Sync + 'static,
@@ -181,21 +209,37 @@ impl<A: Actor> ActorContext<A> {
         restart_type: RestartType,
         shutdown: Shutdown,
         config: Option<runtime::ActorConfig>,
-    ) -> Result<ActorHandle<C>, crate::error::ActorError>
+    ) -> Result<ActorHandle<C>, SpawnError>
     where
         F: Fn() -> C + Send + Sync + 'static,
         C: Actor,
     {
         if self.supervision.is_none() {
-            return Err(SupervisionError::NotASupervisor.into());
+            return Err(SpawnError::NotASupervisor);
         }
 
-        let actor = factory();
-        let child_config = config.unwrap_or_default();
         let child_id: ActorId = name
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
             .into();
+
+        // OTP `already_present` parity: a live child or a kept spec (retained
+        // by `terminate_child`) under this id rejects the spawn before the
+        // factory ever runs. `delete_child` clears the spec so the id can be
+        // reused.
+        let duplicate = self
+            .supervision
+            .as_ref()
+            .expect("supervision presence checked above")
+            .registry
+            .get(&child_id)
+            .is_some();
+        if duplicate {
+            return Err(SpawnError::DuplicateChild(child_id));
+        }
+
+        let actor = factory();
+        let child_config = config.unwrap_or_default();
 
         let (child_handle, join_handle) = runtime::spawn_actor(
             child_id.clone(),
@@ -203,6 +247,8 @@ impl<A: Actor> ActorContext<A> {
             child_config.clone(),
             name.clone(),
             self.system.clone(),
+            None,
+            false,
         )?;
 
         // The parent spawns and owns the watcher (initial incarnation 0).
@@ -277,7 +323,15 @@ impl<A: Actor> ActorContext<A> {
                         }
                     };
 
-                    match runtime::spawn_actor(child_id.clone(), actor, config, name, system) {
+                    match runtime::spawn_actor(
+                        child_id.clone(),
+                        actor,
+                        config,
+                        name,
+                        system,
+                        None,
+                        false,
+                    ) {
                         Ok((handle, join)) => {
                             // The parent adopts the incarnation and spawns the
                             // watcher itself on acceptance, so watcher events
@@ -510,7 +564,14 @@ impl<A: Actor> ActorContext<A> {
     /// Creates a [`ScheduleBuilder`] for scheduling a message.
     ///
     /// Chain `.at(instant)` or `.after(delay)` for one-shot, or `.every(interval)`
-    /// for recurring timers. Then `.await` to register.
+    /// for recurring timers, then `.await` to register. Registration happens
+    /// entirely inside that final `.await`: a builder that is constructed and
+    /// dropped without being awaited registers nothing and never fires. Every
+    /// builder returned from this chain is `#[must_use]`, so that mistake is a
+    /// compiler warning rather than a silent no-op.
+    ///
+    /// Use [`every_with`](Self::every_with) instead of `.every()` when the
+    /// message type does not implement `Clone`.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -542,11 +603,56 @@ impl<A: Actor> ActorContext<A> {
     ///     }
     /// }
     /// ```
-    pub fn schedule(&mut self, message: A::Message) -> ScheduleBuilder<'_, A>
-    where
-        A::Message: Clone + Sync + Send + 'static,
-    {
+    pub fn schedule(&mut self, message: A::Message) -> ScheduleBuilder<'_, A> {
         ScheduleBuilder { ctx: self, message }
+    }
+
+    /// Creates a [`RecurringScheduleBuilder`] whose message is produced by
+    /// `factory` on every tick, instead of being cloned from a single
+    /// template. Use this when `Message` does not implement `Clone`; when it
+    /// does, `.schedule(msg).every(interval)` is the shorter spelling.
+    ///
+    /// Chain `.on_miss(policy)` before `.await` to override the default
+    /// [`MissPolicy::Skip`]. As with every schedule builder, nothing is
+    /// registered until the builder is awaited.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use tokio::time::Duration;
+    /// use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult};
+    ///
+    /// struct Payload(Vec<u8>); // not Clone
+    /// enum Msg { Tick(Payload) }
+    ///
+    /// #[derive(Default)]
+    /// struct MyActor;
+    ///
+    /// impl Actor for MyActor {
+    ///     type Message = Msg;
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: Msg, _: &mut ActorContext<Self>) -> ActorResult<()> { Ok(()) }
+    ///
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         ctx.every_with(Duration::from_millis(100), || Msg::Tick(Payload(Vec::new())))
+    ///             .await?;
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    pub fn every_with<F>(
+        &mut self,
+        interval: Duration,
+        factory: F,
+    ) -> RecurringScheduleBuilder<'_, A>
+    where
+        F: FnMut() -> A::Message + Send + 'static,
+    {
+        RecurringScheduleBuilder {
+            ctx: self,
+            factory: Box::new(factory),
+            interval,
+            miss_policy: MissPolicy::Skip,
+        }
     }
 
     /// Internal: register a one-shot timer.
@@ -554,10 +660,7 @@ impl<A: Actor> ActorContext<A> {
         &mut self,
         message: A::Message,
         when: Instant,
-    ) -> Result<RecurringId, TimerError>
-    where
-        A::Message: Send + 'static,
-    {
+    ) -> Result<RecurringId, TimerError> {
         let id = self.id_gen.next();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
@@ -649,9 +752,11 @@ impl<A: Actor> ActorContext<A> {
 
 /// Builder for spawning a supervised child actor.
 ///
-/// Created by [`ActorContext::spawn_child`]. Implements [`IntoFuture`] so you
-/// can `.await` it directly, or chain `.named()`, `.restart_type()`,
-/// `.shutdown()`, `.with_config()` before awaiting.
+/// Created by [`ActorContext::spawn_child`]. Implements
+/// [`IntoFuture`](std::future::IntoFuture) so you can `.await` it directly,
+/// or chain `.named()`, `.restart_type()`, `.shutdown()`, `.with_config()`
+/// before awaiting. Resolves to `Result<ActorHandle<C>, SpawnError>` - see
+/// [`spawn_child`](ActorContext::spawn_child) for the error variants.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -703,7 +808,7 @@ where
     F: Fn() -> C + Send + Sync + 'static,
 {
     /// Assigns a name to the child. The name also serves as the child's
-    /// [`ActorId`](crate::types::ActorId).
+    /// [`ActorId`].
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -732,7 +837,7 @@ impl<'ctx, A: Actor, F, C: Actor> std::future::IntoFuture for ChildSpawnBuilder<
 where
     F: Fn() -> C + Send + Sync + 'static,
 {
-    type Output = Result<ActorHandle<C>, crate::error::ActorError>;
+    type Output = Result<ActorHandle<C>, SpawnError>;
     type IntoFuture = std::future::Ready<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -755,6 +860,10 @@ where
 /// Created by [`ActorContext::schedule`].
 /// Chain `.at(instant)` or `.after(delay)` for one-shot timers,
 /// or `.every(interval)` for recurring timers, then `.await`.
+///
+/// Nothing is registered until the terminal schedule is awaited - dropping a
+/// builder (or the schedule it produces) without awaiting it registers no
+/// timer, and it never fires.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -786,63 +895,80 @@ where
 ///     }
 /// }
 /// ```
+#[must_use = "a schedule registers nothing until awaited; a dropped builder never fires"]
 pub struct ScheduleBuilder<'ctx, A: Actor> {
     ctx: &'ctx mut ActorContext<A>,
     message: A::Message,
 }
 
-impl<'ctx, A: Actor> ScheduleBuilder<'ctx, A>
-where
-    A::Message: Clone + Sync + Send + 'static,
-{
+impl<'ctx, A: Actor> ScheduleBuilder<'ctx, A> {
     /// Schedule a one-shot message at a specific [`Instant`].
-    pub fn at(self, when: Instant) -> OneShotSchedule {
+    pub fn at(self, when: Instant) -> OneShotSchedule<'ctx, A> {
         OneShotSchedule {
-            result: self.ctx.register_oneshot(self.message, when),
+            ctx: self.ctx,
+            message: self.message,
+            when,
         }
     }
 
     /// Schedule a one-shot message after a [`Duration`].
-    pub fn after(self, delay: Duration) -> OneShotSchedule {
+    pub fn after(self, delay: Duration) -> OneShotSchedule<'ctx, A> {
         let when = Instant::now() + delay;
         OneShotSchedule {
-            result: self.ctx.register_oneshot(self.message, when),
+            ctx: self.ctx,
+            message: self.message,
+            when,
         }
     }
 
     /// Schedule a recurring timer at `interval`. Default `MissPolicy::Skip`.
     ///
-    /// Chain `.on_miss(policy)` before `.await` to override.
-    pub fn every(self, interval: Duration) -> RecurringScheduleBuilder<'ctx, A> {
+    /// Chain `.on_miss(policy)` before `.await` to override. Requires
+    /// `Message: Clone` (the template is cloned for every tick) - use
+    /// [`ActorContext::every_with`] instead for a message type that is not
+    /// `Clone`.
+    pub fn every(self, interval: Duration) -> RecurringScheduleBuilder<'ctx, A>
+    where
+        A::Message: Clone,
+    {
         let msg = self.message;
         RecurringScheduleBuilder {
             ctx: self.ctx,
-            factory: Arc::new(move || msg.clone()),
+            factory: Box::new(move || msg.clone()),
             interval,
             miss_policy: MissPolicy::Skip,
         }
     }
 }
 
-/// Terminal for a one-shot timer. `.await` this to get the [`RecurringId`].
-pub struct OneShotSchedule {
-    result: Result<RecurringId, TimerError>,
+/// Terminal for a one-shot timer. `.await` this to register the timer and
+/// get the [`RecurringId`] - the timer does not exist until this future
+/// resolves, so a dropped, un-awaited `OneShotSchedule` registers nothing and
+/// never fires.
+#[must_use = "a schedule registers nothing until awaited; a dropped builder never fires"]
+pub struct OneShotSchedule<'ctx, A: Actor> {
+    ctx: &'ctx mut ActorContext<A>,
+    message: A::Message,
+    when: Instant,
 }
 
-impl std::future::IntoFuture for OneShotSchedule {
+impl<'ctx, A: Actor> std::future::IntoFuture for OneShotSchedule<'ctx, A> {
     type Output = Result<RecurringId, TimerError>;
     type IntoFuture = std::future::Ready<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        std::future::ready(self.result)
+        std::future::ready(self.ctx.register_oneshot(self.message, self.when))
     }
 }
 
 /// Builder for a recurring timer. `.await` to register with default
-/// `MissPolicy::Skip`, or chain `.on_miss(policy)` first.
+/// `MissPolicy::Skip`, or chain `.on_miss(policy)` first. Returned by
+/// [`ScheduleBuilder::every`] (message cloned from a template per tick) and
+/// by [`ActorContext::every_with`] (message produced by a factory closure).
+#[must_use = "a schedule registers nothing until awaited; a dropped builder never fires"]
 pub struct RecurringScheduleBuilder<'ctx, A: Actor> {
     ctx: &'ctx mut ActorContext<A>,
-    factory: Arc<MessageFactory<A>>,
+    factory: Box<MessageFactory<A>>,
     interval: Duration,
     miss_policy: MissPolicy,
 }
@@ -901,11 +1027,11 @@ struct StreamRegistration {
     token: CancellationToken,
 }
 
-type MessageFactory<A> = dyn Fn() -> <A as Actor>::Message + Send + Sync + 'static;
+type MessageFactory<A> = dyn FnMut() -> <A as Actor>::Message + Send + 'static;
 
 async fn recurring_loop<A: Actor>(
     handle: ActorHandle<A>,
-    factory: Arc<MessageFactory<A>>,
+    mut factory: Box<MessageFactory<A>>,
     interval: Duration,
     miss_policy: MissPolicy,
     token: CancellationToken,
@@ -915,9 +1041,9 @@ async fn recurring_loop<A: Actor>(
         tokio::select! {
             _ = token.cancelled() => break,
             _ = time::sleep_until(next) => {
-                let msg = (factory.as_ref())();
+                let msg = (factory.as_mut())();
                 let _ = handle.notify(msg).await;
-                adjust_next(&mut next, interval, miss_policy, &token, &handle, &factory).await;
+                adjust_next(&mut next, interval, miss_policy, &token, &handle, &mut factory).await;
             }
         }
     }
@@ -958,7 +1084,7 @@ async fn adjust_next<A: Actor>(
     miss_policy: MissPolicy,
     token: &CancellationToken,
     handle: &ActorHandle<A>,
-    factory: &Arc<MessageFactory<A>>,
+    factory: &mut Box<MessageFactory<A>>,
 ) {
     let now = Instant::now();
     match miss_policy {
@@ -977,7 +1103,7 @@ async fn adjust_next<A: Actor>(
                 if token.is_cancelled() {
                     return;
                 }
-                let msg = (factory.as_ref())();
+                let msg = (factory.as_mut())();
                 if handle.try_notify(msg).is_err() {
                     break;
                 }

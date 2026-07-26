@@ -14,6 +14,9 @@ pub mod supervision;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::oneshot;
 
 use crate::error::{ActorError, ActorResult, SpawnError};
 use crate::system::ActorSystem;
@@ -61,6 +64,16 @@ pub trait Actor: Sized + Send + 'static {
     /// Handles a message sent to the actor.
     ///
     /// This method is called sequentially for each message in the mailbox.
+    ///
+    /// # The `Err` contract
+    ///
+    /// A recoverable, expected condition is an `Ok`-encoded domain value in
+    /// `Self::Response`, not an `Err`. Returning `Err` means this actor's
+    /// invariants are broken: it stops with `StopReason::Failure` on BOTH the
+    /// `send` and `notify` paths (cast-exception parity, matching OTP: an
+    /// uncaught exception kills the process the same way whether it came from
+    /// a `call` or a `cast`). Crash cleanup belongs in [`on_stopped`](Self::on_stopped),
+    /// not in `handle` itself.
     fn handle(
         &mut self,
         msg: Self::Message,
@@ -98,9 +111,6 @@ pub trait Actor: Sized + Send + 'static {
     ) -> impl Future<Output = ActorResult<()>> + Send {
         async { Ok(()) }
     }
-
-    /// Called when a message handler returns an error during a `notify` (fire-and-forget) call.
-    fn handle_failure(&mut self, _error: ActorError) {}
 }
 
 /// Type alias tying the strongly typed envelope to a concrete actor.
@@ -109,6 +119,22 @@ pub type ActorEnvelope<A> = Envelope<<A as Actor>::Message, <A as Actor>::Respon
 // ---------------------------------------------------------------------------
 // SpawnBuilder - builder chain with IntoFuture
 // ---------------------------------------------------------------------------
+
+/// How a [`SpawnBuilder`] observes the actor's initialization outcome.
+///
+/// Default is [`Await`](SpawnAck::Await): OTP's `start_link` is synchronous
+/// with an infinity default timeout, so `.await` on the builder waits for
+/// `pre_start` and `on_started` with no deadline unless one is set.
+enum SpawnAck {
+    /// Await the init ack with no deadline.
+    Await,
+    /// Skip the ack entirely: `.await` returns as soon as the task is
+    /// spawned, before `pre_start` ever runs.
+    Detached,
+    /// Await the init ack, bounded by a deadline; on expiry the task is
+    /// aborted and no lifecycle hook runs.
+    Timeout(Duration),
+}
 
 /// Builder for spawning an actor with optional name, system, config, and supervision.
 ///
@@ -137,6 +163,7 @@ pub struct SpawnBuilder<A: Actor> {
     name: Option<String>,
     system: Option<Arc<ActorSystem>>,
     config: ActorConfig,
+    ack: SpawnAck,
 }
 
 impl<A: Actor> SpawnBuilder<A> {
@@ -163,8 +190,8 @@ impl<A: Actor> SpawnBuilder<A> {
     /// 3 restarts / 5s window). A supervisor can spawn supervised children via
     /// [`ActorContext::spawn_child`](crate::actor::context::ActorContext::spawn_child).
     ///
-    /// Renamed from `supervised()` in v0.7.0: the actor takes the supervisor
-    /// role; its children are the supervised ones.
+    /// The actor takes the supervisor role; its children are the supervised
+    /// ones.
     pub fn supervisor(mut self) -> Self {
         self.config = self.config.supervisor();
         self
@@ -173,6 +200,28 @@ impl<A: Actor> SpawnBuilder<A> {
     /// Enables supervision with a custom [`SupervisionConfig`].
     pub fn with_supervision(mut self, sup: SupervisionConfig) -> Self {
         self.config = self.config.with_supervision(sup);
+        self
+    }
+
+    /// Skips the initialization ack entirely: `.await` returns as soon as the
+    /// task is spawned, before `pre_start` ever runs. An init failure is
+    /// then silent to this caller: the actor
+    /// still stops, but nobody here is told why. This does not change how a
+    /// supervised child reports init failure to its parent (the watcher and
+    /// restart budget already cover that); it only changes what an
+    /// unsupervised, top-level caller of `.spawn()` observes.
+    pub fn detached(mut self) -> Self {
+        self.ack = SpawnAck::Detached;
+        self
+    }
+
+    /// Bounds how long `.await` waits for `pre_start`/`on_started` to finish.
+    ///
+    /// On expiry the task is aborted immediately: no lifecycle hook runs
+    /// afterward, matching OTP's untrappable `exit(_, kill)` on a start
+    /// timeout, and the caller gets [`SpawnError::StartTimeout`].
+    pub fn start_timeout(mut self, timeout: Duration) -> Self {
+        self.ack = SpawnAck::Timeout(timeout);
         self
     }
 }
@@ -187,7 +236,61 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                 .name
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            runtime::into_actor(id_str, self.actor, self.config, self.name, self.system)
+
+            match self.ack {
+                SpawnAck::Detached => {
+                    runtime::into_actor(id_str, self.actor, self.config, self.name, self.system)
+                }
+                SpawnAck::Await => {
+                    let (tx, rx) = oneshot::channel();
+                    let (handle, _join) = runtime::spawn_actor(
+                        id_str.into(),
+                        self.actor,
+                        self.config,
+                        self.name,
+                        self.system,
+                        Some(tx),
+                        true,
+                    )?;
+                    match rx.await {
+                        Ok(Ok(())) => Ok(handle),
+                        Ok(Err(err)) => Err(SpawnError::Init(Box::new(err))),
+                        // The ack sender was dropped without sending: not a
+                        // reachable path today (the task always acks exactly
+                        // once), kept as a defensive fallback.
+                        Err(_) => Err(SpawnError::Init(Box::new(ActorError::user(
+                            "spawn ack channel closed before a reply arrived",
+                        )))),
+                    }
+                }
+                SpawnAck::Timeout(timeout) => {
+                    let (tx, rx) = oneshot::channel();
+                    let (handle, join) = runtime::spawn_actor(
+                        id_str.into(),
+                        self.actor,
+                        self.config,
+                        self.name,
+                        self.system,
+                        Some(tx),
+                        true,
+                    )?;
+                    match tokio::time::timeout(timeout, rx).await {
+                        Ok(Ok(Ok(()))) => Ok(handle),
+                        Ok(Ok(Err(err))) => Err(SpawnError::Init(Box::new(err))),
+                        // Same defensive fallback as the no-deadline path above.
+                        Ok(Err(_)) => Err(SpawnError::Init(Box::new(ActorError::user(
+                            "spawn ack channel closed before a reply arrived",
+                        )))),
+                        Err(_elapsed) => {
+                            // Unconditional, untrappable: matches OTP's
+                            // exit(_, kill) on a start timeout. No lifecycle
+                            // hook runs; the task is dropped mid-poll.
+                            join.abort();
+                            Err(SpawnError::StartTimeout)
+                        }
+                    }
+                }
+            }
         })
     }
 }
@@ -203,12 +306,20 @@ pub trait ActorExt: Actor + Sized {
     /// The builder implements [`IntoFuture`], so you can `.await` it directly
     /// for an anonymous spawn, or chain `.named()`, `.on_system()`, `.supervisor()`,
     /// `.with_config()` before awaiting.
+    ///
+    /// By default `.await` acks the actor's initialization: it does not
+    /// return until `pre_start` and `on_started` have both run, with no
+    /// deadline (OTP `start_link` infinity-default parity). An `Err` from
+    /// either surfaces here as [`SpawnError::Init`]. Chain `.detached()` for
+    /// the old fire-and-forget behavior, or `.start_timeout(dur)` to bound
+    /// the wait.
     fn spawn(self) -> SpawnBuilder<Self> {
         SpawnBuilder {
             actor: self,
             name: None,
             system: None,
             config: ActorConfig::default(),
+            ack: SpawnAck::Await,
         }
     }
 }

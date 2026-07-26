@@ -25,12 +25,28 @@ What happens when things go wrong. Every row is exercised by the test suite (see
 | Panic in a handler | Caught at the callback boundary; the actor stops with `StopReason::Failure(ActorError::Panic)` and `on_stopped` still runs with that reason (gen_server terminate-on-exception parity) |
 | Death notification | A runtime watcher on the child's task delivers `ChildStopped` through an awaited send, so the report cannot be silently dropped |
 | Automatic restart | Runtime-managed: OneForOne, OneForAll, RestForOne, SimpleOneForOne |
-| Group restart ordering | OTP ordering: affected children stop in reverse start order, then restart in start order |
+| Group restart ordering | OTP ordering: stop signals go out in reverse start order with every death awaited; restarts are initiated in start order, each next member only after the previous one has re-registered |
 | Manual child management | `terminate_child` / `restart_child` / `delete_child` / `stop_child` with OTP semantics: spec kept, manual stops never charge the budget |
 | Restart budget escalation | Sliding-window budget; exhaustion stops the supervisor with the OTP `shutdown` reason (`StopReason::ParentRequest`), so a grandparent's Transient policy does not restart it |
 | Forced termination | `Shutdown::Timeout` -> `Kill` -> task abort ladder; every stop path is bounded except documented `Infinity` |
 
 **Honest limits.** Panic capture requires unwinding: `panic = "abort"` builds have no in-process supervision (the process dies). A handler stuck at an `.await` point is force-killable, but a non-yielding busy loop is beyond even task abort; it surfaces as a typed `SupervisionError::ChildUnresponsive` after a bounded wait instead of hanging the supervisor. `Shutdown::Infinity` children can stall a group restart indefinitely, matching OTP's own infinity semantics. And there is no distribution layer by design: tokio-actors is local-first (see [Non-Goals](#non-goals)). In-process fidelity is the product, not a stepping stone to a cluster framework.
+
+---
+
+## Lifecycle Contracts
+
+Every lifecycle promise is a mechanism the runtime enforces, not a documentation convention:
+
+| Contract | Guarantee |
+|---|---|
+| Truthful spawn | `spawn().await` acks through `pre_start` AND `on_started` before it resolves, with an infinity default and an opt-in `.start_timeout(dur)`. A failed init returns `SpawnError::Init` instead of dying silently; `.detached()` provides fire-and-forget spawning for callers who want it. |
+| Uniform crash semantics | `Err` from `handle` stops the actor the same way whether the message arrived via `send` or `notify` - one crash path, not two. Recoverable conditions belong in the `Response` type as `Ok` values; crash cleanup belongs in `on_stopped`, which receives the `StopReason`. |
+| Observable lifecycle | `ActorHandle::status()` and `wait_stopped()` form a `watch`-based runtime plane that answers even when an actor is stuck at an `.await` point; `get_status()` serves the richer queue-plane snapshot. |
+| Bounded, truthful shutdown | `ActorSystem::shutdown()` awaits every root actor to a terminal state (stopping roots only, in reverse registration order, so each supervisor tears down its own subtree) and returns a per-actor `ShutdownReport`. Do not call it from inside an actor that is part of the shutdown being awaited: that call hangs. |
+| Matchable errors | `ActorError` carries structured `Timer`/`Stream`/`Supervision` variants instead of stringified messages, `send_timeout` spans one call-wide deadline (`AskError::Timeout { enqueued }`: `enqueued: false` means the request never reached the mailbox and is safe to retry; `true` means the deadline raced the reply, retry only if idempotent), and every error enum is exhaustive. |
+
+In the same spirit: one-shot schedules are lazy and `#[must_use]` (a dropped builder never fires), `.every_with(factory)` covers recurring messages that are not `Clone`, and `ActorSystem::get_by_id` resolves an `ActorId` to a live handle.
 
 ---
 
@@ -46,11 +62,18 @@ Supervision is crash-visible. A panic in a handler or lifecycle hook is caught a
 Group strategies (OneForAll/RestForOne) follow OTP ordering: affected children are stopped in reverse start order, then restarted in start order. Children keep their `ActorId` and `ActorConfig` across restarts. Each child has a `RestartType` (Permanent/Transient/Temporary), and a sliding-window restart budget prevents restart storms. When the budget is exhausted, the supervisor stops with `StopReason::ParentRequest`, and its own supervisor's Transient policy will NOT restart it, matching OTP shutdown semantics.
 
 ### Lifecycle Observability
-Query actor status anytime via the system channel, even when the mailbox is full:
+Two observability planes, matching OTP's `sys:get_status` vs `process_info(Pid, status)` split. The system channel gives a rich snapshot even when the mailbox is full:
 
 ```rust
 let status = handle.get_status().await?;
 println!("{}: {} children, {} timers", status.id, status.child_count, status.timer_count);
+```
+
+The runtime plane answers instantly, even for an actor stuck at an `.await` point inside `handle`, and gives you an awaitable terminal state:
+
+```rust
+let phase = handle.status();   // ActorStatus, no channel round trip
+handle.wait_stopped().await;    // resolves once the actor reaches Stopped
 ```
 
 ### Strongly Typed
@@ -162,8 +185,9 @@ let handle = sys.get::<MyActor>("worker-1");
 sys.stop("worker-1").await?;   // Graceful (vetoable)
 sys.kill("worker-1").await?;   // Force (bypasses all hooks)
 
-// Coordinated shutdown with timeout escalation
-sys.shutdown().await;
+// Coordinated shutdown: stops root actors only (each supervisor tears down
+// its own subtree), awaits every root to a terminal state, and reports
+let report = sys.shutdown().await;
 ```
 
 ---
@@ -244,7 +268,7 @@ async fn handle(&mut self, msg: Cmd, ctx: &mut ActorContext<Self>) -> ActorResul
 
 ### Crash Semantics
 
-Panics are crashes, not errors. A panic in `handle` or a lifecycle hook is caught at the callback boundary: the actor stops with `StopReason::Failure(ActorError::Panic)` (running `on_stopped` for post-init crashes, like gen_server's terminate-on-exception), and its supervisor (if any) restarts it per strategy. On the send path the caller sees the panic directly. `AskError` is flat in v0.7.0 (previously the transport error was nested as `Send(SendError)`):
+Panics are crashes, not errors. A panic in `handle` or a lifecycle hook is caught at the callback boundary: the actor stops with `StopReason::Failure(ActorError::Panic)` (running `on_stopped` for post-init crashes, like gen_server's terminate-on-exception), and its supervisor (if any) restarts it per strategy. On the send path the caller sees the panic directly. `AskError` is flat - transport, actor, and timeout failures are peer variants - and carries `Timeout { enqueued }` from `send_timeout`:
 
 ```rust
 use tokio_actors::{ActorError, AskError};
@@ -260,10 +284,15 @@ match worker.send(job).await {
     Err(AskError::Actor(err)) => eprintln!("handler returned Err: {err}"),
     Err(AskError::Closed) => eprintln!("mailbox closed (actor down or mid-restart)"),
     Err(AskError::ResponseDropped) => eprintln!("actor stopped before replying"),
+    Err(AskError::Timeout { enqueued }) => {
+        // Only reachable via `send_timeout` - plain `send` has no deadline,
+        // but the match must stay exhaustive since both share `AskError`.
+        eprintln!("timed out (enqueued: {enqueued})");
+    }
 }
 ```
 
-On the notify path, `Err` and panic are different animals: a handler that returns `Err` for a notify-dispatched message goes to `handle_failure()` and the actor **continues**; a handler that panics stops the actor and triggers a restart, exactly as on the send path.
+On the notify path, `Err` and panic now behave identically to the send path: both stop the actor with `StopReason::Failure(..)`, `on_stopped` runs, and a supervisor (if any) restarts it per strategy. There is no `handle_failure` hook anymore - a notify caller simply never learns about the crash directly (fire-and-forget has no return channel), while a send caller sees it as `Err(AskError::Actor(..))`.
 
 **Known limitations**: `panic = "abort"` builds have no unwinding, so panic capture cannot exist there (the process dies). The default panic hook still prints to stderr even when supervision handles the crash. Set your own hook to silence it. A child with `Shutdown::Infinity` that refuses to stop can stall a group restart, matching OTP infinity semantics. Infinity is the single unbounded case; every other stop path is bounded by the Timeout -> Kill -> abort ladder. A handler stuck at an `.await` point IS force-killable (the abort backstop cancels the task after a short grace); only a non-yielding busy loop remains beyond reach, and it surfaces as a typed `ChildUnresponsive` error after a bounded wait instead of hanging the supervisor.
 
@@ -302,16 +331,19 @@ handle.notify(msg).await?;
 // Request-response (wait for actor to process)
 let response = handle.send(msg).await?;
 
+// Request-response bounded by a single deadline
+let response = handle.send_timeout(msg, Duration::from_secs(2)).await?;
+
 // Non-blocking attempt (returns immediately)
 handle.try_notify(msg)?;
 ```
 
 **Error Handling Nuance**:
-- `notify` errors -> actor calls `handle_failure()` and **continues processing**
-- `send` errors -> actor stops (caller expects a response, failure is critical)
-- Panics are not errors: a panic on **either** path stops the actor (see Crash Semantics above)
+- `Err` from `handle` stops the actor on **every** path - `notify`, `send`, and `send_timeout` alike. There is no more "notify errors are shrugged off": encode recoverable outcomes as `Ok` values, and treat `Err` as a crash everywhere.
+- Panics behave the same way, on every path (see Crash Semantics above).
+- The only difference left is what the CALLER learns: `notify` cannot report a crash back (fire-and-forget has no return channel), while `send`/`send_timeout` surface it as `Err(AskError::Actor(err))`.
 
-This asymmetry reflects real-world semantics.
+The messaging method you pick changes what the caller learns, never what the actor does.
 
 ### Timers with Drift Control
 
@@ -352,11 +384,9 @@ let status = handle.get_status().await?;
 
 ## Deep Rust Patterns
 
-### Why `Sync` is Required for Recurring Timer Messages
+### Recurring Timer Messages: `Clone`, Not `Sync`
 
-Recurring timers clone the message each tick via an internal `move || msg.clone()` closure held in an `Arc` across tasks. Rust's `Send` future rules require the captured `msg` to be `Sync`.
-
-In practice this is a non-issue. Enum message types are `Sync` by default. Only types with unsynchronized interior mutability (`Cell`, `RefCell`) aren't `Sync`, and those also fail `Send`.
+Recurring timers do not require `A::Message: Sync`. The per-tick factory is a `Box<dyn FnMut() -> Message + Send>` owned by exactly one forwarder task, so `Sync` is never demanded. `.every(msg)` needs `A::Message: Clone` (the factory clones `msg` each tick); `.every_with(|| build_message())` drops the `Clone` bound entirely by calling your factory closure instead. One-shot schedules (`.at()`, `.after()`) need only `Send` - no `Clone`, no `Sync`.
 
 ### ActorHandle Equality
 
@@ -396,8 +426,12 @@ actor.spawn()                     // Start the builder
     .with_config(config)          // Optional: custom ActorConfig
     .supervisor()                 // Optional: supervise children (default config)
     .with_supervision(sup_config) // Optional: enable supervision (custom config)
-    .await?;                      // Finalize: spawns the actor
+    .start_timeout(dur)           // Optional: bound init instead of waiting forever
+    .detached()                   // Optional: skip the init ack entirely
+    .await?;                      // Finalize: awaits pre_start + on_started, then spawns
 ```
+
+`.start_timeout(dur)` and `.detached()` are alternatives: pick a bound on the init ack or skip the ack, not both.
 
 ### ActorHandle Methods
 
@@ -406,8 +440,11 @@ actor.spawn()                     // Start the builder
 | `notify(msg)` | Fire-and-forget (awaits mailbox space) |
 | `try_notify(msg)` | Non-blocking fire-and-forget |
 | `send(msg)` | Request-response (awaits processing) |
+| `send_timeout(msg, dur)` | Request-response bounded by one deadline spanning enqueue + response |
 | `stop(reason)` | Stop via system channel (bypasses full mailbox) |
-| `get_status()` | Introspection snapshot via system channel |
+| `get_status()` | Rich introspection snapshot via system channel (queue plane) |
+| `status()` | Instant lifecycle phase from the runtime plane (answers even for a hung actor) |
+| `wait_stopped()` | Awaits the actor's terminal state |
 | `is_alive()` | Check if actor is still running |
 | `mailbox_len()` | Current queue depth |
 | `mailbox_available()` | Free space in mailbox |
@@ -447,7 +484,7 @@ actor.spawn()                     // Start the builder
 | `get::<A>(name)` | Typed actor lookup (OTP `whereis`) |
 | `stop(name)` | Graceful stop by name |
 | `kill(name)` | Force kill by name |
-| `shutdown()` | Coordinated shutdown with escalation |
+| `shutdown()` | Roots-only coordinated shutdown; awaits every root to a terminal state and returns a `ShutdownReport` |
 | `registered()` | List all registered actor names |
 
 ### ActorConfig Builder
@@ -524,7 +561,7 @@ Multi-agent AI systems need exactly the guarantees described above. Each agent i
 
 Every actor is a dedicated `tokio::task`. No shared executor, no fancy scheduling, just Tokio doing what it does best.
 
-Stop signals and status queries flow through a dedicated **system channel** with `biased; select!` priority over the user mailbox. This means `stop()` and `get_status()` work even when the mailbox is full.
+Stop signals and `get_status()` flow through a dedicated **system channel** with `biased; select!` priority over the user mailbox, so they work even when the mailbox is full. `status()` and `wait_stopped()` bypass channels entirely: they read a `watch` value the runtime updates directly, so they answer even if the actor is stuck processing a message and never touching `select!` at all.
 
 ---
 

@@ -51,6 +51,7 @@ pub use error::{
 };
 pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{
-    ActorId, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId, RestartStrategy,
-    RestartType, SchedulePolicy, Shutdown, StopReason, StreamEvent, StreamId, SupervisionAction,
+    ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId,
+    RestartStrategy, RestartType, SchedulePolicy, Shutdown, ShutdownReport, StopOutcome,
+    StopReason, StreamEvent, StreamId, SupervisionAction,
 };

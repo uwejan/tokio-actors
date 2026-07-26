@@ -1,9 +1,22 @@
+//! Actor task spawning and the message-dispatch run loop.
+//!
+//! The run loop's `select!` is `biased`, always draining the system channel
+//! (`Stop`, `GetStatus`, `ChildStopped`, `RestartComplete`) before the user
+//! mailbox. This ordering is deliberate, not incidental: it mirrors the OTP
+//! spirit of signals and supervisor traffic pre-empting ordinary message-queue
+//! processing, so a pending `Stop` is honored and a child's death is observed
+//! even while the mailbox is full, and `get_status` answers without waiting
+//! behind user traffic. The residual cost is the mirror image of that benefit:
+//! a sustained flood of child-death events on the system channel can starve
+//! the mailbox, delaying user message processing for as long as the flood
+//! keeps the system channel non-empty.
+
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::actor::panic::{catch_callback, payload_into_string};
@@ -71,8 +84,8 @@ impl ActorConfig {
     /// Makes the actor a SUPERVISOR with the default configuration
     /// (OneForOne, 3 restarts / 5s window).
     ///
-    /// Renamed from `supervised()` in v0.7.0: the actor takes the supervisor
-    /// role; its children are the supervised ones.
+    /// The actor takes the supervisor role; its children are the supervised
+    /// ones.
     pub fn supervisor(mut self) -> Self {
         self.supervision = Some(SupervisionConfig::default());
         self
@@ -89,6 +102,9 @@ impl ActorConfig {
 // Spawn
 // ---------------------------------------------------------------------------
 
+/// Spawns an actor detached: no initialization ack, `_join` discarded. This
+/// is the fire-and-forget spawn behind
+/// [`SpawnBuilder::detached`](crate::actor::SpawnBuilder::detached).
 pub(crate) fn into_actor<A: Actor>(
     id: impl Into<ActorId>,
     actor: A,
@@ -96,7 +112,8 @@ pub(crate) fn into_actor<A: Actor>(
     name: Option<String>,
     system: Option<Arc<ActorSystem>>,
 ) -> Result<ActorHandle<A>, SpawnError> {
-    let (handle, _join) = spawn_actor(id.into(), actor, config.into(), name, system)?;
+    // Only reachable from the top-level `.detached()` spawn path: always a root.
+    let (handle, _join) = spawn_actor(id.into(), actor, config.into(), name, system, None, true)?;
     Ok(handle)
 }
 
@@ -106,40 +123,80 @@ pub(crate) fn into_actor<A: Actor>(
 /// children the caller wraps the `JoinHandle` in a watcher
 /// ([`spawn_watcher`]); the watcher, not the dying actor, is the authoritative
 /// death signal (a panicking actor cannot self-report).
+///
+/// `ack`, if present, is signalled exactly once from inside the task: `Ok(())`
+/// right after the actor transitions to [`ActorStatus::Running`] (post
+/// `on_started`, pre message loop), or `Err` once `pre_start`/`on_started`
+/// failed AND the full teardown (including the registry guard drop) has run.
+/// Callers that do not want to wait (supervised children, `.detached()`
+/// spawns) pass `None`.
+///
+/// `is_root` distinguishes a top-level `SpawnBuilder` spawn (`true`) from a
+/// supervised child (`false`, `spawn_child` and its restart path). System
+/// shutdown only signals roots directly; a root's own supervision cascade
+/// takes its children down in turn.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_actor<A: Actor>(
     id: ActorId,
     actor: A,
     config: ActorConfig,
     name: Option<String>,
     system: Option<Arc<ActorSystem>>,
+    ack: Option<oneshot::Sender<Result<(), ActorError>>>,
+    is_root: bool,
 ) -> Result<(ActorHandle<A>, JoinHandle<StopReason>), SpawnError> {
     let handle = Handle::try_current().map_err(|_| SpawnError::MissingRuntime)?;
     let mailbox_capacity = config.mailbox.capacity;
     let (tx, rx) = mpsc::channel(mailbox_capacity);
     let (system_tx, system_rx) = mpsc::channel::<SystemMessage>(64);
-    let actor_handle = ActorHandle::new(id.clone(), tx, system_tx.clone(), mailbox_capacity);
+    let (status_tx, status_rx) = watch::channel(ActorStatus::Initializing);
+    let actor_handle = ActorHandle::new(
+        id.clone(),
+        tx,
+        system_tx.clone(),
+        mailbox_capacity,
+        status_rx,
+    );
 
     let supervision = config.supervision.map(SupervisionState::new);
     let context = ActorContext::new(
         id.clone(),
         actor_handle.clone(),
         handle.clone(),
+        status_tx,
         system_tx.clone(),
         system.clone(),
         name.clone(),
         supervision,
     );
 
-    // Register in the target system when a name or explicit system is provided.
-    let guard = if name.is_some() || system.is_some() {
-        let target = system.unwrap_or_else(ActorSystem::default);
-        target.register_actor::<A>(&id, name.as_deref(), &actor_handle)?;
-        Some(RegistryGuard::new(target, id, name))
+    // Register in the target system when a name or explicit system is
+    // provided. The name-claim happens BEFORE the task is spawned; the
+    // AbortHandle does not exist yet at this point (it only exists once
+    // `handle.spawn` returns a JoinHandle), so it is attached in a second
+    // step just below.
+    let target_system = if name.is_some() || system.is_some() {
+        Some(system.unwrap_or_else(ActorSystem::default))
+    } else {
+        None
+    };
+    let guard = if let Some(target) = &target_system {
+        target.register_actor::<A>(&id, name.as_deref(), &actor_handle, is_root)?;
+        Some(RegistryGuard::new(target.clone(), id.clone(), name.clone()))
     } else {
         None
     };
 
-    let join = handle.spawn(run_actor(actor, context, rx, system_rx, system_tx, guard));
+    let join = handle.spawn(run_actor(
+        actor, context, rx, system_rx, system_tx, guard, ack,
+    ));
+
+    // Attach the abort handle to the just-created registry entries. Any
+    // shutdown sweep that lands in the brief window before this call treats
+    // the entry as not-yet-abortable (see `AnyActorHandle::abort`).
+    if let Some(target) = &target_system {
+        target.attach_abort(&id, name.as_deref(), join.abort_handle());
+    }
 
     Ok((actor_handle, join))
 }
@@ -185,6 +242,15 @@ pub(crate) fn spawn_watcher(
 // Actor run loop
 // ---------------------------------------------------------------------------
 
+/// Runs the actor's whole lifecycle: init, message loop, teardown.
+///
+/// `ack` (see [`spawn_actor`]) is resolved from exactly one of two places in
+/// this function: the success arm right after the `Running` transition, or
+/// the very end, after `registry_guard` has dropped, if init failed. That
+/// ordering is load-bearing (N3 / OTP 26 corpse-consumed parity): it is why
+/// the two former early-return blocks for `pre_start`/`on_started` failures
+/// are now a labeled block that falls through to the shared teardown tail
+/// instead of returning directly.
 async fn run_actor<A: Actor>(
     mut actor: A,
     mut ctx: ActorContext<A>,
@@ -192,131 +258,154 @@ async fn run_actor<A: Actor>(
     mut system_rx: mpsc::Receiver<SystemMessage>,
     system_tx: mpsc::Sender<SystemMessage>,
     registry_guard: Option<RegistryGuard>,
+    mut ack: Option<oneshot::Sender<Result<(), ActorError>>>,
 ) -> StopReason {
-    // Phase 1: pre_start validation (fail-fast gate). A panic is a failed
-    // init, exactly like `Err` (self-cleaning contract: on_stopped not called).
-    let phase1 = match catch_callback(actor.pre_start(&mut ctx)).await {
-        Ok(result) => result,
-        Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+    // Phase 1 + 2: pre_start/on_started validation (fail-fast gate). A panic
+    // is a failed init, exactly like `Err` (self-cleaning contract:
+    // on_stopped is not called). The outcome is captured instead of returned
+    // directly so a failure still falls through to the shared teardown tail
+    // below: the failure ack (if any) must only fire after the registry guard
+    // has dropped, so an immediate same-name respawn can never race the dying
+    // task and observe NameTaken (OTP 26 corpse-consumed parity).
+    let init_result: Result<(), ActorError> = 'init: {
+        // Phase 1: pre_start validation.
+        let phase1 = match catch_callback(actor.pre_start(&mut ctx)).await {
+            Ok(result) => result,
+            Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+        };
+        if let Err(err) = phase1 {
+            break 'init Err(err);
+        }
+
+        // Phase 2: on_started initialization.
+        let phase2 = match catch_callback(actor.on_started(&mut ctx)).await {
+            Ok(result) => result,
+            Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+        };
+        if let Err(err) = phase2 {
+            break 'init Err(err);
+        }
+
+        Ok(())
     };
-    if let Err(err) = phase1 {
-        ctx.record_failure(err.clone());
-        ctx.set_status(ActorStatus::Stopped);
-        return StopReason::Failure(err);
-    }
 
-    // Phase 2: on_started initialization (same failure contract).
-    let phase2 = match catch_callback(actor.on_started(&mut ctx)).await {
-        Ok(result) => result,
-        Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+    let mut stop_reason = match &init_result {
+        Ok(()) => {
+            ctx.set_status(ActorStatus::Running);
+            // Success ack: right after the Running transition, before the
+            // actor ever touches its mailbox.
+            if let Some(tx) = ack.take() {
+                let _ = tx.send(Ok(()));
+            }
+            StopReason::Graceful
+        }
+        Err(err) => {
+            ctx.record_failure(err.clone());
+            StopReason::Failure(err.clone())
+        }
     };
-    if let Err(err) = phase2 {
-        ctx.record_failure(err.clone());
-        ctx.set_status(ActorStatus::Stopped);
-        return StopReason::Failure(err);
-    }
 
-    ctx.set_status(ActorStatus::Running);
-    let mut stop_reason = StopReason::Graceful;
+    // Phase 3: Message loop - biased select! gives system messages priority.
+    // Never entered when init failed: the actor must never enter the loop.
+    if init_result.is_ok() {
+        loop {
+            tokio::select! {
+                biased;
 
-    // Phase 3: Message loop - biased select! gives system messages priority
-    loop {
-        tokio::select! {
-            biased;
-
-            // System channel - priority over user messages
-            sys_msg = system_rx.recv() => {
-                match sys_msg {
-                    Some(SystemMessage::Stop(reason)) => {
-                        // Tier 3 (Kill): bypass ALL callbacks (brutal_kill parity)
-                        if matches!(reason, StopReason::Kill) {
-                            stop_reason = StopReason::Kill;
+                // System channel - priority over user messages
+                sys_msg = system_rx.recv() => {
+                    match sys_msg {
+                        Some(SystemMessage::Stop(reason)) => {
+                            // Tier 3 (Kill): bypass ALL callbacks (brutal_kill parity)
+                            if matches!(reason, StopReason::Kill) {
+                                stop_reason = StopReason::Kill;
+                                break;
+                            }
+                            // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable.
+                            // A pre_stop panic lets the stop proceed as a Failure.
+                            if matches!(reason, StopReason::Graceful | StopReason::ParentRequest) {
+                                match catch_callback(actor.pre_stop(&reason, &mut ctx)).await {
+                                    Ok(true) => {
+                                        stop_reason = reason;
+                                        break;
+                                    }
+                                    Ok(false) => continue, // Actor rejected the stop
+                                    Err(payload) => {
+                                        stop_reason = StopReason::Failure(ActorError::Panic(
+                                            payload_into_string(payload),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            // Tier 2 (Failure/Cancelled): non-vetoable, on_stopped still runs
+                            stop_reason = reason;
                             break;
                         }
-                        // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable.
-                        // A pre_stop panic lets the stop proceed as a Failure.
-                        if matches!(reason, StopReason::Graceful | StopReason::ParentRequest) {
-                            match catch_callback(actor.pre_stop(&reason, &mut ctx)).await {
-                                Ok(true) => {
+                        Some(SystemMessage::GetStatus(reply_tx)) => {
+                            let info = build_status_info(&ctx);
+                            let _ = reply_tx.send(info);
+                        }
+                        Some(SystemMessage::ChildStopped(event)) => {
+                            match handle_child_stopped(&mut actor, &mut ctx, event).await {
+                                ControlFlow::Continue(()) => {}
+                                ControlFlow::Break(reason) => {
                                     stop_reason = reason;
                                     break;
                                 }
-                                Ok(false) => continue, // Actor rejected the stop
-                                Err(payload) => {
-                                    stop_reason = StopReason::Failure(ActorError::Panic(
-                                        payload_into_string(payload),
-                                    ));
+                            }
+                        }
+                        Some(SystemMessage::RestartComplete { seq, child_id, new_system_tx, new_join }) => {
+                            match on_restart_complete(&mut actor, &mut ctx, seq, child_id, new_system_tx, new_join, &system_tx).await {
+                                ControlFlow::Continue(()) => {}
+                                ControlFlow::Break(reason) => {
+                                    stop_reason = reason;
                                     break;
                                 }
                             }
                         }
-                        // Tier 2 (Failure/Cancelled): non-vetoable, on_stopped still runs
-                        stop_reason = reason;
-                        break;
+                        None => break, // system channel closed
                     }
-                    Some(SystemMessage::GetStatus(reply_tx)) => {
-                        let info = build_status_info(&ctx);
-                        let _ = reply_tx.send(info);
-                    }
-                    Some(SystemMessage::ChildStopped(event)) => {
-                        match handle_child_stopped(&mut actor, &mut ctx, event).await {
-                            ControlFlow::Continue(()) => {}
-                            ControlFlow::Break(reason) => {
-                                stop_reason = reason;
-                                break;
-                            }
-                        }
-                    }
-                    Some(SystemMessage::RestartComplete { seq, child_id, new_system_tx, new_join }) => {
-                        match on_restart_complete(&mut actor, &mut ctx, seq, child_id, new_system_tx, new_join, &system_tx).await {
-                            ControlFlow::Continue(()) => {}
-                            ControlFlow::Break(reason) => {
-                                stop_reason = reason;
-                                break;
-                            }
-                        }
-                    }
-                    None => break, // system channel closed
                 }
-            }
 
-            // User mailbox
-            envelope = mailbox.recv() => {
-                match envelope {
-                    Some(env) => {
-                        match dispatch(&mut actor, &mut ctx, env).await {
-                            ControlFlow::Continue(()) => {}
-                            ControlFlow::Break(reason) => {
-                                stop_reason = reason;
-                                break;
+                // User mailbox
+                envelope = mailbox.recv() => {
+                    match envelope {
+                        Some(env) => {
+                            match dispatch(&mut actor, &mut ctx, env).await {
+                                ControlFlow::Continue(()) => {}
+                                ControlFlow::Break(reason) => {
+                                    stop_reason = reason;
+                                    break;
+                                }
                             }
                         }
+                        None => break, // mailbox closed (all handles dropped)
                     }
-                    None => break, // mailbox closed (all handles dropped)
                 }
             }
         }
-    }
 
-    // Phase 4: on_stopped (terminate/2 parity: runs on failures and panics,
-    // skipped only for Kill / brutal_kill).
-    if !matches!(stop_reason, StopReason::Kill) {
-        ctx.set_status(ActorStatus::Stopping);
-        match catch_callback(actor.on_stopped(&stop_reason, &mut ctx)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                stop_reason = StopReason::Failure(err);
-            }
-            Err(payload) => {
-                let panic_err = ActorError::Panic(payload_into_string(payload));
-                ctx.record_failure(panic_err.clone());
-                // A cleanup panic must not mask the original failure.
-                if !matches!(stop_reason, StopReason::Failure(_)) {
-                    stop_reason = StopReason::Failure(panic_err);
+        // Phase 4: on_stopped (terminate/2 parity: runs on failures and panics,
+        // skipped only for Kill / brutal_kill).
+        if !matches!(stop_reason, StopReason::Kill) {
+            ctx.set_status(ActorStatus::Stopping);
+            match catch_callback(actor.on_stopped(&stop_reason, &mut ctx)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    stop_reason = StopReason::Failure(err);
+                }
+                Err(payload) => {
+                    let panic_err = ActorError::Panic(payload_into_string(payload));
+                    ctx.record_failure(panic_err.clone());
+                    // A cleanup panic must not mask the original failure.
+                    if !matches!(stop_reason, StopReason::Failure(_)) {
+                        stop_reason = StopReason::Failure(panic_err);
+                    }
                 }
             }
         }
-    }
+    } // init_result.is_ok(): Phase 3 (loop) + Phase 4 (on_stopped)
 
     // Close the system receiver BEFORE stopping children: late system senders
     // (watchers of already-dead children, escalation timers, get_status
@@ -342,6 +431,15 @@ async fn run_actor<A: Actor>(
     // the parent can act on the death.
     drop(registry_guard);
 
+    // The failure ack (if any) fires only now, after the registry guard has
+    // dropped: an immediate same-name respawn from the caller can never
+    // observe NameTaken (OTP 26 corpse-consumed parity).
+    if let Err(err) = init_result {
+        if let Some(tx) = ack {
+            let _ = tx.send(Err(err));
+        }
+    }
+
     stop_reason
 }
 
@@ -364,23 +462,22 @@ async fn dispatch<A: Actor>(
                     ControlFlow::Continue(())
                 }
                 Ok(Err(err)) => {
+                    // Cast-exception parity: an `Err` from `handle` stops
+                    // the actor identically on the notify and send paths. The
+                    // send path additionally has a caller to notify, so that
+                    // delivery happens first when a responder is present.
                     if let Some(tx) = responder {
-                        // send (request-response): return the error to the
-                        // caller and stop the actor
                         let _ = tx.send(Err(err.clone()));
-                        ControlFlow::Break(StopReason::Failure(err))
-                    } else {
-                        // notify (fire-and-forget): call the error handler but
-                        // continue
-                        actor.handle_failure(err);
-                        ControlFlow::Continue(())
                     }
+                    ControlFlow::Break(StopReason::Failure(err))
                 }
                 Err(payload) => {
-                    // A panic is a crash on BOTH paths (terminate-on-exception
-                    // parity), unlike a returned Err which is recoverable on
-                    // the notify path. A send() caller still receives the
-                    // panic as a matchable error before the actor stops.
+                    // A panic crashes the actor on BOTH paths exactly like a
+                    // returned `Err` does (cast-exception parity, same as the
+                    // arm above): the only difference is the panic payload
+                    // has to be caught and wrapped here instead of being
+                    // handed back verbatim. A send() caller still receives it
+                    // as a matchable error before the actor stops.
                     let err = ActorError::Panic(payload_into_string(payload));
                     if let Some(tx) = responder {
                         let _ = tx.send(Err(err.clone()));
@@ -441,8 +538,7 @@ async fn handle_child_stopped<A: Actor>(
 
         // Manual-stop path: stop_child / terminate_child deaths bypass
         // strategy evaluation entirely - a manual stop is never a failure
-        // (no budget charge, no sibling restarts; OTP
-        // terminate_child).
+        // (no budget charge, no sibling restarts; OTP terminate_child).
         let manual = ctx
             .supervision_mut()
             .and_then(|sup| sup.registry.get_mut(&ev.child_id))
@@ -468,8 +564,8 @@ async fn handle_child_stopped<A: Actor>(
                     SupervisionAction::Removed
                 }
                 ManualStop::Bounce if simple => {
-                    // A manually stopped SimpleOneForOne
-                    // child has its dynamic spec removed entirely.
+                    // A manually stopped SimpleOneForOne child has its
+                    // dynamic spec removed entirely.
                     if let Some(sup) = ctx.supervision_mut() {
                         sup.registry.remove(&ev.child_id);
                         sup.restart_fns.remove(&ev.child_id);

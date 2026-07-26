@@ -132,6 +132,12 @@ impl RestartBudget {
     /// If the budget is exhausted, returns `false`.
     pub fn check_and_record(&mut self) -> bool {
         let now = Instant::now();
+        // checked_sub, never `now - self.restart_window`: a paused or
+        // simulated clock (tokio::time::pause) can sit close to its own
+        // epoch, so a window wider than elapsed time would underflow a raw
+        // subtraction and panic. `None` here just means nothing is old
+        // enough to prune yet - a safe no-op, so the count-based check below
+        // still runs correctly.
         let cutoff = now.checked_sub(self.restart_window);
 
         // Prune expired entries
@@ -350,7 +356,7 @@ pub(crate) enum GroupPhase {
     /// The FRONT of the queue is the member whose restart is in flight; the
     /// next member is initiated only when the front's `RestartComplete` is
     /// adopted, giving sequential registration. (Sequential init COMPLETION
-    /// would additionally need a start acknowledgment protocol.)
+    /// would additionally need the spawn ack wired into the restart path.)
     Restarting(VecDeque<ActorId>),
 }
 
@@ -822,6 +828,43 @@ mod tests {
         // Second restart - budget exhausted
         assert!(matches!(
             evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
+            StrategyOutcome::BudgetExhausted
+        ));
+    }
+
+    // A restart_window wider than any representable Instant forces
+    // checked_sub to return None on every single check - the same underflow
+    // a paused/simulated clock sitting close to its own epoch can trigger
+    // (this crate does not depend on tokio's test-util feature, so the
+    // window itself is used to force the underflow deterministically rather
+    // than driving it through tokio::time::pause()). Two restarts fired
+    // back-to-back with no await between them (genuinely zero elapsed
+    // wall-clock time) must still be accounted for correctly, and the
+    // arithmetic must never panic.
+    #[tokio::test]
+    async fn strategy_survives_zero_elapsed_restarts_with_underflowing_window() {
+        let mut sup = SupervisionState::new(SupervisionConfig {
+            strategy: RestartStrategy::OneForOne,
+            max_restarts: 2,
+            restart_window: Duration::MAX,
+        });
+        sup.registry.register(dummy_child("child"));
+        let id = ActorId::from("child");
+
+        // Two immediate restarts consume the budget, no panic on either.
+        assert!(matches!(
+            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
+            StrategyOutcome::RestartOne(_)
+        ));
+        assert!(matches!(
+            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
+            StrategyOutcome::RestartOne(_)
+        ));
+        // A third restart, still with zero elapsed time, is correctly
+        // denied: the count-based gate works even though the time-based
+        // prune step above never fires (cutoff is None on every call).
+        assert!(matches!(
+            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
             StrategyOutcome::BudgetExhausted
         ));
     }

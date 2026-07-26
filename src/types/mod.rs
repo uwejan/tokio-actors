@@ -110,7 +110,8 @@ pub enum StopReason {
     /// `shutdown`), so a grandparent's `Transient` policy does not restart it.
     ParentRequest,
     /// The actor stopped due to a failure: the handler returned `Err` during a
-    /// `send`, or any callback panicked ([`ActorError::Panic`]).
+    /// `send` or a `notify` (cast-exception parity), or any callback panicked
+    /// ([`ActorError::Panic`]).
     Failure(ActorError),
     /// The actor's task was aborted (observed via `JoinError::is_cancelled`).
     Cancelled,
@@ -246,8 +247,7 @@ pub struct ChildEvent {
 pub enum SupervisionAction {
     /// A restart has been INITIATED for the child (it completes
     /// asynchronously; the new incarnation may still be starting when the
-    /// parent observes this action). Renamed from `Restarted` in v0.7.0 for
-    /// honesty about the timing.
+    /// parent observes this action).
     RestartInitiated,
     /// The child was removed (temporary or graceful transient).
     Removed,
@@ -293,6 +293,45 @@ pub struct ChildInfo {
     pub is_alive: bool,
     /// Whether a restart is pending for this child.
     pub restart_pending: bool,
+}
+
+// ---------------------------------------------------------------------------
+// System shutdown types
+// ---------------------------------------------------------------------------
+
+/// Outcome of stopping a single root actor during
+/// [`ActorSystem::shutdown`](crate::system::ActorSystem::shutdown) (or
+/// [`shutdown_with`](crate::system::ActorSystem::shutdown_with)).
+///
+/// Reported per actor in [`ShutdownReport`], in the order the roots were
+/// stopped (reverse registration order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The actor reached a terminal status within the per-actor window after
+    /// `StopReason::ParentRequest`.
+    Graceful,
+    /// The actor did not stop gracefully in time and needed
+    /// `StopReason::Kill` to reach a terminal status.
+    Killed,
+    /// The actor did not react to `Kill` in time and its task had to be
+    /// aborted directly.
+    Aborted,
+    /// The actor survived even the post-abort grace window: a non-yielding
+    /// task that never reaches a cancellation point (see the crate docs on
+    /// abort limits).
+    Unresponsive,
+}
+
+/// Report returned by [`ActorSystem::shutdown`](crate::system::ActorSystem::shutdown)
+/// and [`ActorSystem::shutdown_with`](crate::system::ActorSystem::shutdown_with):
+/// the outcome of stopping every root actor registered in the system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Per-actor outcomes, in the order the roots were stopped (reverse
+    /// registration order). Only root actors are reported: a supervised
+    /// child's fate is decided by its own supervisor's shutdown cascade, not
+    /// signalled by the system directly.
+    pub outcomes: Vec<(ActorId, StopOutcome)>,
 }
 
 /// Internal system-level messages sent via the system channel.
