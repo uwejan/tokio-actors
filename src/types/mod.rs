@@ -328,10 +328,16 @@ pub enum StopOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownReport {
     /// Per-actor outcomes, in the order the roots were stopped (reverse
-    /// registration order). Only root actors are reported: a supervised
-    /// child's fate is decided by its own supervisor's shutdown cascade, not
-    /// signalled by the system directly.
+    /// registration order). Only root actors are reported here: a
+    /// supervised child's fate is decided by its own supervisor's shutdown
+    /// cascade, not signalled by the system directly.
     pub outcomes: Vec<(ActorId, StopOutcome)>,
+    /// Non-root leftovers terminated by the defensive final sweep. Normally
+    /// empty: supervised children vanish via their own guard drops during
+    /// each root's cascade, and roots are always reported in `outcomes`. An
+    /// id that is already gone by the time the sweep looks at it is reported
+    /// `Graceful`.
+    pub swept: Vec<(ActorId, StopOutcome)>,
 }
 
 /// Internal system-level messages sent via the system channel.

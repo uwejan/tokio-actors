@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -90,6 +90,17 @@ impl<A: Actor> ActorContext<A> {
     }
 
     /// Returns a handle to this actor.
+    ///
+    /// This handle, and any internal self-reference derived from it (a
+    /// recurring [`schedule`](Self::schedule) or an attached
+    /// [`add_stream`](Self::add_stream) forwarder both hold a clone
+    /// internally), never extends the actor's lifetime: process lifetime
+    /// governs timer lifetime, not the reverse. An actor still runs until it
+    /// is stopped, killed, or its system shuts down, whether or not any
+    /// external handle remains; when it stops, every internal self-reference
+    /// is torn down with it. Parity: Erlang/OTP pid-addressed timers are
+    /// automatically canceled when their target process dies (erlang.org,
+    /// OTP 28, `erlang:start_timer/4`).
     pub fn self_handle(&self) -> ActorHandle<A> {
         self.self_handle.clone()
     }
@@ -197,6 +208,7 @@ impl<A: Actor> ActorContext<A> {
             restart_type: RestartType::Permanent,
             shutdown: Shutdown::default(),
             config: None,
+            start_timeout: None,
             _child: std::marker::PhantomData,
         }
     }
@@ -209,6 +221,7 @@ impl<A: Actor> ActorContext<A> {
         restart_type: RestartType,
         shutdown: Shutdown,
         config: Option<runtime::ActorConfig>,
+        start_timeout: Option<Duration>,
     ) -> Result<ActorHandle<C>, SpawnError>
     where
         F: Fn() -> C + Send + Sync + 'static,
@@ -268,6 +281,7 @@ impl<A: Actor> ActorContext<A> {
             spec: ChildSpec {
                 restart_type,
                 shutdown,
+                start_timeout,
             },
             watcher_handle: watcher,
             abort,
@@ -292,6 +306,10 @@ impl<A: Actor> ActorContext<A> {
         let restart_id = child_id.clone();
         let restart_name = name;
         let restart_config = child_config;
+        // Captured alongside the rest of the restart spec so the restart
+        // closure (whose only input is the incarnation sequence number) can
+        // bound its wait for this child's init without reading the registry.
+        let restart_start_timeout = start_timeout;
 
         sup.restart_fns.insert(
             child_id,
@@ -302,6 +320,7 @@ impl<A: Actor> ActorContext<A> {
                 let child_id = restart_id.clone();
                 let name = restart_name.clone();
                 let config = restart_config.clone();
+                let start_timeout = restart_start_timeout;
                 Box::pin(async move {
                     // A panicking factory must not kill the restart task
                     // silently: it surfaces as FactoryFailed and charges the
@@ -323,27 +342,100 @@ impl<A: Actor> ActorContext<A> {
                         }
                     };
 
+                    let (ack_tx, ack_rx) = oneshot::channel();
                     match runtime::spawn_actor(
                         child_id.clone(),
                         actor,
                         config,
                         name,
                         system,
-                        None,
+                        Some(ack_tx),
                         false,
                     ) {
                         Ok((handle, join)) => {
-                            // The parent adopts the incarnation and spawns the
-                            // watcher itself on acceptance, so watcher events
-                            // can never outrun this message on the channel.
-                            let _ = parent_tx
-                                .send(SystemMessage::RestartComplete {
-                                    seq,
-                                    child_id,
-                                    new_system_tx: handle.system_tx(),
-                                    new_join: join,
-                                })
-                                .await;
+                            // The abort handle is taken before the ack is
+                            // awaited (the Kill escalation backstop for a hung
+                            // init); the JoinHandle itself is only handed to
+                            // the parent once the ack confirms Running.
+                            let abort = join.abort_handle();
+                            let new_system_tx = handle.system_tx();
+
+                            // Await the same init contract the top-level spawn
+                            // awaits (pre_start + on_started), bounded by the
+                            // child's start_timeout if one was set; None waits
+                            // indefinitely (OTP start_link parity).
+                            let acked = match start_timeout {
+                                Some(dur) => time::timeout(dur, ack_rx).await,
+                                None => Ok(ack_rx.await),
+                            };
+
+                            match acked {
+                                Ok(Ok(Ok(()))) => {
+                                    // The parent adopts the incarnation and
+                                    // spawns the watcher itself on acceptance,
+                                    // so watcher events can never outrun this
+                                    // message on the channel.
+                                    let _ = parent_tx
+                                        .send(SystemMessage::RestartComplete {
+                                            seq,
+                                            child_id,
+                                            new_system_tx,
+                                            new_join: join,
+                                        })
+                                        .await;
+                                }
+                                Ok(Ok(Err(err))) => {
+                                    let reason = StopReason::Failure(err);
+                                    let _ = parent_tx
+                                        .send(SystemMessage::ChildStopped(ChildStoppedInternal {
+                                            child_id,
+                                            reason,
+                                            incarnation: seq,
+                                        }))
+                                        .await;
+                                }
+                                Ok(Err(_recv_err)) => {
+                                    // The ack channel closed without a value:
+                                    // the fresh incarnation's task ended
+                                    // before it could ack (a panic outside the
+                                    // caught callback boundary, or similar).
+                                    let reason = StopReason::Failure(ActorError::user(
+                                        "restart ack channel closed before a reply arrived",
+                                    ));
+                                    let _ = parent_tx
+                                        .send(SystemMessage::ChildStopped(ChildStoppedInternal {
+                                            child_id,
+                                            reason,
+                                            incarnation: seq,
+                                        }))
+                                        .await;
+                                }
+                                Err(_elapsed) => {
+                                    // start_timeout expired: kill the hung
+                                    // incarnation through the same post-Kill
+                                    // ladder manual stops use, then report the
+                                    // failure through the ordinary path.
+                                    let _ = new_system_tx
+                                        .send(SystemMessage::Stop(StopReason::Kill))
+                                        .await;
+                                    let _ = ActorContext::<A>::await_child_exit(
+                                        &child_id,
+                                        &new_system_tx,
+                                        abort,
+                                    )
+                                    .await;
+                                    let reason = StopReason::Failure(ActorError::Spawn(
+                                        SpawnError::StartTimeout,
+                                    ));
+                                    let _ = parent_tx
+                                        .send(SystemMessage::ChildStopped(ChildStoppedInternal {
+                                            child_id,
+                                            reason,
+                                            incarnation: seq,
+                                        }))
+                                        .await;
+                                }
+                            }
                         }
                         Err(err) => {
                             let reason = StopReason::Failure(ActorError::Spawn(err));
@@ -573,6 +665,11 @@ impl<A: Actor> ActorContext<A> {
     /// Use [`every_with`](Self::every_with) instead of `.every()` when the
     /// message type does not implement `Clone`.
     ///
+    /// A registered schedule holds an internal self-reference (see
+    /// [`self_handle`](Self::self_handle)) that never extends the actor's
+    /// lifetime: the timer is torn down when the actor stops, not the other
+    /// way around.
+    ///
     /// # Examples
     /// ```rust,no_run
     /// use tokio::time::Duration;
@@ -705,6 +802,11 @@ impl<A: Actor> ActorContext<A> {
     // - Streams ------------------------------------------------------------
 
     /// Attaches an external stream to this actor's mailbox.
+    ///
+    /// Like a recurring [`schedule`](Self::schedule), the forwarder task
+    /// holds an internal self-reference (see [`self_handle`](Self::self_handle))
+    /// that never extends the actor's lifetime: it is torn down when the
+    /// actor stops.
     pub fn add_stream<S>(&mut self, stream: S) -> StreamId
     where
         S: Stream + Send + Unpin + 'static,
@@ -800,6 +902,7 @@ pub struct ChildSpawnBuilder<'ctx, A: Actor, F, C: Actor> {
     restart_type: RestartType,
     shutdown: Shutdown,
     config: Option<runtime::ActorConfig>,
+    start_timeout: Option<Duration>,
     _child: std::marker::PhantomData<C>,
 }
 
@@ -831,6 +934,18 @@ where
         self.config = Some(config);
         self
     }
+
+    /// Bounds the supervisor's wait for this child's initialization to
+    /// complete during a restart. `None` (default) waits indefinitely,
+    /// matching Erlang/OTP supervisor semantics; setting a bound is a
+    /// deliberate deviation that trades strict parity for a supervisor that
+    /// can never be stalled by one child's hung init. Initial spawning never
+    /// awaits initialization (see [`spawn_child`](ActorContext::spawn_child)),
+    /// so this bound applies only to restarts.
+    pub fn start_timeout(mut self, dur: Duration) -> Self {
+        self.start_timeout = Some(dur);
+        self
+    }
 }
 
 impl<'ctx, A: Actor, F, C: Actor> std::future::IntoFuture for ChildSpawnBuilder<'ctx, A, F, C>
@@ -847,6 +962,7 @@ where
             self.restart_type,
             self.shutdown,
             self.config,
+            self.start_timeout,
         ))
     }
 }
@@ -1110,5 +1226,61 @@ async fn adjust_next<A: Actor>(
                 *next += interval;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::supervision::{SupervisionConfig, SupervisionState};
+
+    #[derive(Default)]
+    struct Dummy;
+
+    impl Actor for Dummy {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    fn dummy_ctx() -> ActorContext<Dummy> {
+        let (tx, _rx) = mpsc::channel(1);
+        let (system_tx, _system_rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(ActorStatus::Running);
+        let id = ActorId::from("dummy");
+        let handle = ActorHandle::new(id.clone(), tx, system_tx.clone(), 1, status_rx);
+        ActorContext::new(
+            id,
+            handle,
+            Handle::current(),
+            status_tx,
+            system_tx,
+            None,
+            None,
+            Some(SupervisionState::new(SupervisionConfig::default())),
+        )
+    }
+
+    #[tokio::test]
+    async fn start_timeout_defaults_to_none() {
+        let mut ctx = dummy_ctx();
+        let builder = ctx.spawn_child(Dummy::default);
+        assert_eq!(builder.start_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn start_timeout_builder_sets_value() {
+        let mut ctx = dummy_ctx();
+        let builder = ctx
+            .spawn_child(Dummy::default)
+            .start_timeout(Duration::from_millis(200));
+        assert_eq!(builder.start_timeout, Some(Duration::from_millis(200)));
     }
 }

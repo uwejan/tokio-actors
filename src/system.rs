@@ -349,6 +349,43 @@ impl ActorSystem {
         self.by_name.iter().map(|e| e.key().clone()).collect()
     }
 
+    // - Visibility -----------------------------------------------------------
+
+    /// Snapshot of every actor id currently registered in this system,
+    /// named or anonymous. Enumeration parity with `erlang:processes/0`
+    /// (erlang.org/docs/28): every actor is visible through its system,
+    /// regardless of how it was spawned.
+    pub fn actor_ids(&self) -> Vec<ActorId> {
+        self.by_id.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Reads an actor's current status by id. Returns `None` if the id is
+    /// not registered in this system.
+    pub fn actor_status(&self, id: &ActorId) -> Option<ActorStatus> {
+        self.by_id.get(id).map(|e| *e.status_rx.borrow())
+    }
+
+    /// Force-kills an actor by id, bypassing all lifecycle callbacks -
+    /// untrappable, matching `erlang:exit(Pid, kill)` (erlang.org/docs/28).
+    /// Returns `false` if the id is not registered. Runs the same
+    /// `Kill -> grace -> abort -> grace` ladder as the shutdown sweep,
+    /// rather than a bare `Kill` send.
+    pub async fn kill_by_id(&self, id: &ActorId) -> bool {
+        // Guard-before-await discipline, as in `stop`/`kill`: clone the
+        // pieces `force_stop` needs out of the `DashMap` guard before any
+        // `.await`.
+        let (status_rx, system_tx, abort) = match self.by_id.get(id) {
+            Some(e) => (
+                Some(e.status_rx.clone()),
+                Some(e.system_tx.clone()),
+                e.abort.clone(),
+            ),
+            None => return false,
+        };
+        force_stop(status_rx, system_tx, abort).await;
+        true
+    }
+
     // - Internal registration (used by spawn path) --------------------------
 
     /// Registers a spawned actor. `is_root` distinguishes a top-level
@@ -481,6 +518,8 @@ impl ActorSystem {
         // Defensive final sweep: anything still registered that wasn't
         // already reported above. Normally empty - supervised children
         // vanish via their own guard drops as part of each root's cascade.
+        // These are non-root leftovers, so they are reported in `swept`,
+        // never `outcomes`.
         let reported: HashSet<ActorId> = outcomes.iter().map(|(id, _)| id.clone()).collect();
         let leftover: Vec<ActorId> = self
             .by_id
@@ -488,11 +527,12 @@ impl ActorSystem {
             .map(|e| e.key().clone())
             .filter(|id| !reported.contains(id))
             .collect();
+        let mut swept: Vec<(ActorId, StopOutcome)> = Vec::new();
         if !leftover.is_empty() {
-            outcomes.extend(self.concurrent_force_sweep(&leftover).await);
+            swept.extend(self.concurrent_force_sweep(&leftover).await);
         }
 
-        ShutdownReport { outcomes }
+        ShutdownReport { outcomes, swept }
     }
 
     /// Snapshots every currently-registered ROOT actor's id, registration

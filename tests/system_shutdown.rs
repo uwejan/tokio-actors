@@ -230,6 +230,10 @@ async fn shutdown_is_roots_only_with_zero_child_restarts() {
         vec![(root_id, StopOutcome::Graceful)],
         "the report must contain only the root's outcome, no children"
     );
+    assert!(
+        report.swept.is_empty(),
+        "a sweep-free shutdown must report an empty swept list"
+    );
     assert_eq!(
         child_a_starts.load(Ordering::SeqCst),
         1,
@@ -270,7 +274,7 @@ async fn shutdown_stops_roots_in_reverse_registration_order() {
     .await
     .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(5), sys.shutdown())
+    let report = tokio::time::timeout(Duration::from_secs(5), sys.shutdown())
         .await
         .expect("shutdown must not hang");
 
@@ -278,6 +282,14 @@ async fn shutdown_stops_roots_in_reverse_registration_order() {
         *log.lock().unwrap(),
         vec!["B", "A"],
         "the most-recently-registered root (B) must stop first"
+    );
+    assert!(
+        !report.outcomes.is_empty(),
+        "a normal multi-root shutdown must report non-empty outcomes"
+    );
+    assert!(
+        report.swept.is_empty(),
+        "a normal shutdown with no leftovers must report an empty sweep"
     );
 }
 
@@ -313,6 +325,10 @@ async fn vetoing_root_escalates_to_killed() {
         report.outcomes,
         vec![(root_id, StopOutcome::Killed)],
         "a root that always vetoes ParentRequest must be escalated to Kill"
+    );
+    assert!(
+        report.swept.is_empty(),
+        "a sweep-free shutdown must report an empty swept list"
     );
     assert!(
         elapsed < per_actor_timeout + Duration::from_secs(3),
@@ -359,6 +375,10 @@ async fn root_hung_at_await_is_aborted() {
     // the run loop the actor never returns control to): only the abort()
     // backstop can end it.
     assert_eq!(report.outcomes, vec![(root_id, StopOutcome::Aborted)]);
+    assert!(
+        report.swept.is_empty(),
+        "a sweep-free shutdown must report an empty swept list"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +451,10 @@ async fn global_deadline_bounds_total_shutdown_time() {
             "straggler {id:?} must be reported Killed/Aborted/Unresponsive, got {outcome:?}"
         );
     }
+    assert!(
+        report.swept.is_empty(),
+        "deadline stragglers are roots and belong in outcomes, not swept"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +469,7 @@ async fn registration_after_shutdown_begins_is_rejected() {
         .await
         .expect("shutdown of an empty system must not hang");
     assert!(report.outcomes.is_empty());
+    assert!(report.swept.is_empty());
 
     let result = Idle.spawn().named("too-late").on_system(&sys).await;
     match result {

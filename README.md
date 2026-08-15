@@ -26,9 +26,11 @@ What happens when things go wrong. Every row is exercised by the test suite (see
 | Death notification | A runtime watcher on the child's task delivers `ChildStopped` through an awaited send, so the report cannot be silently dropped |
 | Automatic restart | Runtime-managed: OneForOne, OneForAll, RestForOne, SimpleOneForOne |
 | Group restart ordering | OTP ordering: stop signals go out in reverse start order with every death awaited; restarts are initiated in start order, each next member only after the previous one has re-registered |
+| Sequential restart init completion | A group restart awaits each member's full init handshake before initiating the next: sequential, not atomic - a mid-group init failure aborts the remaining starts and the whole restart is retried, so later siblings stay down across retries (OTP parity); the supervisor keeps answering its own messages throughout |
 | Manual child management | `terminate_child` / `restart_child` / `delete_child` / `stop_child` with OTP semantics: spec kept, manual stops never charge the budget |
 | Restart budget escalation | Sliding-window budget; exhaustion stops the supervisor with the OTP `shutdown` reason (`StopReason::ParentRequest`), so a grandparent's Transient policy does not restart it |
 | Forced termination | `Shutdown::Timeout` -> `Kill` -> task abort ladder; every stop path is bounded except documented `Infinity` |
+| Enumeration & kill | `actor_ids()`, `actor_status(id)`, and `kill_by_id(id)` reach every actor registered in a system, named or anonymous - enumeration parity with `erlang:processes/0`, untrappable kill parity with `erlang:exit(Pid, kill)` |
 
 **Honest limits.** Panic capture requires unwinding: `panic = "abort"` builds have no in-process supervision (the process dies). A handler stuck at an `.await` point is force-killable, but a non-yielding busy loop is beyond even task abort; it surfaces as a typed `SupervisionError::ChildUnresponsive` after a bounded wait instead of hanging the supervisor. `Shutdown::Infinity` children can stall a group restart indefinitely, matching OTP's own infinity semantics. And there is no distribution layer by design: tokio-actors is local-first (see [Non-Goals](#non-goals)). In-process fidelity is the product, not a stepping stone to a cluster framework.
 
@@ -43,10 +45,23 @@ Every lifecycle promise is a mechanism the runtime enforces, not a documentation
 | Truthful spawn | `spawn().await` acks through `pre_start` AND `on_started` before it resolves, with an infinity default and an opt-in `.start_timeout(dur)`. A failed init returns `SpawnError::Init` instead of dying silently; `.detached()` provides fire-and-forget spawning for callers who want it. |
 | Uniform crash semantics | `Err` from `handle` stops the actor the same way whether the message arrived via `send` or `notify` - one crash path, not two. Recoverable conditions belong in the `Response` type as `Ok` values; crash cleanup belongs in `on_stopped`, which receives the `StopReason`. |
 | Observable lifecycle | `ActorHandle::status()` and `wait_stopped()` form a `watch`-based runtime plane that answers even when an actor is stuck at an `.await` point; `get_status()` serves the richer queue-plane snapshot. |
-| Bounded, truthful shutdown | `ActorSystem::shutdown()` awaits every root actor to a terminal state (stopping roots only, in reverse registration order, so each supervisor tears down its own subtree) and returns a per-actor `ShutdownReport`. Do not call it from inside an actor that is part of the shutdown being awaited: that call hangs. |
+| Bounded, truthful shutdown | `ActorSystem::shutdown()` awaits every root actor to a terminal state (stopping roots only, in reverse registration order, so each supervisor tears down its own subtree) and returns a `ShutdownReport`: `outcomes` for the roots, `swept` for any non-root leftover the defensive final sweep catches (normally empty). Do not call it from inside an actor that is part of the shutdown being awaited: that call hangs. |
 | Matchable errors | `ActorError` carries structured `Timer`/`Stream`/`Supervision` variants instead of stringified messages, `send_timeout` spans one call-wide deadline (`AskError::Timeout { enqueued }`: `enqueued: false` means the request never reached the mailbox and is safe to retry; `true` means the deadline raced the reply, retry only if idempotent), and every error enum is exhaustive. |
 
 In the same spirit: one-shot schedules are lazy and `#[must_use]` (a dropped builder never fires), `.every_with(factory)` covers recurring messages that are not `Clone`, and `ActorSystem::get_by_id` resolves an `ActorId` to a live handle.
+
+---
+
+## Liveness Model
+
+An actor runs until it is stopped, killed, or its system shuts down; every actor is enumerable and killable through its system. This mirrors Erlang/OTP's mechanism set: links and monitors deliver every death as a signal that cannot be lost, and `supervisor` trees are the documented way to structure a system's lifetime (erlang.org/docs/28). Structuring actors under supervision trees is the recommended way to manage their lifetimes here for the same reason.
+
+Internal self-references - a recurring timer schedule, a stream forwarder, `self_handle()` used inside a callback - never extend an actor's lifetime, and observers (status watchers, `wait_stopped()` futures) never root one either: process lifetime governs timer lifetime, not the reverse (Erlang/OTP's `timer` BIFs cancel a pid-addressed timer automatically when its target dies; erlang.org/docs/28).
+
+Three places tokio-actors deliberately trades strict OTP parity for a friendlier or safer default, each documented rather than silently assumed:
+- Initial sibling spawns during a supervisor's startup may overlap; only restarts are strictly sequential.
+- A restarted child's init wait is unbounded by default, matching OTP; `spawn_child(..).start_timeout(dur)` opts a specific child into a bound instead.
+- A supervisor keeps processing its own mailbox throughout a group restart; OTP's `supervisor` process is blocked for the whole operation.
 
 ---
 
@@ -140,7 +155,7 @@ Every spawn starts with `.spawn()` and chains options via `SpawnBuilder`:
 ```rust
 use tokio_actors::{actor::ActorExt, ActorConfig, ActorSystem, SupervisionConfig};
 
-// Anonymous (UUID auto-id)
+// Anonymous (UUID auto-id, registers as a root in the default system)
 let h = my_actor.spawn().await?;
 
 // Named (registered in default system)
@@ -184,6 +199,11 @@ let handle = sys.get::<MyActor>("worker-1");
 // Stop/kill by name
 sys.stop("worker-1").await?;   // Graceful (vetoable)
 sys.kill("worker-1").await?;   // Force (bypasses all hooks)
+
+// Every actor, named or anonymous, is enumerable and killable by id
+let ids = sys.actor_ids();
+let status = sys.actor_status(&ids[0]);
+sys.kill_by_id(&ids[0]).await;   // Same Kill -> grace -> abort -> grace ladder as kill(name)
 
 // Coordinated shutdown: stops root actors only (each supervisor tears down
 // its own subtree), awaits every root to a terminal state, and reports
@@ -455,7 +475,7 @@ actor.spawn()                     // Start the builder
 
 | Method | Description |
 |--------|-------------|
-| `spawn_child(factory)` | Returns a [`ChildSpawnBuilder`] - chain `.named()`, `.restart_type()`, `.shutdown()`, `.with_config()` |
+| `spawn_child(factory)` | Returns a [`ChildSpawnBuilder`] - chain `.named()`, `.restart_type()`, `.shutdown()`, `.with_config()`, `.start_timeout()` |
 | `children()` | Introspection info for all supervised children |
 | `terminate_child(id)` | Stop a child WITHOUT restart (spec kept for later revival) |
 | `restart_child(id)` | Revive a terminated child from its stored spec |
@@ -484,7 +504,10 @@ actor.spawn()                     // Start the builder
 | `get::<A>(name)` | Typed actor lookup (OTP `whereis`) |
 | `stop(name)` | Graceful stop by name |
 | `kill(name)` | Force kill by name |
-| `shutdown()` | Roots-only coordinated shutdown; awaits every root to a terminal state and returns a `ShutdownReport` |
+| `actor_ids()` | Snapshot of every registered actor id, named or anonymous |
+| `actor_status(id)` | Current lifecycle status by id, or `None` if not registered |
+| `kill_by_id(id)` | Force kill by id, same ladder as `kill(name)`; `false` if not registered |
+| `shutdown()` | Roots-only coordinated shutdown; awaits every root to a terminal state and returns a `ShutdownReport` (`outcomes` for roots, `swept` for defensive-sweep leftovers) |
 | `registered()` | List all registered actor names |
 
 ### ActorConfig Builder

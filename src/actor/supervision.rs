@@ -168,6 +168,19 @@ impl RestartBudget {
 pub(crate) struct ChildSpec {
     pub restart_type: RestartType,
     pub shutdown: Shutdown,
+    /// Bounds the supervisor's wait for this child's initialization to
+    /// complete during a restart. `None` (default) waits indefinitely,
+    /// matching Erlang/OTP supervisor semantics; setting a bound is a
+    /// deliberate deviation that trades strict parity for a supervisor that
+    /// can never be stalled by one child's hung init. Initial spawning never
+    /// awaits initialization (see `spawn_child`), so this bound applies only
+    /// to restarts.
+    ///
+    /// Stored here for restart-path lookups; the active reader is the
+    /// restart closure's own captured copy (see `spawn_child_internal` in
+    /// `context.rs`), which the restart path consumes to bound the ack wait.
+    #[allow(dead_code)]
+    pub start_timeout: Option<Duration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +368,10 @@ pub(crate) enum GroupPhase {
     /// Restarting members one at a time in start order (OTP left-to-right).
     /// The FRONT of the queue is the member whose restart is in flight; the
     /// next member is initiated only when the front's `RestartComplete` is
-    /// adopted, giving sequential registration. (Sequential init COMPLETION
-    /// would additionally need the spawn ack wired into the restart path.)
+    /// adopted. Adoption happens only after the fresh incarnation's init ack
+    /// arrives - the restart path awaits the same `pre_start`/`on_started`
+    /// contract the top-level spawn awaits - so sequential initiation gives
+    /// sequential init COMPLETION: no two consecutive members' inits overlap.
     Restarting(VecDeque<ActorId>),
 }
 
@@ -579,6 +594,7 @@ mod tests {
             spec: ChildSpec {
                 restart_type,
                 shutdown: Shutdown::default(),
+                start_timeout: None,
             },
             watcher_handle: tokio::spawn(async {}),
             abort: tokio::spawn(async {}).abort_handle(),

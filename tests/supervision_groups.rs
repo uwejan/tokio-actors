@@ -16,6 +16,18 @@
 //!   proven with factory-increment / Drop-decrement instance accounting. The
 //!   decrement lives in `Drop`, NOT `on_stopped`, because the Kill escalation
 //!   path bypasses all lifecycle callbacks while `Drop` always runs.
+//! - Restart INIT completion is sequential within a group: the next member's
+//!   restart is initiated only after the previous member's fresh incarnation
+//!   has acked `pre_start`/`on_started`, so consecutive members' init windows
+//!   never overlap (`one_for_all_restart_sequential_init`).
+//! - A member whose restart attempt itself fails (factory panic, or a
+//!   start_timeout expiry) is retried in place; later members in the chain
+//!   stay down until the retry succeeds, and the retry charges the budget
+//!   exactly once, never once per remaining member
+//!   (`one_for_all_mid_group_failure_retries`, `one_for_all_hung_init_escalates`).
+//! - A hung `on_started` during a restart is bounded by the child's
+//!   `start_timeout`; the supervisor keeps answering ordinary messages the
+//!   whole time (`one_for_all_hung_init_escalates`).
 //!
 //! Idioms: multi_thread runtime, per-test-unique actor names (the default
 //! `ActorSystem` registry is process-global and tests run concurrently), and
@@ -23,14 +35,14 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, Shutdown,
-    StopReason, SupervisionAction, SupervisionConfig,
+    SpawnError, StopReason, SupervisionAction, SupervisionConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -857,5 +869,660 @@ async fn interleaved_failure_during_group_queues() {
     assert_eq!(status.child_count, 4, "all four child specs retained");
 
     sampler.abort();
+    let _ = sup.stop(StopReason::Graceful).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: sequential init COMPLETION. Restart INITIATION was already known
+// sequential; this proves the ack is actually awaited, so consecutive
+// members' `on_started` windows never overlap.
+// ---------------------------------------------------------------------------
+
+/// One member's recorded `on_started` window: entry/exit timestamps around an
+/// artificial delay, so overlap between consecutive members is measurable.
+#[derive(Clone, Debug)]
+struct InitSpan {
+    name: String,
+    enter: Instant,
+    exit: Instant,
+}
+
+/// Group member whose `on_started` holds the init window open for `delay`
+/// before recording it, so a bug that let two members' inits run concurrently
+/// would show up as overlapping spans.
+struct SeqChild {
+    name: String,
+    delay: Duration,
+    spans: Arc<Mutex<Vec<InitSpan>>>,
+    counter: InstanceCounter,
+}
+
+impl Actor for SeqChild {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let enter = Instant::now();
+        sleep(self.delay).await;
+        let exit = Instant::now();
+        self.spans.lock().unwrap().push(InitSpan {
+            name: self.name.clone(),
+            enter,
+            exit,
+        });
+        Ok(())
+    }
+}
+
+impl Drop for SeqChild {
+    fn drop(&mut self) {
+        self.counter.on_drop();
+    }
+}
+
+/// Supervisor spawning `child_names` (start order) as [`SeqChild`]s.
+struct SeqGroupSup {
+    child_names: Vec<String>,
+    delay: Duration,
+    spans: Arc<Mutex<Vec<InitSpan>>>,
+    counter: InstanceCounter,
+}
+
+impl Actor for SeqGroupSup {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        for name in self.child_names.clone() {
+            let spans = self.spans.clone();
+            let counter = self.counter.clone();
+            let delay = self.delay;
+            let child_name = name.clone();
+            ctx.spawn_child(move || {
+                counter.on_construct();
+                SeqChild {
+                    name: child_name.clone(),
+                    delay,
+                    spans: spans.clone(),
+                    counter: counter.clone(),
+                }
+            })
+            .named(name)
+            .restart_type(RestartType::Permanent)
+            .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_for_all_restart_sequential_init() {
+    const P: &str = "one_for_all_restart_sequential_init";
+    let a = format!("{P}-a");
+    let b = format!("{P}-b");
+    let c = format!("{P}-c");
+    let names = vec![a.clone(), b.clone(), c.clone()];
+    let delay = Duration::from_millis(60);
+
+    let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = InstanceCounter::default();
+
+    let sup = SeqGroupSup {
+        child_names: names.clone(),
+        delay,
+        spans: spans.clone(),
+        counter: counter.clone(),
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
+    .await
+    .expect("supervisor spawn");
+
+    wait_for("initial startup of a, b, c", || {
+        counter.constructions() == 3 && counter.live() == 3 && spans.lock().unwrap().len() == 3
+    })
+    .await;
+    let baseline = spans.lock().unwrap().len();
+
+    let hb = live_handle::<SeqChild>(&b).await;
+    hb.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver crash to b");
+
+    wait_for("all three members re-initialized after the crash", || {
+        spans.lock().unwrap().len() >= baseline + 3 && counter.live() == 3
+    })
+    .await;
+    sleep(QUIET).await;
+
+    let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
+    assert_eq!(
+        tail.len(),
+        3,
+        "each member's on_started must run exactly once during the restart: {tail:?}"
+    );
+
+    let order: Vec<&str> = tail.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        order,
+        vec![a.as_str(), b.as_str(), c.as_str()],
+        "restart order must match start order: {tail:?}"
+    );
+
+    for pair in tail.windows(2) {
+        assert!(
+            pair[0].exit <= pair[1].enter,
+            "consecutive restart init windows must not overlap ({} exited at {:?}, \
+             {} entered at {:?}): {tail:?}",
+            pair[0].name,
+            pair[0].exit,
+            pair[1].name,
+            pair[1].enter
+        );
+    }
+
+    let _ = sup.stop(StopReason::Graceful).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: mid-group restart failure. A member whose OWN restart attempt
+// fails (factory panic) is retried in place; later members stay down until
+// the retry succeeds, and the retry charges the budget exactly once.
+// ---------------------------------------------------------------------------
+
+/// Supervisor spawning a, b, c as [`GroupChild`]s, where b's factory panics
+/// on its first restart attempt (the second call overall) and succeeds on
+/// every other call.
+struct FlakyGroupSup {
+    a: String,
+    b: String,
+    c: String,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    events: Arc<Mutex<Vec<ChildEvent>>>,
+    b_calls: Arc<AtomicUsize>,
+}
+
+impl Actor for FlakyGroupSup {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let a_name = self.a.clone();
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            GroupChild {
+                name: a_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+            }
+        })
+        .named(self.a.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .await?;
+
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let b_name = self.b.clone();
+        let b_calls = self.b_calls.clone();
+        ctx.spawn_child(move || {
+            let call = b_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 2 {
+                panic!("{b_name} factory failed on its first restart attempt");
+            }
+            counter.on_construct();
+            GroupChild {
+                name: b_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+            }
+        })
+        .named(self.b.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .await?;
+
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let c_name = self.c.clone();
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            GroupChild {
+                name: c_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+            }
+        })
+        .named(self.c.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .await?;
+
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_for_all_mid_group_failure_retries() {
+    const P: &str = "one_for_all_mid_group_failure_retries";
+    let a = format!("{P}-a");
+    let b = format!("{P}-b");
+    let c = format!("{P}-c");
+    let names = vec![a.clone(), b.clone(), c.clone()];
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = InstanceCounter::default();
+    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let b_calls = Arc::new(AtomicUsize::new(0));
+
+    // Budget 2 covers exactly the trigger charge and the one retry charge
+    // (the "threshold technique" from `group_restart_single_budget_charge`):
+    // a per-sibling overcharge would exceed it and stop the supervisor.
+    let sup = FlakyGroupSup {
+        a: a.clone(),
+        b: b.clone(),
+        c: c.clone(),
+        log: log.clone(),
+        counter: counter.clone(),
+        events: events.clone(),
+        b_calls: b_calls.clone(),
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
+    .await
+    .expect("supervisor spawn");
+
+    wait_for("initial startup of a, b, c", || {
+        counter.constructions() == 3
+            && counter.live() == 3
+            && log.lock().unwrap().len() == 3
+            && all_alive::<GroupChild>(&names)
+    })
+    .await;
+    let baseline = log.lock().unwrap().len();
+
+    let hb = live_handle::<GroupChild>(&b).await;
+    hb.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver crash to b");
+
+    wait_for("full recovery after the retried restart", || {
+        counter.live() == 3 && all_alive::<GroupChild>(&names) && sup.is_alive()
+    })
+    .await;
+    sleep(QUIET).await;
+
+    assert!(
+        sup.is_alive(),
+        "budget 2 must cover exactly the trigger charge and the one retry charge; \
+         a per-sibling overcharge would have exhausted it and stopped the supervisor"
+    );
+
+    assert_eq!(
+        b_calls.load(Ordering::SeqCst),
+        3,
+        "b's factory must be called 3 times: initial construction, the failed first \
+         restart attempt, and the successful retry"
+    );
+    assert_eq!(
+        counter.constructions(),
+        6,
+        "the failed factory attempt never constructs an instance; only the 3 initial \
+         plus 3 successful restarts count"
+    );
+
+    let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
+    assert_eq!(
+        tail.iter().filter(|e| e.starts_with("start:")).count(),
+        3,
+        "exactly one successful start per member after the crash (b's failed attempt \
+         never reaches on_started): {tail:?}"
+    );
+    let start_b = tail
+        .iter()
+        .position(|e| e == &format!("start:{b}"))
+        .expect("b must eventually start via its retry");
+    let start_c = tail
+        .iter()
+        .position(|e| e == &format!("start:{c}"))
+        .expect("c must start once the chain reaches it");
+    assert!(
+        start_b < start_c,
+        "c's restart must wait for b's retried restart to complete: {tail:?}"
+    );
+
+    let b_events = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.child_id.as_str() == b)
+        .count();
+    assert!(
+        b_events >= 2,
+        "the supervisor must observe both b's failed attempt and its retry as \
+         separate ChildStopped events"
+    );
+
+    let _ = sup.stop(StopReason::Graceful).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: a hung restart init is bounded by start_timeout. The chain neither
+// deadlocks nor stalls the supervisor's own message loop; the timed-out
+// incarnation is killed/aborted and the failure retries until the budget
+// (deliberately small here) is exhausted.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+enum SupPingMsg {
+    Ping,
+}
+
+/// A child whose `on_started` never returns, so its restart attempt can only
+/// end via the caller's `start_timeout`.
+struct HangChild {
+    name: String,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Actor for HangChild {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        std::future::pending().await
+    }
+}
+
+/// Supervisor for the hung-init test: a normal crash trigger (a) plus a
+/// permanently-hung sibling (b) bounded by `start_timeout` on restart.
+struct HangGroupSup {
+    a: String,
+    b: String,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    events: Arc<Mutex<Vec<ChildEvent>>>,
+}
+
+impl Actor for HangGroupSup {
+    type Message = SupPingMsg;
+    type Response = ();
+
+    async fn handle(&mut self, _msg: SupPingMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let a_name = self.a.clone();
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            GroupChild {
+                name: a_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+            }
+        })
+        .named(self.a.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .await?;
+
+        let log = self.log.clone();
+        let b_name = self.b.clone();
+        ctx.spawn_child(move || HangChild {
+            name: b_name.clone(),
+            log: log.clone(),
+        })
+        .named(self.b.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .start_timeout(Duration::from_millis(200))
+        .await?;
+
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_for_all_hung_init_escalates() {
+    const P: &str = "one_for_all_hung_init_escalates";
+    let a = format!("{P}-a");
+    let b = format!("{P}-b");
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = InstanceCounter::default();
+    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Budget 2: the crash trigger, then b's first start_timeout retry, are
+    // the only charges that must succeed; a second start_timeout retry (the
+    // 3rd charge) exceeds it, so the supervisor's own bounded exhaustion is
+    // the proof the chain never deadlocks.
+    let sup = HangGroupSup {
+        a: a.clone(),
+        b: b.clone(),
+        log: log.clone(),
+        counter: counter.clone(),
+        events: events.clone(),
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
+    .await
+    .expect("supervisor spawn");
+
+    // a completes on_started; b enters on_started and hangs. Neither initial
+    // spawn awaits the child's own ack, so the supervisor's own on_started
+    // returns regardless.
+    wait_for("a started and b entered its hung on_started", || {
+        let l = log.lock().unwrap();
+        l.iter().any(|e| e == &format!("start:{a}")) && l.iter().any(|e| e == &format!("start:{b}"))
+    })
+    .await;
+
+    // Responsiveness probe: pings the supervisor throughout the storm and
+    // records every round trip's latency.
+    let latencies: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let probe_latencies = latencies.clone();
+    let probe_sup = sup.clone();
+    let probe = tokio::spawn(async move {
+        loop {
+            let started = Instant::now();
+            if probe_sup.send(SupPingMsg::Ping).await.is_err() {
+                break;
+            }
+            probe_latencies.lock().unwrap().push(started.elapsed());
+            sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    // Crash a: OneForAll drags the hung b into the group. b's ORIGINAL
+    // incarnation (still parked in on_started) is escalated to Kill by the
+    // existing Shutdown::Timeout ladder during the stop phase; the chain then
+    // restarts a normally and reaches b, whose restart attempt hangs again -
+    // this time bounded by start_timeout.
+    let ha = live_handle::<GroupChild>(&a).await;
+    ha.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver crash to a");
+
+    wait_for("supervisor stops once the budget is exhausted", || {
+        !sup.is_alive()
+    })
+    .await;
+
+    probe.abort();
+
+    let evs = events.lock().unwrap().clone();
+    assert!(
+        evs.iter().any(|e| e.child_id.as_str() == b
+            && matches!(
+                &e.reason,
+                StopReason::Failure(ActorError::Spawn(SpawnError::StartTimeout))
+            )),
+        "b's restart must be reported as a start_timeout failure at least once: {evs:?}"
+    );
+
+    let observed = latencies.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "the responsiveness probe must have completed at least one round trip during the storm"
+    );
+    let max_latency = observed.iter().copied().max().unwrap_or_default();
+    assert!(
+        max_latency < Duration::from_millis(150),
+        "the supervisor must keep answering messages while a group restart is in flight, \
+         worst observed round trip: {max_latency:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: SimpleOneForOne restarts never enter the sequential group chain -
+// each dynamic child restarts independently, so concurrent restarts overlap
+// instead of queueing behind one another.
+// ---------------------------------------------------------------------------
+
+/// Supervisor spawning dynamic SimpleOneForOne children on demand and
+/// recording each one's `on_started` window (entry/exit), same shape as
+/// [`SeqChild`]/[`InitSpan`] above.
+struct DynamicSup {
+    delay: Duration,
+    spans: Arc<Mutex<Vec<InitSpan>>>,
+}
+
+impl Actor for DynamicSup {
+    type Message = String;
+    type Response = ();
+
+    async fn handle(&mut self, name: String, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let spans = self.spans.clone();
+        let delay = self.delay;
+        let child_name = name.clone();
+        ctx.spawn_child(move || SeqChild {
+            name: child_name.clone(),
+            delay,
+            spans: spans.clone(),
+            counter: InstanceCounter::default(),
+        })
+        .named(name)
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn simple_one_for_one_restarts_bypass_group_chain() {
+    const P: &str = "simple_one_for_one_restarts_bypass_group_chain";
+    let x = format!("{P}-x");
+    let y = format!("{P}-y");
+    let delay = Duration::from_millis(150);
+
+    let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sup = DynamicSup {
+        delay,
+        spans: spans.clone(),
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    .with_supervision(
+        SupervisionConfig::simple_one_for_one().max_restarts(10, Duration::from_secs(60)),
+    )
+    .await
+    .expect("supervisor spawn");
+
+    sup.send(x.clone()).await.expect("spawn x");
+    sup.send(y.clone()).await.expect("spawn y");
+
+    wait_for("x and y both initially started", || {
+        spans.lock().unwrap().len() == 2
+    })
+    .await;
+    let baseline = spans.lock().unwrap().len();
+
+    // Crash both dynamic children nearly simultaneously. A sequential group
+    // chain (a bug: SimpleOneForOne wrongly entering it) would serialize
+    // their restarts to at least 2 * delay; independent restarts overlap and
+    // finish in close to 1 * delay.
+    let hx = live_handle::<SeqChild>(&x).await;
+    let hy = live_handle::<SeqChild>(&y).await;
+    let started = Instant::now();
+    let (rx, ry) = tokio::join!(hx.notify(ChildMsg::Crash), hy.notify(ChildMsg::Crash));
+    assert!(rx.is_ok() && ry.is_ok(), "both crashes must be delivered");
+
+    wait_for("both x and y re-initialized", || {
+        spans.lock().unwrap().len() >= baseline + 2
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
+    assert_eq!(tail.len(), 2, "each child restarts exactly once: {tail:?}");
+
+    assert!(
+        elapsed < delay * 2,
+        "independent SimpleOneForOne restarts must overlap instead of queueing behind a \
+         group chain (2 members * {delay:?} would take at least {:?}, took {elapsed:?})",
+        delay * 2
+    );
+
+    let overlap = tail[0].enter < tail[1].exit && tail[1].enter < tail[0].exit;
+    assert!(
+        overlap,
+        "the two independent restarts must have overlapping init windows, proving no \
+         shared sequential chain gates them: {tail:?}"
+    );
+
     let _ = sup.stop(StopReason::Graceful).await;
 }

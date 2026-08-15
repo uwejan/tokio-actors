@@ -170,16 +170,17 @@ pub(crate) fn spawn_actor<A: Actor>(
         supervision,
     );
 
-    // Register in the target system when a name or explicit system is
-    // provided. The name-claim happens BEFORE the task is spawned; the
-    // AbortHandle does not exist yet at this point (it only exists once
-    // `handle.spawn` returns a JoinHandle), so it is attached in a second
-    // step just below.
-    let target_system = if name.is_some() || system.is_some() {
-        Some(system.unwrap_or_else(ActorSystem::default))
-    } else {
-        None
-    };
+    // Every spawn registers, named or not: bare anonymous spawns join
+    // `ActorSystem::default()` as roots, same as named spawns already did.
+    // The name-claim happens BEFORE the task is spawned; the AbortHandle
+    // does not exist yet at this point (it only exists once `handle.spawn`
+    // returns a JoinHandle), so it is attached in a second step just below.
+    //
+    // `ActorContext::new` above already ran with the original `system`
+    // (possibly None), so a bare-spawned actor's `ctx.system` stays None;
+    // this is harmless because every downstream spawn path re-applies the
+    // same default-system fallback.
+    let target_system = Some(system.unwrap_or_else(ActorSystem::default));
     let guard = if let Some(target) = &target_system {
         target.register_actor::<A>(&id, name.as_deref(), &actor_handle, is_root)?;
         Some(RegistryGuard::new(target.clone(), id.clone(), name.clone()))

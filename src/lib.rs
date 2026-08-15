@@ -7,6 +7,16 @@
 //! - Typed request/response semantics through [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
 //! - Recurring timers, supervision hooks, and bounded mailboxes out of the box.
 //!
+//! # Liveness
+//! An actor runs until it is stopped, killed, or its system shuts down; every
+//! actor is enumerable ([`ActorSystem::actor_ids`](crate::system::ActorSystem::actor_ids))
+//! and killable ([`ActorSystem::kill_by_id`](crate::system::ActorSystem::kill_by_id))
+//! through its system, regardless of how it was spawned. This mirrors
+//! Erlang/OTP's mechanism set: links, monitors, and `supervisor` trees
+//! (erlang.org/docs/28) are the documented way to give a process's lifetime
+//! structure, which is why structuring actors under supervision trees is the
+//! recommended way to manage their lifetimes here too.
+//!
 //! ```rust,no_run
 //! use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult, StopReason};
 //!
