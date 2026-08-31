@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use tokio_actors::{
@@ -29,6 +30,27 @@ impl Actor for CrashOnCommand {
         match msg {
             CrashMsg::Ping => Ok(()),
         }
+    }
+}
+
+/// An actor whose handler blocks until released, giving a test a
+/// deterministic window in which the actor's task cannot service its
+/// `select!` at all.
+struct Hangable;
+
+enum HangMsg {
+    Hang(Arc<Notify>, Arc<Notify>),
+}
+
+impl Actor for Hangable {
+    type Message = HangMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: HangMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let HangMsg::Hang(started, release) = msg;
+        started.notify_one();
+        release.notified().await;
+        Ok(())
     }
 }
 
@@ -115,6 +137,45 @@ async fn get_status_bypasses_mailbox_queue() {
     assert_eq!(status.id.as_str(), "sup-status-bypass");
 
     handle.stop(StopReason::Kill).await.unwrap();
+}
+
+/// The stop lane outranks the system channel too, not just the mailbox: with
+/// a `get_status()` request already queued on the system channel and a
+/// `Kill` raised on the lane, the biased `select!` checks the lane first, so
+/// the queued `get_status` is abandoned rather than answered.
+#[tokio::test]
+async fn kill_on_lane_outranks_a_pending_get_status_on_system_channel() {
+    let handle = Hangable
+        .spawn()
+        .named("sup-lane-outranks-system")
+        .await
+        .unwrap();
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    handle
+        .notify(HangMsg::Hang(started.clone(), release.clone()))
+        .await
+        .unwrap();
+    started.notified().await; // the actor's task is now fully occupied
+
+    // Queue a get_status request on the system channel while the actor
+    // cannot service its select! at all.
+    let handle_for_status = handle.clone();
+    let status_call = tokio::spawn(async move { handle_for_status.get_status().await });
+    sleep(Duration::from_millis(20)).await; // let the send land before Kill
+
+    // Raise Kill on the lane - both are now pending when the handler releases.
+    handle.stop(StopReason::Kill).await.unwrap();
+    release.notify_one();
+
+    let result = status_call.await.unwrap();
+    assert!(
+        result.is_err(),
+        "a get_status queued alongside a pending Kill must be abandoned, \
+         not answered - the lane is checked first"
+    );
+    handle.wait_stopped().await;
 }
 
 // ---------------------------------------------------------------------------

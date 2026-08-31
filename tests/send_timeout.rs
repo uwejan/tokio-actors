@@ -145,3 +145,19 @@ async fn healthy_fast_actor_send_timeout_matches_send() {
     assert_eq!(via_send_timeout, 42);
     assert_eq!(via_send, via_send_timeout);
 }
+
+// ---------------------------------------------------------------------------
+// Pathological deadline duration
+// ---------------------------------------------------------------------------
+
+// A plain `Instant::now() + Duration::MAX` panics on overflow; `send_timeout`
+// must saturate the deadline instead, so a caller can pass an effectively
+// "no timeout" duration without risking a panic.
+#[tokio::test]
+async fn send_timeout_with_huge_duration_does_not_panic() {
+    let handle = Worker.spawn().await.unwrap();
+
+    let result = handle.send_timeout(WorkerMsg::Echo(7), Duration::MAX).await;
+
+    assert!(matches!(result, Ok(7)), "expected Ok(7), got {result:?}");
+}

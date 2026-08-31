@@ -786,8 +786,9 @@ async fn named_child_restart_loop_no_nametaken() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mass_death_zero_loss() {
-    // More children than the 64-slot system channel: dying watchers must park
-    // on awaited sends instead of dropping events.
+    // N children die within the same window, each through its own
+    // independent fate cell: every death must still be observed exactly
+    // once, regardless of how many land at once.
     const N: usize = 80;
 
     let events = recorder();
@@ -1043,4 +1044,119 @@ async fn err_from_handle_notify_path_restarts_supervised_twin() {
         sup.is_alive(),
         "supervisor must survive the child's Err-stop"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A restart in flight is torn down along with its parent: killing the
+// supervisor while a fresh incarnation is stuck in `on_started` still frees
+// the child's registered name (a dedicated `ActorSystem` isolates this test's
+// reaper task from any other test's, so its short link-guard grace is never
+// starved by unrelated concurrent activity on the shared default system).
+// ---------------------------------------------------------------------------
+
+/// A child whose SECOND construction (the crash's own restart attempt) hangs
+/// forever in `on_started`; every other construction returns immediately.
+struct HungRestartWorker {
+    hang: bool,
+}
+
+#[derive(Clone)]
+enum HungMsg {
+    Crash,
+}
+
+impl Actor for HungRestartWorker {
+    type Message = HungMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: HungMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            HungMsg::Crash => panic!("hung-restart worker crashed on command"),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if self.hang {
+            std::future::pending().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct HungRestartSup {
+    name: String,
+    constructions: Arc<AtomicUsize>,
+}
+
+impl Actor for HungRestartSup {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let constructions = self.constructions.clone();
+        ctx.spawn_child(move || {
+            let n = constructions.fetch_add(1, Ordering::SeqCst);
+            HungRestartWorker { hang: n == 1 }
+        })
+        .named(self.name.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Kill)
+        .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parent_killed_mid_restart_frees_the_hung_childs_name() {
+    let sys = ActorSystem::create(uname("hung-restart-sys")).unwrap();
+    let name = uname("hung-restart-worker");
+    let constructions = Arc::new(AtomicUsize::new(0));
+
+    let sup = HungRestartSup {
+        name: name.clone(),
+        constructions: constructions.clone(),
+    }
+    .spawn()
+    .named(uname("hung-restart-sup"))
+    .on_system(&sys)
+    .supervisor()
+    .await
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        if let Some(h) = sys.get::<HungRestartWorker>(&name) {
+            if h.is_alive() {
+                break h;
+            }
+        }
+        assert!(Instant::now() < deadline, "worker never came up");
+        sleep(Duration::from_millis(10)).await;
+    };
+    worker.notify(HungMsg::Crash).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while constructions.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the hung restart attempt never started"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    sup.stop(StopReason::Kill).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sys.get::<HungRestartWorker>(&name).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the hung incarnation's name must free once its parent dies"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 }

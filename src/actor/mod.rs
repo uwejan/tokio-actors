@@ -23,7 +23,7 @@ use crate::system::ActorSystem;
 use crate::types::{ChildEvent, Envelope, StopReason};
 use context::ActorContext;
 use runtime::ActorConfig;
-use supervision::SupervisionConfig;
+use supervision::{SupervisionConfig, KILL_GRACE};
 
 /// Primary trait implemented by all actors.
 ///
@@ -219,7 +219,10 @@ impl<A: Actor> SpawnBuilder<A> {
     ///
     /// On expiry the task is aborted immediately: no lifecycle hook runs
     /// afterward, matching OTP's untrappable `exit(_, kill)` on a start
-    /// timeout, and the caller gets [`SpawnError::StartTimeout`].
+    /// timeout. Before the caller gets [`SpawnError::StartTimeout`], this
+    /// bounded-waits for the aborted task's own teardown (including its
+    /// registry guard drop) to finish, so an immediate retry under the same
+    /// name never races a predecessor that is still unwinding.
     pub fn start_timeout(mut self, timeout: Duration) -> Self {
         self.ack = SpawnAck::Timeout(timeout);
         self
@@ -243,7 +246,7 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                 }
                 SpawnAck::Await => {
                     let (tx, rx) = oneshot::channel();
-                    let (handle, _join) = runtime::spawn_actor(
+                    let (handle, _join, _status_tx) = runtime::spawn_actor(
                         id_str.into(),
                         self.actor,
                         self.config,
@@ -265,7 +268,7 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                 }
                 SpawnAck::Timeout(timeout) => {
                     let (tx, rx) = oneshot::channel();
-                    let (handle, join) = runtime::spawn_actor(
+                    let (handle, join, _status_tx) = runtime::spawn_actor(
                         id_str.into(),
                         self.actor,
                         self.config,
@@ -286,6 +289,12 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                             // exit(_, kill) on a start timeout. No lifecycle
                             // hook runs; the task is dropped mid-poll.
                             join.abort();
+                            // Bounded wait for the abort to actually finish
+                            // the task's teardown (including its registry
+                            // guard drop) before reporting the timeout, so a
+                            // caller that immediately retries under the same
+                            // name never races a still-unwinding predecessor.
+                            let _ = tokio::time::timeout(KILL_GRACE, join).await;
                             Err(SpawnError::StartTimeout)
                         }
                     }

@@ -1,13 +1,17 @@
 //! Shared type definitions used across the Tokio Actors runtime.
 
+mod stop_lane;
+
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::ActorError;
+
+pub(crate) use stop_lane::{LaneState, StopLane};
 
 /// Unique identifier assigned to each actor within the system.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -342,32 +346,18 @@ pub struct ShutdownReport {
 
 /// Internal system-level messages sent via the system channel.
 ///
-/// These have priority over user messages via `biased; select!`.
+/// These have priority over user messages via `biased; select!`, and sit
+/// below the stop lane, which the run loop observes first of all (see the
+/// `runtime` module docs). Stop/kill requests do not travel through this
+/// channel: they are delivered through the stop lane instead, so they are
+/// never delayed by anything queued here. A child's death and a restart
+/// attempt's completion likewise never travel here: they are delivered
+/// through the supervisor's death plane and restart plane (per-incarnation
+/// fate cells and a parent-owned `JoinSet`, respectively) instead.
 #[derive(Debug)]
 pub(crate) enum SystemMessage {
-    /// Stop the actor.
-    Stop(StopReason),
     /// Request a status snapshot.
     GetStatus(oneshot::Sender<ActorStatusInfo>),
-    /// A child actor has stopped (delivered by the child's watcher task, or
-    /// synthesized by the restart task on a restart failure).
-    ChildStopped(ChildStoppedInternal),
-    /// A restarted child has been spawned (sent by the restart background
-    /// task). The parent validates `seq`, spawns the new watcher itself (so
-    /// watcher events can never outrun this message on the channel), and
-    /// adopts the new incarnation; a stale completion is rejected and its
-    /// instance killed.
-    RestartComplete {
-        /// Monotonic sequence token to discard stale completions.
-        seq: u64,
-        /// The child that was restarted.
-        child_id: ActorId,
-        /// The new system channel sender for the restarted child.
-        new_system_tx: mpsc::Sender<SystemMessage>,
-        /// The join handle of the restarted child's task (the parent wraps it
-        /// in a watcher on acceptance).
-        new_join: tokio::task::JoinHandle<StopReason>,
-    },
 }
 
 /// Internal event describing a child's death, delivered to the parent's
@@ -380,6 +370,23 @@ pub(crate) struct ChildStoppedInternal {
     /// accepted restart. Events whose incarnation matches neither the child's
     /// current incarnation nor its pending restart seq are stale (a superseded
     /// instance) and are ignored.
+    pub incarnation: u64,
+}
+
+/// Terminal outcome of one child incarnation, written by its watcher once the
+/// child's task has fully exited. Tokio guarantees a task's `JoinHandle`
+/// resolves only after every one of that task's own drops - its
+/// `RegistryGuard` included - have already run, so a populated fate cell
+/// always means the child's registered name is already free.
+// A completion-only wait only needs `is_some()`; the fields themselves are
+// for a caller that also needs to know why and which incarnation.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ChildFate {
+    /// The child's real stop reason (panic, clean exit, or an abort observed
+    /// as `StopReason::Cancelled`).
+    pub reason: StopReason,
+    /// The incarnation this fate belongs to.
     pub incarnation: u64,
 }
 

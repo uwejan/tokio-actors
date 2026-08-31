@@ -70,6 +70,43 @@ async fn kill_bypasses_all_callbacks() {
     );
 }
 
+/// Kill still bypasses pre_stop/on_stopped even with a message left queued
+/// in the mailbox: the stop lane is a separate, higher-priority signal, not
+/// just another entry that would need the queue drained first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_bypasses_callbacks_even_with_pending_mailbox_traffic() {
+    let pre_stop = Arc::new(AtomicBool::new(false));
+    let on_stopped = Arc::new(AtomicBool::new(false));
+
+    let actor = StubActor {
+        pre_stop_called: Arc::clone(&pre_stop),
+        on_stopped_called: Arc::clone(&on_stopped),
+    };
+
+    let config = ActorConfig::default().with_mailbox_capacity(1);
+    let handle = actor
+        .spawn()
+        .named("kill-with-pending-mailbox")
+        .with_config(config)
+        .await
+        .unwrap();
+
+    // Queue a message the actor has had no chance to process yet.
+    let _ = handle.try_notify(());
+
+    handle.stop(StopReason::Kill).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        !pre_stop.load(Ordering::SeqCst),
+        "pre_stop must NOT be called on Kill, even with a message still queued"
+    );
+    assert!(
+        !on_stopped.load(Ordering::SeqCst),
+        "on_stopped must NOT be called on Kill, even with a message still queued"
+    );
+}
+
 /// Graceful stop DOES call pre_stop and on_stopped (sanity check).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_stop_calls_callbacks() {

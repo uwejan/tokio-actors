@@ -159,6 +159,32 @@ impl Actor for VetoActor {
     }
 }
 
+/// Vetoes every stoppable stop forever, exactly like `VetoActor`, but also
+/// supervises one plain child - the vetoing-root-with-a-child probe for the
+/// escalated-Kill cascade test.
+#[derive(Default)]
+struct VetoingSupervisorRoot;
+
+impl Actor for VetoingSupervisorRoot {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(Idle::default)
+            .named("veto-root-child")
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
 /// Signals `entered` and then hangs at an `.await` forever once it starts
 /// processing `Hang` - deaf to both `ParentRequest` and `Kill` (both travel
 /// through the very run loop this actor never returns control to), so only a
@@ -337,6 +363,49 @@ async fn vetoing_root_escalates_to_killed() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn vetoing_root_with_a_child_cascades_the_escalated_kill() {
+    let sys = ActorSystem::create(uname("veto-cascade")).unwrap();
+    let handle = VetoingSupervisorRoot
+        .spawn()
+        .named("veto-cascade-root")
+        .on_system(&sys)
+        .supervisor()
+        .await
+        .unwrap();
+    let root_id = handle.id().clone();
+
+    assert!(
+        wait_until(2_000, || sys.get::<Idle>("veto-root-child").is_some()).await,
+        "the child must be registered before shutdown begins"
+    );
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        sys.shutdown_with(ShutdownPolicy {
+            timeout: Duration::from_secs(5),
+            per_actor_timeout: Duration::from_millis(150),
+        }),
+    )
+    .await
+    .expect("shutdown must not hang");
+
+    assert_eq!(
+        report.outcomes,
+        vec![(root_id, StopOutcome::Killed)],
+        "a root that always vetoes ParentRequest must be escalated to Kill"
+    );
+
+    // The Kill that finally stops the root is an ESCALATION from the
+    // system's own shutdown ladder, not a directly configured one, but it
+    // must cascade to the supervised child exactly the same way: the root
+    // drops its own supervision state instead of awaiting the child.
+    assert!(
+        wait_until(2_000, || sys.get::<Idle>("veto-root-child").is_none()).await,
+        "the supervised child must be cascaded and torn down after the root's escalated Kill"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 12: root hung at an await is Aborted
 // ---------------------------------------------------------------------------
@@ -455,6 +524,34 @@ async fn global_deadline_bounds_total_shutdown_time() {
         report.swept.is_empty(),
         "deadline stragglers are roots and belong in outcomes, not swept"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test: wait_stopped-then-respawn under the same name always succeeds
+// ---------------------------------------------------------------------------
+
+// The registry guard must free the name strictly BEFORE the terminal
+// `Stopped` status write that `wait_stopped()` observes: once `wait_stopped`
+// resolves, an immediate same-name spawn must never race the dying task and
+// see `NameTaken`. Looped, since a single pass could pass by luck even with
+// the ordering reversed.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_stopped_then_respawn_same_name_succeeds_in_a_loop() {
+    let sys = ActorSystem::create(uname("respawn-loop")).unwrap();
+
+    for round in 1..=50 {
+        let handle = Idle
+            .spawn()
+            .named("respawn-slot")
+            .on_system(&sys)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: spawn failed: {e}"));
+        handle
+            .stop(StopReason::Graceful)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: stop failed: {e}"));
+        handle.wait_stopped().await;
+    }
 }
 
 // ---------------------------------------------------------------------------

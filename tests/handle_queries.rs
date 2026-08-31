@@ -1,7 +1,7 @@
 use tokio::time::Duration;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, StopReason,
+    ActorConfig, ActorResult, ActorSystem, StopReason,
 };
 
 #[derive(Default, Debug)]
@@ -110,6 +110,35 @@ async fn handle_equality_based_on_actor_id() {
 
     assert_eq!(actor1, actor1_clone, "Handle should equal its clone");
     assert_ne!(actor1, actor2, "Different actors should not be equal");
+}
+
+#[tokio::test]
+async fn handle_inequality_across_systems() {
+    let sys_a = ActorSystem::create(format!("hq-sys-a-{}", uuid::Uuid::new_v4())).unwrap();
+    let sys_b = ActorSystem::create(format!("hq-sys-b-{}", uuid::Uuid::new_v4())).unwrap();
+
+    let actor_a = TestActor::default()
+        .spawn()
+        .named("shared-name")
+        .on_system(&sys_a)
+        .await
+        .unwrap();
+    let actor_b = TestActor::default()
+        .spawn()
+        .named("shared-name")
+        .on_system(&sys_b)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        actor_a.id(),
+        actor_b.id(),
+        "the same name yields the same ActorId regardless of system"
+    );
+    assert_ne!(
+        actor_a, actor_b,
+        "identical ActorId in different systems must NOT compare equal"
+    );
 }
 
 #[tokio::test]

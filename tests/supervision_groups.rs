@@ -1526,3 +1526,489 @@ async fn simple_one_for_one_restarts_bypass_group_chain() {
 
     let _ = sup.stop(StopReason::Graceful).await;
 }
+
+// ---------------------------------------------------------------------------
+// Test 17: a `terminate_child`'d (Down, non-temporary) member rejoins a
+// OneForAll restart in its own slot order, and the group as a whole still
+// charges the restart budget exactly once for the triggering crash.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+enum DownRejoinCmd {
+    Terminate(String),
+}
+
+#[derive(Debug)]
+enum DownRejoinReply {
+    Done(Result<(), String>),
+}
+
+/// Same shape as [`GroupSup`], plus a command to `terminate_child` one member
+/// on demand.
+struct DownRejoinSup {
+    child_names: Vec<String>,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    events: Arc<Mutex<Vec<ChildEvent>>>,
+}
+
+impl Actor for DownRejoinSup {
+    type Message = DownRejoinCmd;
+    type Response = DownRejoinReply;
+
+    async fn handle(
+        &mut self,
+        msg: DownRejoinCmd,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<DownRejoinReply> {
+        let DownRejoinCmd::Terminate(name) = msg;
+        let res = ctx.terminate_child(name).await.map_err(|e| e.to_string());
+        Ok(DownRejoinReply::Done(res))
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        for name in self.child_names.clone() {
+            let log = self.log.clone();
+            let counter = self.counter.clone();
+            let child_name = name.clone();
+            ctx.spawn_child(move || {
+                counter.on_construct();
+                GroupChild {
+                    name: child_name.clone(),
+                    log: log.clone(),
+                    counter: counter.clone(),
+                }
+            })
+            .named(name)
+            .restart_type(RestartType::Permanent)
+            .shutdown(Shutdown::Kill)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_for_all_down_member_rejoins_and_budget_charged_once() {
+    const P: &str = "one_for_all_down_member_rejoins_and_budget_charged_once";
+    let a = format!("{P}-a");
+    let b = format!("{P}-b");
+    let c = format!("{P}-c");
+    let names = vec![a.clone(), b.clone(), c.clone()];
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = InstanceCounter::default();
+    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sup = DownRejoinSup {
+        child_names: names.clone(),
+        log: log.clone(),
+        counter: counter.clone(),
+        events: events.clone(),
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    // Exactly one triggering failure is affordable: if the Down-rejoin of b
+    // (or any of the group's own internal restarts) incorrectly charged the
+    // budget again, the supervisor would exit here instead of completing.
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)))
+    .await
+    .expect("supervisor spawn");
+
+    wait_for("all three members started", || {
+        counter.constructions() == 3 && all_alive::<GroupChild>(&names)
+    })
+    .await;
+
+    let DownRejoinReply::Done(res) = sup
+        .send(DownRejoinCmd::Terminate(b.clone()))
+        .await
+        .expect("supervisor must answer");
+    res.expect("terminate_child must succeed");
+    assert!(!alive_as::<GroupChild>(&b), "b must be Down");
+
+    let ha = live_handle::<GroupChild>(&a).await;
+    ha.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver crash to a");
+
+    wait_for("the group cycle to revive everyone, b included", || {
+        counter.constructions() >= 6 && all_alive::<GroupChild>(&names)
+    })
+    .await;
+    sleep(QUIET).await;
+
+    assert_eq!(
+        counter.constructions(),
+        6,
+        "a, b, and c each restart exactly once via the chain (3), on top of \
+         the initial 3 constructions - b's revival included"
+    );
+    assert!(
+        sup.is_alive(),
+        "the single triggering crash must be the only budget charge"
+    );
+
+    let _ = sup.stop(StopReason::Graceful).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: a member's own independent restart attempt failing WHILE a
+// sibling group's `Stopping` phase is still in flight must not wedge that
+// member's ledger forever. Before its own crash forms the group, b is
+// already bouncing independently (`stop_child`); its restart attempt's
+// `start_timeout` expires strictly during the group's teardown of the slow
+// sibling c, exactly the interleaving that used to leave b stuck
+// `Restarting` and c permanently queued behind it.
+// ---------------------------------------------------------------------------
+
+/// Group member whose restart attempt (but never its initial spawn) sleeps
+/// long enough to blow past a short `start_timeout`, on the SECOND factory
+/// call only - every later call (the chain's own eventual revival) completes
+/// immediately. `calls` is shared with the test so the exact call sequence
+/// (initial, failed bounce attempt, successful chain revival) is verifiable.
+struct SlowInitChild {
+    name: String,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Actor for SlowInitChild {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 2 {
+            // The bounce-triggered restart attempt: hang well past its
+            // `start_timeout` so the attempt is reported `Failed` instead of
+            // ever adopted.
+            std::future::pending::<()>().await;
+        }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        Ok(())
+    }
+}
+
+impl Drop for SlowInitChild {
+    fn drop(&mut self) {
+        self.counter.on_drop();
+    }
+}
+
+/// Group member whose `pre_stop` holds the stop gate open for `stop_delay`
+/// before allowing it - long enough to outlast a sibling's `start_timeout` -
+/// so its own death is what the group's `Stopping` phase is still awaiting
+/// when that sibling's independent restart attempt fails.
+struct SlowStopChild {
+    name: String,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    stop_delay: Duration,
+}
+
+impl Actor for SlowStopChild {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        sleep(self.stop_delay).await;
+        true
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.log.lock().unwrap().push(format!("stop:{}", self.name));
+        Ok(())
+    }
+}
+
+impl Drop for SlowStopChild {
+    fn drop(&mut self) {
+        self.counter.on_drop();
+    }
+}
+
+#[derive(Clone)]
+enum WedgeCmd {
+    /// `stop_child` (budget-free bounce) issued from inside the supervisor's
+    /// own handler, exactly like every other manual-stop API.
+    Bounce(String),
+}
+
+#[derive(Debug)]
+enum WedgeReply {
+    Done(Result<(), String>),
+}
+
+/// Supervisor spawning a ([`GroupChild`]), b ([`SlowInitChild`], short
+/// `start_timeout`), and c ([`SlowStopChild`], slow `pre_stop`) - the exact
+/// shape needed to interleave an independent restart failure with an
+/// in-flight sibling group teardown.
+struct WedgeSup {
+    a: String,
+    b: String,
+    c: String,
+    log: Arc<Mutex<Vec<String>>>,
+    counter: InstanceCounter,
+    events: Arc<Mutex<Vec<ChildEvent>>>,
+    b_calls: Arc<AtomicUsize>,
+    c_stop_delay: Duration,
+}
+
+impl Actor for WedgeSup {
+    type Message = WedgeCmd;
+    type Response = WedgeReply;
+
+    async fn handle(
+        &mut self,
+        msg: WedgeCmd,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<WedgeReply> {
+        let WedgeCmd::Bounce(name) = msg;
+        let res = ctx.stop_child(name).await.map_err(|e| e.to_string());
+        Ok(WedgeReply::Done(res))
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let a_name = self.a.clone();
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            GroupChild {
+                name: a_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+            }
+        })
+        .named(self.a.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(300)))
+        .await?;
+
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let b_name = self.b.clone();
+        let b_calls = self.b_calls.clone();
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            SlowInitChild {
+                name: b_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+                calls: b_calls.clone(),
+            }
+        })
+        .named(self.b.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(300)))
+        .start_timeout(Duration::from_millis(150))
+        .await?;
+
+        let log = self.log.clone();
+        let counter = self.counter.clone();
+        let c_name = self.c.clone();
+        let c_stop_delay = self.c_stop_delay;
+        ctx.spawn_child(move || {
+            counter.on_construct();
+            SlowStopChild {
+                name: c_name.clone(),
+                log: log.clone(),
+                counter: counter.clone(),
+                stop_delay: c_stop_delay,
+            }
+        })
+        .named(self.c.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Timeout(Duration::from_secs(2)))
+        .await?;
+
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_chain_survives_a_member_restart_failing_mid_group_stop() {
+    const P: &str = "group_chain_survives_a_member_restart_failing_mid_group_stop";
+    let a = format!("{P}-a");
+    let b = format!("{P}-b");
+    let c = format!("{P}-c");
+    let c_stop_delay = Duration::from_millis(500);
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = InstanceCounter::default();
+    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let b_calls = Arc::new(AtomicUsize::new(0));
+
+    // Budget 2: exactly one charge per triggering crash below - a per-event
+    // overcharge (the wedge bug's superseded-attempt event being queued and
+    // evaluated as an ordinary failure) would exhaust it on the very first
+    // cycle and stop the supervisor before the second crash ever gets a
+    // chance to prove the chain is not permanently stuck.
+    let sup = WedgeSup {
+        a: a.clone(),
+        b: b.clone(),
+        c: c.clone(),
+        log: log.clone(),
+        counter: counter.clone(),
+        events: events.clone(),
+        b_calls: b_calls.clone(),
+        c_stop_delay,
+    }
+    .spawn()
+    .named(format!("{P}-sup"))
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
+    .await
+    .expect("supervisor spawn");
+
+    wait_for("initial startup of a, b, c", || {
+        counter.constructions() == 3 && counter.live() == 3
+    })
+    .await;
+
+    // b starts bouncing independently (budget-free): its restart attempt
+    // enters `on_started` and hangs, so it is `Restarting` and will fail via
+    // `start_timeout` shortly.
+    let WedgeReply::Done(res) = sup
+        .send(WedgeCmd::Bounce(b.clone()))
+        .await
+        .expect("supervisor must answer");
+    res.expect("stop_child(b) must succeed");
+
+    // While b's attempt is still in flight (well under its 150ms
+    // start_timeout), crash a: OneForAll forms a group whose only LIVE
+    // sibling is c (b is not `Running`, so it is excluded from the awaited
+    // set but still included in `restart_order`). c's `pre_stop` then holds
+    // the group's `Stopping` phase open for `c_stop_delay`, comfortably
+    // longer than b's `start_timeout` - the exact interleaving under test.
+    let ha = live_handle::<GroupChild>(&a).await;
+    ha.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver crash to a");
+
+    // Full first recovery. `is_alive()` only reflects "task not yet
+    // finished" - the hung (failing) bounce attempt itself reports alive the
+    // whole time it is stuck in `on_started`, so it cannot distinguish real
+    // recovery from the still-failing middle of the sequence. `b_calls`
+    // reaching 3 is unambiguous: it only increments from inside a
+    // successfully-entered `on_started`, and the chain-revival attempt is
+    // the only possible source of a 3rd call (the wedge bug's signature is
+    // this count getting stuck at 2 forever - see the `wait_for` deadline
+    // panic that produces on unfixed code). `counter.live() == 3` confirms
+    // every member (including c, and the hung bounce instance's replacement)
+    // is back to a genuinely live instance, not just constructed.
+    wait_for(
+        "first recovery: b's chain-revival attempt completes",
+        || b_calls.load(Ordering::SeqCst) >= 3 && counter.live() == 3,
+    )
+    .await;
+    sleep(QUIET).await;
+
+    assert!(
+        sup.is_alive(),
+        "the crash trigger must be the only budget charge for the first cycle - a \
+         superseded restart-attempt event double-charging the budget would have \
+         exhausted it here"
+    );
+
+    assert_eq!(
+        b_calls.load(Ordering::SeqCst),
+        3,
+        "b's factory must run exactly 3 times: the initial spawn, the failed bounce \
+         attempt, and the chain's own successful revival"
+    );
+
+    let starts_b = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e == &&format!("start:{b}"))
+        .count();
+    assert_eq!(
+        starts_b, 2,
+        "b's on_started must actually complete twice: the initial start, and the \
+         chain-revived incarnation - the hung bounce attempt never reaches this line"
+    );
+
+    // No wedge: c, which was queued behind b in the old buggy behavior,
+    // really did restart (not just "is alive" from before - it was stopped
+    // and rebuilt).
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.child_id.as_str() == c
+                && matches!(e.action, SupervisionAction::RestartInitiated)),
+        "c must have been reported as restarted, not left permanently queued: {:?}",
+        events.lock().unwrap()
+    );
+
+    // No residual wedge: a completely independent SECOND crash still cycles
+    // the group normally (the chain state left behind by the first cycle,
+    // if any, does not block further supervision).
+    let ha2 = live_handle::<GroupChild>(&a).await;
+    ha2.notify(ChildMsg::Crash)
+        .await
+        .expect("deliver second crash to a");
+
+    wait_for("second recovery: b restarts a 4th time, cleanly", || {
+        b_calls.load(Ordering::SeqCst) >= 4 && counter.live() == 3
+    })
+    .await;
+    sleep(QUIET).await;
+
+    assert!(
+        sup.is_alive(),
+        "the second crash must be exactly the second and final affordable budget charge, \
+         proving neither cycle over-charged"
+    );
+
+    let _ = sup.stop(StopReason::Graceful).await;
+}

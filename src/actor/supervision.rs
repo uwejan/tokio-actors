@@ -5,12 +5,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::sync::{mpsc, watch};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use crate::system::ReaperEntry;
 use crate::types::{
-    ActorId, ChildInfo, ChildStoppedInternal, RestartStrategy, RestartType, Shutdown, SystemMessage,
+    ActorId, ActorStatus, ChildEvent, ChildFate, ChildInfo, ChildStoppedInternal, RestartStrategy,
+    RestartType, Shutdown, StopLane, StopReason,
 };
 
 /// Type-erased restart function stored per child.
@@ -18,16 +20,155 @@ use crate::types::{
 /// The closure captures the child's original [`ActorId`], name, and the full
 /// resolved [`ActorConfig`](crate::actor::runtime::ActorConfig) by value at
 /// `spawn_child` time (OTP child-spec immutability), so every restart reuses
-/// the exact spec. Given the restart sequence token, it spawns a new instance
-/// and reports back to the parent's system channel: `RestartComplete` on
-/// success, a synthesized `ChildStopped` on factory panic or spawn failure.
+/// the exact spec. Given the restart sequence token, it produces the fresh
+/// attempt's [`RestartOutcome`] - the value the parent's restart plane
+/// (`SupervisionState::restart_set`) returns to the run loop once the
+/// attempt is decided one way or the other.
 pub(crate) type RestartFn =
-    Box<dyn Fn(u64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    Box<dyn Fn(u64) -> Pin<Box<dyn Future<Output = RestartOutcome> + Send>> + Send + Sync>;
+
+/// Outcome of one restart attempt, produced by a task in the parent's
+/// restart plane (`SupervisionState::restart_set`) and consumed by the run
+/// loop.
+///
+/// [`Adopted`](Self::Adopted) carries every per-incarnation handle the
+/// adoption path needs (watcher, fate cell, and link guard are rebuilt from
+/// these) - including the [`ChildLinkGuard`] itself, armed the instant the
+/// attempt's `spawn_actor` call succeeded, inside the restart task, before
+/// the child's init ack was ever awaited. Not adopting an `Adopted` value
+/// (a superseded attempt, a rejected chain slot, or the whole restart plane
+/// being dropped because the parent itself died) is exactly what leaves that
+/// guard to run its `Drop`, killing the stray incarnation through the same
+/// Kill-raise/status-force/reaper ladder every other child teardown uses.
+///
+/// [`Failed`](Self::Failed) covers every attempt that never produced a live
+/// child to adopt: a factory panic (nothing was ever spawned), a spawn
+/// error, an init failure or panic (the fresh incarnation's own task has
+/// already fully exited by the time this is reported), or a `start_timeout`
+/// expiry (the hung incarnation's guard was already dropped - and its real
+/// join already awaited - before this was produced). It carries the same
+/// shape [`ChildStoppedInternal`] does and is routed through the identical
+/// failure path: budget-charged strategy evaluation, exactly like any other
+/// child death.
+pub(crate) enum RestartOutcome {
+    /// The fresh incarnation passed its init ack and is ready to become the
+    /// child's live instance.
+    Adopted {
+        child_id: ActorId,
+        incarnation: u64,
+        new_stop_lane: StopLane,
+        new_join: JoinHandle<StopReason>,
+        guard: ChildLinkGuard,
+    },
+    /// The attempt never produced a live child (or the live child it did
+    /// produce is already known fully gone by the time this is reported).
+    Failed {
+        child_id: ActorId,
+        incarnation: u64,
+        reason: StopReason,
+    },
+}
 
 /// Grace given to a cooperative Kill signal before the abort() backstop fires.
 /// Kill is processed with biased priority, so a responsive actor dies in
 /// microseconds; the grace exists only for an actor mid-callback.
 pub(crate) const KILL_GRACE: Duration = Duration::from_millis(100);
+
+/// Grace given to a child that is itself a supervisor before the reaper
+/// aborts it: enough time for its own cascade (raising Kill on its own
+/// children's lanes and, in turn, on theirs) to reach every descendant
+/// before its task actually exits.
+pub(crate) const SUPERVISOR_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Outcome of one child incarnation's watcher task: the child's id, its real
+/// stop reason, and the incarnation token - in the order the run loop's
+/// death-plane branch consumes them.
+pub(crate) type DeathOutcome = (ActorId, StopReason, u64);
+
+/// Synchronous safety net for one child incarnation's watcher task.
+///
+/// Constructed in the parent's own synchronous code, before the watcher is
+/// spawned, and moved into the watcher's future as a captured value. If that
+/// task is ever torn down before it finishes running - most notably, aborted
+/// before it is ever polled at all - Rust still runs the drop glue of
+/// everything it captured, so this guard's `Drop` still fires. That is
+/// exactly what happens, level by level, when a supervisor's own task dies
+/// with `StopReason::Kill`: it never awaits its own children, it simply drops
+/// its supervision state (its death plane included), which aborts every live
+/// child's watcher task in one step.
+///
+/// Every effect below is safe to run more than once, and safe to run after
+/// the child has already stopped on its own: raising `Kill` on an
+/// already-closed lane, publishing `Stopped` over an already-`Stopped` status
+/// watch, and aborting an already-finished task are all no-ops.
+pub(crate) struct ChildLinkGuard {
+    stop_lane: StopLane,
+    status_tx: watch::Sender<ActorStatus>,
+    abort: AbortHandle,
+    reaper: mpsc::Sender<ReaperEntry>,
+    grace: Duration,
+    /// True until the child's fate has been recorded. The watcher disarms
+    /// the guard immediately after writing the fate cell: at that point the
+    /// child has terminated and reported on its own, so the guard's drop has
+    /// no teardown left to force and does nothing. Every abnormal drop (an
+    /// abort before the watcher's first poll, the owning `JoinSet` dropped
+    /// with the parent, an unadopted restart outcome) still finds the guard
+    /// armed and fires the full ladder.
+    armed: bool,
+}
+
+impl ChildLinkGuard {
+    pub(crate) fn new(
+        stop_lane: StopLane,
+        status_tx: watch::Sender<ActorStatus>,
+        abort: AbortHandle,
+        reaper: mpsc::Sender<ReaperEntry>,
+        grace: Duration,
+    ) -> Self {
+        Self {
+            stop_lane,
+            status_tx,
+            abort,
+            reaper,
+            grace,
+            armed: true,
+        }
+    }
+
+    /// Marks the guarded child as fully terminated and reported; the guard's
+    /// drop becomes a no-op. Called by the watcher right after the fate cell
+    /// is written.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildLinkGuard {
+    fn drop(&mut self) {
+        // A disarmed guard belongs to a child that already terminated and
+        // wrote its fate; there is nothing left to tear down.
+        if !self.armed {
+            return;
+        }
+        // (a) Raise Kill: a plain watch write, infallible, and a no-op if
+        // the child has already finished its message loop.
+        self.stop_lane.raise(StopReason::Kill);
+        // (b) Force-publish the terminal status: a `watch` write always
+        // succeeds, even with every receiver already dropped, and overwrites
+        // whatever status was last observed for a child that has not yet
+        // reported its own `Stopped` (or never will, because it is being
+        // aborted instead).
+        self.status_tx.send_replace(ActorStatus::Stopped);
+        // (c) Enqueue a grace deadline with the reaper; a full or closed
+        // feed degrades to an immediate abort instead of blocking (this is
+        // `Drop`: no awaiting, no spawning).
+        let deadline = Instant::now() + self.grace;
+        let entry = ReaperEntry::new(deadline, self.abort.clone());
+        if self.reaper.try_send(entry).is_err() {
+            self.abort.abort();
+        }
+    }
+}
 
 /// How a manual stop was requested, recorded on the child so its death event
 /// bypasses strategy evaluation (manual stops are never failures).
@@ -37,6 +178,85 @@ pub(crate) enum ManualStop {
     Bounce,
     /// `terminate_child`: stay down until restart_child/delete_child (OTP).
     Terminate,
+}
+
+// ---------------------------------------------------------------------------
+// ChildLifecycle
+// ---------------------------------------------------------------------------
+
+/// The lifecycle of one child spec inside its supervisor's registry.
+///
+/// Exactly one variant holds at any moment, and [`transition`](Self::transition)
+/// is the single, default-closed authority for moving between them: every
+/// arrow drawn below is explicit, and anything else is rejected outright
+/// instead of silently applying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildLifecycle {
+    /// The child's current incarnation is live and processing messages.
+    Running(u64),
+    /// A manual stop (`stop_child`/`terminate_child`) has been committed:
+    /// the lane has been raised, and the caller (or the group machinery) is
+    /// awaiting this incarnation's fate cell. `kind` decides what happens
+    /// once that fate is observed.
+    Stopping { incarnation: u64, kind: ManualStop },
+    /// A restart is in flight: `incarnation` is the dead/stopped instance
+    /// this spec last held, `next` is the fresh incarnation token assigned
+    /// to the attempt (adopted on a successful [`RestartOutcome::Adopted`],
+    /// or reverted back to `Down` on a [`RestartOutcome::Failed`]).
+    Restarting { incarnation: u64, next: u64 },
+    /// The spec is retained but no instance is running. `event_pending`
+    /// marks a manual completion whose `on_child_stopped` snapshot is still
+    /// waiting for the run loop's death arm to observe the matching
+    /// incarnation and deliver it (see [`SupervisionState::pending_manual_events`]).
+    Down {
+        incarnation: u64,
+        event_pending: bool,
+    },
+}
+
+impl ChildLifecycle {
+    /// The incarnation this state currently considers its "own": the live
+    /// one for `Running`, the awaited one for `Stopping`, the dead/superseded
+    /// one for `Restarting` (its `next` is a distinct, not-yet-adopted token),
+    /// and the retained one for `Down`.
+    pub(crate) fn incarnation(&self) -> u64 {
+        match self {
+            ChildLifecycle::Running(incarnation)
+            | ChildLifecycle::Stopping { incarnation, .. }
+            | ChildLifecycle::Restarting { incarnation, .. }
+            | ChildLifecycle::Down { incarnation, .. } => *incarnation,
+        }
+    }
+
+    /// True if a death/fate reported for `incarnation` belongs to whichever
+    /// instance this lifecycle currently treats as live or in flight: its own
+    /// incarnation always, plus a `Restarting` attempt's not-yet-adopted
+    /// `next` token (so that attempt's own failure report is not mistaken for
+    /// a death of some other, unrelated incarnation).
+    pub(crate) fn accepts_incarnation(&self, incarnation: u64) -> bool {
+        self.incarnation() == incarnation
+            || matches!(self, ChildLifecycle::Restarting { next, .. } if *next == incarnation)
+    }
+
+    /// The default-closed transition table: every legal move between child
+    /// lifecycle states, listed once. Anything not matched here - a repeated
+    /// commit, a direct `Down` -> `Running` skip, restarting while already
+    /// restarting, and so on - is rejected.
+    fn is_legal(from: &ChildLifecycle, to: &ChildLifecycle) -> bool {
+        use ChildLifecycle::*;
+        matches!(
+            (from, to),
+            (Running(_), Stopping { .. })
+                | (Running(_), Down { .. })
+                | (Running(_), Restarting { .. })
+                | (Stopping { .. }, Down { .. })
+                | (Stopping { .. }, Restarting { .. })
+                | (Down { .. }, Restarting { .. })
+                | (Down { .. }, Down { .. })
+                | (Restarting { .. }, Running(_))
+                | (Restarting { .. }, Down { .. })
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +401,18 @@ pub(crate) struct ChildSpec {
     /// `context.rs`), which the restart path consumes to bound the ack wait.
     #[allow(dead_code)]
     pub start_timeout: Option<Duration>,
+    /// Whether this child's own resolved configuration enables supervision
+    /// (it is itself a supervisor of further children). An invariant of the
+    /// spec, not of any one incarnation, so it survives every restart;
+    /// determines the grace this child's link guard allows before the
+    /// reaper aborts it (see [`SUPERVISOR_KILL_GRACE`]).
+    ///
+    /// Stored here for parity with `start_timeout` above; every reader is a
+    /// captured copy taken at `spawn_child` time (the initial guard, and the
+    /// restart closure's own copy - see `spawn_child_internal` in
+    /// `context.rs`).
+    #[allow(dead_code)]
+    pub is_supervisor: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,31 +424,42 @@ pub(crate) struct ChildState {
     pub id: ActorId,
     pub name: Option<String>,
     pub spec: ChildSpec,
-    /// Handle of the child's WATCHER task. The watcher owns the child's real
-    /// `JoinHandle<StopReason>`; watcher completion therefore implies the
-    /// child task has fully terminated (all its drops have run).
-    pub watcher_handle: JoinHandle<()>,
+    /// Watch cell carrying this incarnation's terminal outcome, populated by
+    /// its watcher once the child's task has fully exited - after every one
+    /// of its own drops, its `RegistryGuard` included, so a populated fate
+    /// cell always means the child's registered name is already free.
+    pub fate_rx: watch::Receiver<Option<ChildFate>>,
     /// Abort handle of the child's OWN task (taken before the watcher consumed
     /// the JoinHandle). The Kill -> abort escalation backstop. Never exposed
     /// outside the supervision tree.
     pub abort: AbortHandle,
-    pub system_tx: mpsc::Sender<SystemMessage>,
-    pub is_alive: bool,
-    pub pending_restart_seq: Option<u64>,
-    /// Incarnation token of the instance currently owning this spec:
-    /// 0 for the initial spawn, the restart seq after each accepted restart.
-    /// Death events from superseded incarnations are ignored.
-    pub current_incarnation: u64,
-    /// Set while a manual stop (stop_child / terminate_child) is in flight;
-    /// the resulting death event bypasses strategy evaluation.
-    pub manual_stop: Option<ManualStop>,
+    /// The child's stop lane: the transport for every stop/kill signal the
+    /// escalation ladder sends this child.
+    pub stop_lane: StopLane,
+    /// This child's lifecycle: which incarnation is current, and whether it
+    /// is running, being manually stopped, restarting, or retained-but-down.
+    /// The single source of truth - see [`ChildLifecycle`].
+    pub lifecycle: ChildLifecycle,
 }
 
 impl ChildState {
     /// True if a death event with this incarnation belongs to the instance
     /// the registry currently tracks (current, or the in-flight restart).
     pub fn accepts_incarnation(&self, incarnation: u64) -> bool {
-        self.current_incarnation == incarnation || self.pending_restart_seq == Some(incarnation)
+        self.lifecycle.accepts_incarnation(incarnation)
+    }
+
+    /// Applies `to` if [`ChildLifecycle::is_legal`] allows the move from the
+    /// current state; otherwise the state is left untouched and the rejected
+    /// target is handed back. The single point every lifecycle change in this
+    /// crate goes through.
+    pub fn transition(&mut self, to: ChildLifecycle) -> Result<(), ChildLifecycle> {
+        if ChildLifecycle::is_legal(&self.lifecycle, &to) {
+            self.lifecycle = to;
+            Ok(())
+        } else {
+            Err(to)
+        }
     }
 }
 
@@ -232,7 +475,6 @@ impl ChildState {
 pub(crate) struct ChildRegistry {
     children: Vec<ChildState>,
     index: HashMap<ActorId, usize>,
-    restart_seq: u64,
 }
 
 impl ChildRegistry {
@@ -240,7 +482,6 @@ impl ChildRegistry {
         Self {
             children: Vec::new(),
             index: HashMap::new(),
-            restart_seq: 0,
         }
     }
 
@@ -279,17 +520,10 @@ impl ChildRegistry {
                 name: c.name.clone(),
                 restart_type: c.spec.restart_type,
                 shutdown: c.spec.shutdown,
-                is_alive: c.is_alive,
-                restart_pending: c.pending_restart_seq.is_some(),
+                is_alive: matches!(c.lifecycle, ChildLifecycle::Running(_)),
+                restart_pending: matches!(c.lifecycle, ChildLifecycle::Restarting { .. }),
             })
             .collect()
-    }
-
-    /// Sequence tokens start at 1 so that 0 is reserved for the initial
-    /// incarnation of every child.
-    pub fn next_seq(&mut self) -> u64 {
-        self.restart_seq += 1;
-        self.restart_seq
     }
 
     /// Returns IDs of children started after the given child (for RestForOne).
@@ -320,24 +554,22 @@ impl ChildRegistry {
     }
 
     /// Adopts a restarted child instance after the parent accepted its
-    /// `RestartComplete` (seq matches the pending restart).
+    /// `RestartOutcome::Adopted` (seq matches the pending restart).
     pub fn update_restarted(
         &mut self,
         child_id: &ActorId,
         seq: u64,
-        new_system_tx: mpsc::Sender<SystemMessage>,
-        new_watcher_handle: JoinHandle<()>,
+        new_stop_lane: StopLane,
+        new_fate_rx: watch::Receiver<Option<ChildFate>>,
         new_abort: AbortHandle,
     ) -> bool {
         if let Some(child) = self.get_mut(child_id) {
-            if child.pending_restart_seq == Some(seq) {
-                child.system_tx = new_system_tx;
-                child.watcher_handle = new_watcher_handle;
+            let pending =
+                matches!(child.lifecycle, ChildLifecycle::Restarting { next, .. } if next == seq);
+            if pending && child.transition(ChildLifecycle::Running(seq)).is_ok() {
+                child.stop_lane = new_stop_lane;
+                child.fate_rx = new_fate_rx;
                 child.abort = new_abort;
-                child.is_alive = true;
-                child.pending_restart_seq = None;
-                child.current_incarnation = seq;
-                child.manual_stop = None;
                 return true;
             }
         }
@@ -357,8 +589,15 @@ pub(crate) struct GroupRestart {
     /// Members whose deaths we are still waiting for.
     pub awaiting: HashSet<ActorId>,
     /// Members to restart (start order) once `awaiting` empties. Excludes
-    /// Temporary children (OTP: terminated with the group, never restarted).
+    /// Temporary children (OTP: terminated with the group, never restarted)
+    /// and, once recorded, any member in `manual_overrides`.
     pub restart_order: Vec<ActorId>,
+    /// Members a caller explicitly `terminate_child`'d while this group stop
+    /// was in flight: the caller's manual intent is honored over the group's
+    /// default disposition, so these are excluded from `restart_order` when
+    /// the chain starts and reported as `Removed` instead of
+    /// `RestartInitiated` when their individual death arrives.
+    pub manual_overrides: HashSet<ActorId>,
 }
 
 /// Phase of an in-flight OneForAll/RestForOne group restart.
@@ -366,12 +605,15 @@ pub(crate) enum GroupPhase {
     /// Affected members told to stop; awaiting their deaths.
     Stopping(GroupRestart),
     /// Restarting members one at a time in start order (OTP left-to-right).
-    /// The FRONT of the queue is the member whose restart is in flight; the
-    /// next member is initiated only when the front's `RestartComplete` is
-    /// adopted. Adoption happens only after the fresh incarnation's init ack
-    /// arrives - the restart path awaits the same `pre_start`/`on_started`
-    /// contract the top-level spawn awaits - so sequential initiation gives
-    /// sequential init COMPLETION: no two consecutive members' inits overlap.
+    /// The FRONT of the queue is the member whose restart is in flight (or,
+    /// for a member the chain finds already restarting independently, the
+    /// one it is holding for); the next member is initiated only once the
+    /// front's [`RestartOutcome`] is adopted. Adoption happens only after the
+    /// fresh incarnation's init ack arrives - the restart path awaits the
+    /// same `pre_start`/`on_started` contract the top-level spawn awaits - so
+    /// sequential initiation gives sequential init COMPLETION: no two
+    /// consecutive members' inits overlap, uniformly whether the chain itself
+    /// initiated the attempt or is simply holding for one already in flight.
     Restarting(VecDeque<ActorId>),
 }
 
@@ -391,6 +633,30 @@ pub(crate) struct SupervisionState {
     /// Failure events that arrived while a group restart was pending;
     /// evaluated FIFO after the group completes.
     pub queued_triggers: VecDeque<ChildStoppedInternal>,
+    /// `on_child_stopped` snapshots for manual completions still awaiting
+    /// their death-plane event, keyed by (child id, incarnation). Populated
+    /// synchronously the moment a manual stop's real fate is classified -
+    /// independent of the registry, so it survives a same-handler
+    /// `delete_child`/respawn of the same name before the run loop's death
+    /// arm gets a chance to drain the matching watcher completion and
+    /// deliver it exactly once.
+    pub pending_manual_events: HashMap<(ActorId, u64), ChildEvent>,
+    /// Every live child's watcher task. Dropping this - which happens as
+    /// soon as this whole `SupervisionState` is dropped - aborts every task
+    /// still in it; a task aborted before it completes its own `join.await`
+    /// still runs its captured [`ChildLinkGuard`]'s `Drop`, which is exactly
+    /// how a `StopReason::Kill` teardown cascades to this supervisor's
+    /// children without this supervisor ever awaiting them.
+    pub death_set: JoinSet<DeathOutcome>,
+    /// Every in-flight restart attempt. Dropping this - which happens as
+    /// soon as this whole `SupervisionState` is dropped - aborts every task
+    /// still in it; an `Adopted` attempt not yet retrieved by the run loop
+    /// carries its own [`ChildLinkGuard`], so aborting (or simply dropping
+    /// the completed-but-unread outcome) still kills the fresh incarnation
+    /// it spawned through the same ladder - no orphaned incarnation, for a
+    /// restart pending in ANY phase (pre-spawn, mid-init, or already
+    /// adopted-but-not-yet-drained).
+    pub restart_set: JoinSet<RestartOutcome>,
 }
 
 impl SupervisionState {
@@ -403,25 +669,40 @@ impl SupervisionState {
             restart_fns: HashMap::new(),
             pending_group: None,
             queued_triggers: VecDeque::new(),
+            pending_manual_events: HashMap::new(),
+            death_set: JoinSet::new(),
+            restart_set: JoinSet::new(),
         }
     }
 
     /// Initiates a restart for a child using its stored restart closure:
-    /// bumps the seq, marks the pending restart, and spawns the closure.
-    /// Does NOT touch the budget (callers decide whether the restart is
-    /// budget-charged - strategy restarts are, manual bounces are not).
-    pub fn initiate(&mut self, child_id: &ActorId) -> bool {
-        let seq = self.registry.next_seq();
+    /// transitions the ledger to `Restarting` with the given (freshly drawn)
+    /// incarnation token, and spawns the closure. Does NOT touch the budget
+    /// (callers decide whether the restart is budget-charged - strategy
+    /// restarts are, manual bounces are not).
+    ///
+    /// `seq` is drawn by the caller from
+    /// [`ActorSystem::next_incarnation`](crate::system::ActorSystem::next_incarnation)
+    /// - the single counter every incarnation in the system draws from.
+    pub fn initiate(&mut self, child_id: &ActorId, seq: u64) -> bool {
         match self.registry.get_mut(child_id) {
             Some(child) => {
-                child.pending_restart_seq = Some(seq);
-                child.is_alive = false;
+                let incarnation = child.lifecycle.incarnation();
+                if child
+                    .transition(ChildLifecycle::Restarting {
+                        incarnation,
+                        next: seq,
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
             }
             None => return false,
         }
         if let Some(restart_fn) = self.restart_fns.get(child_id) {
             let fut = restart_fn(seq);
-            tokio::spawn(fut);
+            self.restart_set.spawn(fut);
             true
         } else {
             false
@@ -430,10 +711,20 @@ impl SupervisionState {
 
     /// True if the child is a member of the in-flight group restart (either
     /// phase). Manual child-management APIs refuse to touch such members.
+    ///
+    /// A member already recorded in `manual_overrides` is excluded even
+    /// though it may still sit in `awaiting`/`restart_order` (the run loop's
+    /// death arm owns removing it from both, once its death event actually
+    /// arrives): its own disposition was already committed synchronously by
+    /// the overriding `terminate_child` call, so it reads as an ordinary
+    /// `Down` child to every other manual API from that point on - notably
+    /// `delete_child`, which the truth contract requires to succeed in the
+    /// very same handler invocation that awaited the override.
     pub fn in_pending_group(&self, child_id: &ActorId) -> bool {
         match self.pending_group.as_ref() {
             Some(GroupPhase::Stopping(group)) => {
-                group.awaiting.contains(child_id) || group.restart_order.contains(child_id)
+                !group.manual_overrides.contains(child_id)
+                    && (group.awaiting.contains(child_id) || group.restart_order.contains(child_id))
             }
             Some(GroupPhase::Restarting(queue)) => queue.contains(child_id),
             None => false,
@@ -529,7 +820,12 @@ fn group_outcome(
         .iter()
         .rev()
         .filter(|id| *id != failed)
-        .filter(|id| registry.get(id).map(|c| c.is_alive).unwrap_or(false))
+        .filter(|id| {
+            registry
+                .get(id)
+                .map(|c| matches!(c.lifecycle, ChildLifecycle::Running(_)))
+                .unwrap_or(false)
+        })
         .cloned()
         .collect();
     // OTP: temporary siblings are terminated with the group but never restarted.
@@ -548,6 +844,53 @@ fn group_outcome(
     }
 }
 
+/// Advances an in-flight [`GroupPhase::Restarting`] chain past every member
+/// already `Running` on a fresher incarnation - an independent restart (a
+/// solo bounce, or one this same supervisor already adopted before the group
+/// chain reached it) that completed on its own is recognized by comparison
+/// and never blind-re-initiated. Returns the id the caller should hand to
+/// [`SupervisionState::initiate`] next: either a `Down` member ready to
+/// start, or a member already `Restarting` independently, in which case
+/// `initiate` is a documented no-op (its transition table rejects
+/// `Restarting` -> `Restarting`) and this is simply how the chain HOLDS -
+/// waiting for that already in-flight attempt's own [`RestartOutcome`]
+/// instead of spawning a second, redundant one. `None` means every remaining
+/// member turned out to already be fresh: the group phase is cleared and
+/// every trigger queued during its lifetime is appended to `work` for
+/// ordinary evaluation.
+pub(crate) fn advance_restart_chain(
+    sup: &mut SupervisionState,
+    work: &mut VecDeque<ChildStoppedInternal>,
+) -> Option<ActorId> {
+    loop {
+        let front = match sup.pending_group.as_ref() {
+            Some(GroupPhase::Restarting(queue)) => queue.front().cloned(),
+            _ => return None,
+        };
+        match front {
+            Some(id) => {
+                let already_fresh = sup
+                    .registry
+                    .get(&id)
+                    .map(|c| matches!(c.lifecycle, ChildLifecycle::Running(_)))
+                    .unwrap_or(false);
+                if already_fresh {
+                    if let Some(GroupPhase::Restarting(queue)) = sup.pending_group.as_mut() {
+                        queue.pop_front();
+                    }
+                    continue;
+                }
+                return Some(id);
+            }
+            None => {
+                sup.pending_group = None;
+                work.extend(sup.queued_triggers.drain(..));
+                return None;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests (pub(crate) internals, Rust Book Ch 11.3)
 // ---------------------------------------------------------------------------
@@ -555,7 +898,9 @@ fn group_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::runtime::spawn_watcher;
     use crate::types::StopReason;
+    use tokio::task::JoinHandle;
 
     // - RestartBudget -------------------------------------------------------
 
@@ -587,7 +932,8 @@ mod tests {
     // - ChildRegistry -------------------------------------------------------
 
     fn dummy_child_with(id: &str, restart_type: RestartType, alive: bool) -> ChildState {
-        let (tx, _rx) = mpsc::channel(1);
+        let (stop_lane, _stop_rx) = StopLane::new();
+        let (_fate_tx, fate_rx) = watch::channel(None);
         ChildState {
             id: ActorId::from(id),
             name: Some(id.to_string()),
@@ -595,14 +941,19 @@ mod tests {
                 restart_type,
                 shutdown: Shutdown::default(),
                 start_timeout: None,
+                is_supervisor: false,
             },
-            watcher_handle: tokio::spawn(async {}),
+            fate_rx,
             abort: tokio::spawn(async {}).abort_handle(),
-            system_tx: tx,
-            is_alive: alive,
-            pending_restart_seq: None,
-            current_incarnation: 0,
-            manual_stop: None,
+            stop_lane,
+            lifecycle: if alive {
+                ChildLifecycle::Running(0)
+            } else {
+                ChildLifecycle::Down {
+                    incarnation: 0,
+                    event_pending: false,
+                }
+            },
         }
     }
 
@@ -678,35 +1029,37 @@ mod tests {
     async fn registry_update_restarted_accepts_pending_seq_only() {
         let mut reg = ChildRegistry::new();
         reg.register(dummy_child("a"));
-        let seq = reg.next_seq();
+        let seq = 7u64;
         reg.get_mut(&ActorId::from("a"))
             .unwrap()
-            .pending_restart_seq = Some(seq);
-        reg.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
+            .transition(ChildLifecycle::Restarting {
+                incarnation: 0,
+                next: seq,
+            })
+            .unwrap();
 
         // Stale seq rejected
-        let (tx, _rx) = mpsc::channel(1);
+        let (lane, _rx) = StopLane::new();
         assert!(!reg.update_restarted(
             &ActorId::from("a"),
             seq + 99,
-            tx,
-            tokio::spawn(async {}),
+            lane,
+            watch::channel(None).1,
             tokio::spawn(async {}).abort_handle()
         ));
 
         // Matching seq accepted; incarnation adopted
-        let (tx, _rx) = mpsc::channel(1);
+        let (lane, _rx) = StopLane::new();
         assert!(reg.update_restarted(
             &ActorId::from("a"),
             seq,
-            tx,
-            tokio::spawn(async {}),
+            lane,
+            watch::channel(None).1,
             tokio::spawn(async {}).abort_handle()
         ));
         let child = reg.get(&ActorId::from("a")).unwrap();
-        assert!(child.is_alive);
-        assert_eq!(child.current_incarnation, seq);
-        assert_eq!(child.pending_restart_seq, None);
+        assert!(matches!(child.lifecycle, ChildLifecycle::Running(_)));
+        assert_eq!(child.lifecycle.incarnation(), seq);
         assert!(child.accepts_incarnation(seq));
         assert!(!child.accepts_incarnation(0));
     }
@@ -771,7 +1124,10 @@ mod tests {
         sup.registry.register(dummy_child("b"));
         sup.registry.register(dummy_child("c"));
         // b failed (already dead)
-        sup.registry.get_mut(&ActorId::from("b")).unwrap().is_alive = false;
+        sup.registry.get_mut(&ActorId::from("b")).unwrap().lifecycle = ChildLifecycle::Down {
+            incarnation: 0,
+            event_pending: false,
+        };
         match evaluate_strategy(&mut sup, &ActorId::from("b"), &StopReason::Kill) {
             StrategyOutcome::RestartGroup {
                 stop_reverse,
@@ -792,7 +1148,10 @@ mod tests {
         sup.registry.register(dummy_child("a"));
         sup.registry.register(dummy_child("b"));
         sup.registry.register(dummy_child("c"));
-        sup.registry.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
+        sup.registry.get_mut(&ActorId::from("a")).unwrap().lifecycle = ChildLifecycle::Down {
+            incarnation: 0,
+            event_pending: false,
+        };
         match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
             StrategyOutcome::RestartGroup {
                 stop_reverse,
@@ -813,7 +1172,10 @@ mod tests {
         sup.registry.register(dummy_child("a"));
         sup.registry
             .register(dummy_child_with("tmp", RestartType::Temporary, true));
-        sup.registry.get_mut(&ActorId::from("a")).unwrap().is_alive = false;
+        sup.registry.get_mut(&ActorId::from("a")).unwrap().lifecycle = ChildLifecycle::Down {
+            incarnation: 0,
+            event_pending: false,
+        };
         match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
             StrategyOutcome::RestartGroup {
                 stop_reverse,
@@ -883,5 +1245,177 @@ mod tests {
             evaluate_strategy(&mut sup, &id, &StopReason::Kill),
             StrategyOutcome::BudgetExhausted
         ));
+    }
+
+    // - ChildLinkGuard / death plane -----------------------------------------
+
+    /// A dummy long-running task whose `AbortHandle` and `JoinHandle` a test
+    /// can use to observe whether the reaper (or a guard's degrade path)
+    /// actually terminated it.
+    fn spawn_forever() -> (JoinHandle<()>, AbortHandle) {
+        let join = tokio::spawn(std::future::pending::<()>());
+        let abort = join.abort_handle();
+        (join, abort)
+    }
+
+    #[tokio::test]
+    async fn guard_drop_raises_kill_forces_status_and_feeds_the_reaper_exactly_once() {
+        let (lane, lane_rx) = StopLane::new();
+        let (status_tx, status_rx) = watch::channel(ActorStatus::Running);
+        let (_join, abort) = spawn_forever();
+        let (reaper_tx, mut reaper_rx) = mpsc::channel(4);
+
+        let guard = ChildLinkGuard::new(
+            lane.clone(),
+            status_tx,
+            abort,
+            reaper_tx,
+            Duration::from_millis(50),
+        );
+        drop(guard);
+
+        assert!(
+            matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
+            "drop must raise Kill on the child's stop lane"
+        );
+        assert_eq!(
+            *status_rx.borrow(),
+            ActorStatus::Stopped,
+            "drop must force-publish a terminal status"
+        );
+        assert!(
+            reaper_rx.try_recv().is_ok(),
+            "drop must feed exactly one entry to the reaper"
+        );
+        assert!(
+            reaper_rx.try_recv().is_err(),
+            "drop must feed the reaper only once"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_drop_effects_are_harmless_on_an_already_stopped_child() {
+        // Every effect a guard's drop performs is safe to run again after
+        // the child already reported its own terminal state: this is
+        // exactly what happens when a watcher completes normally (the
+        // captured guard still drops right after).
+        let (lane, lane_rx) = StopLane::new();
+        lane.raise(StopReason::Graceful);
+        let (status_tx, status_rx) = watch::channel(ActorStatus::Stopped);
+        let (_join, abort) = spawn_forever();
+        abort.abort();
+        let (reaper_tx, mut reaper_rx) = mpsc::channel(4);
+
+        let guard = ChildLinkGuard::new(lane, status_tx, abort, reaper_tx, KILL_GRACE);
+        drop(guard);
+
+        assert!(matches!(lane_rx.borrow().reason, Some(StopReason::Kill)));
+        assert_eq!(*status_rx.borrow(), ActorStatus::Stopped);
+        assert!(reaper_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn guard_degrades_to_immediate_abort_when_the_reaper_channel_is_full() {
+        let (lane, _lane_rx) = StopLane::new();
+        let (status_tx, _status_rx) = watch::channel(ActorStatus::Running);
+        let (join, abort) = spawn_forever();
+
+        // Capacity 1, pre-filled: the guard's own `try_send` below has no
+        // room and must degrade to aborting the child directly instead.
+        let (reaper_tx, _reaper_rx) = mpsc::channel(1);
+        let (_filler_join, filler_abort) = spawn_forever();
+        reaper_tx
+            .try_send(ReaperEntry::new(Instant::now(), filler_abort))
+            .unwrap();
+
+        let guard = ChildLinkGuard::new(lane, status_tx, abort, reaper_tx, Duration::from_secs(60));
+        drop(guard);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), join).await;
+        match result {
+            Ok(Err(join_err)) => assert!(
+                join_err.is_cancelled(),
+                "a full reaper channel must degrade to an immediate abort"
+            ),
+            other => panic!("expected the child to be aborted promptly, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_disarmed_by_the_watcher_is_inert_on_normal_completion() {
+        let (lane, _lane_rx) = StopLane::new();
+        let (status_tx, status_rx) = watch::channel(ActorStatus::Running);
+        let child_join: JoinHandle<StopReason> = tokio::spawn(async { StopReason::Graceful });
+        let abort = child_join.abort_handle();
+        let (reaper_tx, mut reaper_rx) = mpsc::channel(4);
+        let guard = ChildLinkGuard::new(lane, status_tx, abort, reaper_tx, KILL_GRACE);
+        let (fate_tx, mut fate_rx) = watch::channel(None);
+
+        let mut death_set: JoinSet<DeathOutcome> = JoinSet::new();
+        spawn_watcher(
+            &mut death_set,
+            ActorId::from("normal-death"),
+            0,
+            child_join,
+            fate_tx,
+            guard,
+        );
+
+        let (id, reason, incarnation) = death_set.join_next().await.unwrap().unwrap();
+        assert_eq!(id.as_str(), "normal-death");
+        assert!(matches!(reason, StopReason::Graceful));
+        assert_eq!(incarnation, 0);
+
+        assert!(fate_rx.wait_for(|f| f.is_some()).await.is_ok());
+        assert_eq!(
+            *status_rx.borrow(),
+            ActorStatus::Running,
+            "a disarmed guard must not rewrite the status on normal completion"
+        );
+        assert!(
+            reaper_rx.try_recv().is_err(),
+            "a disarmed guard must not occupy the reaper on normal completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_fires_exactly_once_when_aborted_before_its_watcher_is_ever_polled() {
+        // Single-threaded (current_thread) test runtime: a newly spawned
+        // task is never polled until this task yields, so aborting the
+        // JoinSet with no `.await` in between reliably exercises the
+        // abort-before-first-poll path.
+        let (lane, lane_rx) = StopLane::new();
+        let (status_tx, status_rx) = watch::channel(ActorStatus::Running);
+        let child_join: JoinHandle<StopReason> = tokio::spawn(std::future::pending());
+        let abort = child_join.abort_handle();
+        let (reaper_tx, mut reaper_rx) = mpsc::channel(4);
+        let guard = ChildLinkGuard::new(lane, status_tx, abort, reaper_tx, KILL_GRACE);
+        let (fate_tx, fate_rx) = watch::channel(None);
+
+        let mut death_set: JoinSet<DeathOutcome> = JoinSet::new();
+        spawn_watcher(
+            &mut death_set,
+            ActorId::from("never-polled"),
+            0,
+            child_join,
+            fate_tx,
+            guard,
+        );
+        death_set.abort_all();
+
+        // Drains the aborted watcher so its drop glue (the captured guard,
+        // included) actually runs before the assertions below.
+        while death_set.join_next().await.is_some() {}
+
+        assert!(
+            matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
+            "the guard must still fire even though its watcher never polled `join.await`"
+        );
+        assert_eq!(*status_rx.borrow(), ActorStatus::Stopped);
+        assert!(reaper_rx.try_recv().is_ok());
+        assert!(reaper_rx.try_recv().is_err());
+        // The fate cell is untouched: only the watcher's own completion
+        // writes it, and it never got that far.
+        assert!(fate_rx.borrow().is_none());
     }
 }

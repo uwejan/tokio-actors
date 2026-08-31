@@ -18,14 +18,18 @@
 //! `ctx.self_handle()`, deadlocks the actor against itself. See the
 //! "Deadlock warning" section on each method.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Instant};
 
+use crate::actor::runtime::saturating_deadline;
 use crate::actor::{Actor, ActorEnvelope};
 use crate::error::{AskError, SendError, TrySendError};
-use crate::types::{ActorId, ActorStatus, ActorStatusInfo, Envelope, StopReason, SystemMessage};
+use crate::types::{
+    ActorId, ActorStatus, ActorStatusInfo, Envelope, StopLane, StopReason, SystemMessage,
+};
 
 /// Cloneable handle that callers use to communicate with an actor.
 #[derive(Debug)]
@@ -33,8 +37,18 @@ pub struct ActorHandle<A: Actor> {
     id: ActorId,
     tx: mpsc::Sender<ActorEnvelope<A>>,
     system_tx: mpsc::Sender<SystemMessage>,
+    stop_lane: StopLane,
     mailbox_capacity: usize,
     status_rx: watch::Receiver<ActorStatus>,
+    /// Name of the [`ActorSystem`](crate::system::ActorSystem) this actor is
+    /// registered in. Every actor is always registered in exactly one system
+    /// (bare spawns join `ActorSystem::default()`), and a system's name is
+    /// permanently unique once claimed, so this is a stable identity: two
+    /// handles with the same `ActorId` but different systems are genuinely
+    /// different actors, and a supervised child's handle stays equal to
+    /// itself across a restart (same id, same system) even though the
+    /// underlying channels are replaced underneath it.
+    system_name: Arc<str>,
 }
 
 impl<A: Actor> Clone for ActorHandle<A> {
@@ -43,15 +57,17 @@ impl<A: Actor> Clone for ActorHandle<A> {
             id: self.id.clone(),
             tx: self.tx.clone(),
             system_tx: self.system_tx.clone(),
+            stop_lane: self.stop_lane.clone(),
             mailbox_capacity: self.mailbox_capacity,
             status_rx: self.status_rx.clone(),
+            system_name: self.system_name.clone(),
         }
     }
 }
 
 impl<A: Actor> PartialEq for ActorHandle<A> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.id == other.id && self.system_name == other.system_name
     }
 }
 
@@ -60,29 +76,37 @@ impl<A: Actor> Eq for ActorHandle<A> {}
 impl<A: Actor> std::hash::Hash for ActorHandle<A> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+        self.system_name.hash(state);
     }
 }
 
 impl<A: Actor> ActorHandle<A> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: ActorId,
         tx: mpsc::Sender<ActorEnvelope<A>>,
         system_tx: mpsc::Sender<SystemMessage>,
+        stop_lane: StopLane,
         mailbox_capacity: usize,
         status_rx: watch::Receiver<ActorStatus>,
+        system_name: Arc<str>,
     ) -> Self {
         Self {
             id,
             tx,
             system_tx,
+            stop_lane,
             mailbox_capacity,
             status_rx,
+            system_name,
         }
     }
 
-    /// Returns a clone of the system channel sender (for wiring child->parent notifications).
-    pub(crate) fn system_tx(&self) -> mpsc::Sender<SystemMessage> {
-        self.system_tx.clone()
+    /// Returns a clone of this actor's stop lane sender (for wiring the
+    /// supervision escalation ladder and the system registry's shutdown
+    /// sweep without a mailbox round-trip).
+    pub(crate) fn stop_lane(&self) -> StopLane {
+        self.stop_lane.clone()
     }
 
     /// Returns a clone of the runtime status receiver (used by the system
@@ -233,7 +257,7 @@ impl<A: Actor> ActorHandle<A> {
         msg: A::Message,
         timeout: Duration,
     ) -> Result<A::Response, AskError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = saturating_deadline(Instant::now(), timeout);
         let (tx, rx) = oneshot::channel();
 
         self.tx
@@ -261,15 +285,37 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    /// Signals the actor to stop via the system channel.
+    /// Signals the actor to stop.
     ///
-    /// The system channel has priority over the mailbox, so stop signals
-    /// are processed even when the mailbox is full.
+    /// Delivered through the stop lane: a synchronous, infallible signal the
+    /// run loop observes ahead of everything else - the system channel and
+    /// the user mailbox alike - so it is never delayed by a full mailbox or a
+    /// backlog of supervision traffic. Like every signal on the lane, it is
+    /// only ever observed at a turn boundary: an in-flight `handle` invocation
+    /// always runs to completion first (the Isolated Turn Principle), so this
+    /// never races or cancels one.
+    ///
+    /// Escalation only ever increases: calling this with a lower-severity
+    /// `reason` (for example `Graceful` after a `Kill` already landed) has no
+    /// effect, and calling it again with the SAME severity - most commonly a
+    /// retry after [`pre_stop`](crate::actor::Actor::pre_stop) vetoed the
+    /// first request - always lands and is guaranteed a fresh
+    /// [`pre_stop`](crate::actor::Actor::pre_stop) invocation, even though the
+    /// requested reason did not change tier. Calling this several times in a
+    /// row before the actor gets back to its `select!` coalesces into a
+    /// single observation of the highest severity requested: the actor sees
+    /// at most one turn-boundary check per turn, never one per call.
+    ///
+    /// # Errors
+    /// Returns `SendError::Closed` if the actor has already finished its
+    /// message loop - the same case, and the same error, a full mailbox send
+    /// would have failed with before the stop lane existed.
     pub async fn stop(&self, reason: StopReason) -> Result<(), SendError> {
-        self.system_tx
-            .send(SystemMessage::Stop(reason))
-            .await
-            .map_err(|_| SendError::Closed)
+        if self.stop_lane.is_closed() {
+            return Err(SendError::Closed);
+        }
+        self.stop_lane.raise(reason);
+        Ok(())
     }
 
     /// Requests a status snapshot from the actor.

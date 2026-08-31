@@ -461,7 +461,7 @@ actor.spawn()                     // Start the builder
 | `try_notify(msg)` | Non-blocking fire-and-forget |
 | `send(msg)` | Request-response (awaits processing) |
 | `send_timeout(msg, dur)` | Request-response bounded by one deadline spanning enqueue + response |
-| `stop(reason)` | Stop via system channel (bypasses full mailbox) |
+| `stop(reason)` | Stop via the stop lane (bypasses the system channel and a full mailbox alike) |
 | `get_status()` | Rich introspection snapshot via system channel (queue plane) |
 | `status()` | Instant lifecycle phase from the runtime plane (answers even for a hung actor) |
 | `wait_stopped()` | Awaits the actor's terminal state |
@@ -584,7 +584,7 @@ Multi-agent AI systems need exactly the guarantees described above. Each agent i
 
 Every actor is a dedicated `tokio::task`. No shared executor, no fancy scheduling, just Tokio doing what it does best.
 
-Stop signals and `get_status()` flow through a dedicated **system channel** with `biased; select!` priority over the user mailbox, so they work even when the mailbox is full. `status()` and `wait_stopped()` bypass channels entirely: they read a `watch` value the runtime updates directly, so they answer even if the actor is stuck processing a message and never touching `select!` at all.
+A `biased; select!` gives every actor's run loop three priority tiers: a dedicated **stop lane** for `stop()` (a `watch` signal, not a channel - it never waits on mailbox capacity), then the **system channel** for `get_status()`, then the user mailbox. Each tier works even when the ones below it are full or backlogged. `status()` and `wait_stopped()` bypass all three: they read a `watch` value the runtime updates directly, so they answer even if the actor is stuck processing a message and never touching `select!` at all.
 
 ---
 

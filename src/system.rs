@@ -3,20 +3,24 @@
 //! Internal module; the public pieces are re-exported at the crate root.
 
 use std::any::{Any, TypeId};
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 
 use crate::actor::handle::ActorHandle;
+use crate::actor::runtime::saturating_deadline;
 use crate::actor::supervision::KILL_GRACE;
 use crate::actor::Actor;
 use crate::error::{SendError, SpawnError};
-use crate::types::{ActorId, ActorStatus, ShutdownReport, StopOutcome, StopReason, SystemMessage};
+use crate::types::{ActorId, ActorStatus, ShutdownReport, StopLane, StopOutcome, StopReason};
 
 // ---------------------------------------------------------------------------
 // Global systems registry
@@ -70,10 +74,10 @@ pub struct SystemConfig {
 struct AnyActorHandle {
     type_id: TypeId,
     handle: Box<dyn Any + Send + Sync>,
-    /// Clone of the actor's system-channel sender. Enough on its own to
-    /// signal `Stop` without downcasting, and cheap to clone out of a
-    /// `DashMap` `Ref` before an `.await`.
-    system_tx: mpsc::Sender<SystemMessage>,
+    /// Clone of the actor's stop lane. Enough on its own to signal a stop or
+    /// kill without downcasting, and cheap to clone out of a `DashMap` `Ref`
+    /// before an `.await` (raising it is synchronous and infallible anyway).
+    stop_lane: StopLane,
     /// Runtime status plane, threaded straight through from the
     /// `ActorHandle`: the watch channel is created before the actor's task
     /// is spawned, so this is always available at registration time (unlike
@@ -102,7 +106,7 @@ impl AnyActorHandle {
         Self {
             type_id: TypeId::of::<ActorHandle<A>>(),
             handle: Box::new(handle.clone()),
-            system_tx: handle.system_tx(),
+            stop_lane: handle.stop_lane(),
             status_rx: handle.status_rx(),
             abort: None,
             is_root,
@@ -127,19 +131,77 @@ pub(crate) struct RegistryGuard {
     system: Arc<ActorSystem>,
     id: ActorId,
     name: Option<String>,
+    /// The registration this guard owns. Removal on drop is checked against
+    /// this sequence (see [`ActorSystem::unregister_by_id`]/
+    /// [`ActorSystem::unregister_by_name`]) so a stale teardown - one whose
+    /// guard is only dropping now, well after a fresh registration already
+    /// reused the same id/name - can never remove that newer registration
+    /// out from under it. Defense in depth for the death-event race: `by_id`
+    /// has no occupancy check on insert (unlike `by_name`), so an anonymous
+    /// child's id can otherwise be silently reused before the old guard
+    /// drops.
+    registration_seq: u64,
 }
 
 impl RegistryGuard {
-    pub(crate) fn new(system: Arc<ActorSystem>, id: ActorId, name: Option<String>) -> Self {
-        Self { system, id, name }
+    pub(crate) fn new(
+        system: Arc<ActorSystem>,
+        id: ActorId,
+        name: Option<String>,
+        registration_seq: u64,
+    ) -> Self {
+        Self {
+            system,
+            id,
+            name,
+            registration_seq,
+        }
     }
 }
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
-        self.system.unregister_by_id(&self.id);
+        self.system
+            .unregister_by_id(&self.id, self.registration_seq);
         if let Some(name) = &self.name {
-            self.system.by_name.remove(name);
+            self.system.unregister_by_name(name, self.registration_seq);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SystemPhase
+// ---------------------------------------------------------------------------
+
+/// Lifecycle phase of an [`ActorSystem`]'s registry.
+///
+/// `Active` accepts registrations. `shutdown`/`shutdown_with` moves the
+/// system to `ShuttingDown` immediately and to `Defunct` once every root has
+/// been stopped; both reject new registrations with
+/// [`SpawnError::SystemShuttingDown`]. Unlike a plain one-way flag, `Defunct`
+/// is not permanent: [`ActorSystem::reactivate`] moves it back to `Active`,
+/// so a system's name is never poisoned forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemPhase {
+    Active,
+    ShuttingDown,
+    Defunct,
+}
+
+impl SystemPhase {
+    const fn as_u8(self) -> u8 {
+        match self {
+            SystemPhase::Active => 0,
+            SystemPhase::ShuttingDown => 1,
+            SystemPhase::Defunct => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => SystemPhase::Active,
+            1 => SystemPhase::ShuttingDown,
+            _ => SystemPhase::Defunct,
         }
     }
 }
@@ -158,13 +220,23 @@ pub struct ActorSystem {
     by_name: DashMap<String, AnyActorHandle>,
     by_id: DashMap<ActorId, AnyActorHandle>,
     shutdown_policy: ShutdownPolicy,
-    /// Set once `shutdown`/`shutdown_with` begins; `register_actor` rejects
-    /// every registration attempt afterward with
-    /// `SpawnError::SystemShuttingDown` (OTP application-controller parity).
-    /// Never reset.
-    shutting_down: AtomicBool,
+    /// `Active` until `shutdown`/`shutdown_with` is called (moves to
+    /// `ShuttingDown`, then to `Defunct` once every root has stopped).
+    /// `register_actor` rejects every registration attempt in either
+    /// non-`Active` phase with `SpawnError::SystemShuttingDown` (OTP
+    /// application-controller parity). Not a one-way flag:
+    /// [`ActorSystem::reactivate`] moves a `Defunct` system back to `Active`.
+    phase: AtomicU8,
     /// Source of `AnyActorHandle::registration_seq`.
     registration_seq: AtomicU64,
+    /// Source of every child incarnation token this system ever hands out -
+    /// fresh spawns and restarts alike, so no two incarnations of any child,
+    /// under any name, in any supervisor's registry, are ever equal (see
+    /// [`next_incarnation`](Self::next_incarnation)).
+    incarnation_seq: AtomicU64,
+    /// This system's reaper feed, spawned lazily on first use (see
+    /// [`reaper_handle`](Self::reaper_handle)).
+    reaper: OnceLock<mpsc::Sender<ReaperEntry>>,
 }
 
 impl std::fmt::Debug for ActorSystem {
@@ -184,8 +256,10 @@ impl ActorSystem {
             by_name: DashMap::new(),
             by_id: DashMap::new(),
             shutdown_policy,
-            shutting_down: AtomicBool::new(false),
+            phase: AtomicU8::new(SystemPhase::Active.as_u8()),
             registration_seq: AtomicU64::new(0),
+            incarnation_seq: AtomicU64::new(0),
+            reaper: OnceLock::new(),
         }
     }
 
@@ -316,32 +390,50 @@ impl ActorSystem {
 
     /// Stops a named actor gracefully.
     ///
-    /// Returns [`SendError::Closed`] if no actor with the given name is registered.
+    /// Delivered through the actor's stop lane (see the `runtime` module
+    /// docs): a synchronous, infallible signal observed ahead of the system
+    /// channel and the mailbox alike, at the actor's next turn boundary.
+    ///
+    /// # Errors
+    /// - [`SendError::NotFound`] if no actor is registered under `name`.
+    /// - [`SendError::Closed`] if an actor was registered under `name` but
+    ///   has already stopped.
     pub async fn stop(&self, name: &str) -> Result<(), SendError> {
-        // Clone the sender out of the `Ref` and drop the guard before the
-        // `.await`: holding a `DashMap` guard across an await point
-        // can deadlock against a concurrent writer on the same shard.
-        let tx = {
-            let entry = self.by_name.get(name).ok_or(SendError::Closed)?;
-            entry.system_tx.clone()
+        // Clone the lane out of the `Ref` and drop the guard before checking
+        // it: holding a `DashMap` guard across an await point can deadlock
+        // against a concurrent writer on the same shard (the lane check
+        // itself is synchronous, but this keeps the same discipline as every
+        // other method here).
+        let lane = {
+            let entry = self.by_name.get(name).ok_or(SendError::NotFound)?;
+            entry.stop_lane.clone()
         };
-        tx.send(SystemMessage::Stop(StopReason::Graceful))
-            .await
-            .map_err(|_| SendError::Closed)
+        if lane.is_closed() {
+            return Err(SendError::Closed);
+        }
+        lane.raise(StopReason::Graceful);
+        Ok(())
     }
 
     /// Force-kills a named actor, bypassing all lifecycle callbacks.
     ///
-    /// Returns [`SendError::Closed`] if no actor with the given name is registered.
+    /// Same stop-lane delivery as [`stop`](Self::stop), at `Kill` severity.
+    ///
+    /// # Errors
+    /// - [`SendError::NotFound`] if no actor is registered under `name`.
+    /// - [`SendError::Closed`] if an actor was registered under `name` but
+    ///   has already stopped.
     pub async fn kill(&self, name: &str) -> Result<(), SendError> {
-        // Same guard-before-await discipline as `stop`.
-        let tx = {
-            let entry = self.by_name.get(name).ok_or(SendError::Closed)?;
-            entry.system_tx.clone()
+        // Same guard-before-check discipline as `stop`.
+        let lane = {
+            let entry = self.by_name.get(name).ok_or(SendError::NotFound)?;
+            entry.stop_lane.clone()
         };
-        tx.send(SystemMessage::Stop(StopReason::Kill))
-            .await
-            .map_err(|_| SendError::Closed)
+        if lane.is_closed() {
+            return Err(SendError::Closed);
+        }
+        lane.raise(StopReason::Kill);
+        Ok(())
     }
 
     /// Lists all registered actor names in this system.
@@ -374,35 +466,40 @@ impl ActorSystem {
         // Guard-before-await discipline, as in `stop`/`kill`: clone the
         // pieces `force_stop` needs out of the `DashMap` guard before any
         // `.await`.
-        let (status_rx, system_tx, abort) = match self.by_id.get(id) {
+        let (status_rx, stop_lane, abort) = match self.by_id.get(id) {
             Some(e) => (
                 Some(e.status_rx.clone()),
-                Some(e.system_tx.clone()),
+                Some(e.stop_lane.clone()),
                 e.abort.clone(),
             ),
             None => return false,
         };
-        force_stop(status_rx, system_tx, abort).await;
+        force_stop(status_rx, stop_lane, abort).await;
         true
     }
 
     // - Internal registration (used by spawn path) --------------------------
 
-    /// Registers a spawned actor. `is_root` distinguishes a top-level
-    /// (`SpawnBuilder`) spawn, which system shutdown signals directly, from a
-    /// supervised child (`spawn_child`), which is taken down by its own
-    /// supervisor's shutdown cascade instead.
+    /// Registers a spawned actor, returning its registration sequence
+    /// number (the source of [`RegistryGuard`]'s seq-checked removal).
+    /// `is_root` distinguishes a top-level (`SpawnBuilder`) spawn, which
+    /// system shutdown signals directly, from a supervised child
+    /// (`spawn_child`), which is taken down by its own supervisor's shutdown
+    /// cascade instead.
     ///
-    /// Returns [`SpawnError::SystemShuttingDown`] once shutdown has begun:
-    /// OTP's application controller rejects new registrations while stopping.
+    /// Returns [`SpawnError::SystemShuttingDown`] unless the system is
+    /// currently `Active`: OTP's application controller rejects new
+    /// registrations while stopping, and (unlike a one-way flag) this also
+    /// covers a `Defunct` system that has not yet been
+    /// [`reactivate`](Self::reactivate)d.
     pub(crate) fn register_actor<A: Actor>(
         &self,
         id: &ActorId,
         name: Option<&str>,
         handle: &ActorHandle<A>,
         is_root: bool,
-    ) -> Result<(), SpawnError> {
-        if self.shutting_down.load(Ordering::Acquire) {
+    ) -> Result<u64, SpawnError> {
+        if SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) != SystemPhase::Active {
             return Err(SpawnError::SystemShuttingDown(self.name.clone()));
         }
 
@@ -423,11 +520,54 @@ impl ActorSystem {
         }
         self.by_id
             .insert(id.clone(), AnyActorHandle::new(handle, is_root, seq));
-        Ok(())
+        Ok(seq)
     }
 
-    pub(crate) fn unregister_by_id(&self, id: &ActorId) {
-        self.by_id.remove(id);
+    /// Removes the `by_id` entry for `id`, but only if it is still the
+    /// registration identified by `registration_seq`. A stale
+    /// [`RegistryGuard`] whose drop is only running now - well after a
+    /// fresh registration already reused this id - must never remove that
+    /// newer entry (see the field doc on `RegistryGuard::registration_seq`).
+    pub(crate) fn unregister_by_id(&self, id: &ActorId, registration_seq: u64) {
+        self.by_id
+            .remove_if(id, |_, entry| entry.registration_seq == registration_seq);
+    }
+
+    /// Same seq-checked removal as [`unregister_by_id`](Self::unregister_by_id), for `by_name`.
+    pub(crate) fn unregister_by_name(&self, name: &str, registration_seq: u64) {
+        self.by_name
+            .remove_if(name, |_, entry| entry.registration_seq == registration_seq);
+    }
+
+    /// Draws the next child incarnation token for this system: every
+    /// registration a supervisor ever makes for a child - the initial spawn
+    /// included, not just restarts - draws from this single monotonic
+    /// counter. No two incarnations of any child anywhere in this system ever
+    /// collide, so a stale watcher completion (from a superseded instance,
+    /// including one that shared its predecessor's name after a
+    /// terminate/delete/respawn cycle) can never be mistaken for the fresh
+    /// one's death.
+    pub(crate) fn next_incarnation(&self) -> u64 {
+        self.incarnation_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Moves a `Defunct` system (one whose `shutdown`/`shutdown_with` has
+    /// fully completed) back to `Active`, so its name can be registered into
+    /// again instead of staying poisoned forever.
+    ///
+    /// Returns `false` without effect if the system is not currently
+    /// `Defunct` - either still `Active` (nothing to reactivate), or
+    /// `ShuttingDown` (a shutdown is still in flight, and reactivating out
+    /// from under it would race that shutdown's own final phase transition).
+    pub fn reactivate(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                SystemPhase::Defunct.as_u8(),
+                SystemPhase::Active.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Attaches the task's abort handle to the just-created registry entries.
@@ -444,6 +584,21 @@ impl ActorSystem {
                 entry.abort = Some(abort);
             }
         }
+    }
+
+    /// Returns this system's reaper feed, spawning its backing task on first
+    /// use. Every supervised child's link guard feeds a deadline into it on
+    /// drop (see `ChildLinkGuard` in the `supervision` module); the task
+    /// itself never blocks anything and aborts a child's task only if it has
+    /// not exited by its scheduled deadline.
+    pub(crate) fn reaper_handle(&self, rt: &Handle) -> mpsc::Sender<ReaperEntry> {
+        self.reaper
+            .get_or_init(|| {
+                let (tx, rx) = mpsc::channel(REAPER_CHANNEL_CAPACITY);
+                rt.spawn(reaper_loop(rx));
+                tx
+            })
+            .clone()
     }
 
     // - Shutdown -------------------------------------------------------------
@@ -479,8 +634,9 @@ impl ActorSystem {
     /// `RegistryGuard` drop machinery) - never cleared up front, so a lookup
     /// racing the early part of shutdown still finds a live actor.
     pub async fn shutdown_with(&self, policy: ShutdownPolicy) -> ShutdownReport {
-        self.shutting_down.store(true, Ordering::Release);
-        let deadline = Instant::now() + policy.timeout;
+        self.phase
+            .store(SystemPhase::ShuttingDown.as_u8(), Ordering::Release);
+        let deadline = saturating_deadline(Instant::now(), policy.timeout);
 
         let mut roots = self.snapshot_roots();
         // Reverse registration order: most-recently-registered stops first.
@@ -532,6 +688,12 @@ impl ActorSystem {
             swept.extend(self.concurrent_force_sweep(&leftover).await);
         }
 
+        // Shutdown has fully completed: move to `Defunct` rather than
+        // leaving the one-way `ShuttingDown` flag set forever, so
+        // `reactivate` can return this system's name to service.
+        self.phase
+            .store(SystemPhase::Defunct.as_u8(), Ordering::Release);
+
         ShutdownReport { outcomes, swept }
     }
 
@@ -567,7 +729,7 @@ impl ActorSystem {
         deadline: Instant,
     ) -> Option<StopOutcome> {
         // Tier 1: ParentRequest (vetoable via pre_stop).
-        self.send_stop(id, StopReason::ParentRequest).await;
+        self.send_stop(id, StopReason::ParentRequest);
         if wait_terminal(&mut status_rx, time_left(deadline).min(per_actor_timeout)).await {
             return Some(StopOutcome::Graceful);
         }
@@ -578,7 +740,7 @@ impl ActorSystem {
         // Tier 2: Kill (unvetoable, but still only observed cooperatively -
         // an actor stuck inside a callback never reaches the select! that
         // would see it).
-        self.send_stop(id, StopReason::Kill).await;
+        self.send_stop(id, StopReason::Kill);
         if wait_terminal(&mut status_rx, time_left(deadline).min(KILL_GRACE)).await {
             return Some(StopOutcome::Killed);
         }
@@ -606,16 +768,16 @@ impl ActorSystem {
     async fn concurrent_force_sweep(&self, ids: &[ActorId]) -> Vec<(ActorId, StopOutcome)> {
         let mut set = JoinSet::new();
         for id in ids.iter().cloned() {
-            let (status_rx, system_tx, abort) = match self.by_id.get(&id) {
+            let (status_rx, stop_lane, abort) = match self.by_id.get(&id) {
                 Some(e) => (
                     Some(e.status_rx.clone()),
-                    Some(e.system_tx.clone()),
+                    Some(e.stop_lane.clone()),
                     e.abort.clone(),
                 ),
                 None => (None, None, None),
             };
             set.spawn(async move {
-                let outcome = force_stop(status_rx, system_tx, abort).await;
+                let outcome = force_stop(status_rx, stop_lane, abort).await;
                 (id, outcome)
             });
         }
@@ -629,14 +791,13 @@ impl ActorSystem {
         results
     }
 
-    /// Clones the sender out of the map guard and drops the guard before the
-    /// send `.await`s. A missing entry (the actor already died on its
-    /// own) is a silent no-op: the caller's subsequent status wait finds it
-    /// already terminal.
-    async fn send_stop(&self, id: &ActorId, reason: StopReason) {
-        let tx = self.by_id.get(id).map(|e| e.system_tx.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(SystemMessage::Stop(reason)).await;
+    /// Clones the lane out of the map guard and drops the guard before
+    /// raising it. A missing entry (the actor already died on its own) is a
+    /// silent no-op: the caller's subsequent status wait finds it already
+    /// terminal.
+    fn send_stop(&self, id: &ActorId, reason: StopReason) {
+        if let Some(lane) = self.by_id.get(id).map(|e| e.stop_lane.clone()) {
+            lane.raise(reason);
         }
     }
 
@@ -685,15 +846,15 @@ async fn wait_terminal(status_rx: &mut watch::Receiver<ActorStatus>, bound: Dura
 /// `Graceful` since there is nothing left to do.
 async fn force_stop(
     status_rx: Option<watch::Receiver<ActorStatus>>,
-    system_tx: Option<mpsc::Sender<SystemMessage>>,
+    stop_lane: Option<StopLane>,
     abort: Option<AbortHandle>,
 ) -> StopOutcome {
     let Some(mut status_rx) = status_rx else {
         return StopOutcome::Graceful;
     };
 
-    if let Some(tx) = &system_tx {
-        let _ = tx.send(SystemMessage::Stop(StopReason::Kill)).await;
+    if let Some(lane) = &stop_lane {
+        lane.raise(StopReason::Kill);
     }
     if wait_terminal(&mut status_rx, KILL_GRACE).await {
         return StopOutcome::Killed;
@@ -707,4 +868,268 @@ async fn force_stop(
     }
 
     StopOutcome::Unresponsive
+}
+
+// ---------------------------------------------------------------------------
+// Reaper - the abort-on-deadline backstop fed by every child link guard
+// ---------------------------------------------------------------------------
+
+/// Capacity of the reaper's feed channel. Internal, not user-configurable: a
+/// full channel just makes the feeding guard abort its child immediately
+/// instead of scheduling a delayed abort (see `ChildLinkGuard::drop` in the
+/// `supervision` module) - always at least as prompt, so this only trades a
+/// later deadline for an earlier one under contention, never a lost one.
+const REAPER_CHANNEL_CAPACITY: usize = 1024;
+
+/// One pending abort deadline, fed by a dying child's link guard.
+pub(crate) struct ReaperEntry {
+    deadline: Instant,
+    abort: AbortHandle,
+}
+
+impl ReaperEntry {
+    pub(crate) fn new(deadline: Instant, abort: AbortHandle) -> Self {
+        Self { deadline, abort }
+    }
+}
+
+impl PartialEq for ReaperEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline
+    }
+}
+
+impl Eq for ReaperEntry {}
+
+impl PartialOrd for ReaperEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReaperEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reversed so a `BinaryHeap` (a max-heap by default) pops the
+        // SOONEST deadline first, turning it into a min-heap by deadline.
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+/// One task per [`ActorSystem`], lazily spawned on first use: aborts a
+/// child's task if it has not exited by its guard-scheduled deadline.
+/// Entries only ever arrive from a link guard's `Drop` - a synchronous,
+/// non-blocking `try_send` - and are never awaited by anything: a full or
+/// closed feed just means the guard aborts its child immediately instead.
+async fn reaper_loop(mut rx: mpsc::Receiver<ReaperEntry>) {
+    let mut heap: BinaryHeap<ReaperEntry> = BinaryHeap::new();
+    let mut channel_open = true;
+
+    loop {
+        if !channel_open {
+            match heap.pop() {
+                Some(due) => {
+                    tokio::time::sleep_until(due.deadline).await;
+                    if !due.abort.is_finished() {
+                        due.abort.abort();
+                    }
+                }
+                None => break,
+            }
+            continue;
+        }
+
+        match heap.peek() {
+            Some(next) => {
+                let deadline = next.deadline;
+                tokio::select! {
+                    entry = rx.recv() => match entry {
+                        Some(e) => heap.push(e),
+                        None => channel_open = false,
+                    },
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if let Some(due) = heap.pop() {
+                            if !due.abort.is_finished() {
+                                due.abort.abort();
+                            }
+                        }
+                    }
+                }
+            }
+            None => match rx.recv().await {
+                Some(e) => heap.push(e),
+                None => channel_open = false,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (pub(crate) internals, Rust Book Ch 11.3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct Dummy;
+
+    impl Actor for Dummy {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    fn dummy_handle(id: &ActorId, system_name: &str) -> ActorHandle<Dummy> {
+        let (tx, _rx) = mpsc::channel(1);
+        let (system_tx, _system_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(ActorStatus::Running);
+        let (stop_lane, _stop_rx) = StopLane::new();
+        ActorHandle::new(
+            id.clone(),
+            tx,
+            system_tx,
+            stop_lane,
+            1,
+            status_rx,
+            system_name.into(),
+        )
+    }
+
+    // Reproduces the death-event race defended against by `RegistryGuard`'s
+    // seq-checked removal: `by_id` has no occupancy check on insert (unlike
+    // `by_name`), so an anonymous child's id can be silently reused by a
+    // fresh registration before an older, still-tearing-down instance's
+    // guard drops. That stale guard must not remove the newer entry.
+    #[tokio::test]
+    async fn stale_registry_guard_drop_never_removes_a_newer_registration() {
+        let sys = ActorSystem::create(format!("seq-guard-{}", uuid::Uuid::new_v4())).unwrap();
+        let id = ActorId::from("anon-child");
+
+        let old_handle = dummy_handle(&id, sys.name());
+        let old_seq = sys
+            .register_actor::<Dummy>(&id, None, &old_handle, false)
+            .unwrap();
+        let old_guard = RegistryGuard::new(sys.clone(), id.clone(), None, old_seq);
+
+        // A newer registration lands under the SAME id before the old
+        // guard drops.
+        let new_handle = dummy_handle(&id, sys.name());
+        let new_seq = sys
+            .register_actor::<Dummy>(&id, None, &new_handle, false)
+            .unwrap();
+        assert_ne!(old_seq, new_seq);
+
+        drop(old_guard);
+
+        let entry = sys
+            .by_id
+            .get(&id)
+            .expect("the stale guard's drop must not remove the newer registration");
+        assert_eq!(entry.registration_seq, new_seq);
+    }
+
+    #[tokio::test]
+    async fn matching_seq_guard_drop_removes_its_own_registration() {
+        let sys = ActorSystem::create(format!("seq-guard-{}", uuid::Uuid::new_v4())).unwrap();
+        let id = ActorId::from("solo-child");
+
+        let handle = dummy_handle(&id, sys.name());
+        let seq = sys
+            .register_actor::<Dummy>(&id, None, &handle, false)
+            .unwrap();
+        let guard = RegistryGuard::new(sys.clone(), id.clone(), None, seq);
+
+        drop(guard);
+
+        assert!(
+            sys.by_id.get(&id).is_none(),
+            "a guard whose seq still matches the live registration must remove it"
+        );
+    }
+
+    // - Reaper ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reaper_aborts_a_child_that_outlives_its_deadline() {
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(reaper_loop(rx));
+
+        let join = tokio::spawn(std::future::pending::<()>());
+        let abort = join.abort_handle();
+        tx.send(ReaperEntry::new(
+            Instant::now() + Duration::from_millis(30),
+            abort,
+        ))
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), join).await;
+        match result {
+            Ok(Err(err)) => assert!(err.is_cancelled(), "expected a cancelled join error"),
+            other => {
+                panic!("expected the reaper to abort the child by its deadline, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_never_disturbs_a_child_that_already_exited() {
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(reaper_loop(rx));
+
+        let join = tokio::spawn(async { 7u32 });
+        let abort = join.abort_handle();
+        // Let the task actually finish before the reaper ever hears about it.
+        assert_eq!(join.await.unwrap(), 7);
+
+        tx.send(ReaperEntry::new(Instant::now(), abort))
+            .await
+            .unwrap();
+        // Give the reaper a moment to process the (already-moot) deadline;
+        // an already-finished task's `abort()` is a no-op either way, so
+        // there is nothing further to observe here beyond "does not panic".
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn reaper_pops_the_soonest_deadline_first() {
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(reaper_loop(rx));
+
+        let late = tokio::spawn(std::future::pending::<()>());
+        let soon = tokio::spawn(std::future::pending::<()>());
+
+        // Fed out of order: the later deadline is enqueued first.
+        tx.send(ReaperEntry::new(
+            Instant::now() + Duration::from_millis(300),
+            late.abort_handle(),
+        ))
+        .await
+        .unwrap();
+        tx.send(ReaperEntry::new(
+            Instant::now() + Duration::from_millis(30),
+            soon.abort_handle(),
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), soon)
+            .await
+            .expect("soon must be reaped by its own, earlier deadline")
+            .expect_err("soon must be cancelled, not completed");
+        assert!(
+            !late.is_finished(),
+            "late's deadline has not arrived yet; it must still be running"
+        );
+        late.abort();
+    }
 }

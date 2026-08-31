@@ -158,7 +158,7 @@ fn info_for<'r>(children: &'r [ChildInfo], name: &str) -> Option<&'r ChildInfo> 
 // ---------------------------------------------------------------------------
 
 /// A worker with a counter (fresh-state probe) that crashes or wedges on command.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Worker {
     count: u32,
 }
@@ -212,6 +212,28 @@ impl Actor for Vetoer {
     }
 }
 
+/// A child whose `pre_stop` always panics: a deterministic stand-in for "a
+/// real crash lands at the exact moment a manual stop's signal arrives".
+/// Any vetoable stop signal (`ParentRequest`, from `Shutdown::Timeout` or
+/// `Infinity`) drives this into a REAL `StopReason::Failure` regardless of
+/// the caller's intent - exactly the race `manual_stop_child` must classify
+/// on the observed fate rather than the intent.
+#[derive(Default)]
+struct PanicsOnStop;
+
+impl Actor for PanicsOnStop {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        panic!("deliberate pre_stop panic simulating a racing crash");
+    }
+}
+
 /// The command-driven supervisor: records every `ChildEvent`, spawns children
 /// and executes manual child-management ops on command, returning the outcome.
 struct MgmtSup {
@@ -228,6 +250,10 @@ enum SupCmd {
     SpawnVetoer {
         name: String,
         timeout_ms: u64,
+    },
+    SpawnPanicsOnStop {
+        name: String,
+        restart_type: RestartType,
     },
     Terminate {
         id: String,
@@ -275,6 +301,14 @@ impl Actor for MgmtSup {
                     .named(name)
                     .restart_type(RestartType::Permanent)
                     .shutdown(Shutdown::Timeout(Duration::from_millis(timeout_ms)))
+                    .await?;
+                SupReply::Done(Ok(()))
+            }
+            SupCmd::SpawnPanicsOnStop { name, restart_type } => {
+                ctx.spawn_child(PanicsOnStop::default)
+                    .named(name)
+                    .restart_type(restart_type)
+                    .shutdown(Shutdown::Timeout(Duration::from_secs(2)))
                     .await?;
                 SupReply::Done(Ok(()))
             }
@@ -423,6 +457,51 @@ async fn terminate_child_prunes_temporary() {
     assert!(
         info_for(&snapshot, &name).is_none(),
         "Temporary spec must be pruned on terminate: {snapshot:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// The death event's `child_name` must be captured BEFORE the spec is pruned:
+// a Temporary child's spec is removed as part of handling the SAME manual
+// terminate that produces this event, so looking the name up afterward would
+// spuriously see `None` (the entry is already gone).
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_child_event_carries_name_even_when_the_spec_is_pruned() {
+    let events = recorder();
+    let sup = MgmtSup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-temp-name"))
+    .supervisor()
+    .await
+    .unwrap();
+
+    let name = uname("temp-worker-name");
+    op(
+        &sup,
+        SupCmd::SpawnWorker {
+            name: name.clone(),
+            restart_type: RestartType::Temporary,
+            shutdown: Shutdown::Timeout(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("spawn worker");
+    wait_worker_ready(&name, 5_000).await.expect("worker up");
+
+    op(&sup, SupCmd::Terminate { id: name.clone() })
+        .await
+        .expect("terminate_child must return Ok");
+
+    let evs = wait_for_events(&events, 5_000, |e| event_for(e, &name).is_some()).await;
+    let ev = event_for(&evs, &name).unwrap_or_else(|| panic!("no death event: {evs:?}"));
+    assert_eq!(
+        ev.child_name.as_deref(),
+        Some(name.as_str()),
+        "the pruned Temporary spec must not make child_name spuriously None"
     );
 }
 
@@ -846,6 +925,52 @@ async fn terminate_hung_child_abort_backstop() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn handle_equality_stable_across_restart() {
+    let events = recorder();
+    let sup = MgmtSup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-handle-eq"))
+    .supervisor()
+    .await
+    .unwrap();
+
+    let name = uname("handle-eq-worker");
+    op(
+        &sup,
+        SupCmd::SpawnWorker {
+            name: name.clone(),
+            restart_type: RestartType::Permanent,
+            shutdown: Shutdown::Timeout(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("spawn worker");
+
+    let before = wait_worker_ready(&name, 5_000).await.expect("worker up");
+    before.notify(WorkerMsg::Crash).await.unwrap();
+
+    let after = wait_worker_ready(&name, 10_000)
+        .await
+        .expect("worker must be back after the crash-triggered restart");
+
+    assert_eq!(
+        before.id(),
+        after.id(),
+        "a restart must preserve the ActorId"
+    );
+    assert_eq!(
+        before, after,
+        "same id + same system must stay equal across a restart even \
+         though the handle's underlying channels were replaced"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
 async fn manual_ops_error_during_pending_group() {
     let events = recorder();
     let sup = MgmtSup {
@@ -906,11 +1031,14 @@ async fn manual_ops_error_during_pending_group() {
     worker_a.notify(WorkerMsg::Crash).await.unwrap();
     sleep(Duration::from_millis(100)).await;
 
-    // A manual op on a member of the pending group must be refused: one
-    // state machine at a time.
+    // A Bounce (stop_child) on a member of the pending group must still be
+    // refused: unlike Terminate (see
+    // `terminate_during_group_stop_overrides_default_restart`), a Bounce
+    // carries no override semantics, so it stays rejected while the group's
+    // own state machine owns this member.
     match op(
         &sup,
-        SupCmd::Terminate {
+        SupCmd::Stop {
             id: name_veto.clone(),
         },
     )
@@ -918,10 +1046,10 @@ async fn manual_ops_error_during_pending_group() {
     {
         Err(msg) => assert!(
             msg.contains("is restarting"),
-            "manual op on a pending-group member must be ChildRestarting, got: {msg}"
+            "a Bounce on a pending-group member must be ChildRestarting, got: {msg}"
         ),
         // Timing tolerance: on a pathologically slow runner the group may
-        // already have completed, making the terminate legitimately succeed.
+        // already have completed, making the stop legitimately succeed.
         // The 800ms veto window makes this the rare path.
         Ok(()) => eprintln!(
             "group completed before the manual op could race it; accepting Ok \
@@ -932,5 +1060,257 @@ async fn manual_ops_error_during_pending_group() {
     assert!(
         sup.is_alive(),
         "supervisor must stay alive through group restart + refused manual op"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// A caller's `terminate_child` on a group member still awaiting its own
+// death (the group's Stopping phase) is honored over the group's default
+// restart: the member ends up Removed instead of rejoining the restart
+// chain, and the group still completes for its other members.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_during_group_stop_overrides_default_restart() {
+    let events = recorder();
+    let sup = MgmtSup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-group-override"))
+    .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
+    .await
+    .unwrap();
+
+    let name_a = uname("override-a");
+    let name_veto = uname("override-veto");
+    op(
+        &sup,
+        SupCmd::SpawnWorker {
+            name: name_a.clone(),
+            restart_type: RestartType::Permanent,
+            shutdown: Shutdown::Timeout(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("spawn a");
+    op(
+        &sup,
+        SupCmd::SpawnVetoer {
+            name: name_veto.clone(),
+            timeout_ms: 800,
+        },
+    )
+    .await
+    .expect("spawn vetoer");
+
+    let worker_a = wait_worker_ready(&name_a, 5_000).await.expect("a up");
+    let sys = ActorSystem::default();
+    assert!(
+        wait_until(5_000, || sys.get::<Vetoer>(&name_veto).is_some()).await,
+        "vetoer must come up"
+    );
+
+    // Crash `a`: OneForAll pulls the group (both members) into a Stopping
+    // phase. The vetoer holds it open for ~800ms, giving a wide window to
+    // land the override.
+    worker_a.notify(WorkerMsg::Crash).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    // The override: Terminate wins over the group's default restart for
+    // this specific member. It still blocks until the vetoer is actually
+    // gone (escalated Kill after the 800ms timeout).
+    let t0 = Instant::now();
+    op(
+        &sup,
+        SupCmd::Terminate {
+            id: name_veto.clone(),
+        },
+    )
+    .await
+    .expect("terminate_child must be honored during the group's Stopping phase");
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "the override must still be bounded by the vetoer's own escalation ladder"
+    );
+
+    // The group still completes: `a` comes back up with fresh state.
+    let revived_a = wait_worker_ready(&name_a, 10_000)
+        .await
+        .expect("the group must still complete for its other member");
+    assert_eq!(revived_a.send(WorkerMsg::Count).await.unwrap(), 0);
+
+    // The overridden member is Removed, not restarted, and stays down.
+    let evs = wait_for_events(&events, 10_000, |e| event_for(e, &name_veto).is_some()).await;
+    let ev = event_for(&evs, &name_veto)
+        .unwrap_or_else(|| panic!("no death event for the overridden member: {evs:?}"));
+    assert_eq!(
+        ev.action,
+        SupervisionAction::Removed,
+        "a Terminate override must report Removed, not RestartInitiated: {ev:?}"
+    );
+    assert!(
+        sys.get::<Vetoer>(&name_veto).is_none(),
+        "the overridden member must stay down"
+    );
+    sleep(Duration::from_millis(200)).await;
+    assert!(
+        sys.get::<Vetoer>(&name_veto).is_none(),
+        "the overridden member must not be revived by the group's own chain"
+    );
+    assert!(sup.is_alive());
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// A `terminate_child` racing a child that independently crashes at the exact
+// moment the stop signal lands (real `StopReason::Failure`, via a `pre_stop`
+// panic) absorbs the crash into the manual completion: no budget charge, no
+// restart - exactly like a clean terminate.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminate_child_absorbs_a_racing_failure() {
+    let events = recorder();
+    let sup = MgmtSup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-race-terminate"))
+    .with_supervision(SupervisionConfig::one_for_one().max_restarts(1, Duration::from_secs(60)))
+    .await
+    .unwrap();
+
+    let name = uname("race-terminate-worker");
+    op(
+        &sup,
+        SupCmd::SpawnPanicsOnStop {
+            name: name.clone(),
+            restart_type: RestartType::Permanent,
+        },
+    )
+    .await
+    .expect("spawn worker");
+    let sys = ActorSystem::default();
+    assert!(
+        wait_until(5_000, || sys.get::<PanicsOnStop>(&name).is_some()).await,
+        "worker up"
+    );
+
+    // The commit raises ParentRequest (Shutdown::Timeout); `pre_stop` panics
+    // instead of honoring it, so the REAL observed reason is Failure even
+    // though our intent was Terminate.
+    op(&sup, SupCmd::Terminate { id: name.clone() })
+        .await
+        .expect("terminate_child must absorb the racing crash and return Ok");
+
+    let evs = wait_for_events(&events, 5_000, |e| event_for(e, &name).is_some()).await;
+    let ev = event_for(&evs, &name).unwrap_or_else(|| panic!("no death event: {evs:?}"));
+    assert!(
+        matches!(ev.reason, StopReason::Failure(_)),
+        "the REAL reason must be reported, not the intent: {:?}",
+        ev.reason
+    );
+    assert_eq!(
+        ev.action,
+        SupervisionAction::Removed,
+        "Terminate absorbs a racing Failure: no restart"
+    );
+    assert_eq!(evs.len(), 1, "exactly one death event: {evs:?}");
+    assert!(
+        sys.get::<PanicsOnStop>(&name).is_none(),
+        "absorbed Terminate must not restart the child"
+    );
+
+    // The budget was NOT charged: a second, unrelated crash on a fresh
+    // sibling must still be allowed to restart under the same max_restarts=1
+    // supervisor.
+    let sibling = uname("race-terminate-sibling");
+    op(
+        &sup,
+        SupCmd::SpawnWorker {
+            name: sibling.clone(),
+            restart_type: RestartType::Permanent,
+            shutdown: Shutdown::Timeout(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .expect("spawn sibling");
+    let sibling_handle = wait_worker_ready(&sibling, 5_000)
+        .await
+        .expect("sibling up");
+    sibling_handle.notify(WorkerMsg::Crash).await.unwrap();
+    assert!(
+        wait_worker_ready(&sibling, 10_000).await.is_some(),
+        "a fresh crash must still restart - the absorbed racing Failure must not have \
+         consumed the shared restart budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// A `stop_child` (Bounce) racing a child that crashes at the exact moment
+// the stop signal lands (real `StopReason::Failure`, via a `pre_stop` panic)
+// is NOT treated as a manual bounce: the real Failure routes to ordinary,
+// budget-charged strategy evaluation instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_child_bounce_racing_failure_charges_the_budget() {
+    let events = recorder();
+    let sup = MgmtSup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-race-bounce"))
+    .with_supervision(SupervisionConfig::one_for_one().max_restarts(1, Duration::from_secs(60)))
+    .await
+    .unwrap();
+
+    let name = uname("race-bounce-worker");
+    op(
+        &sup,
+        SupCmd::SpawnPanicsOnStop {
+            name: name.clone(),
+            restart_type: RestartType::Permanent,
+        },
+    )
+    .await
+    .expect("spawn worker");
+    let sys = ActorSystem::default();
+    assert!(
+        wait_until(5_000, || sys.get::<PanicsOnStop>(&name).is_some()).await,
+        "worker up"
+    );
+
+    op(&sup, SupCmd::Stop { id: name.clone() })
+        .await
+        .expect("stop_child must still return Ok once the real fate is observed");
+
+    // Routed through ordinary strategy evaluation: restarted ON THE BUDGET,
+    // reported with the REAL Failure reason (not a synthetic ParentRequest).
+    assert!(
+        wait_until(10_000, || sys.get::<PanicsOnStop>(&name).is_some()).await,
+        "a racing Failure under Bounce must still be restarted by strategy"
+    );
+
+    let evs = wait_for_events(&events, 10_000, |e| event_for(e, &name).is_some()).await;
+    let ev = event_for(&evs, &name).unwrap_or_else(|| panic!("no death event: {evs:?}"));
+    assert!(
+        matches!(ev.reason, StopReason::Failure(_)),
+        "a racing Failure under Bounce reports the REAL reason: {:?}",
+        ev.reason
+    );
+    assert_eq!(
+        ev.action,
+        SupervisionAction::RestartInitiated,
+        "a racing Failure under Bounce still restarts, on the budget: {ev:?}"
+    );
+
+    // The single restart slot is now spent: a second manual stop (which will
+    // ALSO panic in pre_stop, i.e. another real Failure) must exhaust the
+    // budget and stop the supervisor - proof the first one DID charge it.
+    let _ = op(&sup, SupCmd::Stop { id: name.clone() }).await;
+    assert!(
+        wait_until(10_000, || !sup.is_alive()).await,
+        "the budget must already be exhausted by the racing-Failure bounce"
     );
 }

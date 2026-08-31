@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult, StopReason, StreamEvent,
@@ -826,5 +826,83 @@ async fn test_cancel_nonexistent_stream() {
         .unwrap();
 
     sleep(Duration::from_millis(50)).await;
+    handle.stop(StopReason::Graceful).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finished_stream_leaves_zero_registrations() {
+    struct FinishReapActor {
+        rx: Option<tokio::sync::mpsc::Receiver<i32>>,
+    }
+
+    enum Msg {
+        Stream(StreamEvent<i32>),
+        GetCount,
+    }
+
+    impl From<StreamEvent<i32>> for Msg {
+        fn from(ev: StreamEvent<i32>) -> Self {
+            Msg::Stream(ev)
+        }
+    }
+
+    enum Resp {
+        Ack,
+        Count(usize),
+    }
+
+    impl Actor for FinishReapActor {
+        type Message = Msg;
+        type Response = Resp;
+
+        async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+            if let Some(rx) = self.rx.take() {
+                ctx.add_stream(ReceiverStream::new(rx));
+            }
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> ActorResult<Self::Response> {
+            match msg {
+                Msg::Stream(_) => Ok(Resp::Ack),
+                Msg::GetCount => Ok(Resp::Count(ctx.active_stream_count())),
+            }
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<i32>(16);
+
+    let handle = FinishReapActor { rx: Some(rx) }
+        .spawn()
+        .named("finish-reap")
+        .with_config(ActorConfig::default())
+        .await
+        .unwrap();
+
+    // Ending the stream (no items, sender dropped) drives it to
+    // `StreamEvent::Finished`; the forwarder task then exits on its own,
+    // with nothing left for `cancel_stream` to have already cleaned up.
+    drop(tx);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = match handle.send(Msg::GetCount).await.unwrap() {
+            Resp::Count(c) => c,
+            Resp::Ack => usize::MAX,
+        };
+        if count == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a finished stream must be reaped from active_stream_count within 5s"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+
     handle.stop(StopReason::Graceful).await.unwrap();
 }

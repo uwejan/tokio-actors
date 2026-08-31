@@ -364,9 +364,10 @@ async fn duplicate_child_kept_spec_then_delete_allows_respawn() {
         "spawn_child against a kept spec must return DuplicateChild (OTP already_present)"
     );
 
-    // Registry bookkeeping may lag the terminate by one system-channel event
-    // (the watcher-delivered death still has to be adopted), so poll the
-    // delete until the child is seen dead instead of asserting immediately.
+    // Registry bookkeeping may lag the terminate by one death-plane
+    // observation (the terminated child's own watcher completion still has
+    // to be picked up and adopted), so poll the delete until the child is
+    // seen dead instead of asserting immediately.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match sup.send(MgmtCmd::Delete(name.clone())).await.unwrap() {

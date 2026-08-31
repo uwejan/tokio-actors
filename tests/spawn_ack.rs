@@ -325,6 +325,31 @@ async fn start_timeout_aborts_slow_init_and_skips_on_stopped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_respawn_after_start_timeout_never_sees_name_taken() {
+    let name = "spawn-ack-start-timeout-respawn-loop";
+
+    for round in 1..=20 {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let result = SlowInit { stopped }
+            .spawn()
+            .named(name)
+            .start_timeout(Duration::from_millis(30))
+            .await;
+        match result {
+            Err(SpawnError::StartTimeout) => {}
+            Ok(_) => {
+                panic!("round {round}: spawn must time out: pre_start sleeps past the deadline")
+            }
+            Err(SpawnError::NameTaken { .. }) => panic!(
+                "round {round}: NameTaken - the timeout error raced the \
+                 aborted task's own teardown"
+            ),
+            Err(other) => panic!("round {round}: expected SpawnError::StartTimeout, got: {other}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_started_panic_surfaces_as_spawn_error_init_and_skips_on_stopped() {
     let stopped = Arc::new(AtomicBool::new(false));
     let result = PanicInit {

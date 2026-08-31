@@ -48,6 +48,9 @@ pub enum SendError {
     /// The actor's mailbox is closed (actor stopped).
     #[error("mailbox closed")]
     Closed,
+    /// No actor is registered under the given name or ID.
+    #[error("no actor registered under this name")]
+    NotFound,
 }
 
 /// Failures encountered while sending without awaiting capacity.
@@ -115,6 +118,12 @@ pub enum SpawnError {
     /// No Tokio runtime was found in the current context.
     #[error("tokio runtime handle not in scope")]
     MissingRuntime,
+    /// The configured mailbox capacity was zero. Every actor's mailbox must
+    /// hold at least one message; `tokio::sync::mpsc::channel` panics on a
+    /// zero-sized buffer, so this is caught before the channel is ever
+    /// created.
+    #[error("mailbox capacity must be at least 1, got 0")]
+    ZeroMailboxCapacity,
     /// A child with the same ID is already registered.
     #[error("child actor `{0}` already registered")]
     DuplicateChild(ActorId),
@@ -129,11 +138,15 @@ pub enum SpawnError {
     /// An actor system with the given name already exists.
     #[error("actor system `{0}` already exists")]
     SystemNameTaken(String),
-    /// The actor system `{0}` has begun shutting down (`shutdown`/
-    /// `shutdown_with` were called): new registrations are rejected from
-    /// that point on, matching OTP's application-controller behavior during
-    /// stop. Un-named, un-systemed spawns are unaffected - they were never
-    /// the registry's to manage.
+    /// The actor system `{0}` is not currently accepting registrations: it
+    /// is either shutting down (`shutdown`/`shutdown_with` in flight) or has
+    /// finished shutting down, matching OTP's application-controller
+    /// behavior during stop. This is not permanent -
+    /// [`ActorSystem::reactivate`](crate::system::ActorSystem::reactivate)
+    /// returns a fully-shut-down system to active once its shutdown has
+    /// completed, so a system's name is never poisoned forever. Un-named,
+    /// un-systemed spawns are unaffected - they were never the registry's to
+    /// manage.
     #[error("actor system `{0}` is shutting down")]
     SystemShuttingDown(String),
     /// The actor's `pre_start` or `on_started` returned `Err`, or panicked,

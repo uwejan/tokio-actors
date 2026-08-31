@@ -1,6 +1,6 @@
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult,
+    ActorConfig, ActorResult, SpawnError,
 };
 
 #[derive(Default)]
@@ -72,4 +72,20 @@ async fn config_with_custom_mailbox_via_builder() {
         .await
         .unwrap();
     assert_eq!(actor.mailbox_capacity(), 128);
+}
+
+#[tokio::test]
+async fn zero_mailbox_capacity_returns_spawn_error_instead_of_panicking() {
+    let config = ActorConfig::default().with_mailbox_capacity(0);
+    let result = DummyActor
+        .spawn()
+        .named("cfg-zero-mailbox")
+        .with_config(config)
+        .await;
+
+    match result {
+        Err(SpawnError::ZeroMailboxCapacity) => {}
+        Ok(_) => panic!("spawn must fail on a zero-capacity mailbox"),
+        Err(other) => panic!("expected SpawnError::ZeroMailboxCapacity, got: {other}"),
+    }
 }

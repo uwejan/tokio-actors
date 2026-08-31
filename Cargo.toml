@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.75"
 description = "OTP-faithful actors for Tokio: panic-visible supervision, restart strategies, and Erlang-grade lifecycle semantics with zero ceremony"
