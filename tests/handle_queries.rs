@@ -59,7 +59,9 @@ async fn is_alive_returns_false_after_stop() {
         .await
         .unwrap();
     actor.stop(StopReason::Graceful).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(10), actor.wait_stopped())
+        .await
+        .expect("the stopped actor stops");
     assert!(
         !actor.is_alive(),
         "Actor should not be alive after stopping"

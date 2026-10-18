@@ -18,13 +18,13 @@ struct PongActor {
 
 #[derive(Clone)]
 enum PongMsg {
-    Ping, // ← No manual reply_to needed!
+    Ping, // No manual reply_to needed.
     GetCount,
 }
 
 #[derive(Clone)]
 enum PongResp {
-    Pong, // ← Response goes through send() automatically
+    Pong, // The response goes back through send() automatically.
     Count(u64),
 }
 
@@ -40,7 +40,7 @@ impl Actor for PongActor {
         match msg {
             PongMsg::Ping => {
                 self.pings_received += 1;
-                Ok(PongResp::Pong) // ← Just return the response!
+                Ok(PongResp::Pong) // Return the response; send() delivers it.
             }
             PongMsg::GetCount => Ok(PongResp::Count(self.pings_received)),
         }

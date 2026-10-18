@@ -15,6 +15,7 @@ async fn create_with_custom_config() {
                 timeout: Duration::from_secs(1),
                 per_actor_timeout: Duration::from_millis(500),
             },
+            ..Default::default()
         },
     )
     .unwrap();

@@ -97,7 +97,9 @@ async fn stop_bypasses_full_mailbox() {
 
     // Stop should still work via system channel
     handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(10), handle.wait_stopped())
+        .await
+        .expect("the stop lands despite the full mailbox");
     assert!(!handle.is_alive());
 }
 
@@ -163,7 +165,11 @@ async fn kill_on_lane_outranks_a_pending_get_status_on_system_channel() {
     // cannot service its select! at all.
     let handle_for_status = handle.clone();
     let status_call = tokio::spawn(async move { handle_for_status.get_status().await });
-    sleep(Duration::from_millis(20)).await; // let the send land before Kill
+    // Makes the both-pending shape likely; the assertion holds whichever
+    // lands first, because the stop lane outranks the system channel at
+    // every turn boundary, and nothing public reads the system channel's
+    // queue to order this by observation.
+    sleep(Duration::from_millis(20)).await;
 
     // Raise Kill on the lane - both are now pending when the handler releases.
     handle.stop(StopReason::Kill).await.unwrap();

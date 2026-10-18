@@ -69,7 +69,7 @@ async fn zombie_actor_visible_and_killable() {
     assert_eq!(sys.actor_status(&id), Some(ActorStatus::Running));
 
     assert!(
-        sys.kill_by_id(&id).await,
+        sys.kill_by_id(&id).await.is_some(),
         "kill_by_id finds the registered zombie"
     );
 
@@ -83,7 +83,7 @@ async fn actor_status_none_for_unknown_id() {
     let sys = ActorSystem::default();
     let unknown = tokio_actors::ActorId::from(format!("unknown-{}", uuid::Uuid::new_v4()));
     assert_eq!(sys.actor_status(&unknown), None);
-    assert!(!sys.kill_by_id(&unknown).await);
+    assert!(sys.kill_by_id(&unknown).await.is_none());
 }
 
 // A gracefully-stopped actor's id leaves `actor_ids()` once its
@@ -102,6 +102,6 @@ async fn stopped_actor_id_leaves_actor_ids() {
         .expect("stop request delivered");
     handle.wait_stopped().await;
 
-    let pruned = wait_until(1_000, || !sys.actor_ids().contains(&id)).await;
+    let pruned = wait_until(10_000, || !sys.actor_ids().contains(&id)).await;
     assert!(pruned, "stopped actor's id must leave actor_ids()");
 }

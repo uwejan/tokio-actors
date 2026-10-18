@@ -90,7 +90,10 @@ async fn timer_actor_liveness_contract() {
          this one is alive because nothing has stopped it yet"
     );
 
-    assert!(sys.kill_by_id(&id).await, "kill_by_id finds the zombie");
+    assert!(
+        sys.kill_by_id(&id).await.is_some(),
+        "kill_by_id finds the zombie"
+    );
 
     // kill_by_id awaits the actor reaching a terminal status, so the
     // ActorContext (and therefore its timer-cancellation Drop impl) has

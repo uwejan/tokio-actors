@@ -4,11 +4,27 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorResult, ActorSystem, SpawnError, StopReason,
+    ActorConfig, ActorError, ActorResult, ActorStatus, ActorSystem, SendError, Shutdown,
+    SpawnError, StopReason, TrySendError,
 };
+
+/// The bound on every outcome a test awaits.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Polls `pred` until it holds; fails the test after `BOUND`.
+async fn eventually(what: &str, mut pred: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while !pred() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        sleep(Duration::from_millis(1)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared message/response types
@@ -86,12 +102,13 @@ async fn lifecycle_hooks_fire_without_supervision() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(10)).await;
-    assert!(started_flag.load(Ordering::SeqCst));
+    eventually("on_started to run", || started_flag.load(Ordering::SeqCst)).await;
 
     handle.notify(Msg::Ping).await.unwrap();
     handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    timeout(BOUND, handle.wait_stopped())
+        .await
+        .expect("the actor stops");
 
     assert!(stopped_flag.load(Ordering::SeqCst));
 }
@@ -264,11 +281,17 @@ async fn pre_stop_rejection_keeps_actor_alive() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(10)).await;
-
-    // First stop attempt - should be rejected
+    // First stop attempt - should be rejected. A reply to a later message
+    // proves the actor kept running after the veto.
     handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    eventually("the first veto", || {
+        reject_count.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(
+        matches!(handle.send(Msg::Ping).await, Ok(Resp::Ack)),
+        "actor must survive first rejected stop"
+    );
     assert!(handle.is_alive(), "actor must survive first rejected stop");
     assert_eq!(reject_count.load(Ordering::SeqCst), 1);
 
@@ -277,13 +300,22 @@ async fn pre_stop_rejection_keeps_actor_alive() {
 
     // Second stop attempt - should also be rejected
     handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    eventually("the second veto", || {
+        reject_count.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    assert!(
+        matches!(handle.send(Msg::Ping).await, Ok(Resp::Ack)),
+        "actor must survive second rejected stop"
+    );
     assert!(handle.is_alive(), "actor must survive second rejected stop");
     assert_eq!(reject_count.load(Ordering::SeqCst), 2);
 
     // Third stop attempt - should succeed (no rejections remaining)
     handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    timeout(BOUND, handle.wait_stopped())
+        .await
+        .expect("the actor stops once its rejections are exhausted");
     assert!(
         !handle.is_alive(),
         "actor must stop after rejections exhausted"
@@ -354,11 +386,11 @@ async fn forced_stop_bypasses_pre_stop() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(10)).await;
-
     // Cancelled stop bypasses pre_stop entirely
     handle.stop(StopReason::Cancelled).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    timeout(BOUND, handle.wait_stopped())
+        .await
+        .expect("the cancelled actor stops");
 
     assert_eq!(
         reject_count.load(Ordering::SeqCst),
@@ -367,4 +399,132 @@ async fn forced_stop_bypasses_pre_stop() {
     );
     assert!(!handle.is_alive(), "actor must be dead after forced stop");
     assert!(stopped_flag.load(Ordering::SeqCst), "on_stopped must fire");
+}
+
+// ---------------------------------------------------------------------------
+// Stopped implies not alive, on every exit path
+// ---------------------------------------------------------------------------
+
+/// A minimal actor with no lifecycle overrides, used to pin `status() ==
+/// Stopped` implying `!is_alive()` across many spawn/stop cycles.
+#[derive(Default)]
+struct PlainActor;
+
+impl Actor for PlainActor {
+    type Message = Msg;
+    type Response = Resp;
+
+    async fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<Self::Response> {
+        match msg {
+            Msg::Ping => Ok(Resp::Ack),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_implies_not_alive() {
+    for i in 0..500 {
+        let handle = PlainActor.spawn().await.unwrap();
+
+        handle.stop(StopReason::Graceful).await.unwrap();
+        handle.wait_stopped().await;
+
+        assert!(
+            !handle.is_alive(),
+            "iteration {i}: is_alive() must be false once wait_stopped() resolves"
+        );
+        let err = handle.notify(Msg::Ping).await.unwrap_err();
+        assert!(
+            matches!(err, SendError::Closed),
+            "iteration {i}: notify must report Closed once the actor has stopped, got {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sends are refused from stop acceptance onward, throughout a slow child
+// cascade
+// ---------------------------------------------------------------------------
+
+/// Vetoes every stoppable stop forever - only the `Kill` its own supervisor's
+/// `Shutdown::Timeout` escalates to can ever end it.
+#[derive(Default)]
+struct VetoingChild;
+
+impl Actor for VetoingChild {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
+/// A supervisor with one child on a long `Shutdown::Timeout`, so its own
+/// stop spends a well-defined window inside the child cascade (after
+/// `on_stopped` has already run).
+#[derive(Default)]
+struct SlowCascadeSupervisor;
+
+impl Actor for SlowCascadeSupervisor {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(VetoingChild::default)
+            .shutdown(Shutdown::Timeout(Duration::from_millis(600)))
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+/// Ports the report's probe scenario: a supervisor whose one child vetoes
+/// with a long `Shutdown::Timeout`, probed 100ms after `stop(Graceful)` -
+/// still well inside the child's 600ms window. Every "already stopped"
+/// probe must agree from the instant the stop was accepted, not only once
+/// the supervisor's task has fully exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_are_refused_from_stop_acceptance_through_a_slow_child_cascade() {
+    let handle = SlowCascadeSupervisor.spawn().supervisor().await.unwrap();
+
+    // Let the child actually finish spawning before stopping the supervisor.
+    sleep(Duration::from_millis(30)).await;
+
+    handle.stop(StopReason::Graceful).await.unwrap();
+
+    // Still well inside the child's 600ms Shutdown::Timeout window.
+    sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(handle.status(), ActorStatus::Stopping);
+
+    let stop_err = handle.stop(StopReason::Graceful).await.unwrap_err();
+    assert!(matches!(stop_err, SendError::Closed));
+
+    assert!(
+        handle.get_status().await.is_err(),
+        "get_status must report an error once a stop has been accepted"
+    );
+
+    assert!(
+        !handle.is_alive(),
+        "is_alive must be false once the actor has left its loop, even mid-cascade"
+    );
+
+    let notify_err = handle.notify(()).await.unwrap_err();
+    assert!(matches!(notify_err, SendError::Closed));
+
+    let try_notify_err = handle.try_notify(()).unwrap_err();
+    assert!(matches!(try_notify_err, TrySendError::Closed));
 }

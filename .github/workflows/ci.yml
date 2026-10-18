@@ -48,10 +48,127 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --all-features --verbose
+        run: cargo test --all-features --no-fail-fast --verbose
 
       - name: Run tests (no default features)
-        run: cargo test --no-default-features --verbose
+        run: cargo test --no-default-features --no-fail-fast --verbose
+
+  flavor-lane:
+    name: Flavor Lane
+    runs-on: ubuntu-latest
+    env:
+      TOKIO_ACTORS_TEST_FLAVOR: current_thread
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run every flavor-aware suite under a current-thread runtime
+        run: >-
+          cargo test --all-features --no-fail-fast
+          --test actor_drop
+          --test boundaries
+          --test cascade
+          --test kill_grace
+          --test loop_drops
+          --test priority_lane
+          --test restart_plane
+          --test spawn_ack
+          --test stop_lane
+          --test stop_reason_kill
+          --test supervision_child_mgmt
+          --test supervision_crash
+          --test supervision_groups
+          --test supervision_matrix
+          --test system_shutdown
+          --test terminal_reason
+          --test truth_contract
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+
+      - name: Check the library against the minimum supported Rust version
+        run: cargo check --lib --all-features --locked
+
+  tokio-floor:
+    name: Tokio Floor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Pin tokio to the minimum the manifest declares
+        run: |
+          FLOOR=$(grep -m1 "^tokio = " Cargo.toml | sed -E "s/.*version = \"([0-9]+\.[0-9]+(\.[0-9]+)?)\".*/\1/")
+          case "$FLOOR" in
+            *.*.*) ;;
+            *) FLOOR="$FLOOR.0" ;;
+          esac
+          echo "$FLOOR" | grep -Eq "^[0-9]+\.[0-9]+\.[0-9]+$" || { echo "could not read the tokio floor from Cargo.toml: '$FLOOR'"; exit 1; }
+          echo "tokio floor: $FLOOR"
+          sed -i -E "s/^(tokio = \{ version = )\"[0-9][0-9.]*\"/\1\"=$FLOOR\"/" Cargo.toml
+          cargo update -p tokio -p tokio-util -p tokio-stream
+          grep -A 1 '^name = "tokio"$' Cargo.lock | grep -q "version = \"$FLOOR\"" || { echo "tokio is not locked at $FLOOR"; exit 1; }
+
+      - name: Check every target against that tokio
+        run: cargo check --all-features --all-targets
+
+  explorer:
+    name: Explorer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the small explorer configurations
+        run: cargo test --all-features --no-fail-fast --lib supervision::explore
+
+      - name: Run the full explorer configurations
+        run: cargo test --release --all-features --no-fail-fast --lib supervision::explore -- --ignored --test-threads=1
+
+  semver:
+    name: Semver Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check public API for semver violations
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  deny:
+    name: Deny
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check licenses, bans, sources, and advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
 
   clippy:
     name: Clippy - ${{ matrix.os }}
@@ -71,7 +188,7 @@ jobs:
           components: clippy
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -102,6 +219,8 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   examples:
     name: Examples - ${{ matrix.os }}
@@ -139,7 +258,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --all-features --workspace --timeout 300 --out Xml
+        run: cargo tarpaulin --all-features --workspace --engine llvm --timeout 1800 --out Xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

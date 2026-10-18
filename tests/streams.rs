@@ -7,6 +7,23 @@ use tokio_actors::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 
+/// The bound on every outcome a test awaits.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Asks `done` until it answers true or `BOUND` passes; the test's own
+/// assertions then decide, so a state that never arrives fails there with
+/// its full contents.
+async fn settle<F, Fut>(mut done: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + BOUND;
+    while !done().await && Instant::now() < deadline {
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_infallible_stream() {
     struct StreamCollector {
@@ -80,7 +97,11 @@ async fn test_infallible_stream() {
     }
     drop(tx2); // close channel -> stream yields None -> Finished
 
-    sleep(Duration::from_millis(50)).await;
+    let h = &handle;
+    settle(|| async move {
+        matches!(h.send(Msg::GetItems).await, Ok(Resp::Items(items, true)) if items == vec![1, 2, 3, 4, 5])
+    })
+    .await;
 
     if let Resp::Items(items, finished) = handle.send(Msg::GetItems).await.unwrap() {
         assert_eq!(items, vec![1, 2, 3, 4, 5]);
@@ -174,7 +195,11 @@ async fn test_fallible_stream() {
     tx.send(Ok("world".into())).await.unwrap();
     drop(tx);
 
-    sleep(Duration::from_millis(50)).await;
+    let h = &handle;
+    settle(|| async move {
+        matches!(h.send(Msg::GetResults).await, Ok(Resp::Results(oks, errs, true)) if oks.len() == 2 && errs.len() == 1)
+    })
+    .await;
 
     if let Resp::Results(oks, errs, finished) = handle.send(Msg::GetResults).await.unwrap() {
         assert_eq!(oks, vec!["hello", "world"]);
@@ -252,7 +277,8 @@ async fn test_stream_finished_on_drop() {
     // Drop sender immediately - stream should yield None -> Finished
     drop(tx);
 
-    sleep(Duration::from_millis(50)).await;
+    let h = &handle;
+    settle(|| async move { matches!(h.send(Msg::Check).await, Ok(Resp::Finished(true))) }).await;
 
     if let Resp::Finished(finished) = handle.send(Msg::Check).await.unwrap() {
         assert!(finished, "Should receive Finished when sender is dropped");
@@ -343,11 +369,14 @@ async fn test_cancel_stream() {
     // Send some items first - these should arrive
     tx.send(1).await.unwrap();
     tx.send(2).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
+    let h = &handle;
+    settle(|| async move {
+        matches!(h.send(Msg::GetState).await, Ok(Resp::State(items, false)) if items == vec![1, 2])
+    })
+    .await;
 
-    // Now cancel the stream
-    handle.notify(Msg::DoCancel).await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    // Now cancel the stream; the reply comes once the cancel is done.
+    assert!(matches!(handle.send(Msg::DoCancel).await, Ok(Resp::Ack)));
 
     // Send more items - these should NOT arrive
     let _ = tx.send(3).await;
@@ -450,11 +479,11 @@ async fn test_cancel_all_streams() {
     // Send items - these arrive before cancel
     tx1.send(1).await.unwrap();
     tx2.send(2).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
+    let h = &handle;
+    settle(|| async move { matches!(h.send(Msg::GetState).await, Ok(Resp::State(2, 0))) }).await;
 
-    // Cancel all streams
-    handle.notify(Msg::DoCancelAll).await.unwrap();
-    sleep(Duration::from_millis(20)).await;
+    // Cancel all streams; the reply comes once the cancel is done.
+    assert!(matches!(handle.send(Msg::DoCancelAll).await, Ok(Resp::Ack)));
 
     // Send more items - should NOT arrive
     let _ = tx1.send(3).await;
@@ -628,7 +657,11 @@ async fn test_multiple_streams() {
     drop(tx1);
     drop(tx2);
 
-    sleep(Duration::from_millis(50)).await;
+    let h = &handle;
+    settle(|| async move {
+        matches!(h.send(Msg::GetState).await, Ok(Resp::State(items, 2)) if items.len() == 4)
+    })
+    .await;
 
     if let Resp::State(mut items, finish_count) = handle.send(Msg::GetState).await.unwrap() {
         items.sort();
@@ -698,7 +731,9 @@ async fn test_stream_cancelled_on_actor_stop() {
 
     // Try to send through channel - should fail because receiver side is dropped
     // or the forwarding task exited (either way, no one is consuming).
-    sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(BOUND, handle.wait_stopped())
+        .await
+        .expect("the stopped actor stops");
 
     // The channel send may succeed if the mpsc buffer isn't full, but the forwarding
     // task should have stopped. We verify by checking the actor actually stopped.
@@ -767,7 +802,8 @@ async fn test_empty_stream() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(50)).await;
+    let h = &handle;
+    settle(|| async move { matches!(h.send(Msg::Check).await, Ok(Resp::Finished(true))) }).await;
 
     if let Resp::Finished(finished) = handle.send(Msg::Check).await.unwrap() {
         assert!(finished, "Empty stream should send Finished immediately");
@@ -905,4 +941,92 @@ async fn finished_stream_leaves_zero_registrations() {
     }
 
     handle.stop(StopReason::Graceful).await.unwrap();
+}
+
+/// A stream that ends at once and panics when dropped.
+struct EndsAndPanicsWhenDropped;
+
+impl futures_core::Stream for EndsAndPanicsWhenDropped {
+    type Item = ();
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<()>> {
+        std::task::Poll::Ready(None)
+    }
+}
+
+impl Drop for EndsAndPanicsWhenDropped {
+    fn drop(&mut self) {
+        panic!("the ended stream panicked when dropped");
+    }
+}
+
+struct ReadsItsForwarderError;
+
+enum ErrMsg {
+    Stream,
+    Read,
+}
+
+impl From<StreamEvent<()>> for ErrMsg {
+    fn from(_: StreamEvent<()>) -> Self {
+        ErrMsg::Stream
+    }
+}
+
+impl Actor for ReadsItsForwarderError {
+    type Message = ErrMsg;
+    type Response = Option<String>;
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.add_stream(EndsAndPanicsWhenDropped);
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        msg: ErrMsg,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<Option<String>> {
+        Ok(match msg {
+            ErrMsg::Stream => None,
+            ErrMsg::Read => ctx.last_forwarder_error().map(|err| err.to_string()),
+        })
+    }
+}
+
+/// A stream that ends during the run and panics when dropped: the panic is
+/// the actor's last forwarder error, read by a later message, and the actor
+/// keeps running.
+async fn an_ended_stream_s_drop_panic_is_the_last_forwarder_error() {
+    let handle = ReadsItsForwarderError.spawn().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let recorded = loop {
+        if let Some(text) = handle.send(ErrMsg::Read).await.unwrap() {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "the drop's panic is recorded");
+        sleep(Duration::from_millis(1)).await;
+    };
+    assert!(
+        recorded.contains("the ended stream panicked when dropped"),
+        "{recorded}"
+    );
+    assert!(
+        handle.is_alive(),
+        "a forwarder's panic never stops the actor"
+    );
+    handle.stop(StopReason::Graceful).await.unwrap();
+    handle.wait_stopped().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_ended_stream_s_drop_panic_is_the_last_forwarder_error_current_thread() {
+    an_ended_stream_s_drop_panic_is_the_last_forwarder_error().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_stream_s_drop_panic_is_the_last_forwarder_error_multi_thread() {
+    an_ended_stream_s_drop_panic_is_the_last_forwarder_error().await;
 }

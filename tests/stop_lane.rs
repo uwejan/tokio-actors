@@ -21,6 +21,8 @@ use tokio_actors::{
     ActorConfig, ActorResult, SendError, StopReason,
 };
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Helper actor
 // ---------------------------------------------------------------------------
@@ -92,70 +94,74 @@ impl Actor for Prober {
 // Item 4: stop to an already-terminated actor
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_after_already_stopped_matches_closed_mpsc_error() {
-    let handle = Prober::default()
-        .spawn()
-        .named("lane-already-dead")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+#[test]
+fn stop_after_already_stopped_matches_closed_mpsc_error() {
+    common::run(2, async {
+        let handle = Prober::default()
+            .spawn()
+            .named("lane-already-dead")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    // accept_from defaults to MAX (always veto), so escalate straight to
-    // Kill to guarantee termination without depending on pre_stop.
-    handle.stop(StopReason::Kill).await.unwrap();
-    handle.wait_stopped().await;
+        // accept_from defaults to MAX (always veto), so escalate straight to
+        // Kill to guarantee termination without depending on pre_stop.
+        handle.stop(StopReason::Kill).await.unwrap();
+        handle.wait_stopped().await;
 
-    let stop_err = handle.stop(StopReason::Graceful).await.unwrap_err();
-    assert!(
-        matches!(stop_err, SendError::Closed),
-        "got {stop_err:?}, expected the same Closed error a full mailbox send used to return"
-    );
+        let stop_err = handle.stop(StopReason::Graceful).await.unwrap_err();
+        assert!(
+            matches!(stop_err, SendError::Closed),
+            "got {stop_err:?}, expected the same Closed error a full mailbox send used to return"
+        );
 
-    // Cross-check against the pre-existing closed-mailbox error for the same
-    // dead actor: both planes must agree on "already stopped".
-    let notify_err = handle.notify(ProbeMsg::Noop).await.unwrap_err();
-    assert!(matches!(notify_err, SendError::Closed));
+        // Cross-check against the pre-existing closed-mailbox error for the same
+        // dead actor: both planes must agree on "already stopped".
+        let notify_err = handle.notify(ProbeMsg::Noop).await.unwrap_err();
+        assert!(matches!(notify_err, SendError::Closed));
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Item 5: veto-then-resend re-fires pre_stop
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn veto_then_resend_same_severity_re_fires_pre_stop() {
-    let actor = Prober {
-        accept_from: 2, // first Graceful is vetoed, second is accepted
-        ..Prober::default()
-    };
-    let pre_stop_calls = actor.pre_stop_calls.clone();
-    let on_stopped_calls = actor.on_stopped_calls.clone();
+#[test]
+fn veto_then_resend_same_severity_re_fires_pre_stop() {
+    common::run(2, async {
+        let actor = Prober {
+            accept_from: 2, // first Graceful is vetoed, second is accepted
+            ..Prober::default()
+        };
+        let pre_stop_calls = actor.pre_stop_calls.clone();
+        let on_stopped_calls = actor.on_stopped_calls.clone();
 
-    let handle = actor
-        .spawn()
-        .named("lane-veto-then-resend")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("lane-veto-then-resend")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    handle.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(50)).await;
-    assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 1);
-    assert!(
-        handle.is_alive(),
-        "the first, vetoed raise must not stop the actor"
-    );
+        handle.stop(StopReason::Graceful).await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            handle.is_alive(),
+            "the first, vetoed raise must not stop the actor"
+        );
 
-    // Same severity, a fresh generation: must land and re-fire pre_stop.
-    handle.stop(StopReason::Graceful).await.unwrap();
-    handle.wait_stopped().await;
+        // Same severity, a fresh generation: must land and re-fire pre_stop.
+        handle.stop(StopReason::Graceful).await.unwrap();
+        handle.wait_stopped().await;
 
-    assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        on_stopped_calls.load(Ordering::SeqCst),
-        1,
-        "the accepted Graceful stop runs on_stopped"
-    );
+        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            on_stopped_calls.load(Ordering::SeqCst),
+            1,
+            "the accepted Graceful stop runs on_stopped"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -164,79 +170,83 @@ async fn veto_then_resend_same_severity_re_fires_pre_stop() {
 // N observations. Together these pin both ends of ">=1 and <=N".
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coalesced_raises_during_a_busy_handler_fire_pre_stop_exactly_once() {
-    let actor = Prober::default(); // vetoes forever: isolates the count
-    let pre_stop_calls = actor.pre_stop_calls.clone();
+#[test]
+fn coalesced_raises_during_a_busy_handler_fire_pre_stop_exactly_once() {
+    common::run(2, async {
+        let actor = Prober::default(); // vetoes forever: isolates the count
+        let pre_stop_calls = actor.pre_stop_calls.clone();
 
-    let handle = actor
-        .spawn()
-        .named("lane-coalesce")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("lane-coalesce")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    handle
-        .notify(ProbeMsg::Hang {
-            started: started.clone(),
-            release: release.clone(),
-        })
-        .await
-        .unwrap();
-    started.notified().await; // the actor's task is now fully occupied
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        handle
+            .notify(ProbeMsg::Hang {
+                started: started.clone(),
+                release: release.clone(),
+            })
+            .await
+            .unwrap();
+        started.notified().await; // the actor's task is now fully occupied
 
-    // Five raises land while the loop cannot possibly be polling the lane.
-    for _ in 0..5 {
-        handle.stop(StopReason::Graceful).await.unwrap();
-    }
+        // Five raises land while the loop cannot possibly be polling the lane.
+        for _ in 0..5 {
+            handle.stop(StopReason::Graceful).await.unwrap();
+        }
 
-    release.notify_one();
-    sleep(Duration::from_millis(50)).await;
+        release.notify_one();
+        sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(
-        pre_stop_calls.load(Ordering::SeqCst),
-        1,
-        "N raises landing between two turn boundaries must coalesce into a \
+        assert_eq!(
+            pre_stop_calls.load(Ordering::SeqCst),
+            1,
+            "N raises landing between two turn boundaries must coalesce into a \
          single observation, not N"
-    );
-    assert!(handle.is_alive());
+        );
+        assert!(handle.is_alive());
 
-    handle.stop(StopReason::Kill).await.unwrap();
+        handle.stop(StopReason::Kill).await.unwrap();
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequential_observed_raises_each_produce_their_own_pre_stop_call() {
-    let actor = Prober::default(); // vetoes forever
-    let pre_stop_calls = actor.pre_stop_calls.clone();
+#[test]
+fn sequential_observed_raises_each_produce_their_own_pre_stop_call() {
+    common::run(2, async {
+        let actor = Prober::default(); // vetoes forever
+        let pre_stop_calls = actor.pre_stop_calls.clone();
 
-    let handle = actor
-        .spawn()
-        .named("lane-sequential")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("lane-sequential")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    const N: usize = 4;
-    for i in 1..=N {
-        handle.stop(StopReason::Graceful).await.unwrap();
-        // Wait for this raise's own observation before issuing the next one,
-        // so none of them can coalesce with each other.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while pre_stop_calls.load(Ordering::SeqCst) < i {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "raise {i} was never observed"
-            );
-            sleep(Duration::from_millis(5)).await;
+        const N: usize = 4;
+        for i in 1..=N {
+            handle.stop(StopReason::Graceful).await.unwrap();
+            // Wait for this raise's own observation before issuing the next one,
+            // so none of them can coalesce with each other.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while pre_stop_calls.load(Ordering::SeqCst) < i {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "raise {i} was never observed"
+                );
+                sleep(Duration::from_millis(5)).await;
+            }
         }
-    }
 
-    assert_eq!(pre_stop_calls.load(Ordering::SeqCst), N);
-    assert!(handle.is_alive());
+        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), N);
+        assert!(handle.is_alive());
 
-    handle.stop(StopReason::Kill).await.unwrap();
+        handle.stop(StopReason::Kill).await.unwrap();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -245,84 +255,88 @@ async fn sequential_observed_raises_each_produce_their_own_pre_stop_call() {
 // vetoed one) - it disappears entirely into the single coalesced cell.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_before_pending_graceful_observation_suppresses_it_entirely() {
-    let actor = Prober::default();
-    let pre_stop_calls = actor.pre_stop_calls.clone();
-    let on_stopped_calls = actor.on_stopped_calls.clone();
+#[test]
+fn kill_before_pending_graceful_observation_suppresses_it_entirely() {
+    common::run(2, async {
+        let actor = Prober::default();
+        let pre_stop_calls = actor.pre_stop_calls.clone();
+        let on_stopped_calls = actor.on_stopped_calls.clone();
 
-    let handle = actor
-        .spawn()
-        .named("lane-kill-supersedes")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("lane-kill-supersedes")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    handle
-        .notify(ProbeMsg::Hang {
-            started: started.clone(),
-            release: release.clone(),
-        })
-        .await
-        .unwrap();
-    started.notified().await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        handle
+            .notify(ProbeMsg::Hang {
+                started: started.clone(),
+                release: release.clone(),
+            })
+            .await
+            .unwrap();
+        started.notified().await;
 
-    // Graceful, then Kill, both while the loop cannot observe either yet.
-    handle.stop(StopReason::Graceful).await.unwrap();
-    handle.stop(StopReason::Kill).await.unwrap();
+        // Graceful, then Kill, both while the loop cannot observe either yet.
+        handle.stop(StopReason::Graceful).await.unwrap();
+        handle.stop(StopReason::Kill).await.unwrap();
 
-    release.notify_one();
-    handle.wait_stopped().await;
+        release.notify_one();
+        handle.wait_stopped().await;
 
-    assert_eq!(
-        pre_stop_calls.load(Ordering::SeqCst),
-        0,
-        "the superseded Graceful raise must never be separately delivered - \
+        assert_eq!(
+            pre_stop_calls.load(Ordering::SeqCst),
+            0,
+            "the superseded Graceful raise must never be separately delivered - \
          Kill bypasses pre_stop, and coalescing means there is only ever one \
          cell, not a queue of both"
-    );
-    assert_eq!(
-        on_stopped_calls.load(Ordering::SeqCst),
-        0,
-        "Kill bypasses on_stopped too"
-    );
+        );
+        assert_eq!(
+            on_stopped_calls.load(Ordering::SeqCst),
+            0,
+            "Kill bypasses on_stopped too"
+        );
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn graceful_after_kill_has_no_effect_once_kill_already_landed() {
-    let actor = Prober::default();
-    let pre_stop_calls = actor.pre_stop_calls.clone();
-    let on_stopped_calls = actor.on_stopped_calls.clone();
+#[test]
+fn graceful_after_kill_has_no_effect_once_kill_already_landed() {
+    common::run(2, async {
+        let actor = Prober::default();
+        let pre_stop_calls = actor.pre_stop_calls.clone();
+        let on_stopped_calls = actor.on_stopped_calls.clone();
 
-    let handle = actor
-        .spawn()
-        .named("lane-kill-first")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("lane-kill-first")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    handle
-        .notify(ProbeMsg::Hang {
-            started: started.clone(),
-            release: release.clone(),
-        })
-        .await
-        .unwrap();
-    started.notified().await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        handle
+            .notify(ProbeMsg::Hang {
+                started: started.clone(),
+                release: release.clone(),
+            })
+            .await
+            .unwrap();
+        started.notified().await;
 
-    // Kill first this time, then a weaker Graceful: order must not matter.
-    handle.stop(StopReason::Kill).await.unwrap();
-    handle.stop(StopReason::Graceful).await.unwrap();
+        // Kill first this time, then a weaker Graceful: order must not matter.
+        handle.stop(StopReason::Kill).await.unwrap();
+        handle.stop(StopReason::Graceful).await.unwrap();
 
-    release.notify_one();
-    handle.wait_stopped().await;
+        release.notify_one();
+        handle.wait_stopped().await;
 
-    assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(on_stopped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(on_stopped_calls.load(Ordering::SeqCst), 0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -331,41 +345,43 @@ async fn graceful_after_kill_has_no_effect_once_kill_already_landed() {
 // the mailbox is simultaneously full and the lane outranks it.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_under_a_flooded_mailbox_waits_for_the_in_flight_handler() {
-    let config = ActorConfig::default().with_mailbox_capacity(1);
-    let handle = Prober::default()
-        .spawn()
-        .named("lane-flood-turn-boundary")
-        .with_config(config)
-        .await
-        .unwrap();
+#[test]
+fn kill_under_a_flooded_mailbox_waits_for_the_in_flight_handler() {
+    common::run(2, async {
+        let config = ActorConfig::default().with_mailbox_capacity(1);
+        let handle = Prober::default()
+            .spawn()
+            .named("lane-flood-turn-boundary")
+            .with_config(config)
+            .await
+            .unwrap();
 
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    handle
-        .notify(ProbeMsg::Hang {
-            started: started.clone(),
-            release: release.clone(),
-        })
-        .await
-        .unwrap();
-    started.notified().await; // handler is now in flight
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        handle
+            .notify(ProbeMsg::Hang {
+                started: started.clone(),
+                release: release.clone(),
+            })
+            .await
+            .unwrap();
+        started.notified().await; // handler is now in flight
 
-    // Flood the mailbox behind the in-flight handler.
-    let _ = handle.try_notify(ProbeMsg::Noop);
+        // Flood the mailbox behind the in-flight handler.
+        let _ = handle.try_notify(ProbeMsg::Noop);
 
-    // Kill outranks both the system channel and the (full) mailbox, but must
-    // still not race the in-flight handler.
-    handle.stop(StopReason::Kill).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
-    assert!(
-        handle.is_alive(),
-        "Kill must not cancel or race an in-flight handler invocation (ITP)"
-    );
+        // Kill outranks both the system channel and the (full) mailbox, but must
+        // still not race the in-flight handler.
+        handle.stop(StopReason::Kill).await.unwrap();
+        sleep(Duration::from_millis(30)).await;
+        assert!(
+            handle.is_alive(),
+            "Kill must not cancel or race an in-flight handler invocation (ITP)"
+        );
 
-    release.notify_one();
-    handle.wait_stopped().await;
+        release.notify_one();
+        handle.wait_stopped().await;
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@
 use std::any::Any;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::task::Poll;
 
 /// Opaque panic payload as produced by the unwind machinery.
@@ -24,16 +25,40 @@ pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
 /// Awaits `fut`, catching an unwinding panic from any of its polls.
 ///
 /// Returns `Ok(output)` on normal completion or `Err(payload)` if a poll
-/// panicked. Zero heap allocation: the future is stack-pinned.
+/// panicked. Zero heap allocation: the future is stack-pinned. However the
+/// awaiting future is dropped (an abort while the callback is suspended
+/// included), `fut` and everything it holds, the message it handles
+/// included, drop under `catch_unwind`, so that drop never unwinds.
 pub(crate) async fn catch_callback<F: Future>(fut: F) -> Result<F::Output, PanicPayload> {
-    tokio::pin!(fut);
-    std::future::poll_fn(
-        |cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+    let slot = Some(fut);
+    tokio::pin!(slot);
+    let mut slot = DropCaught(slot);
+    std::future::poll_fn(|cx| {
+        let fut = slot
+            .0
+            .as_mut()
+            .as_pin_mut()
+            .expect("polled only until it completes");
+        match catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
             Ok(poll) => poll.map(Ok),
             Err(payload) => Poll::Ready(Err(payload)),
-        },
-    )
+        }
+    })
     .await
+}
+
+/// A pinned slot whose value is dropped in place under `catch_unwind` when
+/// the slot's guard is dropped; a panic that drop raises is discarded.
+struct DropCaught<'a, F>(Pin<&'a mut Option<F>>);
+
+impl<F> Drop for DropCaught<'_, F> {
+    fn drop(&mut self) {
+        let slot = &mut self.0;
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| slot.set(None))) {
+            // The payload's own drop may panic: it is dropped under a catch.
+            let _ = payload_into_string(payload);
+        }
+    }
 }
 
 /// Runs a synchronous closure, catching an unwinding panic.
@@ -59,8 +84,34 @@ pub(crate) fn payload_into_string(payload: PanicPayload) -> String {
         Ok(s) => return *s,
         Err(p) => p,
     };
-    let _ = catch_unwind(AssertUnwindSafe(move || drop(payload)));
+    discard(payload);
     "non-string panic payload".to_string()
+}
+
+/// Drops a panic payload inside a catch. A payload whose drop panics again
+/// leaves a second payload, which is forgotten rather than dropped, so this
+/// never unwinds.
+pub(crate) fn discard(payload: PanicPayload) {
+    if let Err(again) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        std::mem::forget(again);
+    }
+}
+
+/// Runs one log call of the crate (see `caught_log!`), containing a panic of
+/// the `tracing` subscriber, so a log line never unwinds into the code that
+/// writes it. A payload that is a `&str` or a `String` is dropped, which
+/// cannot panic. Any other payload is forgotten, never dropped: no drop glue
+/// of the subscriber's runs here, at the cost of one leaked box per such
+/// panic.
+#[cfg(feature = "tracing")]
+pub(crate) fn contain_log(log: impl FnOnce()) {
+    if let Err(payload) = catch_sync(log) {
+        if payload.is::<&'static str>() || payload.is::<String>() {
+            drop(payload);
+        } else {
+            std::mem::forget(payload);
+        }
+    }
 }
 
 #[cfg(test)]

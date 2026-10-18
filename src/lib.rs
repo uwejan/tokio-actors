@@ -1,4 +1,9 @@
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
+#![warn(unreachable_pub)]
+#![warn(rust_2018_idioms)]
+#![warn(rustdoc::broken_intra_doc_links)]
 //! Tokio Actors is a light-weight, Tokio-native actor framework for building
 //! hierarchical systems with strongly-typed mailboxes, timers, and supervision.
 //!
@@ -43,6 +48,38 @@
 //! }
 //! ```
 
+/// `true` when this build unwinds on panic, which is what callback-boundary
+/// panic capture and crash-visible supervision depend on.
+///
+/// Under `panic = "abort"` a panic inside any actor callback terminates the
+/// whole process: no `on_stopped`, no supervisor notification, no typed
+/// error. Unlike the crate's other documented limits, which surface as a
+/// typed error or a documented stall, this one is total and silent.
+/// `Err`-based supervision is unaffected.
+///
+/// To refuse such a build, assert it in your own crate:
+/// `const _: () = assert!(tokio_actors::PANIC_CAPTURE_AVAILABLE);`
+pub const PANIC_CAPTURE_AVAILABLE: bool = cfg!(panic = "unwind");
+
+/// Writes one log line through `tracing` (with the `tracing` feature; a
+/// no-op without it), the subscriber's call inside a catch: a subscriber that
+/// panics never unwinds into the crate code that logs, so it never changes an
+/// actor's reason, never cuts a teardown short, and never aborts the process
+/// from a drop. Two aborts are beyond any catch, and Rust turns both into an
+/// abort: a panic hook that itself panics, and a subscriber that panics
+/// again while its own panic unwinds. Every log line of the crate goes
+/// through this macro. Its
+/// uses sit in `tracing`-gated code, so a build without the feature uses none.
+#[allow(unused_macros)]
+macro_rules! caught_log {
+    ($level:ident, $($arg:tt)+) => {{
+        #[cfg(feature = "tracing")]
+        $crate::actor::panic::contain_log(|| {
+            ::tracing::$level!($($arg)+);
+        });
+    }};
+}
+
 pub mod actor;
 pub mod error;
 pub mod system;
@@ -62,6 +99,6 @@ pub use error::{
 pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{
     ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId,
-    RestartStrategy, RestartType, SchedulePolicy, Shutdown, ShutdownReport, StopOutcome,
-    StopReason, StreamEvent, StreamId, SupervisionAction,
+    RestartStrategy, RestartType, SchedulePolicy, Shutdown, ShutdownReport, StopChildOutcome,
+    StopOutcome, StopReason, StopReport, StreamEvent, StreamId, SupervisionAction,
 };

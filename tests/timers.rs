@@ -1,7 +1,7 @@
 use tokio::time::{sleep, Duration, Instant};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, StopReason,
+    ActorConfig, ActorResult, MissPolicy, StopReason, TimerError,
 };
 
 #[derive(Default)]
@@ -673,6 +673,94 @@ async fn panicking_recurring_factory_surfaces_without_stopping_the_actor() {
 
     // The actor is still fully responsive after the forwarder's panic.
     assert!(handle.send(Msg::CheckError).await.unwrap());
+
+    handle.stop(StopReason::Graceful).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Zero-length recurring interval
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_interval_is_rejected_at_registration() {
+    struct ZeroIntervalActor;
+
+    #[derive(Clone)]
+    enum ZeroMsg {
+        Tick,
+        TryEvery(MissPolicy),
+        TryEveryWith(MissPolicy),
+        Ping,
+    }
+
+    enum ZeroResp {
+        Registered(Result<tokio_actors::RecurringId, TimerError>),
+        Pong,
+    }
+
+    impl Actor for ZeroIntervalActor {
+        type Message = ZeroMsg;
+        type Response = ZeroResp;
+
+        async fn handle(
+            &mut self,
+            msg: Self::Message,
+            ctx: &mut ActorContext<Self>,
+        ) -> ActorResult<Self::Response> {
+            match msg {
+                ZeroMsg::TryEvery(policy) => {
+                    let res = ctx
+                        .schedule(ZeroMsg::Tick)
+                        .every(Duration::ZERO)
+                        .on_miss(policy)
+                        .await;
+                    Ok(ZeroResp::Registered(res))
+                }
+                ZeroMsg::TryEveryWith(policy) => {
+                    let res = ctx
+                        .every_with(Duration::ZERO, || ZeroMsg::Tick)
+                        .on_miss(policy)
+                        .await;
+                    Ok(ZeroResp::Registered(res))
+                }
+                ZeroMsg::Tick => Ok(ZeroResp::Pong),
+                ZeroMsg::Ping => Ok(ZeroResp::Pong),
+            }
+        }
+    }
+
+    let handle = ZeroIntervalActor
+        .spawn()
+        .named("zero-interval")
+        .await
+        .unwrap();
+
+    for policy in [MissPolicy::Skip, MissPolicy::Delay, MissPolicy::CatchUp] {
+        let ZeroResp::Registered(res) = handle.send(ZeroMsg::TryEvery(policy)).await.unwrap()
+        else {
+            panic!("TryEvery must reply with Registered");
+        };
+        assert!(
+            matches!(res, Err(TimerError::ZeroInterval)),
+            "every(Duration::ZERO) with {policy:?} must return Err(TimerError::ZeroInterval)"
+        );
+
+        let ZeroResp::Registered(res) = handle.send(ZeroMsg::TryEveryWith(policy)).await.unwrap()
+        else {
+            panic!("TryEveryWith must reply with Registered");
+        };
+        assert!(
+            matches!(res, Err(TimerError::ZeroInterval)),
+            "every_with(Duration::ZERO) with {policy:?} must return Err(TimerError::ZeroInterval)"
+        );
+    }
+
+    // The actor must still be fully responsive: registration rejected the
+    // timer before anything that could wedge the runtime was ever spawned.
+    assert!(matches!(
+        handle.send(ZeroMsg::Ping).await.unwrap(),
+        ZeroResp::Pong
+    ));
 
     handle.stop(StopReason::Graceful).await.unwrap();
 }

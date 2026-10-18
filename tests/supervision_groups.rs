@@ -21,10 +21,12 @@
 //!   has acked `pre_start`/`on_started`, so consecutive members' init windows
 //!   never overlap (`one_for_all_restart_sequential_init`).
 //! - A member whose restart attempt itself fails (factory panic, or a
-//!   start_timeout expiry) is retried in place; later members in the chain
-//!   stay down until the retry succeeds, and the retry charges the budget
-//!   exactly once, never once per remaining member
-//!   (`one_for_all_mid_group_failure_retries`, `one_for_all_hung_init_escalates`).
+//!   start_timeout expiry) retries the group: under OneForAll every child is
+//!   stopped and started again from the first, under RestForOne the failed
+//!   member and every child after it. Later members stay down until the retry
+//!   succeeds, and the retry charges the budget exactly once, never once per
+//!   member (`one_for_all_mid_group_failure_retries`,
+//!   `one_for_all_hung_init_escalates`).
 //! - A hung `on_started` during a restart is bounded by the child's
 //!   `start_timeout`; the supervisor keeps answering ordinary messages the
 //!   whole time (`one_for_all_hung_init_escalates`).
@@ -35,15 +37,17 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, Shutdown,
-    SpawnError, StopReason, SupervisionAction, SupervisionConfig,
+    SpawnError, StopChildOutcome, StopReason, SupervisionAction, SupervisionConfig,
 };
+
+mod common;
 
 // ---------------------------------------------------------------------------
 // Timing constants: deadlines are generous, polling is tight.
@@ -359,132 +363,140 @@ impl Actor for VetoSup {
 // restarts fire in START order (a, b, c).
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_for_all_stop_reverse_restart_forward() {
-    const P: &str = "one_for_all_stop_reverse_restart_forward";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
+#[test]
+fn one_for_all_stop_reverse_restart_forward() {
+    common::run(0, async {
+        const P: &str = "one_for_all_stop_reverse_restart_forward";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sampler = spawn_max_sampler(&counter);
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sampler = spawn_max_sampler(&counter);
 
-    let sup = GroupSup {
-        child_names: names.clone(),
-        child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    // Initial settle: three constructions, three live, three start events.
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3
-            && counter.live() == 3
-            && log.lock().unwrap().len() == 3
-            && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    let baseline = log.lock().unwrap().len();
-
-    // Crash the middle child.
-    let hb = live_handle::<GroupChild>(&b).await;
-    hb.notify(ChildMsg::Crash)
+        let sup = GroupSup {
+            child_names: names.clone(),
+            child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
         .await
-        .expect("deliver crash to b");
+        .expect("supervisor spawn");
 
-    // Settle: every member reconstructed exactly once, all live again,
-    // 3 stop events + 3 start events appended.
-    wait_for("group restart of the whole set (a, b, c)", || {
-        counter.constructions() >= 6
-            && counter.live() == 3
-            && log.lock().unwrap().len() >= baseline + 6
-            && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    sleep(QUIET).await;
+        // Initial settle: three constructions, three live, three start events.
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3
+                && counter.live() == 3
+                && log.lock().unwrap().len() == 3
+                && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        let baseline = log.lock().unwrap().len();
 
-    assert_eq!(
-        counter.constructions(),
-        6,
-        "exactly one reconstruction per member; more means a double-restart storm"
-    );
+        // Crash the middle child.
+        let hb = live_handle::<GroupChild>(&b).await;
+        hb.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to b");
 
-    let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
-    assert_eq!(
-        tail.len(),
-        6,
-        "expected exactly 3 stops + 3 starts after the crash, got: {tail:?}"
-    );
+        // Settle: every member reconstructed exactly once, all live again,
+        // 3 stop events + 3 start events appended.
+        wait_for("group restart of the whole set (a, b, c)", || {
+            counter.constructions() >= 6
+                && counter.live() == 3
+                && log.lock().unwrap().len() >= baseline + 6
+                && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        sleep(QUIET).await;
 
-    // Stops: coarse set assertion. The trigger (b) dies from the panic; the
-    // live siblings (a, c) are stopped with ParentRequest. Their Stop signals
-    // are SENT in reverse start order, but the tasks die concurrently, so only
-    // membership is asserted here, not inter-stop ordering.
-    let mut stops: Vec<&str> = tail
-        .iter()
-        .filter(|e| e.starts_with("stop:"))
-        .map(String::as_str)
-        .collect();
-    stops.sort_unstable();
-    let stop_a = format!("stop:{a}");
-    let stop_b = format!("stop:{b}");
-    let stop_c = format!("stop:{c}");
-    let mut expected_stops = vec![stop_a.as_str(), stop_b.as_str(), stop_c.as_str()];
-    expected_stops.sort_unstable();
-    assert_eq!(
+        assert_eq!(
+            counter.constructions(),
+            6,
+            "exactly one reconstruction per member; more means a double-restart storm"
+        );
+
+        let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
+        assert_eq!(
+            tail.len(),
+            6,
+            "expected exactly 3 stops + 3 starts after the crash, got: {tail:?}"
+        );
+
+        // Stops: the trigger (b) dies from the panic; the live siblings (a, c)
+        // are stopped with ParentRequest, one at a time in reverse start order,
+        // each after the previous one ended. The membership is asserted first,
+        // then the order.
+        let mut stops: Vec<&str> = tail
+            .iter()
+            .filter(|e| e.starts_with("stop:"))
+            .map(String::as_str)
+            .collect();
+        stops.sort_unstable();
+        let stop_a = format!("stop:{a}");
+        let stop_b = format!("stop:{b}");
+        let stop_c = format!("stop:{c}");
+        let mut expected_stops = vec![stop_a.as_str(), stop_b.as_str(), stop_c.as_str()];
+        expected_stops.sort_unstable();
+        assert_eq!(
         stops, expected_stops,
         "OneForAll must stop every member (trigger by panic, live siblings by ParentRequest): {tail:?}"
     );
 
-    // Phase boundary: terminate-then-restart. Every stop (including the
-    // trigger's own, allowed anywhere in the stop phase) precedes every start.
-    let last_stop = tail.iter().rposition(|e| e.starts_with("stop:")).unwrap();
-    let first_start = tail.iter().position(|e| e.starts_with("start:")).unwrap();
-    assert!(
-        last_stop < first_start,
-        "all member deaths must be awaited before any restart fires: {tail:?}"
-    );
+        let position = |entry: &str| tail.iter().position(|e| e == entry).unwrap();
+        assert!(
+            position(&stop_c) < position(&stop_a),
+            "the group stops c, started last, before a: {tail:?}"
+        );
 
-    // Restarts: coarse set assertion, mirroring the stop assertion above.
-    // Restart INITIATION is strictly sequential in START order (the next
-    // member is initiated only once the previous one has re-registered), but
-    // `on_started` callbacks run on the children's own tasks and may
-    // interleave, so only membership is asserted here, not inter-start
-    // ordering.
-    let mut starts: Vec<&str> = tail
-        .iter()
-        .filter(|e| e.starts_with("start:"))
-        .map(String::as_str)
-        .collect();
-    starts.sort_unstable();
-    let start_a = format!("start:{a}");
-    let start_b = format!("start:{b}");
-    let start_c = format!("start:{c}");
-    let mut expected_starts = vec![start_a.as_str(), start_b.as_str(), start_c.as_str()];
-    expected_starts.sort_unstable();
-    assert_eq!(
-        starts, expected_starts,
-        "every group member must restart exactly once: {tail:?}"
-    );
+        // Phase boundary: terminate-then-restart. Every stop (including the
+        // trigger's own, allowed anywhere in the stop phase) precedes every start.
+        let last_stop = tail.iter().rposition(|e| e.starts_with("stop:")).unwrap();
+        let first_start = tail.iter().position(|e| e.starts_with("start:")).unwrap();
+        assert!(
+            last_stop < first_start,
+            "all member deaths must be awaited before any restart fires: {tail:?}"
+        );
 
-    // Instance invariant: never more live members than the group size.
-    assert!(
-        counter.max_live() <= 3,
-        "live instances exceeded group size during the restart: max {}",
-        counter.max_live()
-    );
+        // Restarts: coarse set assertion, mirroring the stop assertion above.
+        // Restart INITIATION is strictly sequential in START order (the next
+        // member is initiated only once the previous one has re-registered), but
+        // `on_started` callbacks run on the children's own tasks and may
+        // interleave, so only membership is asserted here, not inter-start
+        // ordering.
+        let mut starts: Vec<&str> = tail
+            .iter()
+            .filter(|e| e.starts_with("start:"))
+            .map(String::as_str)
+            .collect();
+        starts.sort_unstable();
+        let start_a = format!("start:{a}");
+        let start_b = format!("start:{b}");
+        let start_c = format!("start:{c}");
+        let mut expected_starts = vec![start_a.as_str(), start_b.as_str(), start_c.as_str()];
+        expected_starts.sort_unstable();
+        assert_eq!(
+            starts, expected_starts,
+            "every group member must restart exactly once: {tail:?}"
+        );
 
-    sampler.abort();
-    let _ = sup.stop(StopReason::Graceful).await;
+        // Instance invariant: never more live members than the group size.
+        assert!(
+            counter.max_live() <= 3,
+            "live instances exceeded group size during the restart: max {}",
+            counter.max_live()
+        );
+
+        sampler.abort();
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -492,122 +504,126 @@ async fn one_for_all_stop_reverse_restart_forward() {
 // affected; earlier siblings see nothing.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rest_for_one_restarts_failed_and_later_only() {
-    const P: &str = "rest_for_one_restarts_failed_and_later_only";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
+#[test]
+fn rest_for_one_restarts_failed_and_later_only() {
+    common::run(0, async {
+        const P: &str = "rest_for_one_restarts_failed_and_later_only";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let sup = GroupSup {
-        child_names: names.clone(),
-        child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::rest_for_one().max_restarts(5, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3
-            && counter.live() == 3
-            && log.lock().unwrap().len() == 3
-            && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    let baseline = log.lock().unwrap().len();
-
-    // Crash the middle child: affected set is {b, c}; a stays untouched.
-    let hb = live_handle::<GroupChild>(&b).await;
-    hb.notify(ChildMsg::Crash)
+        let sup = GroupSup {
+            child_names: names.clone(),
+            child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(
+            SupervisionConfig::rest_for_one().max_restarts(5, Duration::from_secs(60)),
+        )
         .await
-        .expect("deliver crash to b");
+        .expect("supervisor spawn");
 
-    wait_for("restart of b and c only", || {
-        counter.constructions() >= 5
-            && counter.live() == 3
-            && log.lock().unwrap().len() >= baseline + 4
-            && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    sleep(QUIET).await;
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3
+                && counter.live() == 3
+                && log.lock().unwrap().len() == 3
+                && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        let baseline = log.lock().unwrap().len();
 
-    assert_eq!(
-        counter.constructions(),
-        5,
-        "RestForOne on b must reconstruct exactly b and c (3 initial + 2)"
-    );
+        // Crash the middle child: affected set is {b, c}; a stays untouched.
+        let hb = live_handle::<GroupChild>(&b).await;
+        hb.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to b");
 
-    let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
-    assert_eq!(
-        tail.len(),
-        4,
-        "expected exactly 2 stops + 2 starts after the crash, got: {tail:?}"
-    );
+        wait_for("restart of b and c only", || {
+            counter.constructions() >= 5
+                && counter.live() == 3
+                && log.lock().unwrap().len() >= baseline + 4
+                && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        sleep(QUIET).await;
 
-    // Coarse presence: b (trigger) and c (later sibling) each stop and restart.
-    for needle in [
-        format!("stop:{b}"),
-        format!("stop:{c}"),
-        format!("start:{b}"),
-        format!("start:{c}"),
-    ] {
-        assert!(tail.contains(&needle), "missing '{needle}' in: {tail:?}");
-    }
+        assert_eq!(
+            counter.constructions(),
+            5,
+            "RestForOne on b must reconstruct exactly b and c (3 initial + 2)"
+        );
 
-    // a saw NO stop/start events after initial startup.
-    assert!(
-        !tail.iter().any(|e| e.ends_with(a.as_str())),
-        "child a (started before the failure) must be untouched by RestForOne: {tail:?}"
-    );
+        let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
+        assert_eq!(
+            tail.len(),
+            4,
+            "expected exactly 2 stops + 2 starts after the crash, got: {tail:?}"
+        );
 
-    // Phase boundary: both deaths precede both restarts.
-    let last_stop = tail.iter().rposition(|e| e.starts_with("stop:")).unwrap();
-    let first_start = tail.iter().position(|e| e.starts_with("start:")).unwrap();
-    assert!(
-        last_stop < first_start,
-        "affected deaths must be awaited before restarts fire: {tail:?}"
-    );
+        // Coarse presence: b (trigger) and c (later sibling) each stop and restart.
+        for needle in [
+            format!("stop:{b}"),
+            format!("stop:{c}"),
+            format!("start:{b}"),
+            format!("start:{c}"),
+        ] {
+            assert!(tail.contains(&needle), "missing '{needle}' in: {tail:?}");
+        }
 
-    // Supervisor-side ChildEvent recorder: trigger vs group member.
-    let evs = events.lock().unwrap().clone();
-    let trigger = evs
-        .iter()
-        .find(|e| e.child_id.as_str() == b)
-        .expect("supervisor must see a ChildEvent for the trigger b");
-    assert!(
-        matches!(&trigger.reason, StopReason::Failure(ActorError::Panic(_))),
-        "trigger reason must be Failure(Panic), got: {:?}",
-        trigger.reason
-    );
-    assert_eq!(trigger.action, SupervisionAction::RestartInitiated);
+        // a saw NO stop/start events after initial startup.
+        assert!(
+            !tail.iter().any(|e| e.ends_with(a.as_str())),
+            "child a (started before the failure) must be untouched by RestForOne: {tail:?}"
+        );
 
-    let member = evs
-        .iter()
-        .find(|e| e.child_id.as_str() == c)
-        .expect("supervisor must see a ChildEvent for the group member c");
-    assert!(
-        matches!(&member.reason, StopReason::ParentRequest),
-        "group member must be stopped with ParentRequest, got: {:?}",
-        member.reason
-    );
-    assert_eq!(member.action, SupervisionAction::RestartInitiated);
+        // Phase boundary: both deaths precede both restarts.
+        let last_stop = tail.iter().rposition(|e| e.starts_with("stop:")).unwrap();
+        let first_start = tail.iter().position(|e| e.starts_with("start:")).unwrap();
+        assert!(
+            last_stop < first_start,
+            "affected deaths must be awaited before restarts fire: {tail:?}"
+        );
 
-    assert!(
-        !evs.iter().any(|e| e.child_id.as_str() == a),
-        "no ChildEvent may be emitted for the untouched earlier sibling a"
-    );
+        // Supervisor-side ChildEvent recorder: trigger vs group member.
+        let evs = events.lock().unwrap().clone();
+        let trigger = evs
+            .iter()
+            .find(|e| e.child_id.as_str() == b)
+            .expect("supervisor must see a ChildEvent for the trigger b");
+        assert!(
+            matches!(&trigger.reason, StopReason::Failure(ActorError::Panic(_))),
+            "trigger reason must be Failure(Panic), got: {:?}",
+            trigger.reason
+        );
+        assert_eq!(trigger.action, SupervisionAction::RestartInitiated);
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let member = evs
+            .iter()
+            .find(|e| e.child_id.as_str() == c)
+            .expect("supervisor must see a ChildEvent for the group member c");
+        assert!(
+            matches!(&member.reason, StopReason::ParentRequest),
+            "group member must be stopped with ParentRequest, got: {:?}",
+            member.reason
+        );
+        assert_eq!(member.action, SupervisionAction::RestartInitiated);
+
+        assert!(
+            !evs.iter().any(|e| e.child_id.as_str() == a),
+            "no ChildEvent may be emitted for the untouched earlier sibling a"
+        );
+
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -616,80 +632,82 @@ async fn rest_for_one_restarts_failed_and_later_only() {
 // the supervisor. Per-member charging would already die on the first group.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn group_restart_single_budget_charge() {
-    const P: &str = "group_restart_single_budget_charge";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
+#[test]
+fn group_restart_single_budget_charge() {
+    common::run(0, async {
+        const P: &str = "group_restart_single_budget_charge";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let sup = GroupSup {
-        child_names: names.clone(),
-        child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
+        let sup = GroupSup {
+            child_names: names.clone(),
+            child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
+        .await
+        .expect("supervisor spawn");
 
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3 && counter.live() == 3 && all_alive::<GroupChild>(&names)
-    })
-    .await;
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3 && counter.live() == 3 && all_alive::<GroupChild>(&names)
+        })
+        .await;
 
-    // Two full group restarts must succeed: one charge each against budget 2.
-    for (round, expected_constructions) in [(1usize, 6usize), (2, 9)] {
+        // Two full group restarts must succeed: one charge each against budget 2.
+        for (round, expected_constructions) in [(1usize, 6usize), (2, 9)] {
+            let hb = live_handle::<GroupChild>(&b).await;
+            hb.notify(ChildMsg::Crash)
+                .await
+                .unwrap_or_else(|e| panic!("deliver crash for round {round}: {e:?}"));
+
+            wait_for("full group recovery after a trigger", || {
+                counter.constructions() >= expected_constructions
+                    && counter.live() == 3
+                    && all_alive::<GroupChild>(&names)
+            })
+            .await;
+            sleep(QUIET).await;
+
+            assert_eq!(
+                counter.constructions(),
+                expected_constructions,
+                "round {round}: each group restart must reconstruct each member exactly once"
+            );
+            assert!(
+                sup.is_alive(),
+                "round {round}: one charge per group means budget 2 is not yet exhausted; \
+             per-member charging would have killed the supervisor already"
+            );
+        }
+
+        // Third trigger: charge 3 exceeds max_restarts(2, ..) and the supervisor
+        // stops (with its remaining children torn down).
         let hb = live_handle::<GroupChild>(&b).await;
-        hb.notify(ChildMsg::Crash)
-            .await
-            .unwrap_or_else(|e| panic!("deliver crash for round {round}: {e:?}"));
+        let _ = hb.notify(ChildMsg::Crash).await;
 
-        wait_for("full group recovery after a trigger", || {
-            counter.constructions() >= expected_constructions
-                && counter.live() == 3
-                && all_alive::<GroupChild>(&names)
+        wait_for("supervisor stops on budget exhaustion", || !sup.is_alive()).await;
+        wait_for("all children torn down with the supervisor", || {
+            counter.live() == 0
         })
         .await;
         sleep(QUIET).await;
 
         assert_eq!(
             counter.constructions(),
-            expected_constructions,
-            "round {round}: each group restart must reconstruct each member exactly once"
+            9,
+            "no restart may fire after budget exhaustion"
         );
-        assert!(
-            sup.is_alive(),
-            "round {round}: one charge per group means budget 2 is not yet exhausted; \
-             per-member charging would have killed the supervisor already"
-        );
-    }
-
-    // Third trigger: charge 3 exceeds max_restarts(2, ..) and the supervisor
-    // stops (with its remaining children torn down).
-    let hb = live_handle::<GroupChild>(&b).await;
-    let _ = hb.notify(ChildMsg::Crash).await;
-
-    wait_for("supervisor stops on budget exhaustion", || !sup.is_alive()).await;
-    wait_for("all children torn down with the supervisor", || {
-        counter.live() == 0
-    })
-    .await;
-    sleep(QUIET).await;
-
-    assert_eq!(
-        counter.constructions(),
-        9,
-        "no restart may fire after budget exhaustion"
-    );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -698,82 +716,84 @@ async fn group_restart_single_budget_charge() {
 // expiry, and the group still completes.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn vetoing_child_killed_by_timeout_escalation() {
-    const P: &str = "vetoing_child_killed_by_timeout_escalation";
-    let crasher = format!("{P}-crasher");
-    let veto = format!("{P}-veto");
+#[test]
+fn vetoing_child_killed_by_timeout_escalation() {
+    common::run(0, async {
+        const P: &str = "vetoing_child_killed_by_timeout_escalation";
+        let crasher = format!("{P}-crasher");
+        let veto = format!("{P}-veto");
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let crasher_counter = InstanceCounter::default();
-    let veto_counter = InstanceCounter::default();
-    let veto_stopped = Arc::new(AtomicUsize::new(0));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let crasher_counter = InstanceCounter::default();
+        let veto_counter = InstanceCounter::default();
+        let veto_stopped = Arc::new(AtomicUsize::new(0));
 
-    let sup = VetoSup {
-        crasher_name: crasher.clone(),
-        veto_name: veto.clone(),
-        log: log.clone(),
-        crasher_counter: crasher_counter.clone(),
-        veto_counter: veto_counter.clone(),
-        veto_stopped: veto_stopped.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of crasher and veto child", || {
-        crasher_counter.constructions() == 1
-            && veto_counter.constructions() == 1
-            && crasher_counter.live() == 1
-            && veto_counter.live() == 1
-            && alive_as::<GroupChild>(&crasher)
-            && alive_as::<VetoChild>(&veto)
-    })
-    .await;
-
-    // Crash the sibling: OneForAll drags the veto child into the group.
-    let hc = live_handle::<GroupChild>(&crasher).await;
-    hc.notify(ChildMsg::Crash)
+        let sup = VetoSup {
+            crasher_name: crasher.clone(),
+            veto_name: veto.clone(),
+            log: log.clone(),
+            crasher_counter: crasher_counter.clone(),
+            veto_counter: veto_counter.clone(),
+            veto_stopped: veto_stopped.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
         .await
-        .expect("deliver crash to the sibling");
+        .expect("supervisor spawn");
 
-    // The veto child refuses ParentRequest, so only the Timeout(150ms) -> Kill
-    // escalation can complete the group. Both members must come back.
-    wait_for("group completes despite the veto (both restarted)", || {
-        veto_counter.constructions() >= 2
-            && crasher_counter.constructions() >= 2
-            && veto_counter.live() == 1
-            && crasher_counter.live() == 1
-            && alive_as::<GroupChild>(&crasher)
-            && alive_as::<VetoChild>(&veto)
-    })
-    .await;
-    sleep(QUIET).await;
+        wait_for("initial startup of crasher and veto child", || {
+            crasher_counter.constructions() == 1
+                && veto_counter.constructions() == 1
+                && crasher_counter.live() == 1
+                && veto_counter.live() == 1
+                && alive_as::<GroupChild>(&crasher)
+                && alive_as::<VetoChild>(&veto)
+        })
+        .await;
 
-    assert_eq!(veto_counter.constructions(), 2);
-    assert_eq!(crasher_counter.constructions(), 2);
+        // Crash the sibling: OneForAll drags the veto child into the group.
+        let hc = live_handle::<GroupChild>(&crasher).await;
+        hc.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to the sibling");
 
-    // The dead veto instance went down WITHOUT on_stopped running: the only
-    // path that bypasses lifecycle callbacks is Kill, i.e. the escalation
-    // fired. (Drop-based accounting above already proved the instance died.)
-    assert_eq!(
-        veto_stopped.load(Ordering::SeqCst),
-        0,
-        "veto child must die via Kill escalation (on_stopped bypassed), not a graceful stop"
-    );
+        // The veto child refuses ParentRequest, so only the Timeout(150ms) -> Kill
+        // escalation can complete the group. Both members must come back.
+        wait_for("group completes despite the veto (both restarted)", || {
+            veto_counter.constructions() >= 2
+                && crasher_counter.constructions() >= 2
+                && veto_counter.live() == 1
+                && crasher_counter.live() == 1
+                && alive_as::<GroupChild>(&crasher)
+                && alive_as::<VetoChild>(&veto)
+        })
+        .await;
+        sleep(QUIET).await;
 
-    // Name re-lookup responds: the fresh incarnation serves its channels.
-    let hv = live_handle::<VetoChild>(&veto).await;
-    let status = hv
-        .get_status()
-        .await
-        .expect("restarted veto child must respond to get_status");
-    assert_eq!(status.name.as_deref(), Some(veto.as_str()));
-    assert!(sup.is_alive(), "supervisor must survive the escalation");
+        assert_eq!(veto_counter.constructions(), 2);
+        assert_eq!(crasher_counter.constructions(), 2);
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        // The dead veto instance went down WITHOUT on_stopped running: the only
+        // path that bypasses lifecycle callbacks is Kill, i.e. the escalation
+        // fired. (Drop-based accounting above already proved the instance died.)
+        assert_eq!(
+            veto_stopped.load(Ordering::SeqCst),
+            0,
+            "veto child must die via Kill escalation (on_stopped bypassed), not a graceful stop"
+        );
+
+        // Name re-lookup responds: the fresh incarnation serves its channels.
+        let hv = live_handle::<VetoChild>(&veto).await;
+        let status = hv
+            .get_status()
+            .await
+            .expect("restarted veto child must respond to get_status");
+        assert_eq!(status.name.as_deref(), Some(veto.as_str()));
+        assert!(sup.is_alive(), "supervisor must survive the escalation");
+
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -783,93 +803,95 @@ async fn vetoing_child_killed_by_timeout_escalation() {
 // supervisor healthy. Assertions stay coarse (liveness + counts).
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn interleaved_failure_during_group_queues() {
-    const P: &str = "interleaved_failure_during_group_queues";
-    let w = format!("{P}-w");
-    let x = format!("{P}-x");
-    let y = format!("{P}-y");
-    let z = format!("{P}-z");
-    let names = vec![w.clone(), x.clone(), y.clone(), z.clone()];
+#[test]
+fn interleaved_failure_during_group_queues() {
+    common::run(0, async {
+        const P: &str = "interleaved_failure_during_group_queues";
+        let w = format!("{P}-w");
+        let x = format!("{P}-x");
+        let y = format!("{P}-y");
+        let z = format!("{P}-z");
+        let names = vec![w.clone(), x.clone(), y.clone(), z.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sampler = spawn_max_sampler(&counter);
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sampler = spawn_max_sampler(&counter);
 
-    let sup = GroupSup {
-        child_names: names.clone(),
-        child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(4, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of w, x, y, z", || {
-        counter.constructions() == 4 && counter.live() == 4 && all_alive::<GroupChild>(&names)
-    })
-    .await;
-
-    // Broadcast the crash to two children nearly simultaneously. One of them
-    // may be stopped by the forming group before its Crash is dispatched
-    // (system channel has priority), which is fine: at least one panics.
-    let hx = live_handle::<GroupChild>(&x).await;
-    let hy = live_handle::<GroupChild>(&y).await;
-    let (rx, ry) = tokio::join!(hx.notify(ChildMsg::Crash), hy.notify(ChildMsg::Crash));
-    assert!(
-        rx.is_ok() || ry.is_ok(),
-        "at least one crash must reach a live child"
-    );
-
-    // Quiescence: no new constructions for a full window, all four alive.
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    loop {
-        let snapshot = counter.constructions();
-        sleep(Duration::from_millis(400)).await;
-        let settled = counter.constructions() == snapshot
-            && counter.live() == 4
-            && all_alive::<GroupChild>(&names)
-            && sup.is_alive();
-        if settled {
-            break;
+        let sup = GroupSup {
+            child_names: names.clone(),
+            child_shutdown: Shutdown::Timeout(Duration::from_millis(200)),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(4, Duration::from_secs(60)))
+        .await
+        .expect("supervisor spawn");
+
+        wait_for("initial startup of w, x, y, z", || {
+            counter.constructions() == 4 && counter.live() == 4 && all_alive::<GroupChild>(&names)
+        })
+        .await;
+
+        // Broadcast the crash to two children nearly simultaneously. One of them
+        // may be stopped by the forming group before its Crash is dispatched
+        // (system channel has priority), which is fine: at least one panics.
+        let hx = live_handle::<GroupChild>(&x).await;
+        let hy = live_handle::<GroupChild>(&y).await;
+        let (rx, ry) = tokio::join!(hx.notify(ChildMsg::Crash), hy.notify(ChildMsg::Crash));
+        assert!(
+            rx.is_ok() || ry.is_ok(),
+            "at least one crash must reach a live child"
+        );
+
+        // Quiescence: no new constructions for a full window, all four alive.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let snapshot = counter.constructions();
+            sleep(Duration::from_millis(400)).await;
+            let settled = counter.constructions() == snapshot
+                && counter.live() == 4
+                && all_alive::<GroupChild>(&names)
+                && sup.is_alive();
+            if settled {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
                 "interleaved-failure storm never settled: constructions={}, live={}, sup_alive={}",
                 counter.constructions(),
                 counter.live(),
                 sup.is_alive()
             );
+            }
         }
-    }
 
-    // Coarse invariants: full recovery, no duplicate-instance storm.
-    assert!(sup.is_alive(), "supervisor must survive both triggers");
-    assert_eq!(counter.live(), 4, "all four children alive after settling");
-    assert!(
-        counter.constructions() >= 8,
-        "at least one full group restart must have run (4 initial + 4), got {}",
-        counter.constructions()
-    );
-    assert!(
-        counter.max_live() <= 4,
-        "no duplicate instances during interleaved group restarts: max {}",
-        counter.max_live()
-    );
+        // Coarse invariants: full recovery, no duplicate-instance storm.
+        assert!(sup.is_alive(), "supervisor must survive both triggers");
+        assert_eq!(counter.live(), 4, "all four children alive after settling");
+        assert!(
+            counter.constructions() >= 8,
+            "at least one full group restart must have run (4 initial + 4), got {}",
+            counter.constructions()
+        );
+        assert!(
+            counter.max_live() <= 4,
+            "no duplicate instances during interleaved group restarts: max {}",
+            counter.max_live()
+        );
 
-    let status = sup
-        .get_status()
-        .await
-        .expect("supervisor must respond after the storm");
-    assert_eq!(status.child_count, 4, "all four child specs retained");
+        let status = sup
+            .get_status()
+            .await
+            .expect("supervisor must respond after the storm");
+        assert_eq!(status.child_count, 4, "all four child specs retained");
 
-    sampler.abort();
-    let _ = sup.stop(StopReason::Graceful).await;
+        sampler.abort();
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +910,7 @@ struct InitSpan {
 }
 
 /// Group member whose `on_started` holds the init window open for `delay`
-/// before recording it, so a bug that let two members' inits run concurrently
+/// before recording it, so any path that let two members' inits run concurrently
 /// would show up as overlapping spans.
 struct SeqChild {
     name: String,
@@ -966,80 +988,82 @@ impl Actor for SeqGroupSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_for_all_restart_sequential_init() {
-    const P: &str = "one_for_all_restart_sequential_init";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
-    let delay = Duration::from_millis(60);
+#[test]
+fn one_for_all_restart_sequential_init() {
+    common::run(0, async {
+        const P: &str = "one_for_all_restart_sequential_init";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
+        let delay = Duration::from_millis(60);
 
-    let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
+        let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
 
-    let sup = SeqGroupSup {
-        child_names: names.clone(),
-        delay,
-        spans: spans.clone(),
-        counter: counter.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3 && counter.live() == 3 && spans.lock().unwrap().len() == 3
-    })
-    .await;
-    let baseline = spans.lock().unwrap().len();
-
-    let hb = live_handle::<SeqChild>(&b).await;
-    hb.notify(ChildMsg::Crash)
+        let sup = SeqGroupSup {
+            child_names: names.clone(),
+            delay,
+            spans: spans.clone(),
+            counter: counter.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
         .await
-        .expect("deliver crash to b");
+        .expect("supervisor spawn");
 
-    wait_for("all three members re-initialized after the crash", || {
-        spans.lock().unwrap().len() >= baseline + 3 && counter.live() == 3
-    })
-    .await;
-    sleep(QUIET).await;
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3 && counter.live() == 3 && spans.lock().unwrap().len() == 3
+        })
+        .await;
+        let baseline = spans.lock().unwrap().len();
 
-    let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
-    assert_eq!(
-        tail.len(),
-        3,
-        "each member's on_started must run exactly once during the restart: {tail:?}"
-    );
+        let hb = live_handle::<SeqChild>(&b).await;
+        hb.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to b");
 
-    let order: Vec<&str> = tail.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(
-        order,
-        vec![a.as_str(), b.as_str(), c.as_str()],
-        "restart order must match start order: {tail:?}"
-    );
+        wait_for("all three members re-initialized after the crash", || {
+            spans.lock().unwrap().len() >= baseline + 3 && counter.live() == 3
+        })
+        .await;
+        sleep(QUIET).await;
 
-    for pair in tail.windows(2) {
-        assert!(
-            pair[0].exit <= pair[1].enter,
-            "consecutive restart init windows must not overlap ({} exited at {:?}, \
-             {} entered at {:?}): {tail:?}",
-            pair[0].name,
-            pair[0].exit,
-            pair[1].name,
-            pair[1].enter
+        let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
+        assert_eq!(
+            tail.len(),
+            3,
+            "each member's on_started must run exactly once during the restart: {tail:?}"
         );
-    }
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let order: Vec<&str> = tail.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![a.as_str(), b.as_str(), c.as_str()],
+            "restart order must match start order: {tail:?}"
+        );
+
+        for pair in tail.windows(2) {
+            assert!(
+                pair[0].exit <= pair[1].enter,
+                "consecutive restart init windows must not overlap ({} exited at {:?}, \
+             {} entered at {:?}): {tail:?}",
+                pair[0].name,
+                pair[0].exit,
+                pair[1].name,
+                pair[1].enter
+            );
+        }
+
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Test 14: mid-group restart failure. A member whose OWN restart attempt
-// fails (factory panic) is retried in place; later members stay down until
-// the retry succeeds, and the retry charges the budget exactly once.
+// fails (factory panic) retries the whole group; later members stay down
+// until the retry succeeds, and the retry charges the budget exactly once.
 // ---------------------------------------------------------------------------
 
 /// Supervisor spawning a, b, c as [`GroupChild`]s, where b's factory panics
@@ -1130,109 +1154,120 @@ impl Actor for FlakyGroupSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_for_all_mid_group_failure_retries() {
-    const P: &str = "one_for_all_mid_group_failure_retries";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
+#[test]
+fn one_for_all_mid_group_failure_retries() {
+    common::run(0, async {
+        const P: &str = "one_for_all_mid_group_failure_retries";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let b_calls = Arc::new(AtomicUsize::new(0));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let b_calls = Arc::new(AtomicUsize::new(0));
 
-    // Budget 2 covers exactly the trigger charge and the one retry charge
-    // (the "threshold technique" from `group_restart_single_budget_charge`):
-    // a per-sibling overcharge would exceed it and stop the supervisor.
-    let sup = FlakyGroupSup {
-        a: a.clone(),
-        b: b.clone(),
-        c: c.clone(),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-        b_calls: b_calls.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3
-            && counter.live() == 3
-            && log.lock().unwrap().len() == 3
-            && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    let baseline = log.lock().unwrap().len();
-
-    let hb = live_handle::<GroupChild>(&b).await;
-    hb.notify(ChildMsg::Crash)
+        // Budget 2 covers exactly the trigger charge and the one retry charge
+        // (the "threshold technique" from `group_restart_single_budget_charge`):
+        // a per-sibling overcharge would exceed it and stop the supervisor.
+        let sup = FlakyGroupSup {
+            a: a.clone(),
+            b: b.clone(),
+            c: c.clone(),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+            b_calls: b_calls.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
         .await
-        .expect("deliver crash to b");
+        .expect("supervisor spawn");
 
-    wait_for("full recovery after the retried restart", || {
-        counter.live() == 3 && all_alive::<GroupChild>(&names) && sup.is_alive()
-    })
-    .await;
-    sleep(QUIET).await;
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3
+                && counter.live() == 3
+                && log.lock().unwrap().len() == 3
+                && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        let baseline = log.lock().unwrap().len();
 
-    assert!(
-        sup.is_alive(),
-        "budget 2 must cover exactly the trigger charge and the one retry charge; \
+        let hb = live_handle::<GroupChild>(&b).await;
+        hb.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to b");
+
+        wait_for("full recovery after the retried restart", || {
+            b_calls.load(Ordering::SeqCst) == 3
+                && counter.constructions() == 7
+                && counter.live() == 3
+                && all_alive::<GroupChild>(&names)
+                && sup.is_alive()
+        })
+        .await;
+        sleep(QUIET).await;
+
+        assert!(
+            sup.is_alive(),
+            "budget 2 must cover exactly the trigger charge and the one retry charge; \
          a per-sibling overcharge would have exhausted it and stopped the supervisor"
-    );
+        );
 
-    assert_eq!(
-        b_calls.load(Ordering::SeqCst),
-        3,
-        "b's factory must be called 3 times: initial construction, the failed first \
+        assert_eq!(
+            b_calls.load(Ordering::SeqCst),
+            3,
+            "b's factory must be called 3 times: initial construction, the failed first \
          restart attempt, and the successful retry"
-    );
-    assert_eq!(
-        counter.constructions(),
-        6,
-        "the failed factory attempt never constructs an instance; only the 3 initial \
-         plus 3 successful restarts count"
-    );
+        );
+        assert_eq!(
+            counter.constructions(),
+            7,
+            "the failed factory attempt never constructs an instance; the 3 initial ones \
+         count, plus a twice (the retry restarts the whole group, so a is stopped and \
+         started again), b once and c once"
+        );
 
-    let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
-    assert_eq!(
-        tail.iter().filter(|e| e.starts_with("start:")).count(),
-        3,
-        "exactly one successful start per member after the crash (b's failed attempt \
-         never reaches on_started): {tail:?}"
-    );
-    let start_b = tail
-        .iter()
-        .position(|e| e == &format!("start:{b}"))
-        .expect("b must eventually start via its retry");
-    let start_c = tail
-        .iter()
-        .position(|e| e == &format!("start:{c}"))
-        .expect("c must start once the chain reaches it");
-    assert!(
-        start_b < start_c,
-        "c's restart must wait for b's retried restart to complete: {tail:?}"
-    );
+        let tail: Vec<String> = log.lock().unwrap()[baseline..].to_vec();
+        let starts: Vec<&str> = tail
+            .iter()
+            .filter_map(|e| e.strip_prefix("start:"))
+            .collect();
+        assert_eq!(
+            starts,
+            [a.as_str(), a.as_str(), b.as_str(), c.as_str()],
+            "after the crash a starts, b's attempt fails before it starts, the retry stops \
+         a and starts a, b and c in start order: {tail:?}"
+        );
+        let start_b = tail
+            .iter()
+            .position(|e| e == &format!("start:{b}"))
+            .expect("b must eventually start via its retry");
+        let start_c = tail
+            .iter()
+            .position(|e| e == &format!("start:{c}"))
+            .expect("c must start once the chain reaches it");
+        assert!(
+            start_b < start_c,
+            "c's restart must wait for b's retried restart to complete: {tail:?}"
+        );
 
-    let b_events = events
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| e.child_id.as_str() == b)
-        .count();
-    assert!(
-        b_events >= 2,
-        "the supervisor must observe both b's failed attempt and its retry as \
+        let b_events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.child_id.as_str() == b)
+            .count();
+        assert!(
+            b_events >= 2,
+            "the supervisor must observe both b's failed attempt and its retry as \
          separate ChildStopped events"
-    );
+        );
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,6 +1307,11 @@ impl Actor for HangChild {
         std::future::pending().await
     }
 }
+
+/// Both bounds of b: its stop window and its restart's `start_timeout`. A
+/// supervisor whose loop waited on either step would leave a message
+/// unanswered for at least this long, far beyond any scheduling delay.
+const HANG_BOUND: Duration = Duration::from_secs(1);
 
 /// Supervisor for the hung-init test: a normal crash trigger (a) plus a
 /// permanently-hung sibling (b) bounded by `start_timeout` on restart.
@@ -1316,8 +1356,8 @@ impl Actor for HangGroupSup {
         })
         .named(self.b.clone())
         .restart_type(RestartType::Permanent)
-        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
-        .start_timeout(Duration::from_millis(200))
+        .shutdown(Shutdown::Timeout(HANG_BOUND))
+        .start_timeout(HANG_BOUND)
         .await?;
 
         Ok(())
@@ -1333,11 +1373,25 @@ impl Actor for HangGroupSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_for_all_hung_init_escalates() {
-    const P: &str = "one_for_all_hung_init_escalates";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
+#[test]
+fn one_for_all_hung_init_escalates() {
+    common::run(0, one_for_all_hung_init_escalates_body(false));
+}
+
+#[test]
+fn one_for_all_hung_init_escalates_paused() {
+    common::run_paused(one_for_all_hung_init_escalates_body(true));
+}
+
+async fn one_for_all_hung_init_escalates_body(paused: bool) {
+    // Registry names are unique per variant: both run in one process.
+    let p = if paused {
+        "one_for_all_hung_init_escalates_paused"
+    } else {
+        "one_for_all_hung_init_escalates"
+    };
+    let a = format!("{p}-a");
+    let b = format!("{p}-b");
 
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let counter = InstanceCounter::default();
@@ -1355,7 +1409,7 @@ async fn one_for_all_hung_init_escalates() {
         events: events.clone(),
     }
     .spawn()
-    .named(format!("{P}-sup"))
+    .named(format!("{p}-sup"))
     .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
     .await
     .expect("supervisor spawn");
@@ -1419,9 +1473,16 @@ async fn one_for_all_hung_init_escalates() {
     );
     let max_latency = observed.iter().copied().max().unwrap_or_default();
     assert!(
-        max_latency < Duration::from_millis(150),
+        max_latency
+            < if paused {
+                HANG_BOUND / 2
+            } else {
+                // The exact bound is pinned on the paused clock; on real time only
+                // a supervisor that stopped answering fails.
+                Duration::from_secs(10)
+            },
         "the supervisor must keep answering messages while a group restart is in flight, \
-         worst observed round trip: {max_latency:?}"
+     worst observed round trip: {max_latency:?}"
     );
 }
 
@@ -1431,11 +1492,47 @@ async fn one_for_all_hung_init_escalates() {
 // instead of queueing behind one another.
 // ---------------------------------------------------------------------------
 
-/// Supervisor spawning dynamic SimpleOneForOne children on demand and
-/// recording each one's `on_started` window (entry/exit), same shape as
-/// [`SeqChild`]/[`InitSpan`] above.
+/// A dynamic child whose `on_started` records its entry, then stays inside
+/// its init while the test holds `hold`, then records its window, so the test
+/// decides when an init ends and sees which inits are in flight at once.
+struct HeldChild {
+    name: String,
+    hold: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<AtomicUsize>,
+    spans: Arc<Mutex<Vec<InitSpan>>>,
+}
+
+impl Actor for HeldChild {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let enter = Instant::now();
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        while self.hold.load(Ordering::SeqCst) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let exit = Instant::now();
+        self.spans.lock().unwrap().push(InitSpan {
+            name: self.name.clone(),
+            enter,
+            exit,
+        });
+        Ok(())
+    }
+}
+
+/// Supervisor spawning dynamic SimpleOneForOne children on demand, each a
+/// [`HeldChild`] sharing one hold, one entry count and one span log.
 struct DynamicSup {
-    delay: Duration,
+    hold: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<AtomicUsize>,
     spans: Arc<Mutex<Vec<InitSpan>>>,
 }
 
@@ -1444,14 +1541,15 @@ impl Actor for DynamicSup {
     type Response = ();
 
     async fn handle(&mut self, name: String, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let hold = self.hold.clone();
+        let entered = self.entered.clone();
         let spans = self.spans.clone();
-        let delay = self.delay;
         let child_name = name.clone();
-        ctx.spawn_child(move || SeqChild {
+        ctx.spawn_child(move || HeldChild {
             name: child_name.clone(),
-            delay,
+            hold: hold.clone(),
+            entered: entered.clone(),
             spans: spans.clone(),
-            counter: InstanceCounter::default(),
         })
         .named(name)
         .restart_type(RestartType::Permanent)
@@ -1461,70 +1559,79 @@ impl Actor for DynamicSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn simple_one_for_one_restarts_bypass_group_chain() {
-    const P: &str = "simple_one_for_one_restarts_bypass_group_chain";
-    let x = format!("{P}-x");
-    let y = format!("{P}-y");
-    let delay = Duration::from_millis(150);
+#[test]
+fn simple_one_for_one_restarts_bypass_group_chain() {
+    common::run(0, async {
+        const P: &str = "simple_one_for_one_restarts_bypass_group_chain";
+        let x = format!("{P}-x");
+        let y = format!("{P}-y");
 
-    let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let spans: Arc<Mutex<Vec<InitSpan>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let sup = DynamicSup {
-        delay,
-        spans: spans.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(
-        SupervisionConfig::simple_one_for_one().max_restarts(10, Duration::from_secs(60)),
-    )
-    .await
-    .expect("supervisor spawn");
+        let sup = DynamicSup {
+            hold: hold.clone(),
+            entered: entered.clone(),
+            spans: spans.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(
+            SupervisionConfig::simple_one_for_one().max_restarts(10, Duration::from_secs(60)),
+        )
+        .await
+        .expect("supervisor spawn");
 
-    sup.send(x.clone()).await.expect("spawn x");
-    sup.send(y.clone()).await.expect("spawn y");
+        sup.send(x.clone()).await.expect("spawn x");
+        sup.send(y.clone()).await.expect("spawn y");
 
-    wait_for("x and y both initially started", || {
-        spans.lock().unwrap().len() == 2
-    })
-    .await;
-    let baseline = spans.lock().unwrap().len();
+        wait_for("x and y both initially started", || {
+            spans.lock().unwrap().len() == 2
+        })
+        .await;
+        let baseline = spans.lock().unwrap().len();
+        let entered_before = entered.load(Ordering::SeqCst);
 
-    // Crash both dynamic children nearly simultaneously. A sequential group
-    // chain (a bug: SimpleOneForOne wrongly entering it) would serialize
-    // their restarts to at least 2 * delay; independent restarts overlap and
-    // finish in close to 1 * delay.
-    let hx = live_handle::<SeqChild>(&x).await;
-    let hy = live_handle::<SeqChild>(&y).await;
-    let started = Instant::now();
-    let (rx, ry) = tokio::join!(hx.notify(ChildMsg::Crash), hy.notify(ChildMsg::Crash));
-    assert!(rx.is_ok() && ry.is_ok(), "both crashes must be delivered");
+        // Crash both dynamic children with every restarted init held inside
+        // `on_started`. Independent restarts both enter their inits while the
+        // hold lasts; a sequential group chain (SimpleOneForOne wrongly
+        // entering it) would start the second only once the first init ended,
+        // which the hold never allows, so the wait below would time out.
+        hold.store(true, Ordering::SeqCst);
+        let hx = live_handle::<HeldChild>(&x).await;
+        let hy = live_handle::<HeldChild>(&y).await;
+        let (rx, ry) = tokio::join!(hx.notify(ChildMsg::Crash), hy.notify(ChildMsg::Crash));
+        assert!(rx.is_ok() && ry.is_ok(), "both crashes must be delivered");
 
-    wait_for("both x and y re-initialized", || {
-        spans.lock().unwrap().len() >= baseline + 2
-    })
-    .await;
-    let elapsed = started.elapsed();
+        wait_for("both restarted inits to be in flight at once", || {
+            entered.load(Ordering::SeqCst) >= entered_before + 2
+        })
+        .await;
+        assert_eq!(
+            spans.lock().unwrap().len(),
+            baseline,
+            "no restarted init ended while the hold lasted"
+        );
+        hold.store(false, Ordering::SeqCst);
 
-    let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
-    assert_eq!(tail.len(), 2, "each child restarts exactly once: {tail:?}");
+        wait_for("both x and y re-initialized", || {
+            spans.lock().unwrap().len() >= baseline + 2
+        })
+        .await;
 
-    assert!(
-        elapsed < delay * 2,
-        "independent SimpleOneForOne restarts must overlap instead of queueing behind a \
-         group chain (2 members * {delay:?} would take at least {:?}, took {elapsed:?})",
-        delay * 2
-    );
+        let tail: Vec<InitSpan> = spans.lock().unwrap()[baseline..].to_vec();
+        assert_eq!(tail.len(), 2, "each child restarts exactly once: {tail:?}");
 
-    let overlap = tail[0].enter < tail[1].exit && tail[1].enter < tail[0].exit;
-    assert!(
-        overlap,
-        "the two independent restarts must have overlapping init windows, proving no \
+        let overlap = tail[0].enter < tail[1].exit && tail[1].enter < tail[0].exit;
+        assert!(
+            overlap,
+            "the two independent restarts must have overlapping init windows, proving no \
          shared sequential chain gates them: {tail:?}"
-    );
+        );
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,84 +1704,85 @@ impl Actor for DownRejoinSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn one_for_all_down_member_rejoins_and_budget_charged_once() {
-    const P: &str = "one_for_all_down_member_rejoins_and_budget_charged_once";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let names = vec![a.clone(), b.clone(), c.clone()];
+#[test]
+fn one_for_all_down_member_rejoins_and_budget_charged_once() {
+    common::run(0, async {
+        const P: &str = "one_for_all_down_member_rejoins_and_budget_charged_once";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let names = vec![a.clone(), b.clone(), c.clone()];
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let sup = DownRejoinSup {
-        child_names: names.clone(),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    // Exactly one triggering failure is affordable: if the Down-rejoin of b
-    // (or any of the group's own internal restarts) incorrectly charged the
-    // budget again, the supervisor would exit here instead of completing.
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("all three members started", || {
-        counter.constructions() == 3 && all_alive::<GroupChild>(&names)
-    })
-    .await;
-
-    let DownRejoinReply::Done(res) = sup
-        .send(DownRejoinCmd::Terminate(b.clone()))
+        let sup = DownRejoinSup {
+            child_names: names.clone(),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        // Exactly one triggering failure is affordable: if the Down-rejoin of b
+        // (or any of the group's own internal restarts) incorrectly charged the
+        // budget again, the supervisor would exit here instead of completing.
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)))
         .await
-        .expect("supervisor must answer");
-    res.expect("terminate_child must succeed");
-    assert!(!alive_as::<GroupChild>(&b), "b must be Down");
+        .expect("supervisor spawn");
 
-    let ha = live_handle::<GroupChild>(&a).await;
-    ha.notify(ChildMsg::Crash)
-        .await
-        .expect("deliver crash to a");
+        wait_for("all three members started", || {
+            counter.constructions() == 3 && all_alive::<GroupChild>(&names)
+        })
+        .await;
 
-    wait_for("the group cycle to revive everyone, b included", || {
-        counter.constructions() >= 6 && all_alive::<GroupChild>(&names)
-    })
-    .await;
-    sleep(QUIET).await;
+        let DownRejoinReply::Done(res) = sup
+            .send(DownRejoinCmd::Terminate(b.clone()))
+            .await
+            .expect("supervisor must answer");
+        res.expect("terminate_child must succeed");
+        assert!(!alive_as::<GroupChild>(&b), "b must be Down");
 
-    assert_eq!(
-        counter.constructions(),
-        6,
-        "a, b, and c each restart exactly once via the chain (3), on top of \
+        let ha = live_handle::<GroupChild>(&a).await;
+        ha.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to a");
+
+        wait_for("the group cycle to revive everyone, b included", || {
+            counter.constructions() >= 6 && all_alive::<GroupChild>(&names)
+        })
+        .await;
+        sleep(QUIET).await;
+
+        assert_eq!(
+            counter.constructions(),
+            6,
+            "a, b, and c each restart exactly once via the chain (3), on top of \
          the initial 3 constructions - b's revival included"
-    );
-    assert!(
-        sup.is_alive(),
-        "the single triggering crash must be the only budget charge"
-    );
+        );
+        assert!(
+            sup.is_alive(),
+            "the single triggering crash must be the only budget charge"
+        );
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }
 
 // ---------------------------------------------------------------------------
-// Test 18: a member's own independent restart attempt failing WHILE a
+// Test 18: a member's own independent restart attempt ending WHILE a
 // sibling group's `Stopping` phase is still in flight must not wedge that
 // member's ledger forever. Before its own crash forms the group, b is
-// already bouncing independently (`stop_child`); its restart attempt's
-// `start_timeout` expires strictly during the group's teardown of the slow
-// sibling c, exactly the interleaving that used to leave b stuck
-// `Restarting` and c permanently queued behind it.
+// already bouncing independently (`stop_child`) and its attempt hangs in its
+// initialization; the group orders the attempt, which ends strictly during
+// the group's teardown of the slow sibling c, exactly the interleaving that
+// used to leave b stuck `Restarting` and c permanently queued behind it.
 // ---------------------------------------------------------------------------
 
-/// Group member whose restart attempt (but never its initial spawn) sleeps
-/// long enough to blow past a short `start_timeout`, on the SECOND factory
-/// call only - every later call (the chain's own eventual revival) completes
-/// immediately. `calls` is shared with the test so the exact call sequence
+/// Group member whose restart attempt (but never its initial spawn) hangs in
+/// its initialization, on the SECOND factory call only - every later call
+/// (the chain's own eventual revival) completes immediately. `calls` is shared with the test so the exact call sequence
 /// (initial, failed bounce attempt, successful chain revival) is verifiable.
 struct SlowInitChild {
     name: String,
@@ -1696,9 +1804,9 @@ impl Actor for SlowInitChild {
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call == 2 {
-            // The bounce-triggered restart attempt: hang well past its
-            // `start_timeout` so the attempt is reported `Failed` instead of
-            // ever adopted.
+            // The bounce-triggered restart attempt: hang in the
+            // initialization, so the attempt is never adopted and only the
+            // group's order (or a start timeout) ends it.
             std::future::pending::<()>().await;
         }
         self.log
@@ -1774,7 +1882,7 @@ enum WedgeCmd {
 
 #[derive(Debug)]
 enum WedgeReply {
-    Done(Result<(), String>),
+    Done(Result<StopChildOutcome, String>),
 }
 
 /// Supervisor spawning a ([`GroupChild`]), b ([`SlowInitChild`], short
@@ -1839,7 +1947,9 @@ impl Actor for WedgeSup {
         .named(self.b.clone())
         .restart_type(RestartType::Permanent)
         .shutdown(Shutdown::Timeout(Duration::from_millis(300)))
-        .start_timeout(Duration::from_millis(150))
+        // Longer than anything the test waits for: the hung attempt is ended by
+        // the group's order, never by this bound.
+        .start_timeout(Duration::from_secs(5))
         .await?;
 
         let log = self.log.clone();
@@ -1873,142 +1983,169 @@ impl Actor for WedgeSup {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn group_chain_survives_a_member_restart_failing_mid_group_stop() {
-    const P: &str = "group_chain_survives_a_member_restart_failing_mid_group_stop";
-    let a = format!("{P}-a");
-    let b = format!("{P}-b");
-    let c = format!("{P}-c");
-    let c_stop_delay = Duration::from_millis(500);
+#[test]
+fn group_chain_survives_a_member_restart_failing_mid_group_stop() {
+    common::run(0, async {
+        const P: &str = "group_chain_survives_a_member_restart_failing_mid_group_stop";
+        let a = format!("{P}-a");
+        let b = format!("{P}-b");
+        let c = format!("{P}-c");
+        let c_stop_delay = Duration::from_millis(500);
 
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let counter = InstanceCounter::default();
-    let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let b_calls = Arc::new(AtomicUsize::new(0));
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let counter = InstanceCounter::default();
+        let events: Arc<Mutex<Vec<ChildEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let b_calls = Arc::new(AtomicUsize::new(0));
 
-    // Budget 2: exactly one charge per triggering crash below - a per-event
-    // overcharge (the wedge bug's superseded-attempt event being queued and
-    // evaluated as an ordinary failure) would exhaust it on the very first
-    // cycle and stop the supervisor before the second crash ever gets a
-    // chance to prove the chain is not permanently stuck.
-    let sup = WedgeSup {
-        a: a.clone(),
-        b: b.clone(),
-        c: c.clone(),
-        log: log.clone(),
-        counter: counter.clone(),
-        events: events.clone(),
-        b_calls: b_calls.clone(),
-        c_stop_delay,
-    }
-    .spawn()
-    .named(format!("{P}-sup"))
-    .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
-    .await
-    .expect("supervisor spawn");
-
-    wait_for("initial startup of a, b, c", || {
-        counter.constructions() == 3 && counter.live() == 3
-    })
-    .await;
-
-    // b starts bouncing independently (budget-free): its restart attempt
-    // enters `on_started` and hangs, so it is `Restarting` and will fail via
-    // `start_timeout` shortly.
-    let WedgeReply::Done(res) = sup
-        .send(WedgeCmd::Bounce(b.clone()))
+        // Budget 2: exactly one charge per triggering crash below - a per-event
+        // overcharge (a superseded-attempt event being queued and
+        // evaluated as an ordinary failure) would exhaust it on the very first
+        // cycle and stop the supervisor before the second crash ever gets a
+        // chance to prove the chain is not permanently stuck.
+        let sup = WedgeSup {
+            a: a.clone(),
+            b: b.clone(),
+            c: c.clone(),
+            log: log.clone(),
+            counter: counter.clone(),
+            events: events.clone(),
+            b_calls: b_calls.clone(),
+            c_stop_delay,
+        }
+        .spawn()
+        .named(format!("{P}-sup"))
+        .with_supervision(SupervisionConfig::one_for_all().max_restarts(2, Duration::from_secs(60)))
         .await
-        .expect("supervisor must answer");
-    res.expect("stop_child(b) must succeed");
+        .expect("supervisor spawn");
 
-    // While b's attempt is still in flight (well under its 150ms
-    // start_timeout), crash a: OneForAll forms a group whose only LIVE
-    // sibling is c (b is not `Running`, so it is excluded from the awaited
-    // set but still included in `restart_order`). c's `pre_stop` then holds
-    // the group's `Stopping` phase open for `c_stop_delay`, comfortably
-    // longer than b's `start_timeout` - the exact interleaving under test.
-    let ha = live_handle::<GroupChild>(&a).await;
-    ha.notify(ChildMsg::Crash)
-        .await
-        .expect("deliver crash to a");
+        wait_for("initial startup of a, b, c", || {
+            counter.constructions() == 3 && counter.live() == 3
+        })
+        .await;
 
-    // Full first recovery. `is_alive()` only reflects "task not yet
-    // finished" - the hung (failing) bounce attempt itself reports alive the
-    // whole time it is stuck in `on_started`, so it cannot distinguish real
-    // recovery from the still-failing middle of the sequence. `b_calls`
-    // reaching 3 is unambiguous: it only increments from inside a
-    // successfully-entered `on_started`, and the chain-revival attempt is
-    // the only possible source of a 3rd call (the wedge bug's signature is
-    // this count getting stuck at 2 forever - see the `wait_for` deadline
-    // panic that produces on unfixed code). `counter.live() == 3` confirms
-    // every member (including c, and the hung bounce instance's replacement)
-    // is back to a genuinely live instance, not just constructed.
-    wait_for(
-        "first recovery: b's chain-revival attempt completes",
-        || b_calls.load(Ordering::SeqCst) >= 3 && counter.live() == 3,
-    )
-    .await;
-    sleep(QUIET).await;
+        // b starts bouncing independently (budget-free): its restart attempt
+        // enters `on_started` and hangs, so it is `Restarting` and will fail via
+        // `start_timeout` shortly.
+        let WedgeReply::Done(res) = sup
+            .send(WedgeCmd::Bounce(b.clone()))
+            .await
+            .expect("supervisor must answer");
+        assert_eq!(
+            res.expect("stop_child(b) must succeed"),
+            StopChildOutcome::Stopped
+        );
+        // b's bounce attempt is inside `on_started`, the call that hangs.
+        wait_for("b's bounce attempt to enter on_started", || {
+            b_calls.load(Ordering::SeqCst) >= 2
+        })
+        .await;
 
-    assert!(
-        sup.is_alive(),
-        "the crash trigger must be the only budget charge for the first cycle - a \
+        // b's attempt hangs in its initialization, and its start timeout is far
+        // away, so it is in flight whenever a crashes: OneForAll forms a group
+        // that commits both c and b's attempt, and orders the attempt to stop.
+        // The attempt ends by its window and the kill that follows, being
+        // shorter than c's stop. c's `pre_stop` holds the group's `Stopping`
+        // phase open for `c_stop_delay`, longer than b's window - the exact
+        // interleaving under test. The attempt's end is reported once and
+        // charges nothing, and the chain starts b in its slot.
+        let ha = live_handle::<GroupChild>(&a).await;
+        ha.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver crash to a");
+
+        // Full first recovery. `is_alive()` only reflects "task not yet
+        // finished" - the hung (failing) bounce attempt itself reports alive the
+        // whole time it is stuck in `on_started`, so it cannot distinguish real
+        // recovery from the still-failing middle of the sequence. `b_calls`
+        // reaching 3 is unambiguous: it only increments from inside a
+        // successfully-entered `on_started`, and the chain-revival attempt is
+        // the only possible source of a 3rd call (the wedge's signature is
+        // this count getting stuck at 2 forever - see the `wait_for` deadline
+        // panic that produces on unfixed code). `counter.live() == 3` confirms
+        // every member (including c, and the hung bounce instance's replacement)
+        // is back to a genuinely live instance, not just constructed.
+        wait_for(
+            "first recovery: b's chain-revival attempt completes",
+            || b_calls.load(Ordering::SeqCst) >= 3 && counter.live() == 3,
+        )
+        .await;
+        sleep(QUIET).await;
+
+        assert!(
+            sup.is_alive(),
+            "the crash trigger must be the only budget charge for the first cycle - a \
          superseded restart-attempt event double-charging the budget would have \
          exhausted it here"
-    );
+        );
 
-    assert_eq!(
-        b_calls.load(Ordering::SeqCst),
-        3,
-        "b's factory must run exactly 3 times: the initial spawn, the failed bounce \
+        assert_eq!(
+            b_calls.load(Ordering::SeqCst),
+            3,
+            "b's factory must run exactly 3 times: the initial spawn, the failed bounce \
          attempt, and the chain's own successful revival"
-    );
+        );
 
-    let starts_b = log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|e| e == &&format!("start:{b}"))
-        .count();
-    assert_eq!(
-        starts_b, 2,
-        "b's on_started must actually complete twice: the initial start, and the \
-         chain-revived incarnation - the hung bounce attempt never reaches this line"
-    );
-
-    // No wedge: c, which was queued behind b in the old buggy behavior,
-    // really did restart (not just "is alive" from before - it was stopped
-    // and rebuilt).
-    assert!(
-        events
+        let starts_b = log
             .lock()
             .unwrap()
             .iter()
-            .any(|e| e.child_id.as_str() == c
-                && matches!(e.action, SupervisionAction::RestartInitiated)),
-        "c must have been reported as restarted, not left permanently queued: {:?}",
-        events.lock().unwrap()
-    );
+            .filter(|e| e == &&format!("start:{b}"))
+            .count();
+        assert_eq!(
+            starts_b, 2,
+            "b's on_started must actually complete twice: the initial start, and the \
+         chain-revived incarnation - the hung bounce attempt never reaches this line"
+        );
 
-    // No residual wedge: a completely independent SECOND crash still cycles
-    // the group normally (the chain state left behind by the first cycle,
-    // if any, does not block further supervision).
-    let ha2 = live_handle::<GroupChild>(&a).await;
-    ha2.notify(ChildMsg::Crash)
-        .await
-        .expect("deliver second crash to a");
+        // No wedge: c, queued behind b in the group, really did restart (not
+        // just "is alive" from before - it was stopped and rebuilt).
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.child_id.as_str() == c
+                    && matches!(e.action, SupervisionAction::RestartInitiated)),
+            "c must have been reported as restarted, not left permanently queued: {:?}",
+            events.lock().unwrap()
+        );
 
-    wait_for("second recovery: b restarts a 4th time, cleanly", || {
-        b_calls.load(Ordering::SeqCst) >= 4 && counter.live() == 3
-    })
-    .await;
-    sleep(QUIET).await;
+        // b's second report is the attempt's end: killed under the group's
+        // order, reported as the restart it is part of.
+        let b_reports: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.child_id.as_str() == b)
+            .cloned()
+            .collect();
+        assert!(
+            b_reports.len() >= 2
+                && matches!(&b_reports[1].reason, StopReason::Kill)
+                && b_reports[1].action == SupervisionAction::RestartInitiated,
+            "the attempt's end is reported once as a kill under the order: {b_reports:?}"
+        );
 
-    assert!(
-        sup.is_alive(),
-        "the second crash must be exactly the second and final affordable budget charge, \
+        // No residual wedge: a completely independent SECOND crash still cycles
+        // the group normally (the chain state left behind by the first cycle,
+        // if any, does not block further supervision).
+        let ha2 = live_handle::<GroupChild>(&a).await;
+        ha2.notify(ChildMsg::Crash)
+            .await
+            .expect("deliver second crash to a");
+
+        wait_for("second recovery: b restarts a 4th time, cleanly", || {
+            b_calls.load(Ordering::SeqCst) >= 4 && counter.live() == 3
+        })
+        .await;
+        sleep(QUIET).await;
+
+        assert!(
+            sup.is_alive(),
+            "the second crash must be exactly the second and final affordable budget charge, \
          proving neither cycle over-charged"
-    );
+        );
 
-    let _ = sup.stop(StopReason::Graceful).await;
+        let _ = sup.stop(StopReason::Graceful).await;
+    });
 }

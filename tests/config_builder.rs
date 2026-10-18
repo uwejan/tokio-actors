@@ -89,3 +89,19 @@ async fn zero_mailbox_capacity_returns_spawn_error_instead_of_panicking() {
         Err(other) => panic!("expected SpawnError::ZeroMailboxCapacity, got: {other}"),
     }
 }
+
+#[tokio::test]
+async fn oversized_capacities_are_clamped_not_panicking() {
+    let config = ActorConfig::default()
+        .with_mailbox_capacity(usize::MAX)
+        .with_priority_lane(usize::MAX);
+    let actor = DummyActor
+        .spawn()
+        .named("cfg-oversized-capacities")
+        .with_config(config)
+        .await
+        .unwrap();
+
+    assert!(actor.mailbox_capacity() <= tokio::sync::Semaphore::MAX_PERMITS);
+    assert!(actor.priority_capacity() <= tokio::sync::Semaphore::MAX_PERMITS);
+}

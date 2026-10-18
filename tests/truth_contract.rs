@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use tokio::time::{sleep, Instant};
 
+mod common;
+
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, Shutdown, StopReason,
@@ -137,6 +139,24 @@ impl Actor for Worker {
     }
 }
 
+/// A worker that vetoes every request to stop: only the escalation of its
+/// `Shutdown` policy ends it.
+#[derive(Default)]
+struct StubbornWorker;
+
+impl Actor for StubbornWorker {
+    type Message = WorkerMsg;
+    type Response = u32;
+
+    async fn handle(&mut self, _msg: WorkerMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        Ok(0)
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
 /// The command-driven supervisor. Every command below runs to completion
 /// inside ONE dispatched `handle` invocation - the whole point of the tests
 /// that chain terminate/delete/respawn together.
@@ -168,6 +188,11 @@ enum SupCmd {
     /// Issues `terminate_child` but bounds the wait to (effectively) zero and
     /// drops the future the instant it elapses, exercising cancel-safety.
     TerminateAndAbandon {
+        name: String,
+    },
+    /// Spawns a worker that vetoes every request to stop, under a 200 ms
+    /// `Shutdown::Timeout`.
+    SpawnStubbornWorker {
         name: String,
     },
 }
@@ -210,6 +235,14 @@ impl Actor for Sup {
                     .named(name)
                     .restart_type(RestartType::Permanent)
                     .shutdown(Shutdown::Timeout(Duration::from_secs(2)))
+                    .await?;
+                SupReply::Done(Ok(()))
+            }
+            SupCmd::SpawnStubbornWorker { name } => {
+                ctx.spawn_child(StubbornWorker::default)
+                    .named(name)
+                    .restart_type(RestartType::Permanent)
+                    .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
                     .await?;
                 SupReply::Done(Ok(()))
             }
@@ -418,6 +451,104 @@ async fn dropped_terminate_child_future_still_completes_and_fires_once() {
         events_for(&evs, &name).len(),
         1,
         "still exactly one event after a quiet window: {evs:?}"
+    );
+}
+
+/// The vetoing twin of the test above, which passes only because its worker is
+/// cooperative: here the stop can finish only by the escalation of the child's
+/// `Shutdown` policy, which belongs to the child's runner, not to the dropped
+/// future.
+#[test]
+fn dropped_terminate_child_future_stops_a_vetoing_child_and_fires_once() {
+    common::run(
+        0,
+        dropped_terminate_child_future_stops_a_vetoing_child_body(false),
+    );
+}
+
+#[test]
+fn dropped_terminate_child_future_stops_a_vetoing_child_and_fires_once_paused() {
+    common::run_paused(dropped_terminate_child_future_stops_a_vetoing_child_body(
+        true,
+    ));
+}
+
+async fn dropped_terminate_child_future_stops_a_vetoing_child_body(paused: bool) {
+    // The time between a child's Kill and its abort when its spawn builder
+    // sets no kill grace, and the wait after an abort; an integration test
+    // cannot read the crate's constants, so they are named here once.
+    const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
+    const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
+    // The child's window, the Kill step, the abort and a margin; on a real-time
+    // runtime a hang bound past that.
+    let precise = Duration::from_millis(200)
+        + ASSUMED_KILL_GRACE
+        + ASSUMED_ABORT_SETTLE
+        + Duration::from_millis(500);
+    let bound = if paused {
+        precise
+    } else {
+        precise + Duration::from_secs(10)
+    };
+
+    let events = recorder();
+    let sup = Sup {
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup-drop-veto"))
+    .supervisor()
+    .await
+    .unwrap();
+
+    let name = uname("drop-veto-worker");
+    op(&sup, SupCmd::SpawnStubbornWorker { name: name.clone() })
+        .await
+        .expect("spawn worker");
+    let sys = ActorSystem::default();
+    assert!(
+        wait_named_alive::<StubbornWorker>(&name, 5_000).await,
+        "the worker is up"
+    );
+
+    // The handler commits and drops its wait at once. The worker vetoes the
+    // request, so only the escalation of its policy can end it.
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        op(&sup, SupCmd::TerminateAndAbandon { name: name.clone() }),
+    )
+    .await
+    .expect("the command returns")
+    .expect("the command itself always returns Ok regardless of the abandoned wait");
+
+    assert!(
+        wait_until(bound.as_millis() as u64, || sys
+            .get::<StubbornWorker>(&name)
+            .is_none())
+        .await,
+        "the stop must still complete, by escalation, though the caller's future was dropped"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the worker kept its window: {:?}",
+        started.elapsed()
+    );
+
+    wait_for_events(&events, 5_000, |e| !events_for(e, &name).is_empty()).await;
+    sleep(Duration::from_millis(300)).await;
+    let all = events.lock().await.clone();
+    let mine = events_for(&all, &name);
+    assert_eq!(
+        mine.len(),
+        1,
+        "on_child_stopped must fire EXACTLY once despite the dropped future: {mine:?}"
+    );
+    assert_eq!(mine[0].action, SupervisionAction::Removed);
+    assert!(
+        matches!(mine[0].reason, StopReason::Kill),
+        "{:?}",
+        mine[0].reason
     );
 }
 

@@ -155,10 +155,10 @@ async fn wait_stopped_resolves_instantly_when_already_stopped() {
     // handle, not just the original - must observe the terminal state
     // instantly: a borrow() of the watch cell's current value, no changed()
     // wait required. A buggy changed()-wait would never resolve here (no
-    // further transitions exist), so any finite deadline discriminates; the
-    // 500ms one absorbs CI scheduling stalls.
+    // further transitions exist), so any finite deadline discriminates; a
+    // long one absorbs a host that stalls its threads.
     let cloned = handle.clone();
-    tokio::time::timeout(Duration::from_millis(500), cloned.wait_stopped())
+    tokio::time::timeout(Duration::from_secs(10), cloned.wait_stopped())
         .await
         .expect("wait_stopped must resolve immediately when already Stopped");
 

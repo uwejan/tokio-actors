@@ -4,6 +4,8 @@
 //! and awaiting the reply, armed before the mailbox send so a request parked
 //! on a full mailbox still times out.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -13,8 +15,60 @@ use tokio_actors::{
     ActorConfig, ActorResult, AskError,
 };
 
-/// A worker whose handler can be told to hang forever, sleep for a given
-/// duration before replying, or echo a value back immediately.
+/// Iteration count for the sustained huge-timeout suites: enough repeats
+/// that a deadline landing within the timer's internal rounding margin,
+/// rather than merely a large one, has room to actually surface.
+const HUGE_TIMEOUT_ITERATIONS: u32 = 3000;
+
+/// The longest a handler waits at a [`Gate`]: past every bound a test
+/// awaits, so a gate the test never opens shows as that test's own failure.
+const GATE_CAP: Duration = Duration::from_secs(15);
+
+/// A gate a handler waits at until the test opens it, so the handler is
+/// still running whenever the test acts, whatever the scheduling.
+#[derive(Debug, Default)]
+struct Gate {
+    open: AtomicBool,
+    /// Set once the handler went on past the open gate.
+    passed: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl Gate {
+    /// Waits until the gate is open, for at most [`GATE_CAP`].
+    async fn pass(&self) {
+        let _ = tokio::time::timeout(GATE_CAP, async {
+            loop {
+                let mut woken = std::pin::pin!(self.wake.notified());
+                woken.as_mut().enable();
+                if self.open.load(Ordering::SeqCst) {
+                    return;
+                }
+                woken.await;
+            }
+        })
+        .await;
+        self.passed.store(true, Ordering::SeqCst);
+    }
+
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+}
+
+/// Opens its gate when dropped, also while a failed assertion unwinds, so a
+/// handler never waits at the gate past the test that holds it.
+struct OpensOnDrop(Arc<Gate>);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A worker whose handler can be told to hang forever, wait at a gate before
+/// replying, or echo a value back immediately.
 #[derive(Default)]
 struct Worker;
 
@@ -23,8 +77,8 @@ enum WorkerMsg {
     /// Parks the handler on a never-ready future, so the mailbox slot it
     /// occupied is never returned and the actor never revisits its loop.
     Hang,
-    /// Sleeps for the given duration, then replies with `7`.
-    Sleep(Duration),
+    /// Waits at the gate until the test opens it, then replies with `7`.
+    Gated(Arc<Gate>),
     /// Replies immediately with the given value.
     Echo(u32),
 }
@@ -39,8 +93,8 @@ impl Actor for Worker {
                 std::future::pending::<()>().await;
                 unreachable!("pending() never resolves")
             }
-            WorkerMsg::Sleep(dur) => {
-                tokio::time::sleep(dur).await;
+            WorkerMsg::Gated(gate) => {
+                gate.pass().await;
                 Ok(7)
             }
             WorkerMsg::Echo(value) => Ok(value),
@@ -96,14 +150,14 @@ async fn full_mailbox_with_hung_handler_times_out_unenqueued() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_handler_times_out_enqueued_then_actor_survives() {
     let handle = Worker.spawn().await.unwrap();
+    let gate = Arc::new(Gate::default());
+    let _opens = OpensOnDrop(gate.clone());
 
     // Plenty of mailbox room, so the enqueue phase succeeds immediately and
-    // the deadline is spent entirely waiting on the reply.
+    // the deadline is spent entirely waiting on the reply, which the handler
+    // gives only once the test opens its gate.
     let result = handle
-        .send_timeout(
-            WorkerMsg::Sleep(Duration::from_millis(200)),
-            Duration::from_millis(30),
-        )
+        .send_timeout(WorkerMsg::Gated(gate.clone()), Duration::from_millis(30))
         .await;
 
     assert!(
@@ -114,17 +168,21 @@ async fn slow_handler_times_out_enqueued_then_actor_survives() {
     // Let the slow handler actually finish; it must not have been cancelled
     // by the deadline. Its late reply lands in a dropped oneshot and is
     // silently discarded.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(
-        handle.is_alive(),
-        "actor must survive a send_timeout deadline"
-    );
+    gate.open();
 
     // A subsequent plain send must succeed, proving the handler ran to
     // completion and the actor returned to its message loop instead of
     // crashing.
     let value = handle.send(WorkerMsg::Echo(9)).await.unwrap();
     assert_eq!(value, 9);
+    assert!(
+        gate.passed.load(Ordering::SeqCst),
+        "the handler went on past its gate after the deadline"
+    );
+    assert!(
+        handle.is_alive(),
+        "actor must survive a send_timeout deadline"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -160,4 +218,44 @@ async fn send_timeout_with_huge_duration_does_not_panic() {
     let result = handle.send_timeout(WorkerMsg::Echo(7), Duration::MAX).await;
 
     assert!(matches!(result, Ok(7)), "expected Ok(7), got {result:?}");
+}
+
+// A single `Duration::MAX` call only proves the deadline can be constructed
+// without panicking; it says nothing about a deadline that lands inside the
+// timer's own internal rounding margin. Repeating the call thousands of
+// times against one long-lived actor gives that margin room to actually be
+// hit, since each call computes its deadline from a fresh `Instant::now()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn huge_timeouts_never_reach_the_timer_unsafely() {
+    let handle = Worker.spawn().await.unwrap();
+
+    for i in 0..HUGE_TIMEOUT_ITERATIONS {
+        let result = handle.send_timeout(WorkerMsg::Echo(i), Duration::MAX).await;
+        assert!(
+            matches!(result, Ok(v) if v == i),
+            "iteration {i}: expected Ok({i}), got {result:?}"
+        );
+    }
+}
+
+// Same repeated-huge-deadline check, on the priority lane's own
+// `send_priority_timeout`, which computes its deadline through the same
+// `saturating_deadline` helper.
+#[tokio::test(flavor = "multi_thread")]
+async fn huge_priority_timeouts_never_reach_the_timer_unsafely() {
+    let handle = Worker
+        .spawn()
+        .with_config(ActorConfig::default().with_priority_lane(8))
+        .await
+        .unwrap();
+
+    for i in 0..HUGE_TIMEOUT_ITERATIONS {
+        let result = handle
+            .send_priority_timeout(WorkerMsg::Echo(i), Duration::MAX)
+            .await;
+        assert!(
+            matches!(result, Ok(v) if v == i),
+            "iteration {i}: expected Ok({i}), got {result:?}"
+        );
+    }
 }

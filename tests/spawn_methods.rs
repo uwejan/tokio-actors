@@ -123,7 +123,9 @@ async fn system_stop_named_actor() {
     assert!(sys.get::<Ping>("stopper").is_some());
 
     sys.stop("stopper").await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait_stopped())
+        .await
+        .expect("the stopped actor stops");
     assert!(!handle.is_alive(), "actor should be stopped");
 }
 
@@ -140,7 +142,9 @@ async fn system_kill_named_actor() {
         .await
         .unwrap();
     sys.kill("killable").await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait_stopped())
+        .await
+        .expect("the killed actor stops");
     assert!(!handle.is_alive());
 }
 

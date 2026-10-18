@@ -1,0 +1,20 @@
+[graph]
+exclude-dev = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# Add an advisory id here only with a dated reason and the dependency bump that will remove it.
+ignore = []
