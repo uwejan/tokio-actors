@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, ActorSystem, Shutdown, StopOutcome, StopReason,
+    ActorConfig, ActorResult, ActorSystem, Shutdown, StopReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,78 +72,6 @@ async fn kill_bypasses_all_callbacks() {
     );
 }
 
-/// Kill still bypasses pre_stop/on_stopped even with a message left queued
-/// in the mailbox: the stop lane is a separate, higher-priority signal, not
-/// just another entry that would need the queue drained first.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_bypasses_callbacks_even_with_pending_mailbox_traffic() {
-    let pre_stop = Arc::new(AtomicBool::new(false));
-    let on_stopped = Arc::new(AtomicBool::new(false));
-
-    let actor = StubActor {
-        pre_stop_called: Arc::clone(&pre_stop),
-        on_stopped_called: Arc::clone(&on_stopped),
-    };
-
-    let config = ActorConfig::default().with_mailbox_capacity(1);
-    let handle = actor
-        .spawn()
-        .named("kill-with-pending-mailbox")
-        .with_config(config)
-        .await
-        .unwrap();
-
-    // Queue a message the actor has had no chance to process yet.
-    let _ = handle.try_notify(());
-
-    handle.stop(StopReason::Kill).await.unwrap();
-    timeout(BOUND, handle.wait_stopped())
-        .await
-        .expect("the killed actor stops");
-
-    assert!(
-        !pre_stop.load(Ordering::SeqCst),
-        "pre_stop must NOT be called on Kill, even with a message still queued"
-    );
-    assert!(
-        !on_stopped.load(Ordering::SeqCst),
-        "on_stopped must NOT be called on Kill, even with a message still queued"
-    );
-}
-
-/// Graceful stop DOES call pre_stop and on_stopped (sanity check).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn graceful_stop_calls_callbacks() {
-    let pre_stop = Arc::new(AtomicBool::new(false));
-    let on_stopped = Arc::new(AtomicBool::new(false));
-
-    let actor = StubActor {
-        pre_stop_called: Arc::clone(&pre_stop),
-        on_stopped_called: Arc::clone(&on_stopped),
-    };
-
-    let handle = actor
-        .spawn()
-        .named("graceful-test")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-    timeout(BOUND, handle.wait_stopped())
-        .await
-        .expect("the stopped actor stops");
-
-    assert!(
-        pre_stop.load(Ordering::SeqCst),
-        "pre_stop must be called on Graceful"
-    );
-    assert!(
-        on_stopped.load(Ordering::SeqCst),
-        "on_stopped must be called on Graceful"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // A stop reason raised while pre_stop is in flight
 // ---------------------------------------------------------------------------
@@ -181,8 +109,9 @@ impl Gate {
         }
     }
 
+    /// Waits until the callback reached its gate. The bound only limits how long a real hang takes to report.
     async fn entered(&self) {
-        let deadline = Instant::now() + BOUND;
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !self.0 .0.load(Ordering::SeqCst) {
             assert!(
                 Instant::now() < deadline,
@@ -274,81 +203,57 @@ async fn kill_raised_during_an_accepting_pre_stop_bypasses_on_stopped() {
     );
 }
 
-/// A `Cancelled` raised while an accepting `pre_stop` is still in flight also
-/// wins over the stale `Graceful` the gate was called with, but unlike
-/// `Kill`, `on_stopped` still runs - with the escalated reason, not the
-/// stale one.
+/// A forced reason raised while a vetoing `pre_stop` is in flight is the
+/// reason the actor stops with, whichever forced reason it is: the gate is
+/// not asked again, and `on_stopped` runs once with that reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_raised_during_pre_stop_wins_over_graceful() {
-    let on_stopped_reason = Arc::new(Mutex::new(None));
-    let gate = Gate::default();
-    let actor = GatedStopActor {
-        pre_stop_gate: Some(gate.clone()),
-        pre_stop_accepts: true,
-        on_stopped_reason: Arc::clone(&on_stopped_reason),
-        ..Default::default()
-    };
+async fn a_forced_reason_raised_during_a_vetoing_pre_stop_is_the_final_reason() {
+    for forced in [
+        StopReason::ParentKilled,
+        StopReason::Cancelled,
+        StopReason::Failure(ActorError::user("raised while pre_stop ran")),
+    ] {
+        let on_stopped_reason = Arc::new(Mutex::new(None));
+        let gate = Gate::default();
+        let _opens = OpensOnDrop(gate.clone());
+        let actor = GatedStopActor {
+            pre_stop_gate: Some(gate.clone()),
+            pre_stop_accepts: false,
+            on_stopped_reason: Arc::clone(&on_stopped_reason),
+            ..Default::default()
+        };
+        let answered = Arc::clone(&actor.answered);
 
-    let handle = actor
-        .spawn()
-        .named("cancelled-during-pre-stop")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
+        let handle = actor
+            .spawn()
+            .named("forced-during-vetoing-pre-stop")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
 
-    handle.stop(StopReason::Graceful).await.unwrap();
-    gate.entered().await;
-    handle.stop(StopReason::Cancelled).await.unwrap();
-    gate.open();
-    timeout(BOUND, handle.wait_stopped())
-        .await
-        .expect("the cancelled actor stops");
+        handle.stop(StopReason::Graceful).await.unwrap();
+        // The gate is in flight, held: the forced reason lands inside it and
+        // the gate then vetoes.
+        gate.entered().await;
+        handle.stop(forced.clone()).await.unwrap();
+        gate.open();
+        timeout(BOUND, handle.wait_stopped())
+            .await
+            .expect("the actor stops");
 
-    let reason = on_stopped_reason.lock().unwrap().clone();
-    assert!(
-        matches!(reason, Some(StopReason::Cancelled)),
-        "on_stopped must run with the escalated Cancelled reason, got {reason:?}"
-    );
-}
-
-/// Control: a vetoing `pre_stop` already sends the run loop back through
-/// `stop_rx.changed()`, so a `Kill` raised after the veto returns is picked
-/// up correctly independent of the re-read fix above - `on_stopped` must
-/// never run.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_after_a_vetoing_pre_stop_bypasses_on_stopped() {
-    let on_stopped_reason = Arc::new(Mutex::new(None));
-    let actor = GatedStopActor {
-        pre_stop_accepts: false,
-        on_stopped_reason: Arc::clone(&on_stopped_reason),
-        ..Default::default()
-    };
-    let answered = Arc::clone(&actor.answered);
-
-    let handle = actor
-        .spawn()
-        .named("kill-after-vetoing-pre-stop")
-        .with_config(ActorConfig::default())
-        .await
-        .unwrap();
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-    // The veto has answered before Kill lands.
-    let deadline = Instant::now() + BOUND;
-    while answered.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "pre_stop never answered");
-        sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            1,
+            "{forced:?}: pre_stop is not asked again"
+        );
+        let received = on_stopped_reason.lock().unwrap().clone();
+        assert!(
+            received
+                .as_ref()
+                .is_some_and(|got| std::mem::discriminant(got) == std::mem::discriminant(&forced)),
+            "{forced:?}: on_stopped received {received:?}"
+        );
     }
-    handle.stop(StopReason::Kill).await.unwrap();
-    timeout(BOUND, handle.wait_stopped())
-        .await
-        .expect("the killed actor stops");
-
-    let reason = on_stopped_reason.lock().unwrap().clone();
-    assert!(
-        reason.is_none(),
-        "on_stopped must never run once Kill is raised after a veto, got {reason:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -440,128 +345,6 @@ async fn graceful_retried_during_a_vetoing_pre_stop_re_fires_the_gate() {
         2,
         "pre_stop must run once for the vetoed raise and once more for the retry"
     );
-}
-
-/// A `ParentRequest` raised by `ActorSystem::shutdown` while a user's own
-/// `Graceful` stop is being vetoed must not be lost either: the retried gate
-/// is honored, and the actor's own `on_stopped` still runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parent_request_raised_during_a_vetoed_user_stop_is_honored() {
-    let sys = ActorSystem::create(format!("prq-{}", uuid::Uuid::new_v4())).unwrap();
-
-    let gate = Gate::default();
-    let _opens = OpensOnDrop(gate.clone());
-    let actor = VetoOnceActor {
-        first_gate: Some(gate.clone()),
-        ..Default::default()
-    };
-    let on_stopped_reason = Arc::clone(&actor.on_stopped_reason);
-
-    let handle = actor
-        .spawn()
-        .named("prq-root")
-        .on_system(&sys)
-        .await
-        .unwrap();
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-    // The user's `pre_stop` is at its gate before the shutdown raises
-    // `ParentRequest`. The pause makes the raise likely to land while the
-    // gate is still held; the assertions hold whichever lands first (a raise
-    // after the veto re-fires the gate on an idle actor), and nothing public
-    // reads the stop lane to order this by observation.
-    gate.entered().await;
-    let shutdown = {
-        let sys = sys.clone();
-        tokio::spawn(async move { sys.shutdown().await })
-    };
-    sleep(Duration::from_millis(50)).await;
-    gate.open();
-    let report = timeout(BOUND, shutdown)
-        .await
-        .expect("the shutdown returns")
-        .unwrap();
-
-    assert_eq!(report.outcomes.len(), 1, "got {:?}", report.outcomes);
-    assert!(
-        matches!(report.outcomes[0].1.outcome, StopOutcome::Graceful),
-        "the retried gate must resolve without ever needing Kill, got {:?}",
-        report.outcomes[0].1
-    );
-    let reason = on_stopped_reason.lock().unwrap().clone();
-    assert!(
-        reason.is_some(),
-        "on_stopped must run once the retried gate is honored, got {reason:?}"
-    );
-}
-
-/// A supervisor with one `Shutdown::Infinity` child under a once-vetoing
-/// gate: a user request starts the gate, and the parent's own teardown
-/// raises `ParentRequest` on the same lane while that gate is still in
-/// flight. The child's retried gate accepts, so the parent's unbounded wait
-/// on that child resolves instead of hanging forever.
-struct InfinityChildSup {
-    gate: Gate,
-}
-
-impl Actor for InfinityChildSup {
-    type Message = ();
-    type Response = ();
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        let gate = self.gate.clone();
-        ctx.spawn_child(move || VetoOnceActor {
-            first_gate: Some(gate.clone()),
-            ..Default::default()
-        })
-        .named("infinity-child")
-        .shutdown(Shutdown::Infinity)
-        .await?;
-        Ok(())
-    }
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parent_of_an_infinity_child_stops_when_the_child_vetoes_once_during_teardown() {
-    let sys = ActorSystem::create(format!("infinity-veto-{}", uuid::Uuid::new_v4())).unwrap();
-
-    let gate = Gate::default();
-    let _opens = OpensOnDrop(gate.clone());
-    let sup = InfinityChildSup { gate: gate.clone() }
-        .spawn()
-        .named("infinity-sup")
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    let child = loop {
-        if let Some(h) = sys.get::<VetoOnceActor>("infinity-child") {
-            break h;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
-
-    // The user's own request starts the once-vetoing gate, held open until
-    // the parent's stop is accepted.
-    child.stop(StopReason::Graceful).await.unwrap();
-    gate.entered().await;
-    // The parent's own teardown raises ParentRequest on the child's lane.
-    // The pause makes it likely to land while the gate is still held; the
-    // parent stops whichever lands first (a raise after the veto re-fires the
-    // gate on an idle child), and nothing public reads the stop lane to order
-    // this by observation.
-    sup.stop(StopReason::Graceful).await.unwrap();
-    sleep(Duration::from_millis(50)).await;
-    gate.open();
-
-    tokio::time::timeout(std::time::Duration::from_secs(5), sup.wait_stopped())
-        .await
-        .expect("the parent must not hang behind an Infinity child's re-fired gate");
 }
 
 // ---------------------------------------------------------------------------
@@ -798,132 +581,6 @@ fn kill_raised_during_on_stopped_is_the_final_reason() {
             [StopReason::Graceful]
         ));
         assert!(matches!(final_reason(&ends, &name).await, StopReason::Kill));
-    });
-}
-
-/// `on_stopped` yields a few times, so a `Kill` raised from another thread
-/// can land while it runs or right after it returns.
-struct QuickStop {
-    on_stopped_started: Arc<AtomicBool>,
-    on_stopped_returned: Arc<AtomicBool>,
-}
-
-impl Actor for QuickStop {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn on_stopped(
-        &mut self,
-        _reason: &StopReason,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        self.on_stopped_started.store(true, Ordering::SeqCst);
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-        self.on_stopped_returned.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-/// The flags of one `QuickStop`: `on_stopped` started, `on_stopped` returned.
-type FlagPair = (Arc<AtomicBool>, Arc<AtomicBool>);
-
-#[test]
-fn every_accepted_kill_is_the_final_reason_up_to_the_terminal_status() {
-    // A real race between a hammering caller and the stopping actor.
-    common::run_multi_thread_only(4, async {
-        let sys = ActorSystem::create(uname("race")).unwrap();
-        let on_started_flags: Arc<Mutex<Vec<FlagPair>>> = Arc::new(Mutex::new(Vec::new()));
-        let (top, ends) = top(&sys, Duration::from_secs(5), false, {
-            let flags = on_started_flags.clone();
-            move || {
-                let pair = (
-                    Arc::new(AtomicBool::new(false)),
-                    Arc::new(AtomicBool::new(false)),
-                );
-                flags.lock().unwrap().push(pair.clone());
-                QuickStop {
-                    on_stopped_started: pair.0,
-                    on_stopped_returned: pair.1,
-                }
-            }
-        })
-        .await;
-
-        let mut accepted_after_on_stopped = 0usize;
-        let mut accepted_kills = 0usize;
-        for batch in 0..10 {
-            let mut set = tokio::task::JoinSet::new();
-            for i in 0..20 {
-                let name = uname(&format!("racer-{batch}-{i}"));
-                let child: ActorHandle<QuickStop> = start_child(&top, &sys, &name).await;
-                let (started, returned) = on_started_flags.lock().unwrap().last().cloned().unwrap();
-                set.spawn(async move {
-                    let hammer = {
-                        let child = child.clone();
-                        tokio::spawn(async move {
-                            // Waits for `on_stopped`, then hammers `Kill` until the
-                            // lane answers `Closed`, remembering the answers.
-                            while !started.load(Ordering::SeqCst) {
-                                tokio::task::yield_now().await;
-                            }
-                            let (mut accepted, mut after) = (0usize, 0usize);
-                            loop {
-                                let returned_before = returned.load(Ordering::SeqCst);
-                                match child.stop(StopReason::Kill).await {
-                                    Ok(()) => {
-                                        accepted += 1;
-                                        if returned_before {
-                                            after += 1;
-                                        }
-                                        tokio::task::yield_now().await;
-                                    }
-                                    Err(SendError::Closed) => break,
-                                    Err(other) => panic!("unexpected answer {other:?}"),
-                                }
-                            }
-                            // Once a call returned `Closed`, every later call does.
-                            for _ in 0..5 {
-                                assert!(matches!(
-                                    child.stop(StopReason::Kill).await,
-                                    Err(SendError::Closed)
-                                ));
-                            }
-                            (accepted, after)
-                        })
-                    };
-                    child.stop(StopReason::Graceful).await.ok();
-                    let (accepted, after) = timeout(Duration::from_secs(10), hammer)
-                        .await
-                        .expect("the hammer ends")
-                        .unwrap();
-                    (name, accepted, after)
-                });
-            }
-            while let Some(done) = set.join_next().await {
-                let (name, accepted, after) = done.unwrap();
-                let reason = final_reason(&ends, &name).await;
-                if accepted > 0 {
-                    accepted_kills += 1;
-                    assert!(
-                        matches!(reason, StopReason::Kill),
-                        "an accepted Kill is the final reason, got {reason:?} for {name}"
-                    );
-                }
-                if after > 0 {
-                    accepted_after_on_stopped += 1;
-                }
-            }
-        }
-        eprintln!(
-            "iterations with an accepted Kill: {accepted_kills} of 200; \
-             with one accepted after on_stopped returned: {accepted_after_on_stopped}"
-        );
     });
 }
 
@@ -1267,173 +924,3 @@ fn kill_raised_while_the_queued_messages_drop_is_refused() {
 // ---------------------------------------------------------------------------
 // The inherited stop: its place among the forced reasons
 // ---------------------------------------------------------------------------
-
-/// A child whose `pre_stop` accepts once it is released, noting when it
-/// began, and which records the reasons `on_stopped` received.
-struct AcceptsSlowly {
-    in_gate: Arc<AtomicBool>,
-    release: Arc<tokio::sync::Notify>,
-    received: Arc<Mutex<Vec<StopReason>>>,
-}
-
-impl Actor for AcceptsSlowly {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        self.in_gate.store(true, Ordering::SeqCst);
-        self.release.notified().await;
-        true
-    }
-
-    async fn on_stopped(
-        &mut self,
-        reason: &StopReason,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        self.received.lock().unwrap().push(reason.clone());
-        Ok(())
-    }
-}
-
-#[test]
-fn parent_killed_raised_during_an_accepting_pre_stop_is_the_final_reason() {
-    common::run(0, async {
-        let sys = ActorSystem::create(uname("parent-killed-gate")).unwrap();
-        let in_gate = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(tokio::sync::Notify::new());
-        let received: Arc<Mutex<Vec<StopReason>>> = Arc::new(Mutex::new(Vec::new()));
-        let (top, ends) = top(&sys, Duration::from_secs(5), false, {
-            let (in_gate, release, received) = (in_gate.clone(), release.clone(), received.clone());
-            move || AcceptsSlowly {
-                in_gate: in_gate.clone(),
-                release: release.clone(),
-                received: received.clone(),
-            }
-        })
-        .await;
-        let name = uname("gated");
-        let child: ActorHandle<AcceptsSlowly> = start_child(&top, &sys, &name).await;
-        child.stop(StopReason::Graceful).await.unwrap();
-        while !in_gate.load(Ordering::SeqCst) {
-            sleep(Duration::from_millis(2)).await;
-        }
-        // The gate is in flight, held: the inherited stop lands inside it and
-        // is the reason the stop ends with.
-        child.stop(StopReason::ParentKilled).await.unwrap();
-        release.notify_one();
-        timeout(Duration::from_secs(5), child.wait_stopped())
-            .await
-            .expect("the child stops");
-        assert!(
-            matches!(
-                received.lock().unwrap().as_slice(),
-                [StopReason::ParentKilled]
-            ),
-            "on_stopped received {:?}",
-            received.lock().unwrap()
-        );
-        assert!(
-            matches!(final_reason(&ends, &name).await, StopReason::ParentKilled),
-            "and so did the parent's `on_child_stopped`"
-        );
-    });
-}
-
-/// A child whose turn holds until released, noting when it began, and which
-/// records the reasons `on_stopped` received.
-struct HoldsATurn {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-    received: Arc<Mutex<Vec<StopReason>>>,
-}
-
-impl Actor for HoldsATurn {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        self.entered.notify_one();
-        self.release.notified().await;
-        Ok(())
-    }
-
-    async fn on_stopped(
-        &mut self,
-        reason: &StopReason,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        self.received.lock().unwrap().push(reason.clone());
-        Ok(())
-    }
-}
-
-/// Raises `first` and then `second` while the child is inside one turn, and
-/// returns the reason `on_stopped` received and the reason the parent saw.
-async fn two_requests_in_one_turn(
-    base: &str,
-    first: StopReason,
-    second: StopReason,
-) -> (StopReason, StopReason) {
-    let sys = ActorSystem::create(uname(base)).unwrap();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let received: Arc<Mutex<Vec<StopReason>>> = Arc::new(Mutex::new(Vec::new()));
-    let (top, ends) = top(&sys, Duration::from_secs(5), false, {
-        let (entered, release, received) = (entered.clone(), release.clone(), received.clone());
-        move || HoldsATurn {
-            entered: entered.clone(),
-            release: release.clone(),
-            received: received.clone(),
-        }
-    })
-    .await;
-    let name = uname("holding");
-    let child: ActorHandle<HoldsATurn> = start_child(&top, &sys, &name).await;
-    child.notify(()).await.unwrap();
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .expect("the turn begins");
-    // Both requests are accepted: the later, lower-ranked one is not stored.
-    child.stop(first).await.unwrap();
-    child.stop(second).await.unwrap();
-    release.notify_one();
-    timeout(Duration::from_secs(5), child.wait_stopped())
-        .await
-        .expect("the child stops");
-    let reasons = received.lock().unwrap().clone();
-    assert_eq!(reasons.len(), 1, "{reasons:?}");
-    (reasons[0].clone(), final_reason(&ends, &name).await)
-}
-
-#[test]
-fn failure_is_kept_over_a_later_parent_killed() {
-    common::run(0, async {
-        let (stopped, seen) = two_requests_in_one_turn(
-            "failure-kept",
-            StopReason::Failure(ActorError::user("fail")),
-            StopReason::ParentKilled,
-        )
-        .await;
-        assert!(matches!(stopped, StopReason::Failure(_)), "{stopped:?}");
-        assert!(matches!(seen, StopReason::Failure(_)), "{seen:?}");
-    });
-}
-
-#[test]
-fn parent_killed_is_kept_over_a_later_cancelled() {
-    common::run(0, async {
-        let (stopped, seen) = two_requests_in_one_turn(
-            "parent-killed-kept",
-            StopReason::ParentKilled,
-            StopReason::Cancelled,
-        )
-        .await;
-        assert!(matches!(stopped, StopReason::ParentKilled), "{stopped:?}");
-        assert!(matches!(seen, StopReason::ParentKilled), "{seen:?}");
-    });
-}

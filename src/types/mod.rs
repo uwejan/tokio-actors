@@ -1,7 +1,8 @@
 //! Shared type definitions used across the Tokio Actors runtime.
 
-mod stop_lane;
-mod turn_clock;
+pub(crate) mod status_cell;
+pub(crate) mod stop_lane;
+pub(crate) mod turn_clock;
 
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +13,23 @@ use tokio::sync::oneshot;
 
 use crate::error::ActorError;
 
-pub(crate) use stop_lane::{LaneState, RaiseResult, StopLane, StopSeverity};
+pub(crate) use status_cell::{StatusRx, StatusTx};
+pub(crate) use stop_lane::{
+    LaneCell, LaneRx, LaneState, RaiseResult, StopLane, StopSeverity, WakeSlot,
+};
 pub(crate) use turn_clock::TurnClock;
 
-/// Unique identifier assigned to each actor within the system.
+/// Identifier of an actor within its system, unique among the system's live
+/// actors. An actor keeps its id across supervised restarts. An anonymous
+/// actor gets a random id; a named actor's id is its name, so a later actor
+/// that takes the name after the first has ended has an equal id, and an
+/// id-keyed call such as `ActorSystem::kill_by_id` reaches whichever actor
+/// holds the id when the call is made.
+///
+/// An actor's address is its handle's channels; its `ActorId` and name are
+/// aliases a restarted child keeps, so a handle to an ended incarnation and one
+/// to its successor compare equal: check `is_alive()` or resolve the id again
+/// with `ActorSystem::get_by_id`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ActorId(Arc<str>);
 
@@ -23,6 +37,19 @@ impl ActorId {
     /// Returns the identifier as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The id of a named actor, sharing the allocation that holds its name.
+    pub(crate) fn from_shared(name: Arc<str>) -> Self {
+        Self(name)
+    }
+
+    /// A fresh random (version 4) UUID id, hyphenated and lowercase, formatted
+    /// on the stack into a single allocation.
+    pub(crate) fn anonymous() -> Self {
+        let id = uuid::Uuid::new_v4();
+        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+        Self(Arc::from(&*id.hyphenated().encode_lower(&mut buf)))
     }
 }
 
@@ -59,13 +86,18 @@ pub enum SchedulePolicy {
 /// Strategy for handling timer drift when recurring timers miss their scheduled time.
 #[derive(Debug, Clone, Copy)]
 pub enum MissPolicy {
-    /// Skip missed ticks and schedule the next tick at the next aligned interval.
+    /// Skip missed ticks and schedule the next tick at the next aligned interval
+    /// (after `u32::MAX` or more missed intervals, one interval from now).
     /// If multiple intervals have passed, they are all skipped.
     /// Example: If a 1s timer is delayed by 3.5s, the next tick happens at 4s.
     Skip,
 
-    /// Send all missed messages immediately (catch up), then resume normal schedule.
-    /// This ensures no messages are lost but may cause bursts of activity.
+    /// Send the missed ticks at once (catch up), then resume the normal schedule.
+    /// No tick is lost: when the mailbox is full the burst pauses, and the timer
+    /// task waits for room before it sends the next missed tick. Each time the
+    /// burst finds the mailbox full, the message made for that tick is dropped
+    /// and made again, so an `every_with` factory runs once more for each time
+    /// the burst finds the mailbox full; keep it free of side effects.
     /// Example: If a 1s timer is delayed by 3.5s, send 3 messages immediately,
     /// then schedule the next at 4s.
     CatchUp,
@@ -133,10 +165,25 @@ pub enum StopReason {
     ///
     /// Erlang/OTP: a supervisor traps its parent's exit and terminates in
     /// order.
+    ///
+    /// To give a trapping worker an orderly stop under a killed supervisor,
+    /// wrap the worker in a one-child supervisor: a killed supervisor stops
+    /// nothing itself, but the one-child supervisor under it is raised
+    /// `ParentKilled` and stops the worker in order, within the shorter of its
+    /// own `Shutdown` window and the worker's, so the worker gets an orderly
+    /// stop and runs `on_stopped`, at the cost of one more actor.
     ParentKilled,
-    /// The actor was forcibly killed. Bypasses ALL lifecycle hooks.
-    /// Only `RegistryGuard::drop` fires for cleanup.
-    /// OTP equivalent: `exit(Pid, kill)` (untrappable).
+    /// The actor was forcibly killed. Not vetoable, and no lifecycle hook
+    /// begins once the actor reads it: a hook already running finishes, or is
+    /// aborted when it next yields once the actor's kill grace has passed (or
+    /// the window of the `stop_within` call that raised the `Kill`; at once
+    /// when the actor's runtime has no time driver). The actor's value,
+    /// context and queued messages are still dropped. Closest Erlang/OTP
+    /// equivalent: `exit(Pid, kill)`, an untrappable exit signal that ends the
+    /// process with reason `killed`.
+    ///
+    /// Also the reason when the actor's task was dropped because its runtime
+    /// shut down, where Erlang/OTP's nearest end is `noconnection`.
     Kill,
 }
 
@@ -242,11 +289,7 @@ impl StatusValue {
     /// is, its stamp included. With `stopped` the same write publishes the
     /// terminal status, so no reader sees `Stopped` without its reason.
     /// Succeeds with no receivers left. Returns whether this call wrote.
-    pub(crate) fn write_reason(
-        tx: &tokio::sync::watch::Sender<StatusValue>,
-        reason: StopReason,
-        stopped: bool,
-    ) -> bool {
+    pub(crate) fn write_reason(tx: &StatusTx, reason: StopReason, stopped: bool) -> bool {
         tx.send_if_modified(|value| {
             if value.reason.is_some() {
                 return false;
@@ -415,11 +458,13 @@ pub struct ActorStatusInfo {
     pub name: Option<String>,
     /// Current lifecycle status.
     pub status: ActorStatus,
-    /// Current number of messages in the mailbox.
+    /// Number of mailbox slots in use: the messages queued plus the slots
+    /// senders have reserved and not yet filled.
     pub mailbox_len: usize,
     /// Total mailbox capacity.
     pub mailbox_capacity: usize,
-    /// Current number of messages queued in the priority lane. `0` when the
+    /// Number of priority-lane slots in use: the messages queued in the lane
+    /// plus the slots senders have reserved and not yet filled. `0` when the
     /// actor has no priority lane enabled.
     pub priority_len: usize,
     /// Total capacity of the priority lane. `0` when the actor has no
@@ -522,6 +567,20 @@ pub struct StopReport {
     pub reason: Option<StopReason>,
 }
 
+/// How a wait for an actor's subtree ended: the answer of
+/// [`SubtreeObserver::wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtreeEnd {
+    /// The actor and every actor below it have ended.
+    Ended,
+    /// An actor below it was still running when the stop budgets the subtree
+    /// carries ran out: for each child below, its kill grace and the short
+    /// wait that confirms an abort, and for a supervisor child its
+    /// `Shutdown` window as well. The wait stopped nothing: a later call can
+    /// answer `Ended`.
+    Unresponsive,
+}
+
 /// Report returned by [`ActorSystem::shutdown`](crate::system::ActorSystem::shutdown)
 /// and [`ActorSystem::shutdown_with`](crate::system::ActorSystem::shutdown_with):
 /// how stopping every root actor registered in the system ended.
@@ -531,8 +590,8 @@ pub struct ShutdownReport {
     /// [`StopOutcome`]) and its final reason. Roots stopped one at a time come
     /// in stop order (reverse registration order); roots handed to the
     /// concurrent force sweep follow, in the order their waits end. Only root
-    /// actors are reported here: a supervised child's fate is decided by its
-    /// own supervisor's shutdown cascade, not signalled by the system directly.
+    /// actors are reported here; a non-root leftover that the final sweep
+    /// handles is reported in `swept`.
     pub outcomes: Vec<(ActorId, StopReport)>,
     /// Non-root leftovers handled by the final sweep. Normally empty:
     /// supervised children vanish via their own guard drops during each
@@ -553,9 +612,10 @@ pub struct ShutdownReport {
     /// failed is reported from its plane by the same rule once it has ended,
     /// `Unresponsive` while it still runs, though the abort the system
     /// scheduled may still end it. The deadline `Kill` and its abort are
-    /// scheduled with the system when the sweep begins, so they happen even
-    /// if the shutdown future is dropped first, and they stand for a later
-    /// shutdown with a later deadline.
+    /// scheduled with the system when the sweep begins, on the runtime of each
+    /// leftover whose task is already spawned, so they happen even if the walk
+    /// is cut short first, and they stand for a later shutdown with a later
+    /// deadline.
     pub swept: Vec<(ActorId, StopReport)>,
 }
 
@@ -576,7 +636,18 @@ pub struct ShutdownReport {
 #[derive(Debug)]
 pub(crate) enum SystemMessage {
     /// Request a status snapshot.
-    GetStatus(oneshot::Sender<ActorStatusInfo>),
+    GetStatus(StatusRequest),
+}
+
+/// One status request: where its reply goes, and whether the requester is a
+/// runtime task. The kind travels with its own request, so the reply to it
+/// reads that request's kind whatever else is queued.
+#[derive(Debug)]
+pub(crate) struct StatusRequest {
+    /// Where the snapshot is sent.
+    pub(crate) reply: oneshot::Sender<ActorStatusInfo>,
+    /// The requester ran inside a runtime task when it queued the request.
+    pub(crate) task: bool,
 }
 
 /// Internal event describing a child's death, delivered to the parent's

@@ -4,23 +4,29 @@
 #![warn(unreachable_pub)]
 #![warn(rust_2018_idioms)]
 #![warn(rustdoc::broken_intra_doc_links)]
-//! Tokio Actors is a light-weight, Tokio-native actor framework for building
+#![cfg_attr(test, allow(dead_code))]
+//! Tokio Actors is a Tokio-native actor framework for building
 //! hierarchical systems with strongly-typed mailboxes, timers, and supervision.
 //!
 //! # Overview
-//! - Thread-safe actors that run as exclusive tasks on Tokio's multi-threaded runtime.
+//! - Thread-safe actors, each running as its own task on the Tokio runtime you provide, multi-threaded or current-thread.
 //! - Typed request/response semantics through [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
-//! - Recurring timers, supervision hooks, and bounded mailboxes out of the box.
+//! - Recurring timers and supervision (both need a runtime with the Tokio time driver, which `#[tokio::main]` and `#[tokio::test]` enable) and bounded mailboxes, out of the box.
 //!
 //! # Liveness
-//! An actor runs until it is stopped, killed, or its system shuts down; every
-//! actor is enumerable ([`ActorSystem::actor_ids`](crate::system::ActorSystem::actor_ids))
-//! and killable ([`ActorSystem::kill_by_id`](crate::system::ActorSystem::kill_by_id))
-//! through its system, regardless of how it was spawned. This mirrors
-//! Erlang/OTP's mechanism set: links, monitors, and `supervisor` trees
-//! (erlang.org/docs/28) are the documented way to give a process's lifetime
-//! structure, which is why structuring actors under supervision trees is the
-//! recommended way to manage their lifetimes here too.
+//! An actor runs until it is stopped or killed (by a caller, by its supervisor
+//! or by a system shutdown), until it fails (an `Err` or a panic from one of
+//! its callbacks ends it), or until its runtime ends; dropping its handles
+//! does not end it. While it is registered, every actor is enumerable
+//! ([`ActorSystem::actor_ids`](crate::system::ActorSystem::actor_ids)) through
+//! its system, and killable through it with
+//! [`ActorSystem::kill_by_id`](crate::system::ActorSystem::kill_by_id) (which
+//! needs a runtime with the Tokio time driver when the id is registered and
+//! its actor takes the `Kill`), regardless of how it was spawned. Erlang/OTP gives a
+//! process's lifetime structure through links, monitors and `supervisor` trees
+//! (erlang.org/docs/28); this crate provides supervision trees, which is why
+//! structuring actors under supervisors is the recommended way to manage their
+//! lifetimes here.
 //!
 //! ```rust,no_run
 //! use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult, StopReason};
@@ -52,10 +58,11 @@
 /// panic capture and crash-visible supervision depend on.
 ///
 /// Under `panic = "abort"` a panic inside any actor callback terminates the
-/// whole process: no `on_stopped`, no supervisor notification, no typed
-/// error. Unlike the crate's other documented limits, which surface as a
-/// typed error or a documented stall, this one is total and silent.
-/// `Err`-based supervision is unaffected.
+/// whole process: no `on_stopped`, no supervisor notification and no typed
+/// error; the crate reports nothing. `Err`-based supervision is unaffected.
+/// The process ends the same way for a stack overflow, a panic raised while
+/// another unwinds, an allocation failure, `std::process::abort` and
+/// `std::process::exit`: no actor runs `on_stopped` and no supervisor is told.
 ///
 /// To refuse such a build, assert it in your own crate:
 /// `const _: () = assert!(tokio_actors::PANIC_CAPTURE_AVAILABLE);`
@@ -82,12 +89,14 @@ macro_rules! caught_log {
 
 pub mod actor;
 pub mod error;
+mod helper;
 pub mod system;
+mod time_probe;
 pub mod types;
 
 pub use actor::{
     context::{ActorContext, ChildSpawnBuilder, RecurringScheduleBuilder, ScheduleBuilder},
-    handle::ActorHandle,
+    handle::{ActorHandle, SubtreeObserver},
     runtime::{ActorConfig, MailboxConfig},
     supervision::SupervisionConfig,
     Actor, ActorExt, SpawnBuilder,
@@ -100,5 +109,5 @@ pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{
     ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId,
     RestartStrategy, RestartType, SchedulePolicy, Shutdown, ShutdownReport, StopChildOutcome,
-    StopOutcome, StopReason, StopReport, StreamEvent, StreamId, SupervisionAction,
+    StopOutcome, StopReason, StopReport, StreamEvent, StreamId, SubtreeEnd, SupervisionAction,
 };

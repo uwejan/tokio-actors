@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{oneshot, watch, Notify};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 #[cfg(test)]
 use tokio::time::timeout;
 use tokio::time::{sleep_until, Instant};
@@ -34,7 +34,7 @@ use crate::error::{ActorError, SpawnError};
 use crate::system::read_status;
 use crate::system::wait_end_or_floor;
 use crate::types::{
-    ActorId, ActorStatus, ChildFate, RaiseResult, Shutdown, StatusValue, StopLane, StopReason,
+    ActorId, ActorStatus, ChildFate, RaiseResult, Shutdown, StatusRx, StopLane, StopReason,
 };
 
 /// A stop decision written to one incarnation's executor. Level-triggered: it
@@ -105,7 +105,7 @@ pub(crate) struct SlotCell {
     /// its factory: no incarnation existed.
     pub cancelled: bool,
     pub lane: Option<StopLane>,
-    pub status: Option<watch::Receiver<StatusValue>>,
+    pub status: Option<StatusRx>,
     /// What the incarnation's stop is bounded by, published with its lane and
     /// status: the waits on an incarnation whose runner failed read it.
     pub own: Option<OwnStop>,
@@ -329,7 +329,7 @@ impl SlotIo {
     pub(crate) fn publish(
         &self,
         lane: StopLane,
-        status: watch::Receiver<StatusValue>,
+        status: StatusRx,
         own: OwnStop,
         subtree: Option<SubtreeWatch>,
     ) {
@@ -381,7 +381,7 @@ impl SlotCtl {
     }
 
     /// The incarnation's status plane, once its executor published it.
-    pub(crate) fn status(&self) -> Option<watch::Receiver<StatusValue>> {
+    pub(crate) fn status(&self) -> Option<StatusRx> {
         self.cell_rx.borrow().status.clone()
     }
 
@@ -514,6 +514,9 @@ impl SlotCtl {
     pub(crate) fn raise_first(&self, policy: Shutdown) -> bool {
         match self.lane() {
             Some(lane) => {
+                // A `Kill` raised here (a child whose shutdown policy is
+                // `Kill`) belongs to the supervisor's ladder, which holds the
+                // child's abort itself: no registry deadline is declared.
                 lane.raise(initial_signal(policy));
                 true
             }
@@ -593,7 +596,7 @@ impl SlotCtl {
 /// The end of an incarnation whose runner failed, read from the status plane
 /// its cell held.
 pub(crate) struct LostEnd {
-    status: watch::Receiver<StatusValue>,
+    status: StatusRx,
     lost: VerdictFlag,
     /// What bounds the incarnation's own stop.
     own: OwnStop,
@@ -641,6 +644,9 @@ impl LostEnd {
                 .status
                 .wait_for(|value| value.status == ActorStatus::Stopped)
                 .await;
+        }
+        if let Some(record) = &self.record {
+            record.task_ended();
         }
         self.status.borrow().reason_or_kill()
     }
@@ -713,6 +719,9 @@ async fn closed_cell(watch: &CellWatch, incarnation: u64) -> CellOutcome {
     let record = last.lane.as_ref().map(StopLane::abort_record);
     let ended = wait_end_or_floor(&mut status, record, bound, bound).await;
     if ended {
+        if let Some(record) = record {
+            record.task_ended();
+        }
         // The reason the plane carries: the one written at the incarnation's
         // seal, or `Kill` for a plane closed without one.
         let reason = status.borrow().reason_or_kill();
@@ -742,37 +751,41 @@ pub(crate) fn join_error_panic(err: JoinError) -> Option<ActorError> {
 /// joined. A task that panicked wrote its reason into its status plane during
 /// its own unwind, before the join resolved: that reason is the end's, so the
 /// plane and the report carry one reason, and the join's payload is logged.
-/// Any other end reads as [`map_join`] reads it. The log line names the
+/// `plane` is called only for a task that panicked. Any other end reads as
+/// [`map_join`] reads it. The log line names the
 /// supervisor, the child and the incarnation of `io`'s slot, `?` where one
 /// is unknown (no slot, or a slot made without a key).
 #[allow(unused_variables)]
 pub(crate) fn joined_reason(
     res: Result<StopReason, JoinError>,
-    plane: Option<StopReason>,
+    plane: impl FnOnce() -> Option<StopReason>,
     io: Option<&SlotIo>,
 ) -> StopReason {
-    match (res, plane) {
-        (Err(err), Some(reason)) if err.is_panic() => {
-            #[cfg(feature = "tracing")]
-            {
-                let (supervisor, child, incarnation) = io.map_or_else(
-                    || ("?".to_string(), "?".to_string(), "?".to_string()),
-                    |io| io.lost.names(),
-                );
-                caught_log!(warn,
-                    supervisor = %supervisor,
-                    child = %child,
-                    incarnation = %incarnation,
-                    reason = %reason,
-                    panic = %map_join(Err(err)),
-                    "an actor's task panicked outside every catch"
-                );
+    match res {
+        Err(err) if err.is_panic() => match plane() {
+            Some(reason) => {
+                #[cfg(feature = "tracing")]
+                {
+                    let (supervisor, child, incarnation) = io.map_or_else(
+                        || ("?".to_string(), "?".to_string(), "?".to_string()),
+                        |io| io.lost.names(),
+                    );
+                    caught_log!(warn,
+                        supervisor = %supervisor,
+                        child = %child,
+                        incarnation = %incarnation,
+                        reason = %reason,
+                        panic = %map_join(Err(err)),
+                        "an actor's task panicked outside every catch"
+                    );
+                }
+                #[cfg(not(feature = "tracing"))]
+                drop(err);
+                reason
             }
-            #[cfg(not(feature = "tracing"))]
-            drop(err);
-            reason
-        }
-        (res, _) => map_join(res),
+            None => map_join(Err(err)),
+        },
+        res => map_join(res),
     }
 }
 
@@ -798,23 +811,26 @@ pub(crate) fn map_join(res: Result<StopReason, JoinError>) -> StopReason {
 }
 
 /// Raises a ladder's request; a `Kill` the lane takes makes the ladder's
-/// abort owed to the incarnation until it is issued or the incarnation ends.
-fn raise_owing(lane: &StopLane, reason: StopReason) {
+/// abort owed to the incarnation until it is issued or the task ends. A task
+/// that already ended is owed nothing.
+fn raise_owing(lane: &StopLane, reason: StopReason, task: &AbortHandle) {
     let kill = matches!(reason, StopReason::Kill);
+    // The supervisor holds the child's abort handle and record itself, so no
+    // registry entry is involved and no deadline is declared.
     if lane.try_raise(reason) == RaiseResult::Recorded && kill {
-        lane.abort_record().owe();
+        lane.abort_record().owe_for(task);
     }
 }
 
 /// An attempt's ladder enters its kill grace at a start timeout or an ended
 /// initialization: it raises `Kill` when `raise` says the lane holds none
 /// yet, and owes its abort either way, since the ladder aborts the task once
-/// the grace has passed.
-fn owe_kill_grace(lane: &StopLane, raise: bool) {
+/// the grace has passed. A task that already ended is owed nothing.
+fn owe_kill_grace(lane: &StopLane, raise: bool, task: &AbortHandle) {
     if raise {
-        raise_owing(lane, StopReason::Kill);
+        raise_owing(lane, StopReason::Kill, task);
     } else {
-        lane.abort_record().owe();
+        lane.abort_record().owe_for(task);
     }
 }
 
@@ -831,9 +847,10 @@ fn advance(
     let (next, action) = ladder_step(step, event, Instant::now().into_std(), grace);
     match action {
         LadderAction::None => {}
-        LadderAction::Raise(signal) => raise_owing(lane, signal.reason()),
+        LadderAction::Raise(signal) => raise_owing(lane, signal.reason(), &join.abort_handle()),
         LadderAction::Abort => lane.abort_record().abort(&join.abort_handle()),
         LadderAction::WriteVerdict => io.write_verdict(),
+        LadderAction::ReleaseMark => lane.abort_record().task_ended(),
     }
     next
 }
@@ -869,7 +886,11 @@ pub(crate) async fn run_ladder(
         tokio::select! {
             biased;
 
-            res = &mut *join => return joined_reason(res, io.plane_reason(), Some(io)),
+            res = &mut *join => {
+                let reason = joined_reason(res, || io.plane_reason(), Some(io));
+                advance(step, LadderEvent::TaskEnded, grace, join, lane, io);
+                return reason;
+            }
 
             changed = io.cmd_rx.changed(), if commands_open && !armed => {
                 match changed {
@@ -988,6 +1009,7 @@ mod lost_end_cap_tests {
     use super::*;
     use crate::actor::runtime::FAR_FUTURE;
     use crate::actor::supervision::ABORT_SETTLE;
+    use crate::types::{StatusTx, StatusValue};
 
     #[test]
     fn the_lost_end_bound_is_the_kill_grace_plus_the_settle_time() {
@@ -1001,7 +1023,7 @@ mod lost_end_cap_tests {
     /// that ended `Graceful` reads `Graceful`.
     async fn a_closed_cell_reads_the_reason_its_plane_carries() {
         let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _stop_rx) = StopLane::new();
         io.publish(
             lane,
@@ -1035,7 +1057,7 @@ mod lost_end_cap_tests {
     async fn lost_runner_waits_cap_a_saturated_kill_grace() {
         let year = Duration::from_secs(86_400 * 365);
         let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _stop_rx) = StopLane::new();
         io.publish(lane, status_rx, OwnStop::worker(Duration::MAX), None);
         let mut watch = ctl.watch();
@@ -1098,7 +1120,7 @@ fn advance_attempt(
     let (next, action) = ladder_step(step, event, Instant::now().into_std(), grace);
     match action {
         LadderAction::None => {}
-        LadderAction::Raise(signal) => raise_owing(lane, signal.reason()),
+        LadderAction::Raise(signal) => raise_owing(lane, signal.reason(), &join.abort_handle()),
         LadderAction::Abort => lane.abort_record().abort(&join.abort_handle()),
         LadderAction::WriteVerdict => {
             let view = AttemptView {
@@ -1112,6 +1134,7 @@ fn advance_attempt(
                 io.write_verdict();
             }
         }
+        LadderAction::ReleaseMark => lane.abort_record().task_ended(),
     }
     next
 }
@@ -1228,7 +1251,7 @@ pub(crate) async fn run_attempt(attempt: Attempt) -> RestartOutcome {
                         if let AttemptAction::KillPath { raise } =
                             attempt_step(AttemptStage::Init, AttemptEvent::InitEnded, view!())
                         {
-                            owe_kill_grace(&lane, raise);
+                            owe_kill_grace(&lane, raise, &join.abort_handle());
                             step = kill_grace_from(Instant::now().into_std(), grace);
                         }
                     }
@@ -1236,7 +1259,8 @@ pub(crate) async fn run_attempt(attempt: Attempt) -> RestartOutcome {
             }
 
             res = &mut join => {
-                let reason = joined_reason(res, io.plane_reason(), Some(&io));
+                let reason = joined_reason(res, || io.plane_reason(), Some(&io));
+                advance_attempt(step, LadderEvent::TaskEnded, grace, (&join, &lane, &io));
                 let event = AttemptEvent::Ended {
                     ordered: ordered || io.order().is_some(),
                     timeout_raised,
@@ -1286,7 +1310,7 @@ pub(crate) async fn run_attempt(attempt: Attempt) -> RestartOutcome {
                     attempt_step(AttemptStage::Init, AttemptEvent::StartTimeout, view!())
                 {
                     timeout_raised = raise;
-                    owe_kill_grace(&lane, raise);
+                    owe_kill_grace(&lane, raise, &join.abort_handle());
                     step = kill_grace_from(Instant::now().into_std(), grace);
                 }
             }
@@ -1314,20 +1338,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use std::ops::Not as _;
-
     use tokio::sync::{mpsc, oneshot};
-    use tokio::task::JoinSet;
 
     use super::*;
-    use crate::actor::runtime::spawn_runner;
+
     use crate::actor::subtree::{SubtreeHold, SubtreeLink};
     use crate::actor::supervision::{
-        ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState, DeathOutcome, Origin,
-        SupervisionConfig, SupervisionState, TaskPlane, ABORT_SETTLE,
+        ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState, Origin, SupervisionConfig,
+        SupervisionState, TaskPlane,
     };
     use crate::system::ActorSystem;
-    use crate::types::{ActorId, RestartType};
+    use crate::types::{ActorId, RestartType, StatusTx, StatusValue};
 
     fn dummy_system() -> Arc<ActorSystem> {
         ActorSystem::create(format!("slot-test-{}", uuid::Uuid::new_v4())).unwrap()
@@ -1341,7 +1362,7 @@ mod tests {
     struct Child {
         join: JoinHandle<StopReason>,
         lane: StopLane,
-        status: watch::Receiver<StatusValue>,
+        status: StatusRx,
         started: Arc<AtomicUsize>,
         finished: Arc<AtomicUsize>,
         vetoed: Arc<AtomicUsize>,
@@ -1349,7 +1370,7 @@ mod tests {
 
     fn spawn_vetoing_child(turn: Duration, hang: bool) -> Child {
         let (lane, mut lane_rx) = StopLane::new();
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let started = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
         let vetoed = Arc::new(AtomicUsize::new(0));
@@ -1390,70 +1411,11 @@ mod tests {
         }
     }
 
-    struct Rig {
-        death_set: JoinSet<DeathOutcome>,
-        ctl: SlotCtl,
-        abort: tokio::task::AbortHandle,
-        child: ChildStats,
-        _reaper: mpsc::UnboundedReceiver<crate::system::ReaperEntry>,
-    }
-
     struct ChildStats {
         started: Arc<AtomicUsize>,
         finished: Arc<AtomicUsize>,
         vetoed: Arc<AtomicUsize>,
         lane: StopLane,
-    }
-
-    /// A runner over a vetoing child, its order not yet written.
-    fn rig(turn: Duration, hang: bool, grace: Duration) -> Rig {
-        let child = spawn_vetoing_child(turn, hang);
-        let (ctl, io) = slot_pair(Default::default());
-        io.publish(
-            child.lane.clone(),
-            child.status.clone(),
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        rig_over(child, ctl, io, grace)
-    }
-
-    fn rig_over(child: Child, ctl: SlotCtl, io: SlotIo, grace: Duration) -> Rig {
-        let abort = child.join.abort_handle();
-        let (reaper_tx, reaper) = mpsc::unbounded_channel();
-        let guard = ChildLinkGuard::new(
-            child.lane.clone(),
-            abort.clone(),
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: DEFAULT_KILL_GRACE,
-            },
-            dummy_system(),
-            tokio::runtime::Handle::current(),
-        );
-        let mut death_set: JoinSet<DeathOutcome> = JoinSet::new();
-        spawn_runner(
-            &mut death_set,
-            ActorId::from("slot-child"),
-            1,
-            child.join,
-            child.lane.clone(),
-            io,
-            guard,
-            grace,
-        );
-        Rig {
-            death_set,
-            ctl,
-            abort,
-            child: ChildStats {
-                started: child.started,
-                finished: child.finished,
-                vetoed: child.vetoed,
-                lane: child.lane,
-            },
-            _reaper: reaper,
-        }
     }
 
     const ONE_TURN: Duration = Duration::from_millis(30);
@@ -1468,402 +1430,7 @@ mod tests {
             .expect("timed out waiting for an outcome")
     }
 
-    /// The upper bound of a timed outcome whose exact instant is `exact`: on
-    /// the paused clock the outcome lands on it, within one turn; on real
-    /// time what the host adds is not the test's to bound, so only a hang
-    /// fails.
-    fn upper(paused: bool, exact: Duration) -> Duration {
-        if paused {
-            exact + Duration::from_millis(60)
-        } else {
-            BOUND
-        }
-    }
-
     // - the shared bodies ------------------------------------------------------
-
-    async fn runner_escalates_a_vetoing_child_after_its_caller_drops_the_wait(paused: bool) {
-        // A kill grace far longer than one turn: the child reaches its next
-        // turn boundary inside it however late the host runs the test, so it
-        // ends with the `Kill` it observed there, never by the abort.
-        let mut rig = rig(ONE_TURN, false, Duration::from_secs(2));
-        tokio::time::sleep(Duration::from_millis(12)).await;
-        let t0 = Instant::now();
-        let window = Duration::from_millis(200);
-        // The caller commits and then drops its wait almost at once.
-        rig.ctl.order_stop(Shutdown::Timeout(window), true);
-        let mut cell = rig.ctl.watch();
-        let waited = timeout(Duration::from_millis(20), await_cell(&mut cell, 1)).await;
-        assert!(waited.is_err(), "the caller's wait was dropped");
-        let (_, reason, incarnation) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        let took = t0.elapsed();
-        assert!(matches!(reason, StopReason::Kill), "{reason:?}");
-        assert_eq!(incarnation, 1);
-        assert!(took >= window, "the window was honored: {took:?}");
-        assert!(
-            took < upper(paused, window + DEFAULT_KILL_GRACE),
-            "the Kill landed within one turn of the window: {took:?}"
-        );
-        assert_eq!(
-            rig.child.started.load(Ordering::SeqCst),
-            rig.child.finished.load(Ordering::SeqCst),
-            "the Kill was observed only at a turn boundary"
-        );
-        assert!(matches!(
-            rig.ctl.fate().map(|fate| fate.reason),
-            Some(StopReason::Kill)
-        ));
-    }
-
-    async fn runner_aborts_a_turn_parked_at_an_await_after_kill_is_ignored(_paused: bool) {
-        let mut rig = rig(ONE_TURN, true, DEFAULT_KILL_GRACE);
-        tokio::time::sleep(Duration::from_millis(12)).await;
-        let t0 = Instant::now();
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(50)), true);
-        let mut cell = rig.ctl.watch();
-        match bounded(await_cell(&mut cell, 1)).await {
-            CellOutcome::Fate(fate) => assert!(matches!(fate.reason, StopReason::Kill)),
-            other => panic!("expected the aborted child's fate, got {other:?}"),
-        }
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(50) + DEFAULT_KILL_GRACE,
-            "Timeout, then Kill (ignored mid-turn), then the abort: {took:?}"
-        );
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        assert!(matches!(reason, StopReason::Kill));
-        assert!(
-            !rig.ctl.is_unresponsive(),
-            "an abort that landed is no verdict"
-        );
-    }
-
-    async fn runner_honors_a_stop_order_written_before_it_started(_paused: bool) {
-        // The order predates the runner and its first signal was never
-        // raised: no lane existed when it was written.
-        let child = spawn_vetoing_child(Duration::from_millis(10), false);
-        let (ctl, io) = slot_pair(Default::default());
-        ctl.write_order(Shutdown::Timeout(Duration::from_millis(80)), false);
-        io.publish(
-            child.lane.clone(),
-            child.status.clone(),
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        let mut rig = rig_over(child, ctl, io, DEFAULT_KILL_GRACE);
-        let mut cell = rig.ctl.watch();
-        match bounded(await_cell(&mut cell, 1)).await {
-            CellOutcome::Fate(fate) => assert!(matches!(fate.reason, StopReason::Kill)),
-            other => panic!("expected the child's fate, got {other:?}"),
-        }
-        assert!(
-            rig.child.vetoed.load(Ordering::SeqCst) >= 1,
-            "the runner raised the first signal itself"
-        );
-        let _ = bounded(rig.death_set.join_next()).await;
-    }
-
-    async fn runner_with_kill_policy_skips_the_graceful_window(paused: bool) {
-        let mut rig = rig(ONE_TURN, false, DEFAULT_KILL_GRACE);
-        tokio::time::sleep(Duration::from_millis(12)).await;
-        let t0 = Instant::now();
-        rig.ctl.order_stop(Shutdown::Kill, true);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        assert!(matches!(reason, StopReason::Kill));
-        // The `Kill` is observed at the next turn boundary, well inside a
-        // window of 400 ms on the paused clock.
-        let no_window = if paused {
-            Duration::from_millis(400)
-        } else {
-            BOUND
-        };
-        assert!(
-            t0.elapsed() < no_window,
-            "no graceful window: {:?}",
-            t0.elapsed()
-        );
-        assert_eq!(
-            rig.child.vetoed.load(Ordering::SeqCst),
-            0,
-            "the child was never asked politely"
-        );
-    }
-
-    async fn runner_with_infinity_policy_never_escalates(paused: bool) {
-        let mut rig = rig(Duration::from_millis(10), false, DEFAULT_KILL_GRACE);
-        tokio::time::sleep(Duration::from_millis(12)).await;
-        rig.ctl.order_stop(Shutdown::Infinity, true);
-        // Paused time lets an hour pass; a real clock lets a few windows pass.
-        let idle = if paused {
-            Duration::from_secs(3600)
-        } else {
-            Duration::from_millis(400)
-        };
-        tokio::time::sleep(idle).await;
-        assert!(
-            matches!(rig.child.lane.reason(), Some(StopReason::ParentRequest)),
-            "the lane still reads the polite request"
-        );
-        assert!(!rig.abort.is_finished(), "the child still runs");
-        assert!(rig.ctl.fate().is_none());
-        assert!(rig.child.vetoed.load(Ordering::SeqCst) >= 1);
-        // The child obeys at last: the fate is recorded.
-        rig.child.lane.raise(StopReason::Kill);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        assert!(matches!(reason, StopReason::Kill));
-        assert!(rig.ctl.fate().is_some());
-    }
-
-    async fn runner_starts_the_clock_at_its_own_raise_for_an_order_it_raises(_paused: bool) {
-        // An order whose first signal was not raised, written long before the
-        // runner starts: the window runs from the runner's raise.
-        let child = spawn_vetoing_child(Duration::from_millis(10), false);
-        let (ctl, io) = slot_pair(Default::default());
-        ctl.write_order(Shutdown::Timeout(Duration::from_millis(200)), false);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        io.publish(
-            child.lane.clone(),
-            child.status.clone(),
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        let started = Instant::now();
-        let mut rig = rig_over(child, ctl, io, DEFAULT_KILL_GRACE);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        assert!(matches!(reason, StopReason::Kill));
-        assert!(
-            started.elapsed() >= Duration::from_millis(200),
-            "the full window ran after the runner's raise: {:?}",
-            started.elapsed()
-        );
-    }
-
-    async fn ladder_waits_the_grace_it_is_given_between_the_kill_and_the_abort(_paused: bool) {
-        for grace in [
-            Duration::ZERO,
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        ] {
-            // A child parked at an await that never reaches a turn boundary.
-            let child = tokio::spawn(std::future::pending::<StopReason>());
-            let probe = child.abort_handle();
-            let (lane, _lane_rx) = StopLane::new();
-            let (ctl, io) = slot_pair(Default::default());
-            ctl.write_order(Shutdown::Kill, false);
-            let mut join = child;
-            let mut io = io;
-            let ladder = tokio::spawn({
-                let lane = lane.clone();
-                async move { run_ladder(&mut join, &lane, &mut io, grace).await }
-            });
-            // The Kill is raised at once; the abort follows after `grace`.
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-            assert!(matches!(lane.reason(), Some(StopReason::Kill)));
-            if grace.is_zero() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                assert!(probe.is_finished(), "a zero grace aborts at the Kill");
-            } else {
-                tokio::time::sleep(grace - Duration::from_millis(10)).await;
-                assert!(!probe.is_finished(), "never before the grace has passed");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                assert!(probe.is_finished(), "the abort lands after the grace");
-            }
-            let reason = bounded(ladder).await.unwrap();
-            assert!(matches!(reason, StopReason::Kill), "{reason:?}");
-            drop(ctl);
-        }
-    }
-
-    async fn await_cell_waits_on_a_closed_cells_status_until_its_incarnation_ends(_paused: bool) {
-        // A cell closed over a live incarnation returns nothing until the
-        // status it held reads `Stopped`.
-        let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
-        drop(io);
-        let mut cell = ctl.watch();
-        let waiter = tokio::spawn(async move { await_cell(&mut cell, 9).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !waiter.is_finished(),
-            "a closed cell settles nothing by itself"
-        );
-        status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-        match bounded(waiter).await.unwrap() {
-            CellOutcome::Fate(fate) => {
-                assert!(matches!(fate.reason, StopReason::Kill));
-                assert_eq!(fate.incarnation, 9);
-            }
-            other => panic!("expected the incarnation's end, got {other:?}"),
-        }
-
-        // The status sender dropping, an abort, ends it too.
-        let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
-        drop(io);
-        let mut cell = ctl.watch();
-        let waiter = tokio::spawn(async move { await_cell(&mut cell, 4).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        drop(status_tx);
-        assert!(matches!(
-            bounded(waiter).await.unwrap(),
-            CellOutcome::Fate(ChildFate {
-                reason: StopReason::Kill,
-                incarnation: 4
-            })
-        ));
-
-        // An incarnation that outlives its stop budget gets the verdict, and
-        // only after that budget.
-        let (ctl, io) = slot_pair(Default::default());
-        let (_status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
-        drop(io);
-        let mut cell = ctl.watch();
-        let t0 = Instant::now();
-        let outcome = await_cell(&mut cell, 3).await;
-        assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-        assert!(
-            t0.elapsed() >= DEFAULT_KILL_GRACE + ABORT_SETTLE,
-            "{:?}",
-            t0.elapsed()
-        );
-
-        // A cell closed before its incarnation existed returns at once.
-        let (ctl, io) = slot_pair(Default::default());
-        drop(io);
-        let mut cell = ctl.watch();
-        let outcome = timeout(Duration::from_millis(10), await_cell(&mut cell, 2))
-            .await
-            .expect("returns at once");
-        assert!(matches!(outcome, CellOutcome::NoIncarnation), "{outcome:?}");
-    }
-
-    /// How far before the bound a wait is checked to still be waiting: exact
-    /// under paused time, a margin a loaded machine cannot cross otherwise.
-    fn early(paused: bool) -> Duration {
-        if paused {
-            Duration::from_millis(10)
-        } else {
-            Duration::from_millis(100)
-        }
-    }
-
-    /// Waits on `cell` in a task of its own and returns its outcome with the
-    /// instant the wait returned, read in that task: never earlier than the
-    /// verdict, so a check that it comes no sooner than its bound holds on a
-    /// host that runs the test late.
-    fn timed_cell(
-        mut cell: CellWatch,
-        incarnation: u64,
-    ) -> tokio::task::JoinHandle<(CellOutcome, Instant)> {
-        tokio::spawn(async move {
-            let outcome = await_cell(&mut cell, incarnation).await;
-            (outcome, Instant::now())
-        })
-    }
-
-    async fn closed_cell_waits_the_incarnations_own_kill_grace(paused: bool) {
-        let grace = Duration::from_millis(600);
-        // A status that never reaches `Stopped`: the verdict comes at the
-        // incarnation's own grace plus the settle time, and not before.
-        let (ctl, io) = slot_pair(Default::default());
-        let (_status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(grace), None);
-        drop(io);
-        let started = Instant::now();
-        let waiter = timed_cell(ctl.watch(), 3);
-        let bound = grace + ABORT_SETTLE;
-        let (outcome, at) = bounded(waiter).await.unwrap();
-        assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-        let at = at - started;
-        assert!(
-            at >= bound,
-            "the wait lasts the incarnation's own grace plus the settle time: {at:?}"
-        );
-        if paused {
-            assert_eq!(at, bound, "the verdict at the bound");
-        }
-
-        // A zero grace is the settle time, never at once.
-        let (ctl, io) = slot_pair(Default::default());
-        let (_status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(Duration::ZERO), None);
-        drop(io);
-        let started = Instant::now();
-        let waiter = timed_cell(ctl.watch(), 4);
-        let (outcome, at) = bounded(waiter).await.unwrap();
-        assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-        let at = at - started;
-        assert!(
-            at >= ABORT_SETTLE,
-            "a zero grace still waits the settle time: {at:?}"
-        );
-        if paused {
-            assert_eq!(at, ABORT_SETTLE, "the verdict at the settle time");
-        }
-
-        // A status that reaches `Stopped` inside the bound is the incarnation's
-        // end, reported as the `Kill` it ended with.
-        let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(grace), None);
-        drop(io);
-        let mut cell = ctl.watch();
-        let waiter = tokio::spawn(async move { await_cell(&mut cell, 5).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-        match bounded(waiter).await.unwrap() {
-            CellOutcome::Fate(fate) => {
-                assert!(matches!(fate.reason, StopReason::Kill));
-                assert_eq!(fate.incarnation, 5);
-            }
-            other => panic!("expected the incarnation's end, got {other:?}"),
-        }
-    }
-
-    async fn lost_end_waits_the_incarnations_own_kill_grace(paused: bool) {
-        let grace = Duration::from_millis(600);
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let (ctl, io) = slot_pair(verdicts.clone());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (lane, _lane_rx) = StopLane::new();
-        io.publish(lane, status, OwnStop::worker(grace), None);
-        let end = ctl.lost_end().expect("an incarnation was published");
-        let bound = grace + ABORT_SETTLE;
-        let start = Instant::now();
-        let waiter = tokio::spawn(end.wait());
-        // The verdict wakes the supervisor right after it is recorded, so the
-        // instant the wake-up is seen is never earlier than the verdict: it
-        // comes no sooner than the incarnation's own grace plus the settle
-        // time, and exactly then under paused time.
-        bounded(verdicts.notified()).await;
-        let at = start.elapsed();
-        assert!(at >= bound, "the supervisor is not woken early: {at:?}");
-        if paused {
-            assert!(at < bound + early(paused), "woken at the bound: {at:?}");
-        }
-        assert!(ctl.is_unresponsive(), "the verdict is recorded");
-        assert!(
-            timeout(Duration::from_millis(100), verdicts.notified())
-                .await
-                .is_err(),
-            "once"
-        );
-        // The wait goes on, and returns `Kill` once the status reads `Stopped`.
-        assert!(!waiter.is_finished());
-        status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-        assert!(matches!(bounded(waiter).await.unwrap(), StopReason::Kill));
-    }
 
     /// A supervisor child's stop bounds: its window, its kill grace and its
     /// policy; or a worker's, whose own policy never counts.
@@ -1886,174 +1453,14 @@ mod tests {
 
     /// A lost runner's incarnation: a cell that holds `own` and a plane that
     /// never reaches `Stopped`, and the sender of that plane.
-    fn lost_incarnation(own: OwnStop) -> (SlotCtl, watch::Sender<StatusValue>, Arc<Verdicts>) {
+    fn lost_incarnation(own: OwnStop) -> (SlotCtl, StatusTx, Arc<Verdicts>) {
         let verdicts: Arc<Verdicts> = Arc::default();
         let (ctl, io) = slot_pair(verdicts.clone());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _lane_rx) = StopLane::new();
         io.publish(lane, status, own, None);
         drop(io);
         (ctl, status_tx, verdicts)
-    }
-
-    async fn closed_cell_follows_a_supervisor_childs_window_and_policy(paused: bool) {
-        let window = Duration::from_millis(400);
-        let grace = Duration::from_millis(100);
-        let rows = [
-            // A supervisor child under a timeout: its window, then its grace
-            // and the settle time.
-            (
-                child_of(true, Shutdown::Timeout(window), grace),
-                window + grace + ABORT_SETTLE,
-            ),
-            // Under `Kill` the window is nothing.
-            (
-                child_of(true, Shutdown::Kill, Duration::from_millis(300)),
-                Duration::from_millis(300) + ABORT_SETTLE,
-            ),
-            // A worker's own policy never counts.
-            (
-                child_of(false, Shutdown::Timeout(window), grace),
-                grace + ABORT_SETTLE,
-            ),
-            (
-                child_of(false, Shutdown::Infinity, grace),
-                grace + ABORT_SETTLE,
-            ),
-        ];
-        for (n, (own, bound)) in rows.into_iter().enumerate() {
-            let (ctl, _status_tx, _verdicts) = lost_incarnation(own);
-            let started = Instant::now();
-            let waiter = timed_cell(ctl.watch(), n as u64);
-            let (outcome, at) = bounded(waiter).await.unwrap();
-            assert!(
-                matches!(outcome, CellOutcome::Unresponsive),
-                "row {n}: {outcome:?}"
-            );
-            let at = at - started;
-            assert!(at >= bound, "row {n}: the wait lasts {bound:?}: {at:?}");
-            if paused {
-                assert_eq!(at, bound, "row {n}: the verdict at the bound");
-            }
-            assert!(ctl.is_unresponsive(), "row {n}");
-        }
-
-        // Under `Infinity` no verdict is written however long the orderly
-        // stop takes, and the wait ends with the incarnation's end.
-        let (ctl, status_tx, _verdicts) =
-            lost_incarnation(child_of(true, Shutdown::Infinity, grace));
-        let mut cell = ctl.watch();
-        let waiter = tokio::spawn(async move { await_cell(&mut cell, 9).await });
-        // Three times the bound a worker would get.
-        tokio::time::sleep((grace + ABORT_SETTLE) * 3).await;
-        assert!(!waiter.is_finished(), "an unbounded stop is waited for");
-        assert!(!ctl.is_unresponsive(), "no verdict is written");
-        status_tx.send_replace(ended_with(StopReason::ParentKilled));
-        match bounded(waiter).await.unwrap() {
-            CellOutcome::Fate(fate) => {
-                assert!(matches!(fate.reason, StopReason::ParentKilled));
-                assert_eq!(fate.incarnation, 9);
-            }
-            other => panic!("expected the incarnation's end, got {other:?}"),
-        }
-        assert!(!ctl.is_unresponsive());
-
-        // A grace that saturates leaves the supervisor child a bound of
-        // thirty years, never a short one.
-        if paused {
-            let year = Duration::from_secs(86_400 * 365);
-            let (ctl, _status_tx, _verdicts) =
-                lost_incarnation(child_of(true, Shutdown::Timeout(window), Duration::MAX));
-            let mut cell = ctl.watch();
-            let waiter = tokio::spawn(async move { await_cell(&mut cell, 10).await });
-            tokio::task::yield_now().await;
-            tokio::time::advance(year * 29).await;
-            tokio::task::yield_now().await;
-            assert!(!waiter.is_finished());
-            tokio::time::advance(year * 2).await;
-            let outcome = bounded(waiter).await.unwrap();
-            assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-        }
-    }
-
-    async fn lost_end_follows_a_supervisor_childs_window_and_policy(paused: bool) {
-        let window = Duration::from_millis(400);
-        let grace = Duration::from_millis(100);
-        let rows = [
-            (
-                child_of(true, Shutdown::Timeout(window), grace),
-                window + grace + ABORT_SETTLE,
-            ),
-            (
-                child_of(true, Shutdown::Kill, Duration::from_millis(300)),
-                Duration::from_millis(300) + ABORT_SETTLE,
-            ),
-            (
-                child_of(false, Shutdown::Timeout(window), grace),
-                grace + ABORT_SETTLE,
-            ),
-            (
-                child_of(false, Shutdown::Infinity, grace),
-                grace + ABORT_SETTLE,
-            ),
-        ];
-        for (n, (own, bound)) in rows.into_iter().enumerate() {
-            let (ctl, status_tx, verdicts) = lost_incarnation(own);
-            let end = ctl.lost_end().expect("an incarnation was published");
-            let start = Instant::now();
-            let waiter = tokio::spawn(end.wait());
-            // The wake-up is seen no earlier than the verdict it follows.
-            bounded(verdicts.notified()).await;
-            let at = start.elapsed();
-            assert!(at >= bound, "row {n}: no verdict before {bound:?}: {at:?}");
-            if paused {
-                assert!(
-                    at < bound + early(paused),
-                    "row {n}: the verdict at the bound: {at:?}"
-                );
-            }
-            assert!(ctl.is_unresponsive(), "row {n}: the verdict is recorded");
-            assert!(!waiter.is_finished(), "row {n}: the wait goes on");
-            status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-            assert!(matches!(bounded(waiter).await.unwrap(), StopReason::Kill));
-        }
-
-        // Under `Infinity` the wait has no bound: no verdict, no wake-up.
-        let (ctl, status_tx, verdicts) =
-            lost_incarnation(child_of(true, Shutdown::Infinity, grace));
-        let end = ctl.lost_end().expect("an incarnation was published");
-        let waiter = tokio::spawn(end.wait());
-        tokio::time::sleep((grace + ABORT_SETTLE) * 3).await;
-        assert!(!ctl.is_unresponsive(), "no verdict is written");
-        assert!(
-            timeout(Duration::from_millis(1), verdicts.notified())
-                .await
-                .is_err(),
-            "the supervisor is not woken"
-        );
-        assert!(!waiter.is_finished());
-        status_tx.send_replace(ended_with(StopReason::ParentKilled));
-        assert!(matches!(
-            bounded(waiter).await.unwrap(),
-            StopReason::ParentKilled
-        ));
-        assert!(!ctl.is_unresponsive());
-
-        if paused {
-            let year = Duration::from_secs(86_400 * 365);
-            let (ctl, _status_tx, _verdicts) =
-                lost_incarnation(child_of(true, Shutdown::Timeout(window), Duration::MAX));
-            let end = ctl.lost_end().expect("an incarnation was published");
-            let waiter = tokio::spawn(end.wait());
-            tokio::task::yield_now().await;
-            tokio::time::advance(year * 29).await;
-            tokio::task::yield_now().await;
-            assert!(!ctl.is_unresponsive());
-            tokio::time::advance(year * 2).await;
-            tokio::task::yield_now().await;
-            assert!(ctl.is_unresponsive());
-            waiter.abort();
-        }
     }
 
     async fn closed_cell_and_lost_end_return_the_planes_reason(_paused: bool) {
@@ -2089,164 +1496,7 @@ mod tests {
         }
     }
 
-    async fn first_stop_order_keeps_its_issue_time(_paused: bool) {
-        let (ctl, io) = slot_pair(Default::default());
-        let (lane, lane_rx) = StopLane::new();
-        let (_status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
-        ctl.order_stop(Shutdown::Timeout(Duration::from_secs(5)), true);
-        let first = io.cmd_rx.borrow().stop.expect("the first order is written");
-        assert!(first.initial_raised);
-        let generation = lane_rx.borrow().generation;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // A second origin neither restarts the clock nor raises again.
-        ctl.order_stop(Shutdown::Timeout(Duration::from_secs(1)), true);
-        ctl.order_stop(Shutdown::Kill, true);
-        let second = io.cmd_rx.borrow().stop.expect("the order stays");
-        assert_eq!(second.issued_at, first.issued_at);
-        assert!(matches!(second.policy, Shutdown::Timeout(d) if d == Duration::from_secs(5)));
-        assert_eq!(lane_rx.borrow().generation, generation);
-    }
-
-    async fn runner_flags_unresponsive_and_still_records_a_late_fate() {
-        // A turn that never yields for 1500 ms: the abort cannot land until it
-        // ends, so the verdict is written first.
-        let (lane, mut lane_rx) = StopLane::new();
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let turn_ended = Arc::new(AtomicUsize::new(0));
-        let ended = turn_ended.clone();
-        let join: JoinHandle<StopReason> = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(1500));
-            ended.store(1, Ordering::SeqCst);
-            loop {
-                if lane_rx.changed().await.is_err() {
-                    return StopReason::Kill;
-                }
-                if matches!(lane_rx.borrow_and_update().reason, Some(StopReason::Kill)) {
-                    status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-                    return StopReason::Kill;
-                }
-            }
-        });
-        let (ctl, io) = slot_pair(Default::default());
-        io.publish(
-            lane.clone(),
-            status,
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        let child = Child {
-            join,
-            lane,
-            status: watch::channel(StatusValue::new(ActorStatus::Running)).1,
-            started: Arc::new(AtomicUsize::new(0)),
-            finished: Arc::new(AtomicUsize::new(0)),
-            vetoed: Arc::new(AtomicUsize::new(0)),
-        };
-        let mut rig = rig_over(child, ctl, io, DEFAULT_KILL_GRACE);
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(50)), true);
-        let mut cell = rig.ctl.watch();
-        match bounded(await_cell(&mut cell, 1)).await {
-            CellOutcome::Unresponsive => {}
-            other => panic!("expected the verdict, got {other:?}"),
-        }
-        assert_eq!(
-            turn_ended.load(Ordering::SeqCst),
-            0,
-            "the flag was set before the turn ended"
-        );
-        assert!(rig.ctl.fate().is_none());
-        // After the turn the abort lands and the fate is recorded.
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
-        assert!(matches!(reason, StopReason::Kill));
-        assert!(matches!(
-            rig.ctl.fate().map(|fate| fate.reason),
-            Some(StopReason::Kill)
-        ));
-        assert!(rig.ctl.is_unresponsive(), "the flag stays beside the fate");
-    }
-
     // - each shared body on both runtime flavors -------------------------------
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_escalates_a_vetoing_child_after_its_caller_drops_the_wait_current_thread() {
-        runner_escalates_a_vetoing_child_after_its_caller_drops_the_wait(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_escalates_a_vetoing_child_after_its_caller_drops_the_wait_multi_thread() {
-        runner_escalates_a_vetoing_child_after_its_caller_drops_the_wait(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_aborts_a_turn_parked_at_an_await_after_kill_is_ignored_current_thread() {
-        runner_aborts_a_turn_parked_at_an_await_after_kill_is_ignored(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_aborts_a_turn_parked_at_an_await_after_kill_is_ignored_multi_thread() {
-        runner_aborts_a_turn_parked_at_an_await_after_kill_is_ignored(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_honors_a_stop_order_written_before_it_started_current_thread() {
-        runner_honors_a_stop_order_written_before_it_started(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_honors_a_stop_order_written_before_it_started_multi_thread() {
-        runner_honors_a_stop_order_written_before_it_started(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_with_kill_policy_skips_the_graceful_window_current_thread() {
-        runner_with_kill_policy_skips_the_graceful_window(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_with_kill_policy_skips_the_graceful_window_multi_thread() {
-        runner_with_kill_policy_skips_the_graceful_window(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_with_infinity_policy_never_escalates_current_thread() {
-        runner_with_infinity_policy_never_escalates(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_with_infinity_policy_never_escalates_multi_thread() {
-        runner_with_infinity_policy_never_escalates(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_starts_the_clock_at_its_own_raise_for_an_order_it_raises_current_thread() {
-        runner_starts_the_clock_at_its_own_raise_for_an_order_it_raises(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_starts_the_clock_at_its_own_raise_for_an_order_it_raises_multi_thread() {
-        runner_starts_the_clock_at_its_own_raise_for_an_order_it_raises(false).await;
-    }
-
-    // A turn that blocks a worker thread needs real parallelism: the runner
-    // must run on another worker while the child's turn holds one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_flags_unresponsive_and_still_records_a_late_fate_multi_thread() {
-        runner_flags_unresponsive_and_still_records_a_late_fate().await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn await_cell_waits_on_a_closed_cell_s_status_until_its_incarnation_ends_current_thread()
-    {
-        await_cell_waits_on_a_closed_cells_status_until_its_incarnation_ends(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn await_cell_waits_on_a_closed_cell_s_status_until_its_incarnation_ends_multi_thread() {
-        await_cell_waits_on_a_closed_cells_status_until_its_incarnation_ends(false).await;
-    }
 
     /// A status plane closed without `Stopped` is an ended incarnation (its
     /// task ended and nothing is left to publish), also once a caller
@@ -2254,7 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn closed_cell_reads_a_closed_plane_as_ended() {
         let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _lane_rx) = StopLane::new();
         io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
         drop(io);
@@ -2277,68 +1527,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn closed_cell_waits_the_incarnations_own_kill_grace_current_thread() {
-        closed_cell_waits_the_incarnations_own_kill_grace(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn closed_cell_waits_the_incarnations_own_kill_grace_multi_thread() {
-        closed_cell_waits_the_incarnations_own_kill_grace(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn lost_end_waits_the_incarnations_own_kill_grace_current_thread() {
-        lost_end_waits_the_incarnations_own_kill_grace(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn lost_end_waits_the_incarnations_own_kill_grace_multi_thread() {
-        lost_end_waits_the_incarnations_own_kill_grace(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn closed_cell_follows_a_supervisor_childs_window_and_policy_current_thread() {
-        closed_cell_follows_a_supervisor_childs_window_and_policy(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn closed_cell_follows_a_supervisor_childs_window_and_policy_multi_thread() {
-        closed_cell_follows_a_supervisor_childs_window_and_policy(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn lost_end_follows_a_supervisor_childs_window_and_policy_current_thread() {
-        lost_end_follows_a_supervisor_childs_window_and_policy(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn lost_end_follows_a_supervisor_childs_window_and_policy_multi_thread() {
-        lost_end_follows_a_supervisor_childs_window_and_policy(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn closed_cell_and_lost_end_return_the_planes_reason_current_thread() {
         closed_cell_and_lost_end_return_the_planes_reason(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn closed_cell_and_lost_end_return_the_planes_reason_multi_thread() {
-        closed_cell_and_lost_end_return_the_planes_reason(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn first_stop_order_keeps_its_issue_time_current_thread() {
-        first_stop_order_keeps_its_issue_time(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn first_stop_order_keeps_its_issue_time_multi_thread() {
-        first_stop_order_keeps_its_issue_time(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn ladder_waits_the_grace_it_is_given_between_the_kill_and_the_abort_current_thread() {
-        ladder_waits_the_grace_it_is_given_between_the_kill_and_the_abort(true).await;
     }
 
     // - a failed task of either plane -------------------------------------------
@@ -2347,7 +1537,7 @@ mod tests {
         let mut sup = SupervisionState::new(SupervisionConfig::default());
         sup.registry.register(ChildState {
             id: ActorId::from(id),
-            name: Some(id.to_string()),
+            name: Some(Arc::from(id.to_string())),
             spec: ChildSpec {
                 restart_type: RestartType::Permanent,
                 shutdown: Shutdown::default(),
@@ -2365,7 +1555,7 @@ mod tests {
 
     async fn runner_join_error_becomes_a_recorded_death_after_the_incarnation_ends() {
         let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _lane_rx) = StopLane::new();
         io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
         let mut sup = state_with_a_child("lost", ctl, 5);
@@ -2420,62 +1610,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_lost_verdict_is_recorded_and_signalled_once() {
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let id = ActorId::from("lost-set");
-        let (ctl, _io) = slot_pair_for(verdicts.clone(), Some((id.clone(), 3)));
-        assert!(!ctl.is_unresponsive());
-        assert!(ctl.lost.set(), "the first call records the verdict");
-        assert!(!ctl.lost.set(), "a second call records nothing");
-        assert!(ctl.is_unresponsive());
-        timeout(Duration::from_millis(50), verdicts.notified())
-            .await
-            .expect("the loop is woken once");
-        assert!(
-            timeout(Duration::from_millis(100), verdicts.notified())
-                .await
-                .is_err(),
-            "and not a second time"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_ladder_and_the_closed_cell_share_one_verdict_flag() {
-        // The first writer makes the verdict, whichever it is; the other finds
-        // the flag set and makes nothing (it would log nothing more).
-        let id = ActorId::from("shared-flag");
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let (ctl, io) = slot_pair_for(verdicts.clone(), Some((id.clone(), 4)));
-        assert!(!ctl.is_unresponsive());
-        io.write_verdict();
-        assert!(ctl.is_unresponsive());
-        timeout(Duration::from_millis(50), verdicts.notified())
-            .await
-            .expect("the ladder's verdict wakes the loop once");
-        assert!(!ctl.lost.set(), "the ladder wrote the verdict first");
-        assert!(
-            timeout(Duration::from_millis(100), verdicts.notified())
-                .await
-                .is_err(),
-            "a later writer wakes nothing, and logs nothing"
-        );
-
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let (ctl, io) = slot_pair_for(verdicts.clone(), Some((id, 5)));
-        assert!(ctl.lost.set(), "a wait on the closed cell wrote it first");
-        timeout(Duration::from_millis(50), verdicts.notified())
-            .await
-            .expect("that verdict wakes the loop once");
-        io.write_verdict();
-        assert!(
-            timeout(Duration::from_millis(100), verdicts.notified())
-                .await
-                .is_err(),
-            "the ladder's later write wakes nothing, and logs nothing"
-        );
-    }
-
     #[test]
     fn a_reader_that_sees_the_published_verdict_finds_the_flag_set() {
         // The flag (which logs) is set before the cell publishes the verdict,
@@ -2527,88 +1661,11 @@ mod tests {
         assert!(sup.death_set.is_empty());
     }
 
-    async fn runner_join_error_before_any_spawn_is_reported_at_once() {
-        // The slot held no incarnation: nothing can follow the attempt's end,
-        // so its failure is reported at once, in both planes.
-        let (ctl, io) = slot_pair(Default::default());
-        let mut sup = state_with_a_child("early", ctl, 6);
-        let task = sup.death_set.spawn(async move {
-            let _io = io;
-            tokio::task::yield_now().await;
-            if std::hint::black_box(true) {
-                panic!("attempt failed");
-            }
-            (ActorId::from("early"), StopReason::Graceful, 6)
-        });
-        sup.task_owner
-            .insert(task.id(), (ActorId::from("early"), 6, TaskPlane::Death));
-        let err = sup
-            .death_set
-            .join_next_with_id()
-            .await
-            .unwrap()
-            .expect_err("the task failed");
-        let (panic, _) = sup.lost_death_task(err);
-        assert!(matches!(&panic, Some(ActorError::Panic(text)) if text == "attempt failed"));
-        let (id, reason, incarnation) =
-            timeout(Duration::from_millis(50), sup.death_set.join_next())
-                .await
-                .expect("reported at once")
-                .unwrap()
-                .unwrap();
-        assert_eq!((id.as_str(), incarnation), ("early", 6));
-        assert!(
-            matches!(&reason, StopReason::Failure(ActorError::Panic(text)) if text == "attempt failed"),
-            "{reason:?}"
-        );
-
-        // The restart plane: an attempt that failed before its incarnation
-        // existed is routed as a failed attempt.
-        let (ctl, io) = slot_pair(Default::default());
-        let mut sup = state_with_a_child("attempt", ctl, 7);
-        if let Some(child) = sup.registry.get_mut(&ActorId::from("attempt")) {
-            child.lifecycle = ChildLifecycle::Restarting {
-                incarnation: 7,
-                next: 8,
-            };
-        }
-        let task = sup.restart_set.spawn(async move {
-            let _io = io;
-            tokio::task::yield_now().await;
-            if std::hint::black_box(true) {
-                panic!("attempt task failed");
-            }
-            crate::actor::supervision::RestartOutcome::Failed {
-                child_id: ActorId::from("attempt"),
-                incarnation: 8,
-                reason: StopReason::Graceful,
-            }
-        });
-        sup.task_owner
-            .insert(task.id(), (ActorId::from("attempt"), 8, TaskPlane::Restart));
-        let Err(err) = bounded(sup.restart_set.join_next_with_id()).await.unwrap() else {
-            panic!("the attempt task failed");
-        };
-        let (outcome, panic, _) = sup.lost_restart_task(err);
-        assert!(matches!(&panic, Some(ActorError::Panic(text)) if text == "attempt task failed"));
-        match outcome {
-            Some(crate::actor::supervision::RestartOutcome::Failed {
-                child_id,
-                incarnation,
-                reason: StopReason::Failure(ActorError::Panic(text)),
-            }) => {
-                assert_eq!((child_id.as_str(), incarnation), ("attempt", 8));
-                assert_eq!(text, "attempt task failed");
-            }
-            _ => panic!("expected the attempt to be reported failed at once"),
-        }
-    }
-
     async fn restart_task_join_error_becomes_a_recorded_death_after_the_incarnation_ends() {
         // An attempt that published its incarnation's status and then failed:
         // the attempt's end is followed to the incarnation's end.
         let (ctl, io) = slot_pair(Default::default());
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (lane, _lane_rx) = StopLane::new();
         io.publish(lane, status, OwnStop::worker(DEFAULT_KILL_GRACE), None);
         let mut sup = state_with_a_child("attempt-lost", ctl, 7);
@@ -2678,31 +1735,10 @@ mod tests {
         restart_task_join_error_becomes_a_recorded_death_after_the_incarnation_ends().await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restart_task_join_error_becomes_a_recorded_death_after_the_incarnation_ends_multi_thread(
-    ) {
-        restart_task_join_error_becomes_a_recorded_death_after_the_incarnation_ends().await;
-    }
-
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn runner_join_error_becomes_a_recorded_death_after_the_incarnation_ends_current_thread()
     {
         runner_join_error_becomes_a_recorded_death_after_the_incarnation_ends().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_join_error_becomes_a_recorded_death_after_the_incarnation_ends_multi_thread() {
-        runner_join_error_becomes_a_recorded_death_after_the_incarnation_ends().await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn runner_join_error_before_any_spawn_is_reported_at_once_current_thread() {
-        runner_join_error_before_any_spawn_is_reported_at_once().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runner_join_error_before_any_spawn_is_reported_at_once_multi_thread() {
-        runner_join_error_before_any_spawn_is_reported_at_once().await;
     }
 
     // - restart attempts ----------------------------------------------------------
@@ -2763,54 +1799,6 @@ mod tests {
             verdicts,
             _ack: ack_tx,
             _reaper: reaper,
-        }
-    }
-
-    /// A child whose single turn blocks its thread for 1500 ms, then ends on
-    /// a `Kill`.
-    fn stuck_child() -> Child {
-        let (lane, mut lane_rx) = StopLane::new();
-        let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let join: JoinHandle<StopReason> = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(1500));
-            loop {
-                if lane_rx.changed().await.is_err() {
-                    return StopReason::Kill;
-                }
-                if matches!(lane_rx.borrow_and_update().reason, Some(StopReason::Kill)) {
-                    status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
-                    return StopReason::Kill;
-                }
-            }
-        });
-        Child {
-            join,
-            lane,
-            status,
-            started: Arc::new(AtomicUsize::new(0)),
-            finished: Arc::new(AtomicUsize::new(0)),
-            vetoed: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    async fn attempt_honors_an_order_written_before_its_factory_runs(_paused: bool) {
-        let (ctl, mut io) = slot_pair(Default::default());
-        assert!(
-            !cancelled_before_factory(&mut io),
-            "no order: the factory runs"
-        );
-        assert!(ctl.watch().cell.borrow().cancelled.not());
-        ctl.order_stop(Shutdown::Timeout(Duration::from_millis(50)), false);
-        assert!(
-            cancelled_before_factory(&mut io),
-            "an order cancels the attempt"
-        );
-        drop(io);
-        let mut watch = ctl.watch();
-        match bounded(await_cell(&mut watch, 1)).await {
-            CellOutcome::Cancelled => {}
-            other => panic!("expected the cancel, got {other:?}"),
         }
     }
 
@@ -2905,166 +1893,6 @@ mod tests {
         }
     }
 
-    async fn attempt_honors_an_order_written_during_init_with_the_window_from_the_order(
-        paused: bool,
-    ) {
-        let rig = attempt_rig(
-            spawn_vetoing_child(ONE_TURN, false),
-            None,
-            DEFAULT_KILL_GRACE,
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let window = Duration::from_millis(200);
-        let ordered_at = Instant::now();
-        rig.ctl.order_stop(Shutdown::Timeout(window), false);
-        let outcome = bounded(rig.run).await.unwrap();
-        let took = ordered_at.elapsed();
-        match outcome {
-            RestartOutcome::Stopped {
-                reason,
-                incarnation,
-                ..
-            } => {
-                assert!(matches!(reason, StopReason::Kill), "{reason:?}");
-                assert_eq!(incarnation, 3);
-            }
-            _ => panic!("expected the incarnation to end under the order"),
-        }
-        assert!(took >= window, "the window counts from the order: {took:?}");
-        assert!(
-            took < upper(paused, window + DEFAULT_KILL_GRACE),
-            "{took:?}"
-        );
-        assert!(
-            rig.child.vetoed.load(Ordering::SeqCst) >= 1,
-            "the child was asked politely first"
-        );
-        assert!(matches!(
-            rig.ctl.fate().map(|fate| fate.reason),
-            Some(StopReason::Kill)
-        ));
-    }
-
-    async fn attempt_start_timeout_and_order_whichever_ends_first(paused: bool) {
-        // The start timeout ends first: its expiry raises the first Kill and
-        // the start is reported as timed out.
-        let spawned = Instant::now();
-        let rig = attempt_rig(
-            spawn_vetoing_child(ONE_TURN, false),
-            Some(Duration::from_millis(100)),
-            DEFAULT_KILL_GRACE,
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(500)), false);
-        match bounded(rig.run).await.unwrap() {
-            RestartOutcome::Failed { reason, .. } => assert!(
-                matches!(
-                    reason,
-                    StopReason::Failure(ActorError::Spawn(SpawnError::StartTimeout))
-                ),
-                "{reason:?}"
-            ),
-            _ => panic!("expected the start failure"),
-        }
-        let took = spawned.elapsed();
-        assert!(took >= Duration::from_millis(100), "{took:?}");
-        assert!(
-            took < upper(paused, Duration::from_millis(100) + DEFAULT_KILL_GRACE),
-            "{took:?}"
-        );
-
-        // The order's window ends first: the incarnation ends under the order.
-        let spawned = Instant::now();
-        let rig = attempt_rig(
-            spawn_vetoing_child(ONE_TURN, false),
-            Some(Duration::from_millis(400)),
-            DEFAULT_KILL_GRACE,
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(50)), false);
-        match bounded(rig.run).await.unwrap() {
-            RestartOutcome::Stopped { reason, .. } => {
-                assert!(matches!(reason, StopReason::Kill), "{reason:?}")
-            }
-            _ => panic!("expected the stop under the order"),
-        }
-        let took = spawned.elapsed();
-        assert!(took >= Duration::from_millis(70), "{took:?}");
-        assert!(
-            took < upper(paused, Duration::from_millis(70) + DEFAULT_KILL_GRACE),
-            "{took:?}"
-        );
-    }
-
-    async fn attempt_writes_no_fate_while_its_task_runs() {
-        let rig = attempt_rig(stuck_child(), None, DEFAULT_KILL_GRACE);
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(50)), false);
-        let mut watch = rig.ctl.watch();
-        match bounded(await_cell(&mut watch, 3)).await {
-            CellOutcome::Unresponsive => {}
-            other => panic!("expected the verdict, got {other:?}"),
-        }
-        assert!(rig.ctl.fate().is_none(), "no fate while the task runs");
-        assert!(
-            !rig.run.is_finished(),
-            "the attempt keeps waiting for the task"
-        );
-        assert!(
-            timeout(Duration::from_millis(50), rig.verdicts.notified())
-                .await
-                .is_ok(),
-            "the verdict wakes the supervisor"
-        );
-        // Once the turn ends the attempt records the fate and reports.
-        match bounded(rig.run).await.unwrap() {
-            RestartOutcome::Stopped { reason, .. } => {
-                assert!(matches!(reason, StopReason::Kill), "{reason:?}")
-            }
-            _ => panic!("expected the stop under the order"),
-        }
-        assert!(rig.ctl.fate().is_some());
-        assert!(
-            rig.ctl.is_unresponsive(),
-            "the verdict stays beside the fate"
-        );
-    }
-
-    async fn ladder_writes_the_verdict_and_signals_once() {
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let child = stuck_child();
-        let (ctl, io) = slot_pair(verdicts.clone());
-        io.publish(
-            child.lane.clone(),
-            child.status.clone(),
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        let mut rig = rig_over(child, ctl, io, DEFAULT_KILL_GRACE);
-        rig.ctl
-            .order_stop(Shutdown::Timeout(Duration::from_millis(50)), true);
-        let mut watch = rig.ctl.watch();
-        match bounded(await_cell(&mut watch, 1)).await {
-            CellOutcome::Unresponsive => {}
-            other => panic!("expected the verdict, got {other:?}"),
-        }
-        assert!(
-            timeout(Duration::from_millis(50), verdicts.notified())
-                .await
-                .is_ok(),
-            "the verdict signals the supervisor"
-        );
-        assert!(
-            timeout(Duration::from_millis(300), verdicts.notified())
-                .await
-                .is_err(),
-            "and signals it once"
-        );
-        let _ = bounded(rig.death_set.join_next()).await;
-    }
-
     async fn await_cell_returns_cancelled_for_an_attempt_that_cancelled_and_dropped_its_sender(
         _paused: bool,
     ) {
@@ -3086,144 +1914,10 @@ mod tests {
         }
     }
 
-    async fn lost_runner_of_a_stuck_incarnation_gets_the_verdict_after_its_abort() {
-        let child = stuck_child();
-        let verdicts: Arc<Verdicts> = Arc::default();
-        let (ctl, io) = slot_pair(verdicts.clone());
-        io.publish(
-            child.lane.clone(),
-            child.status.clone(),
-            OwnStop::worker(DEFAULT_KILL_GRACE),
-            None,
-        );
-        let mut sup = state_with_a_child("lost-stuck", ctl, 5);
-        sup.verdicts = verdicts.clone();
-        // The guard feeds a running reaper: the verdict follows the abort it
-        // issues once the grace has passed.
-        let system = dummy_system();
-        let reaper_tx = system.reaper_handle(&tokio::runtime::Handle::current());
-        let guard = ChildLinkGuard::new(
-            child.lane.clone(),
-            child.join.abort_handle(),
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: DEFAULT_KILL_GRACE,
-            },
-            system.clone(),
-            tokio::runtime::Handle::current(),
-        );
-        // The stand-in for the runner holds the slot and the guard, and
-        // fails; its guard raises `Kill` on the incarnation's lane.
-        let task = sup.death_set.spawn(async move {
-            let _io = io;
-            let _guard = guard;
-            let _join = child.join;
-            tokio::task::yield_now().await;
-            if std::hint::black_box(true) {
-                panic!("runner failed");
-            }
-            (ActorId::from("lost-stuck"), StopReason::Graceful, 5)
-        });
-        sup.task_owner.insert(
-            task.id(),
-            (ActorId::from("lost-stuck"), 5, TaskPlane::Death),
-        );
-        let err = bounded(sup.death_set.join_next_with_id())
-            .await
-            .unwrap()
-            .expect_err("the runner failed");
-        let called = Instant::now();
-        let _ = sup.lost_death_task(err);
-        let is_flagged = |sup: &SupervisionState| {
-            sup.registry
-                .get(&ActorId::from("lost-stuck"))
-                .is_some_and(|child| child.ctl.is_unresponsive())
-        };
-        // No report and no verdict while the incarnation is inside its grace.
-        tokio::time::sleep(DEFAULT_KILL_GRACE).await;
-        assert!(!is_flagged(&sup));
-        // The grace and the settle time passed: the verdict is recorded and
-        // the supervisor woken, once.
-        tokio::time::sleep(ABORT_SETTLE + Duration::from_millis(100)).await;
-        assert!(called.elapsed() >= DEFAULT_KILL_GRACE + ABORT_SETTLE);
-        assert!(is_flagged(&sup), "the verdict flag is set");
-        assert!(
-            timeout(Duration::from_millis(50), verdicts.notified())
-                .await
-                .is_ok(),
-            "the supervisor was woken"
-        );
-        assert!(
-            timeout(Duration::from_millis(100), verdicts.notified())
-                .await
-                .is_err(),
-            "once"
-        );
-        // After the turn the incarnation reads the guard's `Kill`: exactly
-        // one report, with `Kill`.
-        let (id, reason, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
-        assert_eq!((id.as_str(), incarnation), ("lost-stuck", 5));
-        assert!(matches!(reason, StopReason::Kill), "{reason:?}");
-        assert!(
-            sup.death_set.join_next().await.is_none(),
-            "exactly one report"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn attempt_honors_an_order_written_before_its_factory_runs_current_thread() {
-        attempt_honors_an_order_written_before_its_factory_runs(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn attempt_honors_an_order_written_before_its_factory_runs_multi_thread() {
-        attempt_honors_an_order_written_before_its_factory_runs(false).await;
-    }
-
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_flag_cancels_an_attempt_before_its_factory_and_is_ignored_after_current_thread()
     {
         cancel_flag_cancels_an_attempt_before_its_factory_and_is_ignored_after(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancel_flag_cancels_an_attempt_before_its_factory_and_is_ignored_after_multi_thread() {
-        cancel_flag_cancels_an_attempt_before_its_factory_and_is_ignored_after(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn attempt_honors_an_order_written_during_init_with_the_window_from_the_order_current_thread(
-    ) {
-        attempt_honors_an_order_written_during_init_with_the_window_from_the_order(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn attempt_honors_an_order_written_during_init_with_the_window_from_the_order_multi_thread(
-    ) {
-        attempt_honors_an_order_written_during_init_with_the_window_from_the_order(false).await;
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn attempt_start_timeout_and_order_whichever_ends_first_current_thread() {
-        attempt_start_timeout_and_order_whichever_ends_first(true).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn attempt_start_timeout_and_order_whichever_ends_first_multi_thread() {
-        attempt_start_timeout_and_order_whichever_ends_first(false).await;
-    }
-
-    // The attempt's task must outlive the whole ladder, which only a thread
-    // blocked outside the runtime does: these two run on a multi-thread
-    // runtime alone.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn attempt_writes_no_fate_while_its_task_runs_multi_thread() {
-        attempt_writes_no_fate_while_its_task_runs().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ladder_writes_the_verdict_and_signals_once_multi_thread() {
-        ladder_writes_the_verdict_and_signals_once().await;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -3231,18 +1925,6 @@ mod tests {
     ) {
         await_cell_returns_cancelled_for_an_attempt_that_cancelled_and_dropped_its_sender(true)
             .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn await_cell_returns_cancelled_for_an_attempt_that_cancelled_and_dropped_its_sender_multi_thread(
-    ) {
-        await_cell_returns_cancelled_for_an_attempt_that_cancelled_and_dropped_its_sender(false)
-            .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lost_runner_of_a_stuck_incarnation_gets_the_verdict_after_its_abort_multi_thread() {
-        lost_runner_of_a_stuck_incarnation_gets_the_verdict_after_its_abort().await;
     }
 
     /// The waits that can give the Unresponsive verdict, against a stop whose
@@ -3292,9 +1974,9 @@ mod tests {
         struct Occupant {
             join: JoinHandle<()>,
             lane: StopLane,
-            status: watch::Receiver<StatusValue>,
+            status: StatusRx,
             /// Holds a stuck occupant's plane open past its task.
-            _plane: Option<watch::Sender<StatusValue>>,
+            _plane: Option<StatusTx>,
             /// Holds a stuck occupant's subtree alive past its task.
             _kept: Option<Arc<SubtreeHold>>,
             ended: Arc<Mutex<Option<Instant>>>,
@@ -3306,7 +1988,7 @@ mod tests {
             let (lane, mut lane_rx) = StopLane::new();
             let hold =
                 link.map(|link| SubtreeHold::with_record(Some(link), lane.abort_record().clone()));
-            let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let plane = (kind == Kind::Stuck).then(|| status_tx.clone());
             let kept = hold.clone().filter(|_| kind == Kind::Stuck);
             let ended = Arc::new(Mutex::new(None));
@@ -3374,62 +2056,6 @@ mod tests {
 
         // - LostEnd::wait -------------------------------------------------------
 
-        #[tokio::test(start_paused = true)]
-        async fn a_lost_end_reads_the_kill_of_an_incarnation_that_obeys_a_late_kill() {
-            let verdicts: Arc<Verdicts> = Arc::default();
-            let (ctl, io) = slot_pair(verdicts.clone());
-            let occ = occupant(Kind::Obeys, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let reason = bounded(ctl.lost_end().unwrap().wait()).await;
-            assert!(matches!(reason, StopReason::Kill), "{reason:?}");
-            assert_eq!(
-                *occ.ended.lock().unwrap(),
-                Some(fired + WINDOW + LATE + OBEY)
-            );
-            assert!(!ctl.is_unresponsive());
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_lost_end_gives_a_stuck_incarnation_its_verdict_the_settle_time_after_a_late_abort(
-        ) {
-            let verdicts: Arc<Verdicts> = Arc::default();
-            let (ctl, io) = slot_pair(verdicts.clone());
-            let occ = occupant(Kind::Stuck, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            let watcher = verdict_watch(&verdicts);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let end = ctl.lost_end().unwrap();
-            let waiter = tokio::spawn(end.wait());
-            let at = bounded(watcher).await.unwrap();
-            assert_eq!(at, abort_at(fired, LATE) + ABORT_SETTLE);
-            assert!(ctl.is_unresponsive());
-            waiter.abort();
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_lost_end_waits_for_an_owed_abort_up_to_its_cap() {
-            let verdicts: Arc<Verdicts> = Arc::default();
-            let (ctl, io) = slot_pair(verdicts.clone());
-            let occ = occupant(Kind::Stuck, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            let watcher = verdict_watch(&verdicts);
-            let started = Instant::now();
-            // An entry that is owed and never fires: a reaper that never runs.
-            let entry = ReaperEntry::two_stage(
-                started + WINDOW,
-                occ.lane.clone(),
-                started + WINDOW + GRACE,
-                occ.join.abort_handle(),
-            );
-            let waiter = tokio::spawn(ctl.lost_end().unwrap().wait());
-            let at = bounded(watcher).await.unwrap();
-            let bound = lost_end_bound(own());
-            assert_eq!(at, started + bound + bound);
-            drop(entry);
-            waiter.abort();
-        }
-
         /// An abort that becomes owed after the wait began still holds the
         /// verdict: the wait reads the record again when it reaches its
         /// deadline, and an entry that never fires gives the verdict at the
@@ -3460,34 +2086,6 @@ mod tests {
 
         // - closed_cell -----------------------------------------------------------
 
-        #[tokio::test(start_paused = true)]
-        async fn a_closed_cell_reads_the_fate_of_an_incarnation_that_obeys_a_late_kill() {
-            let (ctl, io) = slot_pair(Default::default());
-            let occ = occupant(Kind::Obeys, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            drop(io);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let outcome = bounded(await_cell(&mut ctl.watch(), 1)).await;
-            assert!(
-                matches!(&outcome, CellOutcome::Fate(f) if matches!(f.reason, StopReason::Kill)),
-                "{outcome:?}"
-            );
-            assert_eq!(Instant::now(), fired + WINDOW + LATE + OBEY);
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_closed_cell_gives_a_stuck_incarnation_its_verdict_the_settle_time_after_a_late_abort(
-        ) {
-            let (ctl, io) = slot_pair(Default::default());
-            let occ = occupant(Kind::Stuck, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            drop(io);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let outcome = bounded(await_cell(&mut ctl.watch(), 1)).await;
-            assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-            assert_eq!(Instant::now(), abort_at(fired, LATE) + ABORT_SETTLE);
-        }
-
         // - SubtreeWait: await_subtree and await_predecessor ------------------------
 
         /// The subtree of a previous incarnation: one supervisor child of
@@ -3503,35 +2101,6 @@ mod tests {
             let predecessor = Predecessor::untracked(root.watch());
             drop(root);
             (predecessor, occ)
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_subtree_wait_lets_a_child_that_obeys_a_late_kill_end() {
-            let (predecessor, occ) = ended_root_with_a_child(Kind::Obeys);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let action = bounded(await_subtree(&predecessor)).await;
-            assert_eq!(action, WaitAction::Proceed);
-            assert_eq!(Instant::now(), fired + WINDOW + LATE + OBEY);
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_subtree_wait_escalates_a_stuck_child_the_settle_time_after_a_late_abort() {
-            let (predecessor, occ) = ended_root_with_a_child(Kind::Stuck);
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let action = bounded(await_subtree(&predecessor)).await;
-            assert_eq!(action, WaitAction::Escalate);
-            assert_eq!(Instant::now(), abort_at(fired, LATE) + ABORT_SETTLE);
-            occ.join.abort();
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_restart_attempt_waits_out_a_child_that_obeys_a_late_kill() {
-            let (predecessor, occ) = ended_root_with_a_child(Kind::Obeys);
-            let (_ctl, mut io) = slot_pair(Default::default());
-            let (fired, _system) = guard_fires(&occ, LATE);
-            let action = bounded(await_predecessor(Some(&predecessor), &mut io)).await;
-            assert_eq!(action, WaitAction::Proceed);
-            assert_eq!(Instant::now(), fired + WINDOW + LATE + OBEY);
         }
 
         #[tokio::test(start_paused = true)]
@@ -3573,29 +2142,6 @@ mod tests {
             assert_eq!(Instant::now(), dropped_at + ABORT_SETTLE);
         }
 
-        /// A ladder's `Kill` makes its abort owed, and its abort records the
-        /// instant: the first abort wins, so the reaper's later abort does
-        /// not move it.
-        #[tokio::test(start_paused = true)]
-        async fn a_ladders_kill_owes_its_abort_and_its_abort_is_the_first_record() {
-            let occ = occupant(Kind::Stuck, None);
-            let record = occ.lane.abort_record().clone();
-            raise_owing(&occ.lane, StopReason::Kill);
-            assert_eq!(record.view(), (None, true), "owed after the Kill");
-            let first = Instant::now();
-            record.abort(&occ.join.abort_handle());
-            tokio::time::sleep(GRACE).await;
-            record.abort(&occ.join.abort_handle());
-            assert_eq!(record.view(), (Some(first), false));
-            occ.lane.raise(StopReason::Kill);
-            raise_owing(&occ.lane, StopReason::Kill);
-            assert_eq!(
-                record.view(),
-                (Some(first), false),
-                "a re-raise moves nothing"
-            );
-        }
-
         /// The ladder's own abort is recorded on the incarnation's lane at
         /// the end of its grace, and its `Kill` owes that abort until then.
         #[tokio::test(start_paused = true)]
@@ -3631,7 +2177,7 @@ mod tests {
         async fn an_attempts_start_timeout_abort_is_recorded_on_the_incarnations_lane() {
             const START: Duration = Duration::from_millis(200);
             let (lane, lane_rx) = StopLane::new();
-            let (status_tx, status) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let join = tokio::spawn(async move {
                 let _lane_rx = lane_rx;
                 let _status = status_tx;
@@ -3670,167 +2216,271 @@ mod tests {
 
         // - The control -----------------------------------------------------------
 
-        /// The same waits with the `Kill` stage on time: an obeying
-        /// incarnation ends without a verdict, and a stuck one gets its
-        /// verdict at each wait's own budget deadline, since the abort plus
-        /// the settle time lands exactly on that deadline.
-        #[tokio::test(start_paused = true)]
-        async fn the_same_waits_with_the_kill_stage_on_time_keep_their_budget_deadline() {
-            let (ctl, io) = slot_pair(Default::default());
-            let occ = occupant(Kind::Obeys, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            let (_f, _s) = guard_fires(&occ, Duration::ZERO);
-            let reason = bounded(ctl.lost_end().unwrap().wait()).await;
-            assert!(matches!(reason, StopReason::Kill));
-            assert!(!ctl.is_unresponsive());
+        // - A task that ends while a hold outlives it ---------------------------
 
-            let (ctl, io) = slot_pair(Default::default());
-            let occ = occupant(Kind::Stuck, None);
-            io.publish(occ.lane.clone(), occ.status.clone(), own(), None);
-            drop(io);
-            let (fired, _s) = guard_fires(&occ, Duration::ZERO);
-            let outcome = bounded(await_cell(&mut ctl.watch(), 1)).await;
-            assert!(matches!(outcome, CellOutcome::Unresponsive), "{outcome:?}");
-            assert_eq!(Instant::now(), fired + lost_end_bound(own()));
-
-            let (predecessor, occ) = ended_root_with_a_child(Kind::Stuck);
-            let (fired, _s) = guard_fires(&occ, Duration::ZERO);
-            assert_eq!(
-                bounded(await_subtree(&predecessor)).await,
-                WaitAction::Escalate
-            );
-            let bound = own_budget(true, Shutdown::Timeout(WINDOW), GRACE).unwrap() + ABORT_SETTLE;
-            assert_eq!(Instant::now(), fired + bound);
-            occ.join.abort();
+        /// A hold on the incarnation's token kept past its task, as a stream
+        /// forwarder still ending keeps it, linked below `root` with the
+        /// lane's record.
+        fn kept_below(root: &SubtreeHold, lane: &StopLane) -> Arc<SubtreeHold> {
+            SubtreeHold::with_record(
+                Some(SubtreeLink {
+                    parent: root.token(),
+                    own: Duration::ZERO,
+                    infinity: false,
+                }),
+                lane.abort_record().clone(),
+            )
         }
 
-        /// A predecessor owed an abort past its subtree's deadline obeys its
-        /// late `Kill` and ends on its own, with a worker below it whose
-        /// runner its end cancels: the worker's guard owes the worker's abort
-        /// only once the runtime drops that runner. The subtree's verdict
-        /// waits for that cascade: the end of an owed actor counts as its
-        /// abort, so no verdict comes inside the settle time after the end,
-        /// in which the worker's abort is owed and issued. The rounds run on
-        /// real time, since the order the runtime polls the woken wait and
-        /// the cancelled runner in is what the guarantee covers; a host that
-        /// stalls the process for longer than the settle time inside that
-        /// cascade can still see the verdict first, which is the settle
-        /// time's own residual, so a round counts a verdict as wrong only
-        /// when it comes inside the settle time after the end.
-        mod ends_while_owed {
-            use super::*;
-
-            /// The worker's link guard, with a zero kill grace: its drop
-            /// owes the worker's abort and issues it at once.
-            struct OweOnDrop(AbortRecord, tokio::task::AbortHandle);
-
-            impl Drop for OweOnDrop {
-                fn drop(&mut self) {
-                    self.0.owe();
-                    self.0.abort(&self.1);
-                }
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn a_subtree_verdict_waits_for_the_cascade_of_a_predecessor_that_ended_while_owed_multi_thread(
-            ) {
-                body().await;
-            }
-
-            /// On one thread the order the guarantee covers does not arise
-            /// (the wait is not polled ahead of the cancelled runner), so
-            /// this variant passes even when an owed end raises nothing: the
-            /// multi-thread variant carries the proof, and this one keeps
-            /// the single-thread order covered.
-            #[tokio::test(flavor = "current_thread")]
-            async fn a_subtree_verdict_waits_for_the_cascade_of_a_predecessor_that_ended_while_owed_current_thread(
-            ) {
-                body().await;
-            }
-
-            /// The worker's own budget: the wait's bound, and its cap past
-            /// the deadline, both long enough for a stalled host to leave the
-            /// wait held when the predecessor ends.
-            const WORKER_OWN: Duration = Duration::from_millis(300);
-
-            async fn body() {
-                let rounds = 8;
-                let mut wrong = 0;
-                for _ in 0..rounds {
-                    let root = SubtreeHold::new(None);
-                    let p_rec = AbortRecord::new();
-                    let p = SubtreeHold::with_record(
-                        Some(SubtreeLink {
-                            parent: root.token(),
-                            own: Duration::ZERO,
-                            infinity: false,
-                        }),
-                        p_rec.clone(),
-                    );
-                    let g_rec = AbortRecord::new();
-                    let g = SubtreeHold::with_record(
-                        Some(SubtreeLink {
-                            parent: p.token(),
-                            own: WORKER_OWN,
-                            infinity: false,
-                        }),
-                        g_rec.clone(),
-                    );
-                    // The worker: its actor holds its token; its runner holds
-                    // the guard that owes its abort when the runner is dropped.
-                    let g_actor = tokio::spawn(async move {
-                        let _g = g;
+        /// A task that obeys the first `Kill` it reads, `OBEY` later, and
+        /// publishes `Stopped` when it ends if `publish_stopped` says so.
+        fn obeying(
+            mut lane_rx: crate::types::LaneRx,
+            status_tx: StatusTx,
+            publish_stopped: bool,
+        ) -> JoinHandle<StopReason> {
+            tokio::spawn(async move {
+                loop {
+                    if lane_rx.changed().await.is_err() {
                         std::future::pending::<()>().await;
-                    });
-                    let guard = OweOnDrop(g_rec.clone(), g_actor.abort_handle());
-                    let g_runner = tokio::spawn(async move {
-                        let _guard = guard;
-                        std::future::pending::<()>().await;
-                    });
-                    // The predecessor is owed its abort (an entry whose stage
-                    // the reaper reaches late).
-                    p_rec.owe();
-                    let bound = p.watch().release_bound().unwrap();
-                    let predecessor = Predecessor::untracked(p.watch());
-                    let waiter = tokio::spawn(async move {
-                        let action = await_subtree(&predecessor).await;
-                        (action, Instant::now())
-                    });
-                    tokio::time::sleep(bound + Duration::from_millis(30)).await;
-                    assert!(!waiter.is_finished(), "held while the abort is owed");
-                    // The predecessor obeys its late `Kill` and ends: its end
-                    // cancels its children's runners, then its hold drops.
-                    let (go_tx, go_rx) = oneshot::channel::<()>();
-                    let runner_abort = g_runner.abort_handle();
-                    let p_task = tokio::spawn(async move {
-                        let _ = go_rx.await;
-                        runner_abort.abort();
-                        let ended = Instant::now();
-                        drop(p);
-                        ended
-                    });
-                    tokio::task::yield_now().await;
-                    go_tx.send(()).unwrap();
-                    let (action, verdict_at) = bounded(waiter).await.unwrap();
-                    let ended = p_task.await.unwrap();
-                    let _ = g_runner.await;
-                    if action == WaitAction::Escalate {
-                        assert!(g_rec.view().0.is_some(), "the worker's abort followed");
-                        if verdict_at < ended + ABORT_SETTLE {
-                            wrong += 1;
-                        }
-                    } else {
-                        assert_eq!(action, WaitAction::Proceed);
                     }
-                    g_actor.abort();
-                    let _ = g_actor.await;
-                    drop(root);
+                    if matches!(lane_rx.borrow_and_update().reason, Some(StopReason::Kill)) {
+                        break;
+                    }
                 }
-                assert_eq!(
-                    wrong, 0,
-                    "{wrong} of {rounds} verdicts came inside the settle time after the end"
-                );
+                tokio::time::sleep(OBEY).await;
+                if publish_stopped {
+                    status_tx.send_replace(StatusValue::new(ActorStatus::Stopped));
+                }
+                drop(status_tx);
+                StopReason::Kill
+            })
+        }
+
+        /// The runner's ladder raises a `Kill` it owes an abort for, the
+        /// incarnation obeys inside the grace, and the hold is kept past the
+        /// task: the join releases the mark, and the end counts as the
+        /// subtree's latest abort.
+        #[tokio::test(start_paused = true)]
+        async fn a_runner_that_sees_its_task_end_releases_the_mark_its_kill_took() {
+            let root = SubtreeHold::new(None);
+            let (lane, lane_rx) = StopLane::new();
+            let kept = kept_below(&root, &lane);
+            let (status_tx, _status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+            let mut join = obeying(lane_rx, status_tx, false);
+            let (ctl, mut io) = slot_pair(Default::default());
+            let started = Instant::now();
+            ctl.write_order(Shutdown::Kill, false);
+            let ladder = tokio::spawn({
+                let lane = lane.clone();
+                async move { run_ladder(&mut join, &lane, &mut io, GRACE).await }
+            });
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                lane.abort_record().view(),
+                (None, true),
+                "owed after the Kill"
+            );
+            assert_eq!(root.watch().abort_view(), (None, true));
+            let reason = bounded(ladder).await.unwrap();
+            assert!(matches!(reason, StopReason::Kill), "{reason:?}");
+            assert_eq!(lane.abort_record().view(), (None, false));
+            assert_eq!(
+                root.watch().abort_view(),
+                (Some(started + OBEY), false),
+                "the end is the subtree's latest abort and nothing stays owed"
+            );
+            drop((ctl, kept, root));
+        }
+
+        /// The attempt's start timeout raises a `Kill` it owes an abort for,
+        /// the incarnation obeys inside the grace, and the hold is kept past
+        /// the task.
+        #[tokio::test(start_paused = true)]
+        async fn an_attempt_that_sees_its_task_end_releases_the_mark_its_kill_took() {
+            const START: Duration = Duration::from_millis(200);
+            let root = SubtreeHold::new(None);
+            let (lane, lane_rx) = StopLane::new();
+            let kept = kept_below(&root, &lane);
+            let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+            let join = obeying(lane_rx, status_tx, false);
+            let child = Child {
+                join,
+                lane: lane.clone(),
+                status,
+                started: Arc::default(),
+                finished: Arc::default(),
+                vetoed: Arc::default(),
+            };
+            let started = Instant::now();
+            let rig = attempt_rig(child, Some(START), GRACE);
+            tokio::time::sleep(START + Duration::from_millis(1)).await;
+            assert_eq!(
+                lane.abort_record().view(),
+                (None, true),
+                "owed after the Kill"
+            );
+            let outcome = bounded(rig.run).await.unwrap();
+            assert!(
+                matches!(outcome, RestartOutcome::Failed { .. }),
+                "a start timeout fails the attempt"
+            );
+            assert_eq!(lane.abort_record().view(), (None, false));
+            assert_eq!(
+                root.watch().abort_view(),
+                (Some(started + START + OBEY), false)
+            );
+            drop((kept, root));
+        }
+
+        /// A `Kill` another party stored and an initialization that ends only
+        /// after its task ended, with the hold kept past the task: the
+        /// attempt's kill path runs over an ended task and owes it nothing.
+        #[tokio::test(start_paused = true)]
+        async fn an_attempts_kill_path_owes_nothing_to_a_task_that_already_ended() {
+            let root = SubtreeHold::new(None);
+            let (lane, lane_rx) = StopLane::new();
+            let kept = kept_below(&root, &lane);
+            let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+            lane.raise(StopReason::Kill);
+            let join = tokio::spawn(async move {
+                let _lane_rx = lane_rx;
+                let _status = status_tx;
+                StopReason::Kill
+            });
+            while !join.is_finished() {
+                tokio::task::yield_now().await;
             }
+            let child = Child {
+                join,
+                lane: lane.clone(),
+                status,
+                started: Arc::default(),
+                finished: Arc::default(),
+                vetoed: Arc::default(),
+            };
+            let AttemptRig {
+                run,
+                _ack,
+                ctl,
+                _reaper,
+                ..
+            } = attempt_rig(child, None, GRACE);
+            drop(_ack);
+            let outcome = bounded(run).await.unwrap();
+            assert!(
+                matches!(outcome, RestartOutcome::Failed { .. }),
+                "a failed start"
+            );
+            assert_eq!(lane.abort_record().view(), (None, false));
+            assert_eq!(
+                root.watch().abort_view(),
+                (None, false),
+                "nothing was owed, so the end raised nothing"
+            );
+            drop((ctl, kept, root));
+        }
+
+        /// The lane took a `Kill` and the task ended before the ladder owed
+        /// its abort, with the lane's receiver still held: the ladder owes
+        /// the ended task nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_ladders_raise_over_an_ended_task_owes_nothing() {
+            let root = SubtreeHold::new(None);
+            let (lane, _lane_rx) = StopLane::new();
+            let kept = kept_below(&root, &lane);
+            let join = tokio::spawn(async { StopReason::Kill });
+            while !join.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            raise_owing(&lane, StopReason::Kill, &join.abort_handle());
+            assert_eq!(lane.abort_record().view(), (None, false));
+            assert_eq!(root.watch().abort_view(), (None, false));
+            drop((kept, root));
+        }
+
+        /// A lost runner: the guard fired (a two-stage entry owes the abort
+        /// from the moment it exists), the incarnation obeys the `Kill` of
+        /// the entry's first stage and ends well inside the entry's grace,
+        /// its hold kept past the task. Returns what the subtree reads when
+        /// the observer of the plane's end returns, the instant of that
+        /// return, and the answer and the delay of a successor wait started
+        /// then, with the hold dropped `drop_after` later.
+        async fn lost(
+            closed: bool,
+            drop_after: Duration,
+        ) -> ((Option<Instant>, bool), Instant, WaitAction, Duration) {
+            const ENTRY_GRACE: Duration = Duration::from_millis(300);
+            let root = SubtreeHold::new(None);
+            let (lane, lane_rx) = StopLane::new();
+            let kept = kept_below(&root, &lane);
+            let (status_tx, status) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+            let join = obeying(lane_rx, status_tx, true);
+            let own = OwnStop {
+                is_supervisor: true,
+                shutdown: Shutdown::Timeout(WINDOW),
+                kill_grace: ENTRY_GRACE,
+            };
+            let (ctl, io) = slot_pair(Default::default());
+            io.publish(lane.clone(), status, own, None);
+            if closed {
+                drop(io);
+            }
+            let fired = Instant::now();
+            lane.raise(StopReason::ParentKilled);
+            let kill_at = fired + WINDOW;
+            let entry = ReaperEntry::two_stage(
+                kill_at,
+                lane.clone(),
+                kill_at + ENTRY_GRACE,
+                join.abort_handle(),
+            );
+            let system = dummy_system();
+            system.feed_reaper(&tokio::runtime::Handle::current(), entry);
+            if closed {
+                let mut watch = ctl.watch();
+                let outcome = bounded(await_cell(&mut watch, 1)).await;
+                assert!(matches!(outcome, CellOutcome::Fate(_)), "{outcome:?}");
+            } else {
+                let reason = bounded(ctl.lost_end().unwrap().wait()).await;
+                assert!(matches!(reason, StopReason::Kill), "{reason:?}");
+            }
+            let seen_at = Instant::now();
+            let at_return = root.watch().abort_view();
+            let predecessor = Predecessor::untracked(root.watch());
+            drop(root);
+            let dropper = tokio::spawn(async move {
+                tokio::time::sleep(drop_after).await;
+                drop(kept);
+            });
+            let action = bounded(await_subtree(&predecessor)).await;
+            let waited = Instant::now() - seen_at;
+            dropper.abort();
+            drop(system);
+            (at_return, seen_at, action, waited)
+        }
+
+        /// The observer of a lost runner's incarnation returns on the end of
+        /// its plane and releases the mark the guard's entry owes: a hold
+        /// kept past the task keeps nothing owed, and a wait on the subtree
+        /// gives its verdict the settle time after the end.
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_end_releases_the_mark_when_its_plane_ends() {
+            let (at, seen_at, action, waited) = lost(false, Duration::from_millis(1_000)).await;
+            assert_eq!(at, (Some(seen_at), false), "the end is the latest abort");
+            assert_eq!(action, WaitAction::Escalate);
+            assert_eq!(waited, ABORT_SETTLE);
+        }
+
+        /// As for the lost end, for the wait on a cell whose executor is
+        /// gone.
+        #[tokio::test(start_paused = true)]
+        async fn a_closed_cell_releases_the_mark_when_its_plane_ends() {
+            let (at, seen_at, action, waited) = lost(true, Duration::from_millis(1_000)).await;
+            assert_eq!(at, (Some(seen_at), false), "the end is the latest abort");
+            assert_eq!(action, WaitAction::Escalate);
+            assert_eq!(waited, ABORT_SETTLE);
         }
     }
 }

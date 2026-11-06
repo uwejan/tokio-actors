@@ -5,6 +5,8 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: "17 5 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +14,7 @@ env:
 jobs:
   test:
     name: Test - ${{ matrix.os }} / ${{ matrix.rust }}
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -55,6 +58,7 @@ jobs:
 
   flavor-lane:
     name: Flavor Lane
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       TOKIO_ACTORS_TEST_FLAVOR: current_thread
@@ -72,23 +76,56 @@ jobs:
           --test actor_drop
           --test boundaries
           --test cascade
+          --test child_placement
+          --test child_placement_entry
           --test kill_grace
           --test loop_drops
           --test priority_lane
+          --test receive_order_with_a_full_mailbox
+          --test reply_hand_back_latency_task
           --test restart_plane
+          --test runtime_without_timers
+          --test shutdown_from_anywhere
           --test spawn_ack
+          --test start_bound_owned_by_the_system
+          --test stop_ladder_owned_by_the_system
           --test stop_lane
           --test stop_reason_kill
+          --test stop_within_caller_runtime
           --test supervision_child_mgmt
           --test supervision_crash
           --test supervision_groups
           --test supervision_matrix
           --test system_shutdown
           --test terminal_reason
-          --test truth_contract
+          --test timerless_facts
+
+  abort-profile:
+    name: Abort Profile
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the checks that need panic = "abort"
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu --test abort_profile
+        env:
+          RUSTFLAGS: "-C panic=abort"
+
+      - name: Run the checks that need panic = "abort" (no default features)
+        run: cargo test --no-default-features --target x86_64-unknown-linux-gnu --test abort_profile
+        env:
+          RUSTFLAGS: "-C panic=abort"
 
   msrv:
     name: MSRV
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -105,6 +142,7 @@ jobs:
 
   tokio-floor:
     name: Tokio Floor
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -130,8 +168,39 @@ jobs:
       - name: Check every target against that tokio
         run: cargo check --all-features --all-targets
 
+      - name: Check the closed-queue answer the end relies on
+        run: cargo test --test tokio_closed_queue
+
+      - name: Run the forwarder end-order pin against that tokio
+        run: |
+          cargo test --all-features --lib a_shutdown_counts_each_forwarder_before_its_task_reads_finished > pin.log 2>&1 || { cat pin.log; exit 1; }
+          cat pin.log
+          grep -q "test result: ok. 1 passed" pin.log || { echo "the order pin did not run"; exit 1; }
+
+  newest-tokio:
+    name: Newest Tokio
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update tokio to its newest release
+        run: |
+          cargo update -p tokio -p tokio-util -p tokio-stream
+          grep -A 1 '^name = "tokio"$' Cargo.lock
+
+      - name: Run the suite on that tokio
+        run: cargo test --all-features --no-fail-fast --verbose
+
   explorer:
     name: Explorer
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -150,6 +219,7 @@ jobs:
 
   semver:
     name: Semver Check
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -161,6 +231,7 @@ jobs:
 
   deny:
     name: Deny
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -172,6 +243,7 @@ jobs:
 
   clippy:
     name: Clippy - ${{ matrix.os }}
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -192,6 +264,7 @@ jobs:
 
   fmt:
     name: Format
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -208,6 +281,7 @@ jobs:
 
   doc:
     name: Documentation
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -224,6 +298,7 @@ jobs:
 
   examples:
     name: Examples - ${{ matrix.os }}
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -245,6 +320,7 @@ jobs:
 
   coverage:
     name: Code Coverage
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:

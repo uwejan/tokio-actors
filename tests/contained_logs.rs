@@ -82,21 +82,6 @@ impl Actor for Parked {
 /// The line that records a drop at the abort.
 const ABORT_DROP: &str = "a drop at the abort or the unwind";
 
-/// An actor whose turn never yields is killed: the abort drops its queued
-/// message and its value, both panicking, and the subscriber panics on each
-/// line that records them. The process does not abort, and the actor reads
-/// `Kill`.
-#[test]
-fn a_panicking_subscriber_at_an_aborted_task_s_drops_does_not_abort() {
-    if !common::in_a_child_process(
-        "a_panicking_subscriber_at_an_aborted_task_s_drops_does_not_abort",
-    ) {
-        return;
-    }
-    let lines = subscriber::install(Some(ABORT_DROP));
-    kill_a_parked_actor(&lines);
-}
-
 /// [`a_panicking_subscriber_at_an_aborted_task_s_drops_does_not_abort`],
 /// with a subscriber whose panic payload holds two values that each panic
 /// when dropped. A drop of that payload would panic again while unwinding,

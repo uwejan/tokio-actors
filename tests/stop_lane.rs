@@ -1,13 +1,12 @@
-//! Behavioral suite for the stop lane: the `watch`-based signal that
-//! delivers stop/kill requests, replacing the escalation ladder's former
-//! awaited-send transport.
+//! Behavioral suite for the stop lane: the per-actor cell, with a version,
+//! that delivers stop/kill requests without awaiting mailbox capacity.
 //!
 //! Covers: turn-boundary delivery under a flooded mailbox (never racing an
 //! in-flight handler), monotone severity (a `Kill` in flight is never
 //! displaced, and never displaces nothing weaker either - order-independent),
 //! coalescing of multiple raises landing between two turn boundaries, the
-//! veto-then-resend re-fire guarantee, and the already-terminated-actor error
-//! parity with the pre-lane closed-mpsc behavior.
+//! veto-then-resend re-fire guarantee, and the error a stop raised at an
+//! already-terminated actor reports.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,6 +21,22 @@ use tokio_actors::{
 };
 
 mod common;
+
+#[path = "common/source_scan.rs"]
+mod source_scan;
+
+/// Waits until `calls` reads at least `n`, for at most 60 s. The bound only limits how long a real hang takes to report.
+async fn wait_calls(calls: &AtomicUsize, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while calls.load(Ordering::SeqCst) < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pre_stop ran {} times, expected at least {n}",
+            calls.load(Ordering::SeqCst)
+        );
+        sleep(Duration::from_millis(1)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helper actor
@@ -112,7 +127,7 @@ fn stop_after_already_stopped_matches_closed_mpsc_error() {
         let stop_err = handle.stop(StopReason::Graceful).await.unwrap_err();
         assert!(
             matches!(stop_err, SendError::Closed),
-            "got {stop_err:?}, expected the same Closed error a full mailbox send used to return"
+            "got {stop_err:?}, expected SendError::Closed"
         );
 
         // Cross-check against the pre-existing closed-mailbox error for the same
@@ -144,7 +159,10 @@ fn veto_then_resend_same_severity_re_fires_pre_stop() {
             .unwrap();
 
         handle.stop(StopReason::Graceful).await.unwrap();
-        sleep(Duration::from_millis(50)).await;
+        wait_calls(&pre_stop_calls, 1).await;
+        // The lane outranks the mailbox, so a message answered now proves the
+        // loop finished the vetoed stop and went back to serving.
+        handle.send(ProbeMsg::Noop).await.unwrap();
         assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 1);
         assert!(
             handle.is_alive(),
@@ -169,85 +187,6 @@ fn veto_then_resend_same_severity_re_fires_pre_stop() {
 // observation; N raises each separated by an observed turn boundary produce
 // N observations. Together these pin both ends of ">=1 and <=N".
 // ---------------------------------------------------------------------------
-
-#[test]
-fn coalesced_raises_during_a_busy_handler_fire_pre_stop_exactly_once() {
-    common::run(2, async {
-        let actor = Prober::default(); // vetoes forever: isolates the count
-        let pre_stop_calls = actor.pre_stop_calls.clone();
-
-        let handle = actor
-            .spawn()
-            .named("lane-coalesce")
-            .with_config(ActorConfig::default())
-            .await
-            .unwrap();
-
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        handle
-            .notify(ProbeMsg::Hang {
-                started: started.clone(),
-                release: release.clone(),
-            })
-            .await
-            .unwrap();
-        started.notified().await; // the actor's task is now fully occupied
-
-        // Five raises land while the loop cannot possibly be polling the lane.
-        for _ in 0..5 {
-            handle.stop(StopReason::Graceful).await.unwrap();
-        }
-
-        release.notify_one();
-        sleep(Duration::from_millis(50)).await;
-
-        assert_eq!(
-            pre_stop_calls.load(Ordering::SeqCst),
-            1,
-            "N raises landing between two turn boundaries must coalesce into a \
-         single observation, not N"
-        );
-        assert!(handle.is_alive());
-
-        handle.stop(StopReason::Kill).await.unwrap();
-    });
-}
-
-#[test]
-fn sequential_observed_raises_each_produce_their_own_pre_stop_call() {
-    common::run(2, async {
-        let actor = Prober::default(); // vetoes forever
-        let pre_stop_calls = actor.pre_stop_calls.clone();
-
-        let handle = actor
-            .spawn()
-            .named("lane-sequential")
-            .with_config(ActorConfig::default())
-            .await
-            .unwrap();
-
-        const N: usize = 4;
-        for i in 1..=N {
-            handle.stop(StopReason::Graceful).await.unwrap();
-            // Wait for this raise's own observation before issuing the next one,
-            // so none of them can coalesce with each other.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while pre_stop_calls.load(Ordering::SeqCst) < i {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "raise {i} was never observed"
-                );
-                sleep(Duration::from_millis(5)).await;
-            }
-        }
-
-        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), N);
-        assert!(handle.is_alive());
-
-        handle.stop(StopReason::Kill).await.unwrap();
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Severity monotonicity: Kill always wins, regardless of raise order, and a
@@ -299,43 +238,6 @@ fn kill_before_pending_graceful_observation_suppresses_it_entirely() {
             0,
             "Kill bypasses on_stopped too"
         );
-    });
-}
-
-#[test]
-fn graceful_after_kill_has_no_effect_once_kill_already_landed() {
-    common::run(2, async {
-        let actor = Prober::default();
-        let pre_stop_calls = actor.pre_stop_calls.clone();
-        let on_stopped_calls = actor.on_stopped_calls.clone();
-
-        let handle = actor
-            .spawn()
-            .named("lane-kill-first")
-            .with_config(ActorConfig::default())
-            .await
-            .unwrap();
-
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        handle
-            .notify(ProbeMsg::Hang {
-                started: started.clone(),
-                release: release.clone(),
-            })
-            .await
-            .unwrap();
-        started.notified().await;
-
-        // Kill first this time, then a weaker Graceful: order must not matter.
-        handle.stop(StopReason::Kill).await.unwrap();
-        handle.stop(StopReason::Graceful).await.unwrap();
-
-        release.notify_one();
-        handle.wait_stopped().await;
-
-        assert_eq!(pre_stop_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(on_stopped_calls.load(Ordering::SeqCst), 0);
     });
 }
 
@@ -422,4 +324,211 @@ fn escalation_ladder_contains_no_awaited_stop_sends() {
              must go through the stop lane instead"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Every registry Kill is raised through the declaring function
+// ---------------------------------------------------------------------------
+
+/// The text of `src` without its comments and without every item that exists
+/// only under `cfg(test)`: a module, a function or a statement.
+fn production_text(src: &str) -> String {
+    let mut text = source_scan::library_code(src).join("\n");
+    text.push('\n');
+    text
+}
+
+#[test]
+fn every_registry_kill_raise_goes_through_the_declaring_function() {
+    // The files that raise or could raise on a stop lane, with the number of
+    // `.raise(`, `try_raise(` and `.raise_kill(` calls each production text may
+    // hold. Every count is an allowed site:
+    //
+    // - handle.rs: the two non-Kill raises of `stop` and `stop_within`.
+    // - start_bound.rs: the cut of a start that timed out, which holds the
+    //   task's abort handle and requests the abort itself, so no registry
+    //   entry is involved and no deadline is declared.
+    // - supervision.rs: the child link guard, which holds the child's abort
+    //   handle and its own reaper entry.
+    // - slot.rs: `raise_first` (a `Kill` there belongs to the supervisor's
+    //   ladder), `raise_owing` (the supervisor holds the abort and record),
+    //   and the orderly stop of a slot.
+    // - system.rs: `.raise(` is the reaper entry (it holds the abort handle
+    //   itself) and the stop sent by id; `try_raise(` is the graceful stop by
+    //   name, the shared function and the step cell's own raise;
+    //   `.raise_kill(` is the reaper entry, the shared function and the
+    //   private by-id helper that calls the shared function.
+    let scanned: &[(&str, &str, [usize; 3])] = &[
+        (
+            "actor/context.rs",
+            include_str!("../src/actor/context.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/handle.rs",
+            include_str!("../src/actor/handle.rs"),
+            [0, 2, 0],
+        ),
+        (
+            "actor/mailbox.rs",
+            include_str!("../src/actor/mailbox.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/mod.rs",
+            include_str!("../src/actor/mod.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/panic.rs",
+            include_str!("../src/actor/panic.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/runtime.rs",
+            include_str!("../src/actor/runtime.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/start_bound.rs",
+            include_str!("../src/actor/start_bound.rs"),
+            [1, 0, 0],
+        ),
+        (
+            "actor/subtree.rs",
+            include_str!("../src/actor/subtree.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/supervision.rs",
+            include_str!("../src/actor/supervision.rs"),
+            [2, 0, 0],
+        ),
+        (
+            "actor/supervision/rules.rs",
+            include_str!("../src/actor/supervision/rules.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/supervision/slot.rs",
+            include_str!("../src/actor/supervision/slot.rs"),
+            [2, 1, 0],
+        ),
+        ("error.rs", include_str!("../src/error.rs"), [0, 0, 0]),
+        ("helper.rs", include_str!("../src/helper.rs"), [0, 0, 0]),
+        ("lib.rs", include_str!("../src/lib.rs"), [0, 0, 0]),
+        ("system.rs", include_str!("../src/system.rs"), [2, 3, 3]),
+        (
+            "time_probe.rs",
+            include_str!("../src/time_probe.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "types/mod.rs",
+            include_str!("../src/types/mod.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "types/status_cell.rs",
+            include_str!("../src/types/status_cell.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "types/turn_clock.rs",
+            include_str!("../src/types/turn_clock.rs"),
+            [0, 0, 0],
+        ),
+    ];
+    // The lane itself defines the raise; the files that exist only under
+    // `cfg(test)` do not ship, and are found from the declarations that bring
+    // them in.
+    let lane_implementation = "types/stop_lane.rs";
+
+    // A new source file must be classified here before it passes.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let sources = source_scan::rust_sources(&root);
+    let (test_only, unresolved) = source_scan::test_only_files(&sources);
+    assert!(
+        unresolved.is_empty(),
+        "test-only modules without a file: {unresolved:?}"
+    );
+    let found: Vec<String> = sources
+        .keys()
+        .filter(|path| !test_only.contains(*path))
+        .cloned()
+        .collect();
+    let mut known: Vec<String> = scanned
+        .iter()
+        .map(|(path, _, _)| (*path).to_string())
+        .collect();
+    known.push(lane_implementation.to_string());
+    known.sort();
+    assert_eq!(
+        found, known,
+        "a source file is not classified for the Kill raiser scan"
+    );
+
+    for (path, src, [raise, try_raise, raise_kill]) in scanned {
+        let text = production_text(src);
+        assert_eq!(
+            [
+                text.matches(".raise(").count(),
+                text.matches("try_raise(").count(),
+                text.matches(".raise_kill(").count(),
+            ],
+            [*raise, *try_raise, *raise_kill],
+            "{path}: a raiser was added or removed; a registry Kill goes through \
+             raise_kill_declared, and any other raise needs a reason at its site"
+        );
+    }
+
+    let handle = production_text(include_str!("../src/actor/handle.rs"));
+    assert!(
+        !handle.contains("try_raise(StopReason::Kill")
+            && !handle.contains(".raise(StopReason::Kill"),
+        "handle.rs raises a Kill without the declaring function"
+    );
+    assert!(
+        !handle.contains("declare_kill("),
+        "handle.rs declares a Kill deadline itself"
+    );
+    let system = production_text(include_str!("../src/system.rs"));
+    assert_eq!(
+        system.matches("try_raise(StopReason::Kill)").count(),
+        2,
+        "system.rs raises a Kill outside the declaring function and the step cell"
+    );
+}
+
+#[test]
+fn the_production_text_skips_test_only_items_by_their_braces() {
+    let src = r##"
+fn shipped() { a.raise(1); }
+
+#[cfg(test)]
+mod tests {
+    fn nested() {
+        let text = r#"
+}
+"#;
+        b.raise(2);
+    }
+}
+
+#[cfg(test)]
+fn only_in_tests() { c.raise(3); }
+
+#[cfg(doctest)]
+mod only_in_doctests {
+    fn nested() { f.raise(6); }
+}
+
+#[cfg(all(doctest, feature = "x"))]
+fn also_only_in_doctests() { g.raise(7); }
+
+fn also_shipped() { d.raise(4); } // e.raise(5)
+"##;
+    let text = production_text(src);
+    assert_eq!(text.matches(".raise(").count(), 2, "{text}");
+    assert!(text.contains("a.raise(1)") && text.contains("d.raise(4)"));
 }

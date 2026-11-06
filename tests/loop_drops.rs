@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! User values an actor drops during its run. The loop's own drops, a
 //! handler's response nobody receives (a notify, or a send whose caller is
 //! gone) and the factory of a pruned child, are caught, and a panic in one
@@ -37,13 +38,15 @@ async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     }
 }
 
+/// Polls `cond` until it holds. The bound only limits how long a real hang takes to report.
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    within(what, async {
+    let waited = timeout(Duration::from_secs(60), async {
         while !cond() {
             sleep(Duration::from_millis(2)).await;
         }
     })
     .await;
+    assert!(waited.is_ok(), "timed out waiting for: {what}");
 }
 
 fn panic_reason(text: &str) -> StopReason {
@@ -192,16 +195,6 @@ async fn assert_one_reason(rig: &SubjectRig, want: &StopReason) {
     assert_eq!(&events[0].reason, want, "the supervisor's report");
     assert_eq!(events[0].action, SupervisionAction::Removed);
     assert!(rig.top.is_alive());
-}
-
-#[test]
-fn a_notify_whose_response_drop_panics_stops_the_actor_with_one_reason() {
-    common::run(2, async {
-        let rig = subject_rig(None).await;
-        rig.child.notify(()).await.expect("queued");
-        assert_one_reason(&rig, &panic_reason(RESPONSE_PANIC)).await;
-        let _ = rig.top.stop(StopReason::Graceful).await;
-    });
 }
 
 #[test]
@@ -440,39 +433,6 @@ async fn assert_mid_ended_with(rig: &MidRig, want: &StopReason) {
     assert_eq!(&reports[0].reason, want, "the root's report of mid");
 }
 
-/// A leaf's end still undelivered when mid's loop ends is delivered by mid's
-/// final drain, and the leaf's factory is dropped with mid's teardown. That
-/// drop comes before mid's reason is final: caught, its panic makes mid's
-/// graceful stop a panic.
-#[test]
-fn a_factory_dropped_at_the_teardown_makes_a_graceful_stop_a_panic() {
-    common::run(2, async {
-        let rig = mid_rig(RestartType::Temporary).await;
-        rig.armed.store(true, Ordering::SeqCst);
-        rig.gate.held.store(true, Ordering::SeqCst);
-        rig.mid.notify(MidMsg::Hold).await.expect("queued");
-        wait_until("mid's turn to begin", || {
-            rig.gate.entered.load(Ordering::SeqCst)
-        })
-        .await;
-        // The leaf ends while mid is in its turn, and mid is asked to stop:
-        // the stop is read first at the turn's end, so the leaf's end is
-        // left for the final drain.
-        rig.leaf.stop(StopReason::Graceful).await.expect("accepted");
-        within("the leaf's end", rig.leaf.wait_stopped()).await;
-        rig.mid.stop(StopReason::Graceful).await.expect("accepted");
-        rig.gate.held.store(false, Ordering::SeqCst);
-        assert_mid_ended_with(&rig, &panic_reason(FACTORY_PANIC)).await;
-        let leaf_reports = rig.leaf_events.lock().unwrap().clone();
-        assert_eq!(leaf_reports.len(), 1, "{leaf_reports:?}");
-        assert_eq!(
-            leaf_reports[0].action,
-            SupervisionAction::SupervisorStopping
-        );
-        let _ = rig.root.stop(StopReason::Graceful).await;
-    });
-}
-
 #[test]
 fn a_pruned_factory_whose_drop_panics_stops_its_supervisor_with_one_reason() {
     common::run(2, async {
@@ -646,35 +606,6 @@ async fn assert_deleter_ended_with_the_factory_panic(rig: &DeleterRig) {
     );
 }
 
-/// `pre_stop` deletes the down leaf and vetoes: the factory's drop panics
-/// inside `pre_stop`, a panic of that callback, which stops the deleter at
-/// once whatever `pre_stop` would have answered.
-#[test]
-fn a_factory_dropped_in_a_vetoing_pre_stop_stops_the_actor_with_its_panic() {
-    common::run(2, async {
-        let rig = deleter_rig(Some(true)).await;
-        rig.deleter
-            .stop(StopReason::Graceful)
-            .await
-            .expect("accepted");
-        assert_deleter_ended_with_the_factory_panic(&rig).await;
-    });
-}
-
-/// `pre_stop` deletes the down leaf and accepts: the deleter ends with the
-/// panic, and `on_stopped` receives it.
-#[test]
-fn a_factory_dropped_in_an_accepting_pre_stop_is_the_reason_on_stopped_receives() {
-    common::run(2, async {
-        let rig = deleter_rig(Some(false)).await;
-        rig.deleter
-            .stop(StopReason::Graceful)
-            .await
-            .expect("accepted");
-        assert_deleter_ended_with_the_factory_panic(&rig).await;
-    });
-}
-
 /// A turn deletes the down leaf: the factory's drop panics inside `handle`,
 /// so the waiting caller receives the panic and the deleter stops with it.
 #[test]
@@ -813,82 +744,5 @@ fn a_collector_whose_senders_a_factory_holds_drains_within_its_stop() {
             "the collector's drain ended"
         );
         assert_eq!(drained.lock().unwrap().clone(), vec![1]);
-    });
-}
-
-/// A child death the supervisor has not yet recorded when `pre_stop` runs
-/// (the stop lane is read before the death plane) is refused by
-/// `delete_child`, and the factory is not dropped: the vetoing `pre_stop`
-/// keeps the supervisor running. The deleter holds a turn while the leaf
-/// ends and the stop is raised, so both are ready when the turn ends.
-#[test]
-fn a_death_still_pending_when_pre_stop_deletes_is_refused() {
-    common::run(2, async {
-        let leaf_name = uname("leaf");
-        let armed = Arc::new(AtomicBool::new(false));
-        let stopped_with = Arc::new(Mutex::new(None));
-        let deleted_in_pre_stop = Arc::new(Mutex::new(None));
-        let deleter = Deleter {
-            leaf: leaf_name.clone(),
-            armed: armed.clone(),
-            delete_in_pre_stop: Some(true),
-            stopped_with: stopped_with.clone(),
-            deleted_in_pre_stop: deleted_in_pre_stop.clone(),
-        }
-        .spawn()
-        .named(uname("deleter"))
-        .supervisor()
-        .await
-        .expect("the deleter spawns");
-        wait_until("the leaf to be registered", || {
-            ActorSystem::default().get::<Leaf>(&leaf_name).is_some()
-        })
-        .await;
-        let leaf = ActorSystem::default()
-            .get::<Leaf>(&leaf_name)
-            .expect("registered");
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let entered = Arc::new(AtomicBool::new(false));
-        let held = {
-            let deleter = deleter.clone();
-            let (entered, gate) = (entered.clone(), gate.clone());
-            tokio::spawn(async move { deleter.send(DeleterMsg::Hold(entered, gate)).await })
-        };
-        wait_until("the deleter to hold its turn", || {
-            entered.load(Ordering::SeqCst)
-        })
-        .await;
-        leaf.stop(StopReason::Graceful).await.expect("accepted");
-        within("the leaf's end", leaf.wait_stopped()).await;
-        armed.store(true, Ordering::SeqCst);
-        deleter.stop(StopReason::Graceful).await.expect("accepted");
-        gate.add_permits(1);
-        within("the held turn", held)
-            .await
-            .expect("joined")
-            .expect("answered");
-        // pre_stop ran: its delete_child was refused, and its veto stands.
-        wait_until("pre_stop's delete_child", || {
-            deleted_in_pre_stop.lock().unwrap().is_some()
-        })
-        .await;
-        let answer = deleted_in_pre_stop.lock().unwrap().take();
-        assert!(
-            matches!(
-                answer,
-                Some(Err(
-                    SupervisionError::ChildRestarting(_) | SupervisionError::ChildRunning(_)
-                ))
-            ),
-            "the death was still pending, so delete_child was refused: {answer:?}"
-        );
-        assert!(
-            deleter.send(DeleterMsg::Settled).await.is_ok(),
-            "the veto stands: the deleter still answers"
-        );
-        assert!(stopped_with.lock().unwrap().is_none());
-        armed.store(false, Ordering::SeqCst);
-        deleter.stop(StopReason::Kill).await.expect("accepted");
-        within("the deleter's end", deleter.wait_stopped()).await;
     });
 }

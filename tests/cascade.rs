@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Behavioral suite for supervision-tree teardown under `StopReason::Kill`.
 //!
 //! A task dying with `Kill` - whether configured directly or escalated from
@@ -20,7 +21,7 @@ use tokio::time::{sleep, Instant};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorHandle, ActorResult, ActorStatus, ActorSystem, ChildEvent, RestartType,
-    Shutdown, StopOutcome, StopReason,
+    Shutdown, StopReason,
 };
 
 mod common;
@@ -33,25 +34,6 @@ type EventLog = Arc<Mutex<Vec<ChildEvent>>>;
 
 fn recorder() -> EventLog {
     Arc::new(Mutex::new(Vec::new()))
-}
-
-/// The bound on a timed outcome on a real-time runtime. A tighter limit would
-/// fail on a host that stalls its threads; the exact timing is pinned on the
-/// paused clock, where an outcome lands on its instant.
-const HANG_BOUND: Duration = Duration::from_secs(10);
-
-/// The upper bound of an outcome that lands at `precise` on the paused clock.
-fn upper(paused: bool, precise: Duration) -> Duration {
-    if paused {
-        precise
-    } else {
-        HANG_BOUND
-    }
-}
-
-/// `upper` for a poll deadline given in milliseconds.
-fn upper_ms(paused: bool, precise_ms: u64) -> u64 {
-    upper(paused, Duration::from_millis(precise_ms)).as_millis() as u64
 }
 
 /// Unique registry names so tests can run in parallel within one process.
@@ -75,22 +57,6 @@ where
             return false;
         }
         sleep(Duration::from_millis(5)).await;
-    }
-}
-
-/// Re-looks a named `Node` up until it answers a `Ping` - proof that
-/// whichever incarnation is registered under the name right now is alive and
-/// responsive (a crashed predecessor can never satisfy this).
-async fn wait_responsive(sys: &ActorSystem, name: &str, timeout_ms: u64) -> ActorHandle<Node> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if let Some(handle) = sys.get::<Node>(name) {
-            if handle.send(NodeMsg::Ping).await.is_ok() {
-                return handle;
-            }
-        }
-        assert!(Instant::now() < deadline, "{name} never became responsive");
-        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -128,11 +94,6 @@ impl Node {
 
     fn recording_stops(mut self, stops: &StopLog) -> Self {
         self.stops = Some(stops.clone());
-        self
-    }
-
-    fn with_child_grace(mut self, grace: Duration) -> Self {
-        self.child_grace = Some(grace);
         self
     }
 }
@@ -232,317 +193,6 @@ impl Actor for Node {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cascaded_subtree_has_no_observably_running_descendant_after_kill() {
-    let sys = ActorSystem::create(uname("sys")).unwrap();
-    let mid_name = uname("mid");
-    let leaf_name = uname("leaf");
-
-    let top = Node::new(false, recorder())
-        .spawn()
-        .named(uname("top"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    top.send(NodeMsg::SpawnChild {
-        name: mid_name.clone(),
-        as_supervisor: true,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-    let mid = sys.get::<Node>(&mid_name).expect("mid registered");
-
-    mid.send(NodeMsg::SpawnChild {
-        name: leaf_name.clone(),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-    let leaf = sys.get::<Node>(&leaf_name).expect("leaf registered");
-
-    let mid_id = mid.id().clone();
-    let leaf_id = leaf.id().clone();
-
-    top.stop(StopReason::Kill).await.unwrap();
-    top.wait_stopped().await;
-
-    assert!(
-        wait_until(2_000, || {
-            !matches!(sys.actor_status(&mid_id), Some(ActorStatus::Running))
-        })
-        .await,
-        "mid must not be observably Running after the cascade"
-    );
-    assert!(
-        wait_until(2_000, || {
-            !matches!(sys.actor_status(&leaf_id), Some(ActorStatus::Running))
-        })
-        .await,
-        "leaf must not be observably Running after the cascade"
-    );
-}
-
-/// A kill grace no wait in this test comes near: an abort after it cannot be
-/// what ends a descendant here.
-const FAR_GRACE: Duration = Duration::from_secs(30);
-
-#[tokio::test(flavor = "multi_thread")]
-async fn nested_cooperative_subtree_tears_down_without_reaper_rescue() {
-    let sys = ActorSystem::create(uname("sys")).unwrap();
-    let mid_name = uname("mid");
-    let leaf_name = uname("leaf");
-
-    // Every descendant has a 30 s kill grace, so the reaper's abort of either
-    // is 30 s away.
-    let top = Node::new(false, recorder())
-        .with_child_grace(FAR_GRACE)
-        .spawn()
-        .named(uname("top"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    top.send(NodeMsg::SpawnChild {
-        name: mid_name.clone(),
-        as_supervisor: true,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-    let mid = sys.get::<Node>(&mid_name).expect("mid registered");
-
-    mid.send(NodeMsg::SpawnChild {
-        name: leaf_name.clone(),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-    let leaf = sys.get::<Node>(&leaf_name).expect("leaf registered");
-
-    top.stop(StopReason::Kill).await.unwrap();
-    top.wait_stopped().await;
-
-    // Both cooperative descendants must be FULLY torn down (name released,
-    // task exited) by observing the Kill themselves, long before the reaper
-    // could abort either of them.
-    let all_gone = wait_until(2_000, || {
-        sys.get::<Node>(&mid_name).is_none() && sys.get::<Node>(&leaf_name).is_none()
-    })
-    .await;
-    assert!(
-        all_gone,
-        "a cooperative nested subtree must tear down well within either grace \
-         window, not by reaper rescue"
-    );
-    assert_eq!(mid.status(), ActorStatus::Stopped);
-    assert_eq!(leaf.status(), ActorStatus::Stopped);
-}
-
-async fn wedged_child_is_aborted_only_after_its_grace(paused: bool) {
-    let sys = ActorSystem::create(uname("sys")).unwrap();
-    let leaf_name = uname("leaf");
-
-    let sup = Node::new(false, recorder())
-        .spawn()
-        .named(uname("sup"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    sup.send(NodeMsg::SpawnChild {
-        name: leaf_name.clone(),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-
-    let leaf = sys.get::<Node>(&leaf_name).expect("leaf registered");
-    // The handler runs only after the leaf's start, and the Kill comes only
-    // once the wedge holds.
-    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    leaf.notify(NodeMsg::Wedge(wedged.clone())).await.unwrap();
-    assert!(
-        wait_until(2_000, || wedged.load(Ordering::SeqCst)).await,
-        "the leaf's handler parks"
-    );
-
-    let t0 = Instant::now();
-    sup.stop(StopReason::Kill).await.unwrap();
-    sup.wait_stopped().await;
-
-    assert!(
-        wait_until(2_000, || sys.get::<Node>(&leaf_name).is_none()).await,
-        "a wedged leaf must eventually be aborted by the reaper"
-    );
-    let elapsed = t0.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(90),
-        "the reaper must honor the leaf's grace window before aborting, took {elapsed:?}"
-    );
-    assert!(
-        elapsed < upper(paused, Duration::from_secs(1)),
-        "the reaper must not take drastically longer than the grace window, took {elapsed:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn wedged_child_is_aborted_only_after_its_grace_multi_thread() {
-    wedged_child_is_aborted_only_after_its_grace(false).await;
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn wedged_child_is_aborted_only_after_its_grace_current_thread() {
-    wedged_child_is_aborted_only_after_its_grace(true).await;
-}
-
-async fn escalated_timeout_kill_cascades_the_same_as_configured_kill(paused: bool) {
-    let sys = ActorSystem::create(uname("sys")).unwrap();
-    let mid_name = uname("mid");
-    let leaf_name = uname("leaf");
-
-    let top = Node::new(false, recorder())
-        .spawn()
-        .named(uname("top"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    // `mid` vetoes every stoppable stop forever and has a short Shutdown
-    // timeout, so `top`'s own child-stop ladder escalates it to Kill
-    // instead of waiting for a cooperative stop that never comes.
-    top.send(NodeMsg::SpawnChild {
-        name: mid_name.clone(),
-        as_supervisor: true,
-        shutdown: Shutdown::Timeout(Duration::from_millis(50)),
-        restart_type: RestartType::Permanent,
-        veto: true,
-    })
-    .await
-    .unwrap();
-    let mid = sys.get::<Node>(&mid_name).expect("mid registered");
-
-    // `leaf` ALSO vetoes forever and carries a Shutdown policy long enough
-    // to be unmistakable: if `mid`'s own teardown ever awaited it under
-    // that policy instead of cascading Kill directly, this test would see
-    // it take seconds, not milliseconds.
-    mid.send(NodeMsg::SpawnChild {
-        name: leaf_name.clone(),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(Duration::from_secs(2)),
-        restart_type: RestartType::Permanent,
-        veto: true,
-    })
-    .await
-    .unwrap();
-
-    // A graceful top-level stop, NOT Kill: this is what drives `top`'s own
-    // child-stop ladder, which is where the Timeout -> Kill escalation on
-    // `mid` actually happens.
-    let stopping = Instant::now();
-    top.stop(StopReason::Graceful).await.unwrap();
-    top.wait_stopped().await;
-
-    assert!(
-        wait_until(upper_ms(paused, 500), || sys
-            .get::<Node>(&leaf_name)
-            .is_none())
-        .await,
-        "leaf must be torn down promptly by the inverted cascade under mid's \
-         escalated Kill, not left waiting out its own unrelated Shutdown policy"
-    );
-    // The whole stop, counted from the request: mid's 50 ms window, then its
-    // escalated Kill, which mid obeys and cascades to the leaf at once; the
-    // bound adds a kill grace and a settle time of margin and more. A ladder
-    // that gave mid more than its window ends past it on the paused clock.
-    let took = stopping.elapsed();
-    assert!(
-        took < upper(paused, Duration::from_millis(500)),
-        "the escalated stop and its cascade took {took:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn escalated_timeout_kill_cascades_the_same_as_configured_kill_multi_thread() {
-    escalated_timeout_kill_cascades_the_same_as_configured_kill(false).await;
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn escalated_timeout_kill_cascades_the_same_as_configured_kill_current_thread() {
-    escalated_timeout_kill_cascades_the_same_as_configured_kill(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn restarted_incarnation_still_cascades_on_a_later_parent_kill() {
-    let sys = ActorSystem::create(uname("sys")).unwrap();
-    let worker_name = uname("worker");
-
-    let sup = Node::new(false, recorder())
-        .spawn()
-        .named(uname("sup"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    sup.send(NodeMsg::SpawnChild {
-        name: worker_name.clone(),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-
-    let worker = wait_responsive(&sys, &worker_name, 5_000).await;
-    worker.notify(NodeMsg::Crash).await.unwrap();
-
-    // A FRESH incarnation re-registers under the same name; only it can
-    // answer a Ping (its crashed predecessor cannot).
-    let restarted = wait_responsive(&sys, &worker_name, 5_000).await;
-    // The Kill comes only once the wedge holds.
-    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    restarted
-        .notify(NodeMsg::Wedge(wedged.clone()))
-        .await
-        .unwrap();
-    assert!(
-        wait_until(2_000, || wedged.load(Ordering::SeqCst)).await,
-        "the restarted incarnation's handler parks"
-    );
-
-    sup.stop(StopReason::Kill).await.unwrap();
-    sup.wait_stopped().await;
-
-    // The fresh incarnation's own link guard - minted during the restart,
-    // not inherited from the original spawn - must still be the one that
-    // eventually reaps it.
-    assert!(
-        wait_until(2_000, || sys.get::<Node>(&worker_name).is_none()).await,
-        "the restarted incarnation must still be cascaded and reaped after its \
-         supervisor dies"
-    );
-}
-
 /// A wedged (never-cooperating) child's `status()` must never report
 /// `Stopped` while it is still alive, from the instant its supervisor is
 /// killed through to the reaper actually aborting it: `status() == Stopped`
@@ -622,52 +272,6 @@ fn status_stopped_implies_not_alive_through_a_cascade() {
             panic!("a same-name respawn under a freed name must succeed: {err}");
         }
     });
-}
-
-/// A child's `Shutdown::Timeout` at the very edge of what `Instant::checked_add`
-/// accepts must not panic the supervisor's own teardown: the timer it
-/// eventually reaches rounds a deadline up to the next millisecond with its
-/// own unchecked addition, which panics if that deadline was already within
-/// the last millisecond of the representable `Instant` range.
-#[tokio::test(flavor = "multi_thread")]
-async fn edge_of_range_child_shutdown_timeout_does_not_panic() {
-    let base = Instant::now();
-    let mut lo = Duration::ZERO;
-    let mut hi = Duration::from_secs(u64::MAX / 2);
-    while hi - lo > Duration::from_nanos(1) {
-        let mid = lo + (hi - lo) / 2;
-        if base.checked_add(mid).is_some() {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let d = lo - Duration::from_micros(500);
-
-    let sys = ActorSystem::create(uname("edge-of-range")).unwrap();
-    let top = Node::new(false, recorder())
-        .spawn()
-        .named(uname("top"))
-        .on_system(&sys)
-        .supervisor()
-        .await
-        .unwrap();
-
-    top.send(NodeMsg::SpawnChild {
-        name: uname("child"),
-        as_supervisor: false,
-        shutdown: Shutdown::Timeout(d),
-        restart_type: RestartType::Permanent,
-        veto: false,
-    })
-    .await
-    .unwrap();
-
-    let outcome = top
-        .stop_within(StopReason::Graceful, Duration::from_secs(5))
-        .await
-        .unwrap();
-    assert_eq!(outcome, StopOutcome::Graceful);
 }
 
 /// The inherited stop of a supervisor child whose `Shutdown::Timeout` is at

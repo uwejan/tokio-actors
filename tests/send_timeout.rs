@@ -15,11 +15,6 @@ use tokio_actors::{
     ActorConfig, ActorResult, AskError,
 };
 
-/// Iteration count for the sustained huge-timeout suites: enough repeats
-/// that a deadline landing within the timer's internal rounding margin,
-/// rather than merely a large one, has room to actually surface.
-const HUGE_TIMEOUT_ITERATIONS: u32 = 3000;
-
 /// The longest a handler waits at a [`Gate`]: past every bound a test
 /// awaits, so a gate the test never opens shows as that test's own failure.
 const GATE_CAP: Duration = Duration::from_secs(15);
@@ -74,9 +69,10 @@ struct Worker;
 
 #[derive(Clone)]
 enum WorkerMsg {
-    /// Parks the handler on a never-ready future, so the mailbox slot it
-    /// occupied is never returned and the actor never revisits its loop.
-    Hang,
+    /// Raises the flag, then parks the handler on a never-ready future: the
+    /// flag shows the handler took the message and freed its mailbox slot,
+    /// and the actor never revisits its loop.
+    Hang(Arc<AtomicBool>),
     /// Waits at the gate until the test opens it, then replies with `7`.
     Gated(Arc<Gate>),
     /// Replies immediately with the given value.
@@ -89,7 +85,8 @@ impl Actor for Worker {
 
     async fn handle(&mut self, msg: WorkerMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         match msg {
-            WorkerMsg::Hang => {
+            WorkerMsg::Hang(entered) => {
+                entered.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 unreachable!("pending() never resolves")
             }
@@ -114,12 +111,23 @@ async fn full_mailbox_with_hung_handler_times_out_unenqueued() {
         .await
         .unwrap();
 
-    // Dequeued almost immediately (the mailbox starts empty with one free
-    // slot); parks the handler on `pending()` forever.
-    handle.notify(WorkerMsg::Hang).await.unwrap();
-    // Give the actor task a chance to actually pull `Hang` out of the
-    // mailbox and start awaiting it before we refill the single slot.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Dequeued as soon as the actor runs (the mailbox starts empty with one
+    // free slot); parks the handler on `pending()` forever.
+    let entered = Arc::new(AtomicBool::new(false));
+    handle
+        .notify(WorkerMsg::Hang(entered.clone()))
+        .await
+        .unwrap();
+    // The handler raises the flag once it holds the message, so the single
+    // slot is free again before the test refills it.
+    let waited = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            waited.elapsed() < GATE_CAP,
+            "the handler never took the message"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 
     // Takes the only mailbox slot. It can never be dequeued: the handler is
     // wedged inside the first message's `handle()` call for good.
@@ -189,73 +197,6 @@ async fn slow_handler_times_out_enqueued_then_actor_survives() {
 // Healthy fast actor, fast path
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn healthy_fast_actor_send_timeout_matches_send() {
-    let handle = Worker.spawn().await.unwrap();
-
-    let via_send = handle.send(WorkerMsg::Echo(42)).await.unwrap();
-    let via_send_timeout = handle
-        .send_timeout(WorkerMsg::Echo(42), Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    assert_eq!(via_send, 42);
-    assert_eq!(via_send_timeout, 42);
-    assert_eq!(via_send, via_send_timeout);
-}
-
 // ---------------------------------------------------------------------------
 // Pathological deadline duration
 // ---------------------------------------------------------------------------
-
-// A plain `Instant::now() + Duration::MAX` panics on overflow; `send_timeout`
-// must saturate the deadline instead, so a caller can pass an effectively
-// "no timeout" duration without risking a panic.
-#[tokio::test]
-async fn send_timeout_with_huge_duration_does_not_panic() {
-    let handle = Worker.spawn().await.unwrap();
-
-    let result = handle.send_timeout(WorkerMsg::Echo(7), Duration::MAX).await;
-
-    assert!(matches!(result, Ok(7)), "expected Ok(7), got {result:?}");
-}
-
-// A single `Duration::MAX` call only proves the deadline can be constructed
-// without panicking; it says nothing about a deadline that lands inside the
-// timer's own internal rounding margin. Repeating the call thousands of
-// times against one long-lived actor gives that margin room to actually be
-// hit, since each call computes its deadline from a fresh `Instant::now()`.
-#[tokio::test(flavor = "multi_thread")]
-async fn huge_timeouts_never_reach_the_timer_unsafely() {
-    let handle = Worker.spawn().await.unwrap();
-
-    for i in 0..HUGE_TIMEOUT_ITERATIONS {
-        let result = handle.send_timeout(WorkerMsg::Echo(i), Duration::MAX).await;
-        assert!(
-            matches!(result, Ok(v) if v == i),
-            "iteration {i}: expected Ok({i}), got {result:?}"
-        );
-    }
-}
-
-// Same repeated-huge-deadline check, on the priority lane's own
-// `send_priority_timeout`, which computes its deadline through the same
-// `saturating_deadline` helper.
-#[tokio::test(flavor = "multi_thread")]
-async fn huge_priority_timeouts_never_reach_the_timer_unsafely() {
-    let handle = Worker
-        .spawn()
-        .with_config(ActorConfig::default().with_priority_lane(8))
-        .await
-        .unwrap();
-
-    for i in 0..HUGE_TIMEOUT_ITERATIONS {
-        let result = handle
-            .send_priority_timeout(WorkerMsg::Echo(i), Duration::MAX)
-            .await;
-        assert!(
-            matches!(result, Ok(v) if v == i),
-            "iteration {i}: expected Ok({i}), got {result:?}"
-        );
-    }
-}

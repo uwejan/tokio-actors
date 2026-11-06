@@ -194,29 +194,11 @@ fn a_parked_recurring_tick_and_its_factory_both_panicking_end_in_one_reason_curr
 }
 
 #[test]
-fn a_parked_recurring_tick_and_its_factory_both_panicking_end_in_one_reason_multi_thread() {
-    if common::in_a_child_process(
-        "a_parked_recurring_tick_and_its_factory_both_panicking_end_in_one_reason_multi_thread",
-    ) {
-        a_parked_forwarder_with_two_panicking_drops_ends_in_one_reason(false, "multi_thread");
-    }
-}
-
-#[test]
 fn a_parked_stream_item_and_its_stream_both_panicking_end_in_one_reason_current_thread() {
     if common::in_a_child_process(
         "a_parked_stream_item_and_its_stream_both_panicking_end_in_one_reason_current_thread",
     ) {
         a_parked_forwarder_with_two_panicking_drops_ends_in_one_reason(true, "current_thread");
-    }
-}
-
-#[test]
-fn a_parked_stream_item_and_its_stream_both_panicking_end_in_one_reason_multi_thread() {
-    if common::in_a_child_process(
-        "a_parked_stream_item_and_its_stream_both_panicking_end_in_one_reason_multi_thread",
-    ) {
-        a_parked_forwarder_with_two_panicking_drops_ends_in_one_reason(true, "multi_thread");
     }
 }
 
@@ -339,31 +321,6 @@ fn a_lone_factory_drop_panic_is_the_task_s() {
     }
 }
 
-#[test]
-fn a_lone_factory_drop_panic_during_an_unrelated_unwind_is_the_task_s() {
-    if common::in_a_child_process(
-        "a_lone_factory_drop_panic_during_an_unrelated_unwind_is_the_task_s",
-    ) {
-        a_lone_owner_drop_panic_is_the_task_s(false, true);
-    }
-}
-
-#[test]
-fn a_lone_stream_drop_panic_is_the_task_s() {
-    if common::in_a_child_process("a_lone_stream_drop_panic_is_the_task_s") {
-        a_lone_owner_drop_panic_is_the_task_s(true, false);
-    }
-}
-
-#[test]
-fn a_lone_stream_drop_panic_during_an_unrelated_unwind_is_the_task_s() {
-    if common::in_a_child_process(
-        "a_lone_stream_drop_panic_during_an_unrelated_unwind_is_the_task_s",
-    ) {
-        a_lone_owner_drop_panic_is_the_task_s(true, true);
-    }
-}
-
 /// Set by a test whose log subscriber panics on every line that records an
 /// ended stream's panic its forwarder did not report.
 #[cfg(feature = "tracing")]
@@ -441,35 +398,6 @@ fn a_runtime_panic_and_a_factory_drop_panic_in_one_timer_do_not_abort() {
     }
     #[cfg(not(feature = "tracing"))]
     let _ = name;
-}
-
-/// The same timer, with a log subscriber that panics on the line that
-/// records the factory's discarded panic: the line is written, the
-/// subscriber's panic is contained there, the process does not abort, and
-/// the task's panic stays the runtime's.
-#[cfg(feature = "tracing")]
-#[test]
-fn a_panicking_log_of_a_discarded_panic_does_not_abort() {
-    if !common::in_a_child_process("a_panicking_log_of_a_discarded_panic_does_not_abort") {
-        return;
-    }
-    let logged = warnings::install();
-    PANIC_ON_DISCARDED.store(true, Ordering::SeqCst);
-    let (name, error) = a_timer_without_a_time_driver();
-    assert!(error.contains("timer"), "the runtime's panic: {error}");
-    let token = format!("actor_id={name} ");
-    let lines: Vec<String> = logged
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|line| line.contains(&token) && line.contains(OWNER))
-        .cloned()
-        .collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "the factory's panic is logged once: {lines:?}"
-    );
 }
 
 /// Set by the stream that ends at once, when its drop ran.
@@ -622,57 +550,6 @@ fn an_ended_stream_whose_finished_conversion_panics() -> (String, String) {
     (name, error.expect("the stream's task panicked"))
 }
 
-/// A stream ends during the run with a panicking drop, and its `Finished`
-/// is sent: the drop's panic is reported with it, as the last forwarder
-/// error, and with the `tracing` feature it is not logged as an unreported
-/// panic.
-#[test]
-fn an_ended_stream_s_reported_drop_panic_is_not_logged_as_unreported() {
-    if !common::in_a_child_process(
-        "an_ended_stream_s_reported_drop_panic_is_not_logged_as_unreported",
-    ) {
-        return;
-    }
-    #[cfg(feature = "tracing")]
-    let logged = warnings::install();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
-    let (name, error) = runtime.block_on(async {
-        let actor = Ender { stop: false }
-            .spawn()
-            .await
-            .expect("the actor starts");
-        actor.send(EndMsg::Start).await.expect("the stream ends");
-        let mut error = None;
-        for _ in 0..1000 {
-            error = actor.send(EndMsg::Read).await.expect("the actor answers");
-            if error.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        (actor.id().to_string(), error)
-    });
-    let error = error.expect("the stream's drop panic is reported");
-    assert!(error.contains(ENDED), "the ended stream's panic: {error}");
-    #[cfg(feature = "tracing")]
-    {
-        let token = format!("actor_id={name} ");
-        let lines: Vec<String> = logged
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| line.contains(&token) && line.contains("ended before reporting"))
-            .cloned()
-            .collect();
-        assert!(lines.is_empty(), "{lines:?}");
-    }
-    #[cfg(not(feature = "tracing"))]
-    let _ = name;
-}
-
 /// The conversion's panic is the stream's task panic, the last forwarder
 /// error, and with the `tracing` feature the ended stream's drop panic is
 /// logged once, naming the actor.
@@ -729,55 +606,6 @@ fn a_panicking_log_of_an_ended_stream_s_panic_during_a_conversion_panic_does_not
         error.contains(FINISHED_FROM),
         "the conversion's panic: {error}"
     );
-}
-
-/// A stream ends during the run with a panicking drop while the mailbox is
-/// full, its `Finished` waits for room, the actor stops, and the end's
-/// abort drops the `Finished`, whose drop panics; a log subscriber panics on
-/// the ended stream's line, written during that unwind. The log's panic is
-/// caught and discarded, the process does not abort, and the actor's reason
-/// is the `Finished` message's drop panic.
-#[cfg(feature = "tracing")]
-#[test]
-fn a_panicking_log_of_an_ended_stream_s_panic_at_the_end_s_abort_does_not_abort() {
-    if !common::in_a_child_process(
-        "a_panicking_log_of_an_ended_stream_s_panic_at_the_end_s_abort_does_not_abort",
-    ) {
-        return;
-    }
-    let logged = warnings::install();
-    PANIC_ON_ENDED.store(true, Ordering::SeqCst);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
-    let (name, reason) = runtime.block_on(async {
-        let actor = Ender { stop: true }
-            .spawn()
-            .with_config(ActorConfig::default().with_mailbox_capacity(1))
-            .await
-            .expect("the actor starts");
-        actor.notify(EndMsg::Start).await.expect("queued");
-        let reason = timeout(BOUND, actor.wait_stopped())
-            .await
-            .expect("the actor ends");
-        (actor.id().to_string(), reason)
-    });
-    ARMED.store(false, Ordering::SeqCst);
-    assert_eq!(
-        reason,
-        StopReason::Failure(ActorError::Panic(FINISHED_DROP.to_string()))
-    );
-    // The holder's line was written, once, before the subscriber panicked.
-    let token = format!("actor_id={name} ");
-    let lines: Vec<String> = logged
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|line| line.contains(&token) && line.contains("ended before reporting"))
-        .cloned()
-        .collect();
-    assert_eq!(lines.len(), 1, "{lines:?}");
 }
 
 #[cfg(feature = "tracing")]

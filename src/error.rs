@@ -45,7 +45,9 @@ impl ActorError {
 /// Failures encountered while sending a message asynchronously.
 #[derive(Debug, Error, Clone)]
 pub enum SendError {
-    /// The actor's mailbox is closed (actor stopped).
+    /// The actor's mailbox is closed: the actor is stopping or has stopped, and
+    /// the message was not processed. Its name can stay registered to the
+    /// ending incarnation until its teardown ends.
     #[error("mailbox closed")]
     Closed,
     /// No actor is registered under the given name or ID.
@@ -83,7 +85,17 @@ pub enum TrySendError {
 ///   ([`get_status`](crate::actor::handle::ActorHandle::get_status)) fails
 ///   this way too.
 /// - [`Actor`](AskError::Actor): the handler produced this error - either it
-///   returned `Err` or it panicked ([`ActorError::Panic`]).
+///   returned `Err` or it panicked ([`ActorError::Panic`]). It is returned at
+///   the same point as `ResponseDropped`, when the actor seals its stop lane:
+///   after its `on_stopped` and its children's teardown, with its name
+///   already free, as an Erlang/OTP `gen_server:call` caller reads a crash
+///   after the process is dead. A lookup by name right after it finds no
+///   registration, or the next incarnation if a supervisor restarts the actor;
+///   `None` is final for an actor that nothing restarts, and for a supervised
+///   one it means either that the next incarnation is not registered yet or
+///   that its supervisor will not restart it, so bound the retries. A `Kill`,
+///   an abort or the end of the actor's runtime that ends the actor first
+///   makes the call `ResponseDropped` with the final reason instead.
 /// - [`Timeout`](AskError::Timeout): the caller-supplied deadline
 ///   ([`send_timeout`](crate::actor::handle::ActorHandle::send_timeout))
 ///   elapsed before a response arrived. `enqueued: false` behaves like
@@ -132,16 +144,16 @@ pub enum SpawnError {
     #[error("tokio runtime handle not in scope")]
     MissingRuntime,
     /// The configured mailbox capacity, or the configured priority lane
-    /// capacity, was zero. Every bounded channel a spawned actor owns - its
+    /// capacity, was zero. Every bounded queue a spawned actor owns - its
     /// mailbox, and its priority lane when one is enabled - must hold at
-    /// least one message; `tokio::sync::mpsc::channel` panics on a
-    /// zero-sized buffer, so this is caught before either channel is ever
+    /// least one message, so a zero capacity is refused before either queue is
     /// created.
     #[error("mailbox and priority lane capacities must be at least 1, got 0")]
     ZeroMailboxCapacity,
-    /// An actor with this id is already registered: a supervised child's id
-    /// in use under its supervisor, or a second live registration of an id
-    /// in its system.
+    /// An actor with this id is already registered: a child spec the
+    /// supervisor holds under this id, whether the child runs, is being
+    /// restarted or is stopped with its spec kept, or a second live
+    /// registration of an id in its system.
     #[error("an actor with id `{0}` is already registered")]
     DuplicateChild(ActorId),
     /// An actor with the given name is already registered in the system.
@@ -156,15 +168,19 @@ pub enum SpawnError {
     #[error("actor system `{0}` already exists")]
     SystemNameTaken(String),
     /// The actor system `{0}` is not currently accepting registrations: it is
-    /// either shutting down (`shutdown`/`shutdown_with` in flight, or dropped
-    /// before it completed, which leaves the system shutting down until a later
-    /// `shutdown` call finishes the job) or has finished shutting down,
-    /// matching OTP's application-controller behavior during stop. A supervised
+    /// either shutting down (`shutdown`/`shutdown_with` in flight, or cut short
+    /// before it completed (its runtime ended, a call that walks in its own
+    /// future was dropped, or the call panicked at a wait that needs a driven
+    /// runtime with the time driver), which leaves the
+    /// system refusing registrations
+    /// until a shutdown of the system has completed, an earlier one included)
+    /// or has finished shutting down. A supervised
     /// restart is refused the same way, and charged to the restart budget like
     /// any failed restart, so a supervisor whose child dies in that phase and
     /// is due a restart exhausts a budget whose window holds its `max_restarts`
-    /// restarts, while a zero window keeps retrying until a shutdown reaches
-    /// the supervisor, unless the restarts read the same instant (see
+    /// restarts, while a zero window with a `max_restarts` above zero keeps
+    /// retrying until a shutdown reaches the supervisor, unless the restarts
+    /// read the same instant (see
     /// [`SupervisionConfig::restart_window`](crate::actor::supervision::SupervisionConfig::restart_window)).
     /// This is not permanent -
     /// [`ActorSystem::reactivate`](crate::system::ActorSystem::reactivate)
@@ -187,9 +203,14 @@ pub enum SpawnError {
     #[error("actor failed to initialize: {0}")]
     Init(Box<ActorError>),
     /// The actor did not finish `pre_start`/`on_started` within the deadline
-    /// passed to `.start_timeout()`. The task is aborted immediately (no
-    /// lifecycle hook runs afterward), matching OTP's untrappable
-    /// `exit(_, kill)` on a start timeout.
+    /// passed to `.start_timeout()`. The start is cut at once, as Erlang/OTP
+    /// kills a process whose start times out: `Kill` is raised on the actor's
+    /// stop lane and its task is aborted. The abort takes effect when the task
+    /// next suspends; once the start has timed out no hook begins and no
+    /// message is handled, while a hook that is already running finishes first
+    /// if it never yields. It is also the answer when the system's task for the
+    /// bound ended without deciding and the actor's end was not final within
+    /// the abort settle time after the deadline.
     #[error("actor did not finish initializing within the start timeout")]
     StartTimeout,
     /// The actor was killed before its spawn was answered: a `Kill` it

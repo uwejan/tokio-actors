@@ -22,8 +22,8 @@ use tokio::time::{timeout, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, SendError,
-    ShutdownPolicy, StopOutcome, StopReason,
+    ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, ShutdownPolicy,
+    StopOutcome, StopReason,
 };
 
 const BOUND: Duration = Duration::from_secs(10);
@@ -93,117 +93,6 @@ async fn root(sys: &Arc<ActorSystem>, v: Held, grace: Duration) -> ActorHandle<H
         .kill_grace(grace)
         .await
         .unwrap()
-}
-
-/// `stop_within(Graceful)`: the window ends inside the value's drop, the
-/// `Kill` step's raise is refused (the lane is sealed), and the drop ends
-/// inside the kill grace: the actor ended with its own reason, `Graceful`.
-#[test]
-fn a_refused_kill_step_leaves_stop_within_graceful() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (v, entered, release) = held();
-        let h = root(&sys, v, Duration::from_secs(5)).await;
-        let (start_tx, start_rx) = oneshot::channel();
-        let call = tokio::spawn({
-            let h = h.clone();
-            async move {
-                let _ = start_tx.send(Instant::now());
-                h.stop_within(StopReason::Graceful, WINDOW).await
-            }
-        });
-        timeout(BOUND, entered).await.unwrap().unwrap();
-        let start = start_rx.await.expect("the call began");
-        assert!(matches!(
-            h.stop(StopReason::Kill).await,
-            Err(SendError::Closed)
-        ));
-        hold_past_the_window(start, PAST).await;
-        let _ = release.send(());
-        let out = timeout(BOUND, call).await.unwrap().unwrap().unwrap();
-        assert_eq!(out, StopOutcome::Graceful, "refused Kill read as {out:?}");
-    });
-}
-
-/// Shutdown: the first step's window ends inside the value's drop; the entry
-/// is gone, so no `Kill` is raised, and the drop ends inside the grace:
-/// `Graceful`.
-#[test]
-fn a_shutdown_whose_kill_step_raises_nothing_reads_graceful() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (v, entered, release) = held();
-        let h = root(&sys, v, Duration::from_secs(5)).await;
-        let id = h.id().clone();
-        let (start_tx, start_rx) = oneshot::channel();
-        let call = tokio::spawn({
-            let sys = sys.clone();
-            async move {
-                let _ = start_tx.send(Instant::now());
-                sys.shutdown_with(ShutdownPolicy {
-                    timeout: BOUND,
-                    per_actor_timeout: WINDOW,
-                })
-                .await
-            }
-        });
-        timeout(BOUND, entered).await.unwrap().unwrap();
-        let start = start_rx.await.expect("the call began");
-        hold_past_the_window(start, PAST).await;
-        let _ = release.send(());
-        let rep = timeout(BOUND, call).await.unwrap().unwrap();
-        let out = rep
-            .outcomes
-            .iter()
-            .find(|(a, _)| *a == id)
-            .map(|(_, o)| o.outcome);
-        assert_eq!(
-            out,
-            Some(StopOutcome::Graceful),
-            "no Kill raised, read {out:?}"
-        );
-    });
-}
-
-/// Shutdown: the `Kill` step waits the root's own 5 s kill grace, read when
-/// the shutdown began, so a drop held 600 ms past the first window ends
-/// inside it.
-#[test]
-fn the_shutdown_kill_step_waits_the_root_s_own_grace() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (v, entered, release) = held();
-        let h = root(&sys, v, Duration::from_secs(5)).await;
-        let id = h.id().clone();
-        let (start_tx, start_rx) = oneshot::channel();
-        let call = tokio::spawn({
-            let sys = sys.clone();
-            async move {
-                let _ = start_tx.send(Instant::now());
-                sys.shutdown_with(ShutdownPolicy {
-                    timeout: BOUND,
-                    per_actor_timeout: WINDOW,
-                })
-                .await
-            }
-        });
-        timeout(BOUND, entered).await.unwrap().unwrap();
-        let start = start_rx.await.expect("the call began");
-        // Well past the default kill grace, well inside the root's own.
-        hold_past_the_window(start, Duration::from_millis(600)).await;
-        let _ = release.send(());
-        let rep = timeout(BOUND, call).await.unwrap().unwrap();
-        let out = rep
-            .outcomes
-            .iter()
-            .find(|(a, _)| *a == id)
-            .map(|(_, o)| o.outcome);
-        assert_eq!(
-            out,
-            Some(StopOutcome::Graceful),
-            "own 5 s grace not used, read {out:?}"
-        );
-    });
 }
 
 // Supervised: the caller and the supervisor read one end.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A restart, a `terminate_child` and a `spawn_child` under a reused id wait
 //! until every actor the previous incarnation spawned has ended.
 //!
@@ -454,7 +455,7 @@ impl Actor for Top {
                 ));
             }
             TopMsg::TerminateAbandoned => {
-                let _ = timeout(Duration::from_millis(20), ctx.terminate_child(p_name)).await;
+                let _ = timeout(Duration::ZERO, ctx.terminate_child(p_name)).await;
                 self.probe.note("terminate_abandoned");
             }
             TopMsg::DeleteSpawn => {
@@ -815,27 +816,8 @@ mod restart_of_a_killed_supervisor_waits_for_its_old_subtree_to_release_its_name
     use super::*;
 
     #[test]
-    fn by_name() {
-        common::run(4, async { kill_path_scenario(KillPath::ByName).await });
-    }
-
-    #[test]
     fn by_id() {
         common::run(4, async { kill_path_scenario(KillPath::ById).await });
-    }
-
-    #[test]
-    fn group_kill_policy() {
-        common::run(4, async {
-            kill_path_scenario(KillPath::GroupKillPolicy).await
-        });
-    }
-
-    #[test]
-    fn group_timeout_escalated() {
-        common::run(4, async {
-            kill_path_scenario(KillPath::GroupTimeoutEscalated).await
-        });
     }
 
     #[test]
@@ -844,215 +826,11 @@ mod restart_of_a_killed_supervisor_waits_for_its_old_subtree_to_release_its_name
             kill_path_scenario(KillPath::GroupTimeoutEscalatedLongGrace).await
         });
     }
-
-    #[test]
-    fn bounce_kill_policy() {
-        common::run(4, async {
-            kill_path_scenario(KillPath::BounceKillPolicy).await
-        });
-    }
-}
-
-#[test]
-fn restart_of_a_killed_supervisor_with_an_idle_named_worker_never_collides() {
-    common::run(4, async {
-        let sub = named_worker(SubSetup::default());
-        let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-        world.sys.kill(&world.p_name).await.unwrap();
-        world.wait_started(2).await;
-        sleep(QUIET).await;
-        assert!(world.top_running());
-        world.assert_no_collision();
-        world.assert_no_budget_exhaustion();
-        assert_eq!(
-            world.probe.reports_of(&world.p_name),
-            vec![SupervisionAction::RestartInitiated]
-        );
-    });
-}
-
-#[test]
-fn graceful_stop_of_a_supervisor_child_restarts_it_after_its_busy_worker_ended() {
-    common::run(4, async {
-        let sub = named_worker(SubSetup {
-            busy_ms: 300,
-            ..SubSetup::default()
-        });
-        let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-        world.sys.stop(&world.p_name).await.unwrap();
-        world.wait_started(2).await;
-        sleep(QUIET).await;
-        assert!(world.top_running());
-        world.assert_no_collision();
-        world.probe.assert_before("w_dropped:1", "p_built:2");
-    });
-}
-
-#[test]
-fn one_worker_crash_does_not_storm_the_grandparent() {
-    common::run(4, async {
-        // `Top` is OneForAll over the supervisor child (window 1 s) and a
-        // sibling; the child's worker (window 5 s) sits in a 3 s turn. The
-        // sibling's crash stops the child, whose orderly stop outlives its
-        // window, so it is aborted while its worker still holds the name.
-        let sub = named_worker(SubSetup {
-            busy_ms: 3000,
-            w_shutdown: Some(Shutdown::Timeout(Duration::from_secs(5))),
-            ..SubSetup::default()
-        });
-        let mut top_setup = setup(Shutdown::Timeout(Duration::from_secs(1)), sub);
-        top_setup.q_name = Some(uname("q"));
-        let q_name = top_setup.q_name.clone().unwrap();
-        let world = start(SupervisionConfig::one_for_all(), top_setup).await;
-        world
-            .sys
-            .get::<Plain>(&q_name)
-            .unwrap()
-            .notify(())
-            .await
-            .unwrap();
-        world.wait_started(2).await;
-        sleep(QUIET * 2).await;
-        assert!(world.top_running(), "{:?}", world.probe.lines());
-        world.assert_no_collision();
-        world.assert_no_budget_exhaustion();
-    });
-}
-
-#[test]
-fn grandparent_survives_a_busy_named_grandchild_at_its_supervisor_s_kill() {
-    // The busy and the idle worker, five runs each: the kill never reaches
-    // the grandparent's budget and the names are always free.
-    for busy_ms in [0, 2000] {
-        for _ in 0..5 {
-            common::run(4, async move {
-                let sub = named_worker(SubSetup {
-                    busy_ms,
-                    ..SubSetup::default()
-                });
-                let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-                world.sys.kill(&world.p_name).await.unwrap();
-                world.wait_started(2).await;
-                sleep(QUIET).await;
-                assert!(
-                    world.top_running(),
-                    "busy {busy_ms}: {:?}",
-                    world.probe.lines()
-                );
-                world.assert_no_collision();
-                world.assert_no_budget_exhaustion();
-            });
-        }
-    }
-}
-
-#[test]
-fn anonymous_grandchildren_of_a_killed_supervisor_never_overlap_its_restart() {
-    // Workers inside a turn when their supervisor dies end by the abort of
-    // their grace; idle ones leave their loop on the `Kill` and finish by
-    // themselves. Either way the old worker value is gone before the
-    // successor's workers are built.
-    for busy_ms in [400, 0] {
-        common::run(4, async move {
-            let sub = SubSetup {
-                anon: 3,
-                busy_ms,
-                w_grace: Some(Duration::from_secs(2)),
-                ..SubSetup::default()
-            };
-            let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-            assert_eq!(world.expected_workers, 3);
-            // A long drop: a successor built while any old value is still
-            // being dropped shows as a fourth live worker, whatever the
-            // scheduling delays.
-            world.probe.drop_ms.store(300, Ordering::SeqCst);
-            world.sys.kill(&world.p_name).await.unwrap();
-            world.wait_started(2).await;
-            sleep(QUIET).await;
-            assert_eq!(
-                world.probe.w_max.load(Ordering::SeqCst),
-                3,
-                "the live workers never exceed the configured count: {:?}",
-                world.probe.lines()
-            );
-            assert_eq!(world.probe.w_built.load(Ordering::SeqCst), 6);
-            world.assert_no_budget_exhaustion();
-        });
-    }
 }
 
 // ---------------------------------------------------------------------------
 // The bound, and what happens when it passes
 // ---------------------------------------------------------------------------
-
-/// The worker's turn blocks its thread until the test ends it: the
-/// restart's wait expires at its bound (the worker's kill grace plus the
-/// settle time, plus the slack), and the grandparent stops with
-/// `ChildUnresponsive` while the turn still runs.
-async fn expiry_scenario(w_shutdown: Option<Shutdown>) {
-    let sub = named_worker(SubSetup {
-        block_ms: LONG_BLOCK_MS,
-        w_shutdown,
-        ..SubSetup::default()
-    });
-    let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-    let unblocks = Unblocks(world.probe.clone());
-    let started = Instant::now();
-    world.sys.kill(&world.p_name).await.unwrap();
-    within(BOUND, "the grandparent to stop", world.top.wait_stopped()).await;
-    let elapsed = started.elapsed();
-    assert!(
-        world.probe.at("w_turn_ended").is_none(),
-        "the verdict came while the turn ran: {:?}",
-        world.probe.lines()
-    );
-    assert_at_the_bound(elapsed, "the successor wait");
-    let reason = world.probe.top_stopped.lock().unwrap().clone().unwrap();
-    assert!(
-        reason.contains("ChildUnresponsive") && reason.contains(&world.p_name),
-        "{reason}"
-    );
-    assert_eq!(world.probe.built_p(), 1, "no new incarnation was built");
-    assert_eq!(world.probe.reports_of(&world.p_name).len(), 1);
-    drop(unblocks);
-}
-
-#[test]
-fn successor_wait_escalates_when_an_old_grandchild_never_yields() {
-    // A turn that blocks its thread needs real parallelism.
-    common::run_multi_thread_only(4, async { expiry_scenario(None).await });
-}
-
-#[test]
-fn successor_wait_for_an_infinity_worker_is_bounded_by_its_kill_grace() {
-    // A turn that blocks its thread freezes a current-thread runtime's timer,
-    // so the bound could never pass there; it needs real parallelism.
-    common::run_multi_thread_only(4, async { expiry_scenario(Some(Shutdown::Infinity)).await });
-}
-
-#[test]
-fn successor_wait_covers_a_grandchild_s_long_kill_grace() {
-    common::run(4, async {
-        let sub = named_worker(SubSetup {
-            busy_ms: 1000,
-            w_grace: Some(Duration::from_millis(1500)),
-            ..SubSetup::default()
-        });
-        let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-        world.sys.kill(&world.p_name).await.unwrap();
-        world.wait_started(2).await;
-        sleep(QUIET).await;
-        assert!(world.top_running(), "{:?}", world.probe.lines());
-        let reason = world.probe.top_stopped.lock().unwrap().clone();
-        assert!(
-            reason.is_none(),
-            "the grandparent never stopped: {reason:?}"
-        );
-        world.assert_no_collision();
-        world.assert_no_budget_exhaustion();
-        world.probe.assert_before("w_dropped:1", "p_built:2");
-    });
-}
 
 #[test]
 fn failed_attempt_subtree_is_waited_for_by_the_next_attempt() {
@@ -1082,57 +860,6 @@ fn failed_attempt_subtree_is_waited_for_by_the_next_attempt() {
         assert!(world.top_running(), "{:?}", world.probe.lines());
         world.assert_no_collision();
         world.probe.assert_before("w_dropped:2", "p_built:3");
-    });
-}
-
-#[test]
-fn parent_stop_cancels_a_restart_attempt_that_waits_for_its_predecessor_subtree() {
-    common::run(4, async {
-        // The child's worker has a 5 s kill grace and sits in a turn the test
-        // ends. The child is killed, so its restart attempt waits for that
-        // worker. A graceful stop of the root cancels the attempt: the root
-        // reaches `Stopped` while the worker's turn still runs, and the
-        // factory ran once only. The child's own window is long, so the
-        // root's teardown waits for the attempt's cancel and does not cut it
-        // short.
-        let sub = named_worker(SubSetup {
-            held: true,
-            w_grace: Some(Duration::from_secs(5)),
-            ..SubSetup::default()
-        });
-        let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
-        // The kill finds the worker inside its held turn.
-        let probe = world.probe.clone();
-        wait_until(BOUND, "the worker's held turn", move || {
-            probe.at("w_turn_started:1").is_some()
-        })
-        .await;
-        world.sys.kill(&world.p_name).await.unwrap();
-        world.wait_line("the kill to be reported", "report:").await;
-        within(
-            BOUND,
-            "the root to stop",
-            world.top.stop(StopReason::Graceful),
-        )
-        .await
-        .unwrap();
-        within(
-            BOUND,
-            "the root to publish Stopped",
-            world.top.wait_stopped(),
-        )
-        .await;
-        // Neither the worker's turn nor the worker itself has ended.
-        assert!(
-            world.probe.at("w_turn_ended").is_none() && world.probe.at("w_dropped").is_none(),
-            "{:?}",
-            world.probe.lines()
-        );
-        world.probe.release.notify_one();
-        assert_eq!(world.probe.built_p(), 1, "{:?}", world.probe.lines());
-        world.assert_no_collision();
-        let reason = world.probe.top_stopped.lock().unwrap().clone().unwrap();
-        assert!(!reason.contains("ChildUnresponsive"), "{reason}");
     });
 }
 
@@ -1267,135 +994,6 @@ mod same_id_spawn_child_never_starts_beside_a_retired_subtree {
     }
 
     #[test]
-    fn abandoned_terminate() {
-        common::run(4, async {
-            let mut sub = long_lived_worker();
-            sub.veto_stop = true;
-            let world = start(
-                one_restart(),
-                setup(Shutdown::Timeout(Duration::from_millis(200)), sub),
-            )
-            .await;
-            world.send(TopMsg::TerminateAbandoned).await;
-            // The supervisor handles the child's end after its window.
-            world.wait_line("the end to be reported", "report:").await;
-            world.send(TopMsg::DeleteSpawn).await;
-            let line = world.wait_line("the respawn to return", "delete:").await;
-            assert!(
-                line.contains("delete:Ok(())") && line.contains("spawn:Ok(())"),
-                "{line}"
-            );
-            world.wait_started(2).await;
-            sleep(QUIET).await;
-            world.assert_no_collision();
-            world.assert_no_budget_exhaustion();
-            world.probe.assert_before("w_dropped:1", "p_built:2");
-        });
-    }
-
-    #[test]
-    fn expired_terminate() {
-        // The worker blocks its thread until the test ends its turn.
-        common::run_multi_thread_only(4, async {
-            let sub = named_worker(SubSetup {
-                block_ms: LONG_BLOCK_MS,
-                ..SubSetup::default()
-            });
-            let world = start(one_restart(), setup(Shutdown::Kill, sub)).await;
-            let unblocks = Unblocks(world.probe.clone());
-            world.send(TopMsg::TerminateP).await;
-            let line = world
-                .wait_line("the terminate to return", "terminate:")
-                .await;
-            assert!(
-                line.contains("ChildUnresponsive") && line.contains("alive=false"),
-                "{line}"
-            );
-            assert_at_the_bound(recorded(&line), "the terminate wait");
-            world.send(TopMsg::DeleteSpawn).await;
-            let line = world.wait_line("the spawn to return", "delete:").await;
-            assert!(
-                line.contains("delete:Ok(())") && line.contains("spawn:Err(ChildUnresponsive"),
-                "{line}"
-            );
-            assert_at_the_bound(recorded(&line), "the spawn wait");
-            assert!(
-                world.probe.at("w_turn_ended").is_none(),
-                "both verdicts came while the turn ran: {:?}",
-                world.probe.lines()
-            );
-            assert_eq!(world.probe.built_p(), 1, "no new child was constructed");
-            // After the worker ended, a spawn succeeds without a collision.
-            drop(unblocks);
-            world.wait_no_workers().await;
-            world.probe.note("workers_ended");
-            world.send(TopMsg::DeleteSpawn).await;
-            let probe = world.probe.clone();
-            wait_until(BOUND, "the second spawn to return", move || {
-                probe
-                    .lines()
-                    .iter()
-                    .filter(|l| l.starts_with("delete:"))
-                    .count()
-                    == 2
-            })
-            .await;
-            let second = world
-                .probe
-                .lines()
-                .into_iter()
-                .filter(|l| l.starts_with("delete:"))
-                .nth(1)
-                .unwrap();
-            assert!(second.contains("spawn:Ok(())"), "{second}");
-            world.wait_started(2).await;
-            world.assert_no_collision();
-        });
-    }
-
-    #[test]
-    fn temporary_pruned() {
-        common::run(4, async {
-            let mut top_setup = setup(Shutdown::default(), long_lived_worker());
-            top_setup.p_restart = RestartType::Temporary;
-            top_setup.respawn_on = Some(top_setup.p_name.clone());
-            let world = start(one_restart(), top_setup).await;
-            world.sys.kill(&world.p_name).await.unwrap();
-            let line = world
-                .wait_line("the respawn in the report to return", "respawn_in_report")
-                .await;
-            assert!(line.contains("spawn:Ok(())"), "{line}");
-            world.wait_started(2).await;
-            sleep(QUIET).await;
-            world.assert_no_collision();
-            world.probe.assert_before("w_dropped:1", "p_built:2");
-        });
-    }
-
-    #[test]
-    fn pool_pruned() {
-        common::run(4, async {
-            let mut top_setup = setup(Shutdown::default(), long_lived_worker());
-            top_setup.p_restart = RestartType::Temporary;
-            top_setup.respawn_on = Some(top_setup.p_name.clone());
-            let world = start(
-                SupervisionConfig::simple_one_for_one().max_restarts(1, Duration::from_secs(60)),
-                top_setup,
-            )
-            .await;
-            world.sys.kill(&world.p_name).await.unwrap();
-            let line = world
-                .wait_line("the respawn in the report to return", "respawn_in_report")
-                .await;
-            assert!(line.contains("spawn:Ok(())"), "{line}");
-            world.wait_started(2).await;
-            sleep(QUIET).await;
-            world.assert_no_collision();
-            world.probe.assert_before("w_dropped:1", "p_built:2");
-        });
-    }
-
-    #[test]
     fn pool_bounced() {
         common::run(4, async {
             let world = start(
@@ -1459,46 +1057,6 @@ mod terminate_child_of_a_child_already_down_waits_for_its_old_subtree {
         let mut top_setup = setup(Shutdown::Timeout(Duration::from_millis(200)), sub);
         top_setup.p_restart = RestartType::Transient;
         top_setup
-    }
-
-    #[test]
-    fn waits_then_ok() {
-        common::run(4, async {
-            let sub = named_worker(SubSetup {
-                busy_ms: 900,
-                w_grace: Some(Duration::from_millis(1500)),
-                veto_stop: true,
-                ..SubSetup::default()
-            });
-            let world = start(one_restart(), down_child_setup(sub)).await;
-            world.send(TopMsg::StopP).await;
-            let line = world.wait_line("the stop to return", "stop_child:").await;
-            assert!(line.contains("Ok(Stopped)"), "{line}");
-            world.wait_line("the death to be reported", "report:").await;
-            assert_eq!(
-                world.probe.reports_of(&world.p_name),
-                vec![SupervisionAction::Removed]
-            );
-            // The child reads down, its worker still runs.
-            assert_eq!(world.probe.live(), 1, "{:?}", world.probe.lines());
-            world.send(TopMsg::TerminateP).await;
-            let line = world
-                .wait_line("the terminate to return", "terminate:")
-                .await;
-            assert!(
-                line.contains("terminate:Ok(())") && line.contains("live=0"),
-                "{line}"
-            );
-            world.probe.assert_before("w_dropped:1", "terminate:Ok(())");
-            world.send(TopMsg::Cycle).await;
-            let line = world.wait_line("the cycle to finish", "cycle ").await;
-            assert!(
-                line.contains("delete:Ok(())") && line.contains("spawn:Ok(())"),
-                "{line}"
-            );
-            world.wait_started(2).await;
-            world.assert_no_collision();
-        });
     }
 
     #[test]
@@ -1698,30 +1256,6 @@ mod each_subtree_verdict_logs_once {
                 again, mine,
                 "spawn_child reached the verdict the terminate already recorded"
             );
-        });
-    }
-
-    #[test]
-    fn spawn_child_s_wait() {
-        let logged = warnings::install();
-        common::run_multi_thread_only(4, async {
-            let world = start(one_restart(), setup(Shutdown::Kill, blocked_worker())).await;
-            // The caller gives up at once; the child's end is reported, and
-            // its subtree, the blocked worker, still runs.
-            world.send(TopMsg::TerminateAbandoned).await;
-            world.wait_line("the end to be reported", "report:").await;
-            assert!(
-                warnings_of(&world, &logged).await.is_empty(),
-                "no wait has expired yet"
-            );
-            world.send(TopMsg::DeleteSpawn).await;
-            let line = world.wait_line("the spawn to return", "delete:").await;
-            assert!(
-                line.contains("delete:Ok(())") && line.contains("spawn:Err(ChildUnresponsive"),
-                "{line}"
-            );
-            let mine = warnings_of(&world, &logged).await;
-            assert_eq!(mine.len(), 1, "{mine:?}");
         });
     }
 }

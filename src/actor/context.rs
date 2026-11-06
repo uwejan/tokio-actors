@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -30,10 +30,11 @@ use crate::actor::supervision::{
 use crate::actor::{runtime, Actor};
 use crate::error::{ActorError, SpawnError, StreamError, SupervisionError, TimerError};
 use crate::system::ActorSystem;
+use crate::time_probe::require_runtime_timers;
 use crate::types::{
     ActorId, ActorStatus, ChildEvent, ChildInfo, MissPolicy, RecurringId, RecurringIdGenerator,
-    RestartStrategy, RestartType, Shutdown, StatusValue, StopChildOutcome, StopReason, StreamEvent,
-    StreamId, TurnClock,
+    RestartStrategy, RestartType, Shutdown, StatusTx, StatusValue, StopChildOutcome, StopLane,
+    StopReason, StreamEvent, StreamId, TurnClock,
 };
 
 /// Zero-sized marker that deliberately does not implement `Clone`, so
@@ -152,11 +153,40 @@ pub struct ActorContext<A: Actor> {
     actor_id: ActorId,
     self_handle: ActorHandle<A>,
     runtime: Handle,
+    /// The timers, streams and their forwarders, and the errors they and
+    /// the supervision tasks recorded: created on first use, so an actor
+    /// that never uses them holds one empty pointer.
+    extras: Option<Box<Extras>>,
+    #[allow(dead_code)]
+    _not_clone: NotClone,
+    last_error: Option<ActorError>,
+    /// Runtime status plane (`process_info`-style, see the `handle` module
+    /// docs): the status and the final reason. Every write goes through
+    /// `send_if_modified`, which succeeds even when no reader is left and
+    /// leaves a reason already written as it is.
+    status_tx: StatusTx,
+    /// Set while this actor's task is polled: tells this task's own unwind
+    /// from an abort or an unrelated unwind when the context drops.
+    task_marker: runtime::TaskMarker,
+    // Supervision fields
+    system: Option<Arc<ActorSystem>>,
+    name: Option<Arc<str>>,
+    supervision: Option<Box<SupervisionState>>,
+    /// The actor's turn clock, bracketing the callbacks the run loop runs
+    /// through the context.
+    turn_clock: TurnClock,
+    /// The actor's hold on its subtree token: the actors it spawns attach to
+    /// it, and it is released only when the actor has ended.
+    subtree: Arc<SubtreeHold>,
+}
+
+/// The parts of an [`ActorContext`] that only an actor with timers, streams
+/// or supervision-task failures uses, boxed on first use. The field order
+/// keeps the drop order the context had.
+struct Extras {
     timers: HashMap<RecurringId, TimerRegistration>,
     streams: HashMap<StreamId, StreamRegistration>,
     id_gen: RecurringIdGenerator,
-    #[allow(dead_code)]
-    _not_clone: NotClone,
     /// Every timer and stream forwarder task, owned here so none of them can
     /// outlive this context. A finished task (a fired one-shot, a stream that
     /// ran out of items, a cancelled loop noticing its token) is reaped from
@@ -176,26 +206,40 @@ pub struct ActorContext<A: Actor> {
     /// The most recent panic of a task the crate runs to supervise this
     /// actor's children. Such a panic never stops this actor.
     last_supervision_task_error: Option<ActorError>,
-    last_error: Option<ActorError>,
-    /// Runtime status plane (`process_info`-style, see the `handle` module
-    /// docs): the status and the final reason. Every write goes through
-    /// `send_if_modified`, which succeeds even when every receiver has been
-    /// dropped (a plain `send` would error at zero receivers) and leaves a
-    /// reason already written as it is.
-    status_tx: watch::Sender<StatusValue>,
-    /// Set while this actor's task is polled: tells this task's own unwind
-    /// from an abort or an unrelated unwind when the context drops.
-    task_marker: runtime::TaskMarker,
-    // Supervision fields
-    system: Option<Arc<ActorSystem>>,
-    name: Option<String>,
-    supervision: Option<SupervisionState>,
-    /// The actor's turn clock, bracketing the callbacks the run loop runs
-    /// through the context.
-    turn_clock: TurnClock,
-    /// The actor's hold on its subtree token: the actors it spawns attach to
-    /// it, and it is released only when the actor has ended.
-    subtree: Arc<SubtreeHold>,
+    /// The forwarder ends counted so far, created with the first forwarder:
+    /// each forwarder counts once, at the first of its ready poll and its
+    /// drop, so before its task's entry in `forwarders` can be ready. Shared
+    /// with every forwarder task, which writes it.
+    forwarders_done: Option<Arc<AtomicU64>>,
+    /// The entries of `forwarders` the run loop has taken.
+    forwarders_taken: u64,
+    /// Set when a forwarder is spawned and when one is reaped, cleared when
+    /// the run loop's select polls the forwarder plane: until then the plane
+    /// may hold no waker of the task, so the fast path does not skip it.
+    forwarders_unpolled: bool,
+}
+
+impl Extras {
+    fn new() -> Self {
+        Self {
+            timers: HashMap::new(),
+            streams: HashMap::new(),
+            id_gen: RecurringIdGenerator::default(),
+            forwarders: JoinSet::new(),
+            forwarder_kinds: HashMap::new(),
+            last_forwarder_error: None,
+            last_supervision_task_error: None,
+            forwarders_done: None,
+            forwarders_taken: 0,
+            forwarders_unpolled: false,
+        }
+    }
+}
+
+/// What a context without extras reads.
+fn no_extras() -> &'static Extras {
+    static EMPTY: std::sync::OnceLock<Extras> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(Extras::new)
 }
 
 impl<A: Actor> std::fmt::Debug for ActorContext<A> {
@@ -204,8 +248,8 @@ impl<A: Actor> std::fmt::Debug for ActorContext<A> {
             .field("actor_id", &self.actor_id)
             .field("name", &self.name)
             .field("status", &self.status())
-            .field("timer_count", &self.timers.len())
-            .field("stream_count", &self.streams.len())
+            .field("timer_count", &self.ex().timers.len())
+            .field("stream_count", &self.ex().streams.len())
             .finish_non_exhaustive()
     }
 }
@@ -219,48 +263,47 @@ impl<A: Actor> ActorContext<A> {
         actor_id: ActorId,
         handle: ActorHandle<A>,
         runtime: Handle,
-        status_tx: watch::Sender<StatusValue>,
+        status_tx: StatusTx,
         system: Option<Arc<ActorSystem>>,
-        name: Option<String>,
+        name: Option<Arc<str>>,
         supervision: Option<SupervisionState>,
+        turn_clock: TurnClock,
+        subtree: Arc<SubtreeHold>,
     ) -> Self {
         Self {
             actor_id,
             self_handle: handle,
             runtime,
-            timers: HashMap::new(),
-            streams: HashMap::new(),
-            id_gen: RecurringIdGenerator::default(),
+            extras: None,
             _not_clone: NotClone,
-            forwarders: JoinSet::new(),
-            forwarder_kinds: HashMap::new(),
-            last_forwarder_error: None,
-            last_supervision_task_error: None,
             last_error: None,
             status_tx,
             system,
             name,
-            supervision,
-            turn_clock: TurnClock::default(),
-            subtree: SubtreeHold::new(None),
+            supervision: supervision.map(Box::new),
+            turn_clock,
+            subtree,
             task_marker: runtime::TaskMarker::default(),
         }
+    }
+
+    /// The extras, or an empty set when none were created.
+    fn ex(&self) -> &Extras {
+        match self.extras.as_deref() {
+            Some(extras) => extras,
+            None => no_extras(),
+        }
+    }
+
+    /// The extras, created on first use.
+    fn ex_mut(&mut self) -> &mut Extras {
+        self.extras.get_or_insert_with(|| Box::new(Extras::new()))
     }
 
     /// The marker of this actor's task's own poll (see
     /// [`runtime::TaskMarker`]).
     pub(crate) fn task_marker(&self) -> runtime::TaskMarker {
         self.task_marker.clone()
-    }
-
-    /// Gives the context the actor's hold on its subtree token.
-    pub(crate) fn set_subtree(&mut self, subtree: Arc<SubtreeHold>) {
-        self.subtree = subtree;
-    }
-
-    /// Gives the context the actor's turn clock.
-    pub(crate) fn set_turn_clock(&mut self, clock: TurnClock) {
-        self.turn_clock = clock;
     }
 
     /// A handle to the actor's turn clock.
@@ -276,8 +319,8 @@ impl<A: Actor> ActorContext<A> {
     }
 
     /// Returns the registered name of this actor, if any.
-    pub fn actor_name(&self) -> Option<&String> {
-        self.name.as_ref()
+    pub fn actor_name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Returns a handle to this actor.
@@ -296,6 +339,12 @@ impl<A: Actor> ActorContext<A> {
         self.self_handle.clone()
     }
 
+    /// The actor's own stop lane, borrowed from its handle: the run loop reads
+    /// and narrows it at its start and its end without cloning the handle.
+    pub(crate) fn stop_lane(&self) -> &StopLane {
+        self.self_handle.stop_lane_ref()
+    }
+
     /// Records a failure that occurred during message processing.
     pub fn record_failure(&mut self, error: ActorError) {
         self.last_error = Some(error);
@@ -306,12 +355,12 @@ impl<A: Actor> ActorContext<A> {
         self.last_error.as_ref()
     }
 
-    /// Returns the most recent panic from a timer or stream forwarder task,
-    /// if any. A forwarder panic never stops this actor - the message loop
-    /// keeps running - so this is the only way to observe one after the
-    /// fact.
+    /// Returns the most recent panic from a poll of a timer or stream
+    /// forwarder task, if any. Such a panic never stops this actor - the
+    /// message loop keeps running - so this is the only way to observe one
+    /// after the fact.
     pub fn last_forwarder_error(&self) -> Option<&ActorError> {
-        self.last_forwarder_error.as_ref()
+        self.ex().last_forwarder_error.as_ref()
     }
 
     /// Returns the most recent panic of a task the crate runs to supervise
@@ -320,19 +369,19 @@ impl<A: Actor> ActorContext<A> {
     /// [`last_error`](Self::last_error); the child's own end is still
     /// reported through `on_child_stopped` with the reason it ended with.
     pub fn last_supervision_task_error(&self) -> Option<&ActorError> {
-        self.last_supervision_task_error.as_ref()
+        self.ex().last_supervision_task_error.as_ref()
     }
 
     /// Accounts for a death-plane task that failed instead of completing,
     /// and records its panic, if it panicked. Returns the id of the
     /// replacement task when the incarnation it follows had ended already.
     pub(crate) fn lost_death_task(&mut self, err: JoinError) -> Option<tokio::task::Id> {
-        let (panic, replacement) = match self.supervision.as_mut() {
+        let (panic, replacement) = match self.supervision.as_deref_mut() {
             Some(sup) => sup.lost_death_task(err),
             None => (None, None),
         };
         if let Some(panic) = panic {
-            self.last_supervision_task_error = Some(panic);
+            self.ex_mut().last_supervision_task_error = Some(panic);
         }
         replacement
     }
@@ -346,25 +395,24 @@ impl<A: Actor> ActorContext<A> {
         &mut self,
         err: JoinError,
     ) -> (Option<RestartOutcome>, Option<tokio::task::Id>) {
-        let (outcome, panic, replacement) = match self.supervision.as_mut() {
+        let (outcome, panic, replacement) = match self.supervision.as_deref_mut() {
             Some(sup) => sup.lost_restart_task(err),
             None => (None, None, None),
         };
         if let Some(panic) = panic {
-            self.last_supervision_task_error = Some(panic);
+            self.ex_mut().last_supervision_task_error = Some(panic);
         }
         (outcome, replacement)
     }
 
     /// Returns the current lifecycle status of the actor.
     pub fn status(&self) -> ActorStatus {
-        self.status_tx.borrow().status
+        self.status_tx.status()
     }
 
     pub(crate) fn set_status(&mut self, status: ActorStatus) {
-        // `send_if_modified`, not `send`: this must succeed even if every
-        // `ActorHandle` (and therefore every watch receiver) has already been
-        // dropped, which a plain `send` would treat as an error. The plane's
+        // This write must succeed even if every `ActorHandle` (and therefore
+        // every reader of the plane) has already been dropped. The plane's
         // reason is never touched here.
         self.status_tx.send_if_modified(|value| {
             value.status = status;
@@ -375,18 +423,18 @@ impl<A: Actor> ActorContext<A> {
     // - Supervision --------------------------------------------------------
 
     pub(crate) fn supervision_mut(&mut self) -> Option<&mut SupervisionState> {
-        self.supervision.as_mut()
+        self.supervision.as_deref_mut()
     }
 
     pub(crate) fn supervision_ref(&self) -> Option<&SupervisionState> {
-        self.supervision.as_ref()
+        self.supervision.as_deref()
     }
 
     /// Whether a final delivery of `on_child_stopped` is running: the
     /// supervisor is stopping, and its supervision calls are refused.
     fn supervisor_stopping(&self) -> bool {
         self.supervision
-            .as_ref()
+            .as_deref()
             .is_some_and(|sup| sup.final_delivery)
     }
 
@@ -396,7 +444,7 @@ impl<A: Actor> ActorContext<A> {
     /// runner task without this actor ever awaiting any of them (see the
     /// `runtime` module docs).
     pub(crate) fn take_supervision(&mut self) -> Option<SupervisionState> {
-        self.supervision.take()
+        self.supervision.take().map(|b| *b)
     }
 
     /// Borrows the supervisor's restart and death planes (if this actor is a
@@ -414,13 +462,18 @@ impl<A: Actor> ActorContext<A> {
             &mut JoinSet<DeathOutcome>,
             &Arc<Verdicts>,
         )>,
-        &mut JoinSet<ForwarderEnd>,
+        Option<&mut JoinSet<ForwarderEnd>>,
     ) {
         let planes = self
             .supervision
             .as_mut()
             .map(|sup| (&mut sup.restart_set, &mut sup.death_set, &sup.verdicts));
-        (planes, &mut self.forwarders)
+        (
+            planes,
+            self.extras
+                .as_deref_mut()
+                .map(|extras| &mut extras.forwarders),
+        )
     }
 
     /// Reaps one forwarder task's completion: removes its registration from
@@ -434,10 +487,46 @@ impl<A: Actor> ActorContext<A> {
     /// is logged as discarded. A completion whose registration was already
     /// removed (an explicit `cancel_timer`/`cancel_stream` beat it here) is a
     /// harmless no-op.
+    /// Whether no entry of the forwarder plane can be ready and the plane
+    /// holds the task's waker wherever the select's poll would leave one:
+    /// every forwarder end counted so far has had its entry taken, and the
+    /// select has polled the plane since the last spawn and the last reap.
+    pub(crate) fn forwarders_idle(&self) -> bool {
+        let Some(extras) = self.extras.as_deref() else {
+            return true;
+        };
+        if extras.forwarders_unpolled {
+            return false;
+        }
+        match &extras.forwarders_done {
+            None => true,
+            Some(done) => {
+                let done = done.load(Ordering::Acquire);
+                debug_assert!(
+                    extras.forwarders_taken <= done,
+                    "a forwarder entry was taken before its end was counted"
+                );
+                done == extras.forwarders_taken
+            }
+        }
+    }
+
+    /// The run loop's select is polling the forwarder plane.
+    pub(crate) fn note_forwarders_polled(&mut self) {
+        if let Some(extras) = self.extras.as_deref_mut() {
+            extras.forwarders_unpolled = false;
+        }
+    }
+
     pub(crate) fn reap_forwarder(
         &mut self,
         outcome: Result<(tokio::task::Id, ForwarderEnd), JoinError>,
     ) -> Option<String> {
+        {
+            let extras = self.ex_mut();
+            extras.forwarders_taken += 1;
+            extras.forwarders_unpolled = true;
+        }
         let (task_id, panic) = match outcome {
             Ok((id, ForwarderEnd::Done)) => (id, None),
             Ok((id, ForwarderEnd::Panicked(payload))) => (id, Some(payload)),
@@ -470,13 +559,13 @@ impl<A: Actor> ActorContext<A> {
                 (id, panic)
             }
         };
-        if let Some(kind) = self.forwarder_kinds.remove(&task_id) {
+        if let Some(kind) = self.ex_mut().forwarder_kinds.remove(&task_id) {
             match kind {
                 ForwarderKind::Timer(id) => {
-                    self.timers.remove(&id);
+                    self.ex_mut().timers.remove(&id);
                 }
                 ForwarderKind::Stream(id) => {
-                    self.streams.remove(&id);
+                    self.ex_mut().streams.remove(&id);
                 }
             }
         }
@@ -487,7 +576,7 @@ impl<A: Actor> ActorContext<A> {
                 panic = %payload,
                 "a timer or stream of the actor panicked"
             );
-            self.last_forwarder_error = Some(ActorError::Panic(payload.clone()));
+            self.ex_mut().last_forwarder_error = Some(ActorError::Panic(payload.clone()));
         }
         panic
     }
@@ -496,8 +585,8 @@ impl<A: Actor> ActorContext<A> {
     /// registered, that is, neither cancelled nor reaped.
     fn is_registered(&self, kind: &ForwarderKind) -> bool {
         match kind {
-            ForwarderKind::Timer(id) => self.timers.contains_key(id),
-            ForwarderKind::Stream(id) => self.streams.contains_key(id),
+            ForwarderKind::Timer(id) => self.ex().timers.contains_key(id),
+            ForwarderKind::Stream(id) => self.ex().streams.contains_key(id),
         }
     }
 
@@ -509,15 +598,25 @@ impl<A: Actor> ActorContext<A> {
     where
         F: std::future::Future<Output = Released> + Send + 'static,
     {
+        let done = self
+            .ex_mut()
+            .forwarders_done
+            .get_or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
         let forwarder = Forwarder {
+            done,
+            counted: false,
             future: Some(Box::pin(fut)),
             slot,
             owner: self.actor_id().clone(),
             _status: self.status_tx.clone(),
             _subtree: self.subtree.clone(),
         };
-        let abort = self.forwarders.spawn_on(forwarder, &self.runtime);
-        self.forwarder_kinds.insert(abort.id(), kind);
+        let runtime = self.runtime.clone();
+        let extras = self.ex_mut();
+        let abort = extras.forwarders.spawn_on(forwarder, &runtime);
+        extras.forwarders_unpolled = true;
+        extras.forwarder_kinds.insert(abort.id(), kind);
     }
 
     /// Ends every timer and stream forwarder and waits until each one's
@@ -537,16 +636,18 @@ impl<A: Actor> ActorContext<A> {
     /// and discarded. A panic of the run reaped here is logged by
     /// `reap_forwarder`, as one the message loop reaps is.
     pub(crate) async fn end_forwarders(&mut self) -> Option<String> {
+        self.extras.as_ref()?;
         let registered: HashSet<tokio::task::Id> = self
+            .ex()
             .forwarder_kinds
             .iter()
             .filter(|(_, kind)| self.is_registered(kind))
             .map(|(id, _)| *id)
             .collect();
-        self.forwarders.abort_all();
+        self.ex_mut().forwarders.abort_all();
         let owner = self.actor_id().clone();
         let mut first = None;
-        while let Some(joined) = self.forwarders.join_next_with_id().await {
+        while let Some(joined) = self.ex_mut().forwarders.join_next_with_id().await {
             match joined {
                 Err(err) if err.is_panic() && registered.contains(&err.id()) => {
                     let payload = match err.try_into_panic() {
@@ -601,6 +702,27 @@ impl<A: Actor> ActorContext<A> {
     /// awaiting that ack from inside the parent's own callback would invite
     /// the same self-call deadlock documented on
     /// [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
+    ///
+    /// A child whose first `pre_start` or `on_started` fails ends with
+    /// `StopReason::Failure` and is restarted under the budget like any crash
+    /// (a `Temporary` child is removed), while the supervisor's own start
+    /// succeeds, where an Erlang/OTP supervisor whose child fails to start
+    /// stops the children already started and fails its own start. To start in
+    /// order, spawn each child in `on_started` and await its `get_status()`,
+    /// which the child answers only after its `pre_start` and `on_started`; a
+    /// child that calls back into the supervisor and awaits the answer during
+    /// its initialization then waits forever, as an Erlang/OTP child does when
+    /// its call to the supervisor has an infinite timeout, and a
+    /// `start_timeout` on the supervisor's own spawn ends the start with
+    /// [`SpawnError::StartTimeout`]. With `?` on each `get_status()` (each
+    /// error mapped with `ActorError::user(e.to_string())`), the supervisor's
+    /// `on_started` returns the error, its awaited spawn returns
+    /// `SpawnError::Init`, and its teardown stops the children already started.
+    ///
+    /// Because this start is not awaited, a `Kill` of the child that lands
+    /// before its task first runs ends that incarnation before any start hook
+    /// begins, and the child then follows its restart type like after any
+    /// other `Kill`.
     ///
     /// The spawn fails with [`SpawnError::SupervisorStopping`] when called
     /// inside [`on_child_stopped`](crate::actor::Actor::on_child_stopped)
@@ -667,11 +789,20 @@ impl<A: Actor> ActorContext<A> {
     /// - [`SpawnError::NotASupervisor`]
     ///   if this actor has no supervision config.
     /// - [`SpawnError::DuplicateChild`]
-    ///   if a live child or a kept spec (a child previously stopped with
-    ///   [`terminate_child`](Self::terminate_child)) already occupies this
-    ///   name - the factory is never called (OTP `already_present` parity).
-    ///   [`delete_child`](Self::delete_child) the old spec first to reuse the
-    ///   name.
+    ///   if the supervisor holds a child spec under this name, whatever the
+    ///   child is doing: it runs (one whose death the supervisor has not
+    ///   handled yet included), it is being restarted, or it is stopped and
+    ///   its spec is kept until [`delete_child`](Self::delete_child) removes
+    ///   it ([`terminate_child`](Self::terminate_child) says which stopped
+    ///   children keep their spec). The factory is never called. A call made
+    ///   inside [`on_child_stopped`](crate::actor::Actor::on_child_stopped)
+    ///   while the supervisor itself is stopping is answered
+    ///   [`SpawnError::SupervisorStopping`] first. Erlang/OTP answers
+    ///   `{already_started, Pid}` for a running child, or one whose exit the
+    ///   supervisor has not processed yet, and `already_present` for the
+    ///   others, a child being restarted included; this call answers
+    ///   `DuplicateChild` for all of them, and [`children`](Self::children)
+    ///   lists the specs the supervisor holds.
     /// - [`SpawnError::ChildUnresponsive`]
     ///   if an actor of a deleted or removed child under this id, or one that
     ///   child spawned, did not end within the bound of that subtree.
@@ -691,7 +822,26 @@ impl<A: Actor> ActorContext<A> {
             config: None,
             start_timeout: None,
             kill_grace: DEFAULT_KILL_GRACE,
+            runtime: None,
             _child: std::marker::PhantomData,
+        }
+    }
+
+    /// The refusals of a spawn that need no wait and change nothing, in the
+    /// order every spawn answers them: not a supervisor, the supervisor is
+    /// stopping, the name is taken. An unnamed spawn has no name to take.
+    fn refuse_spawn(&self, id: Option<&ActorId>) -> Result<(), SpawnError> {
+        let Some(sup) = self.supervision.as_deref() else {
+            return Err(SpawnError::NotASupervisor);
+        };
+        if sup.final_delivery {
+            return Err(SpawnError::SupervisorStopping);
+        }
+        match id {
+            Some(id) if sup.registry.get(id).is_some() => {
+                Err(SpawnError::DuplicateChild(id.clone()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -700,20 +850,15 @@ impl<A: Actor> ActorContext<A> {
     /// that need no wait are answered first and in their own order, so a
     /// refused call never reads, prunes or waits on the removed children; a
     /// spawn under an id nobody removed completes without waiting.
-    async fn await_retired_subtree(&mut self, name: Option<&str>) -> Result<(), SpawnError> {
+    async fn await_retired_subtree(&mut self, name: Option<&Arc<str>>) -> Result<(), SpawnError> {
         let Some(name) = name else {
             return Ok(());
         };
-        let id = ActorId::from(name);
-        let Some(sup) = self.supervision.as_mut() else {
+        let id = ActorId::from_shared(Arc::clone(name));
+        self.refuse_spawn(Some(&id))?;
+        let Some(sup) = self.supervision.as_deref_mut() else {
             return Err(SpawnError::NotASupervisor);
         };
-        if sup.final_delivery {
-            return Err(SpawnError::SupervisorStopping);
-        }
-        if sup.registry.get(&id).is_some() {
-            return Err(SpawnError::DuplicateChild(id));
-        }
         let Some(subtree) = sup.retired_subtree(&id) else {
             return Ok(());
         };
@@ -728,43 +873,28 @@ impl<A: Actor> ActorContext<A> {
     fn spawn_child_internal<F, C>(
         &mut self,
         factory: F,
-        name: Option<String>,
+        name: Option<Arc<str>>,
         restart_type: RestartType,
         shutdown: Shutdown,
         config: Option<runtime::ActorConfig>,
         start_timeout: Option<Duration>,
         kill_grace: Duration,
+        placement: Option<Handle>,
     ) -> Result<ActorHandle<C>, SpawnError>
     where
         F: Fn() -> C + Send + Sync + 'static,
         C: Actor,
     {
-        if self.supervision.is_none() {
-            return Err(SpawnError::NotASupervisor);
-        }
-        if self.supervisor_stopping() {
-            return Err(SpawnError::SupervisorStopping);
-        }
-
-        let child_id: ActorId = name
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-            .into();
-
-        // OTP `already_present` parity: a live child or a kept spec (retained
-        // by `terminate_child`) under this id rejects the spawn before the
-        // factory ever runs. `delete_child` clears the spec so the id can be
-        // reused.
-        let duplicate = self
-            .supervision
+        // A spec the supervisor holds under this id, whatever its child is
+        // doing (running, being restarted, or stopped with the spec kept),
+        // rejects the spawn before the factory ever runs: OTP answers
+        // `already_started` or `already_present` there. `delete_child` clears
+        // the spec so the id can be reused.
+        let named_id = name
             .as_ref()
-            .expect("supervision presence checked above")
-            .registry
-            .get(&child_id)
-            .is_some();
-        if duplicate {
-            return Err(SpawnError::DuplicateChild(child_id));
-        }
+            .map(|name| ActorId::from_shared(Arc::clone(name)));
+        self.refuse_spawn(named_id.as_ref())?;
+        let child_id: ActorId = named_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string().into());
 
         let actor = factory();
         let child_config = config.unwrap_or_default();
@@ -785,7 +915,12 @@ impl<A: Actor> ActorContext<A> {
         let subtree_infinity = is_supervisor && shutdown == Shutdown::Infinity;
         let subtree_parent = self.subtree.token();
 
-        let (child_handle, join_handle, child_subtree) = runtime::spawn_actor(
+        // The runtime every incarnation of this child runs on, its link guard
+        // and its reaper too: the one the builder placed it on, else the
+        // supervisor's. Resolved once, so a restart lands where the first
+        // incarnation did.
+        let guard_runtime = placement.unwrap_or_else(|| self.runtime_handle().clone());
+        let (child_handle, join_handle, child_subtree) = runtime::spawn_actor_in(
             child_id.clone(),
             actor,
             child_config.clone(),
@@ -799,6 +934,7 @@ impl<A: Actor> ActorContext<A> {
                 own: subtree_own,
                 infinity: subtree_infinity,
             }),
+            Some(&guard_runtime),
         )?;
 
         // The parent spawns and owns the runner of the initial incarnation,
@@ -808,7 +944,6 @@ impl<A: Actor> ActorContext<A> {
         // The abort handle is taken first - the Kill escalation backstop.
         let abort = join_handle.abort_handle();
         let resolved_system = self.resolved_system();
-        let guard_runtime = self.runtime_handle().clone();
         let reaper = resolved_system.reaper_handle(&guard_runtime);
         // Cloned before the initial guard consumes `reaper` (and the system)
         // by value: the restart closure below needs the same per-system
@@ -965,7 +1100,7 @@ impl<A: Actor> ActorContext<A> {
                             };
 
                         let (ack_tx, ack_rx) = oneshot::channel();
-                        let (handle, join, subtree) = match runtime::spawn_actor(
+                        let (handle, join, subtree) = match runtime::spawn_actor_in(
                             child_id.clone(),
                             actor,
                             config,
@@ -979,6 +1114,7 @@ impl<A: Actor> ActorContext<A> {
                                 own: subtree_own,
                                 infinity: subtree_infinity,
                             }),
+                            Some(&runtime),
                         ) {
                             Ok(spawned) => spawned,
                             Err(err) => {
@@ -1042,7 +1178,12 @@ impl<A: Actor> ActorContext<A> {
         Ok(child_handle)
     }
 
-    /// Returns introspection info for all supervised children.
+    /// Returns introspection info for all supervised children. To count the
+    /// children (all of them, and the live ones through `is_alive`, as
+    /// Erlang/OTP's `supervisor:count_children` does for specs and active) or
+    /// to find one by id, as a scan of `supervisor:which_children` does, use
+    /// this list; its entries also carry the name, restart type and `Shutdown`,
+    /// and no worker or supervisor type.
     ///
     /// A child is alive while it has a started incarnation whose stop, if
     /// any, has not completed, and its restart is pending while an attempt is
@@ -1050,7 +1191,7 @@ impl<A: Actor> ActorContext<A> {
     /// pending group restart will restart it.
     pub fn children(&self) -> Vec<ChildInfo> {
         self.supervision
-            .as_ref()
+            .as_deref()
             .map_or(Vec::new(), |s| s.children_info())
     }
 
@@ -1183,9 +1324,14 @@ impl<A: Actor> ActorContext<A> {
     /// down.
     ///
     /// Returns only once the child is fully gone and its registered name is
-    /// free: [`delete_child`](Self::delete_child) and a same-name
-    /// [`spawn_child`](Self::spawn_child) succeed afterward, even from the
-    /// very same handler invocation that awaited this call.
+    /// free. Where the spec is kept, [`delete_child`](Self::delete_child)
+    /// succeeds afterward, even from the very same handler invocation that
+    /// awaited this call, and a same-name [`spawn_child`](Self::spawn_child)
+    /// made after the `delete_child` succeeds; made before it, `spawn_child`
+    /// is refused with [`SpawnError::DuplicateChild`] (OTP `already_present`).
+    /// Where the call removes the spec (a `Temporary` child, or a child of a
+    /// `SimpleOneForOne` supervisor), a same-name `spawn_child` succeeds at
+    /// once and `delete_child` answers [`SupervisionError::ChildNotFound`].
     ///
     /// Unlike [`stop_child`](Self::stop_child), this call also waits for the
     /// child's subtree: it returns once the child and every actor it spawned
@@ -1199,9 +1345,9 @@ impl<A: Actor> ActorContext<A> {
     /// the system owes it has had the settle time to end it: an abort that is
     /// late holds the wait, for at most the bound once more plus one more
     /// settle time. If an actor never yields, the call returns
-    /// [`SupervisionError::ChildUnresponsive`] and the child stays stopped; a
-    /// [`spawn_child`](Self::spawn_child) under the same id then waits for
-    /// that subtree again.
+    /// [`SupervisionError::ChildUnresponsive`] and the child stays stopped; once
+    /// its spec is gone, a [`spawn_child`](Self::spawn_child) under the same id
+    /// waits for that subtree again.
     ///
     /// While a group restart is pending, a `terminate_child` keeps the child
     /// down through every retry of that group restart, a child started since
@@ -1593,10 +1739,12 @@ impl<A: Actor> ActorContext<A> {
     ) -> Option<RestartFn> {
         let sup = self.supervision_mut()?;
         let pool = matches!(sup.config.strategy, RestartStrategy::SimpleOneForOne);
-        let (restart_type, child_name) = sup
-            .registry
-            .get(id)
-            .map(|child| (child.spec.restart_type, child.name.clone()))?;
+        let (restart_type, child_name) = sup.registry.get(id).map(|child| {
+            (
+                child.spec.restart_type,
+                child.name.as_deref().map(str::to_string),
+            )
+        })?;
         // A member the pending group restarts, and not released by a
         // `terminate_child`: its end belongs to that restart. A member the
         // group only stops (a `Temporary` one) is not in the set.
@@ -1751,14 +1899,14 @@ impl<A: Actor> ActorContext<A> {
         message: A::Message,
         when: Instant,
     ) -> Result<RecurringId, TimerError> {
-        let id = self.id_gen.next();
+        let id = self.ex_mut().id_gen.next();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
         let handle = self.self_handle.clone();
         let claimed = Arc::new(AtomicBool::new(false));
         let fut = oneshot_forward(handle, message, when, cancel_clone, claimed.clone());
         self.spawn_forwarder(ForwarderKind::Timer(id), fut, PanicSlot::default());
-        self.timers.insert(
+        self.ex_mut().timers.insert(
             id,
             TimerRegistration {
                 token,
@@ -1782,7 +1930,7 @@ impl<A: Actor> ActorContext<A> {
     /// For a recurring timer, `Ok` means no later tick is sent; a tick
     /// already sent, or being sent at that instant, arrives.
     pub fn cancel_timer(&mut self, id: RecurringId) -> Result<(), TimerError> {
-        match self.timers.remove(&id) {
+        match self.ex_mut().timers.remove(&id) {
             Some(entry) if entry.claim() => {
                 entry.token.cancel();
                 Ok(())
@@ -1796,17 +1944,19 @@ impl<A: Actor> ActorContext<A> {
     /// it there at that instant, as [`cancel_timer`](Self::cancel_timer)
     /// reads; a recurring tick being sent at that instant still arrives.
     pub fn cancel_all_timers(&mut self) {
-        for entry in self.timers.values() {
-            if entry.claim() {
-                entry.token.cancel();
+        if let Some(extras) = self.extras.as_deref_mut() {
+            for entry in extras.timers.values() {
+                if entry.claim() {
+                    entry.token.cancel();
+                }
             }
+            extras.timers.clear();
         }
-        self.timers.clear();
     }
 
     /// Returns the number of active timers.
     pub fn active_timer_count(&self) -> usize {
-        self.timers.len()
+        self.ex().timers.len()
     }
 
     // - Streams ------------------------------------------------------------
@@ -1817,26 +1967,48 @@ impl<A: Actor> ActorContext<A> {
     /// holds an internal self-reference (see [`self_handle`](Self::self_handle))
     /// that never extends the actor's lifetime: it is torn down when the
     /// actor stops.
+    ///
+    /// A one-item stream also gives a request that does not block the turn,
+    /// as Erlang/OTP's `send_request` does: clone the peer's handle and attach
+    /// `Box::pin(futures::stream::once(async move { h.send(msg).await }))`,
+    /// the reply mapped into the actor's message through `From<StreamEvent<_>>`
+    /// (the `futures` crate is the caller's). An actor can likewise stand in
+    /// for Erlang/OTP's `supervisor_bridge`: its `on_started` spawns the task
+    /// and attaches `futures::stream::once(task)` over the task's `JoinHandle`
+    /// as a one-item stream, its `handle` turns the task's end into an `Err`,
+    /// so the actor stops with `StopReason::Failure` (a `supervisor_bridge`
+    /// stops with the subsystem's own exit reason), and its `on_stopped`
+    /// aborts the task.
     pub fn add_stream<S>(&mut self, stream: S) -> StreamId
     where
         S: Stream + Send + Unpin + 'static,
         S::Item: Send + 'static,
         A::Message: From<StreamEvent<S::Item>>,
     {
-        let id = self.id_gen.next_stream_id();
+        let id = self.ex_mut().id_gen.next_stream_id();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
         let handle = self.self_handle.clone();
         let slot = PanicSlot::default();
         let fut = stream_forward::<A, S>(stream, handle, cancel_clone, slot.clone());
         self.spawn_forwarder(ForwarderKind::Stream(id), fut, slot);
-        self.streams.insert(id, StreamRegistration { token });
+        self.ex_mut()
+            .streams
+            .insert(id, StreamRegistration { token });
         id
     }
 
     /// Cancels a specific stream by its ID.
+    ///
+    /// Once the call returns, nothing more from the stream is put in the
+    /// mailbox, except an item that a worker was already putting there at
+    /// that instant (multi-thread runtimes); items already in the mailbox are
+    /// handled as usual. An item that waits for room in a full mailbox is
+    /// dropped by the stream's forwarder in its next poll instead of being
+    /// delivered, and so is a `Finished` that waits; neither is dropped inside
+    /// the call.
     pub fn cancel_stream(&mut self, id: StreamId) -> Result<(), StreamError> {
-        match self.streams.remove(&id) {
+        match self.ex_mut().streams.remove(&id) {
             Some(entry) => {
                 entry.token.cancel();
                 Ok(())
@@ -1845,17 +2017,20 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    /// Cancels all active streams.
+    /// Cancels all active streams, each as [`cancel_stream`](Self::cancel_stream)
+    /// describes.
     pub fn cancel_all_streams(&mut self) {
-        for entry in self.streams.values() {
-            entry.token.cancel();
+        if let Some(extras) = self.extras.as_deref_mut() {
+            for entry in extras.streams.values() {
+                entry.token.cancel();
+            }
+            extras.streams.clear();
         }
-        self.streams.clear();
     }
 
     /// Returns the number of active streams.
     pub fn active_stream_count(&self) -> usize {
-        self.streams.len()
+        self.ex().streams.len()
     }
 }
 
@@ -1915,7 +2090,21 @@ pub struct ChildSpawnBuilder<'ctx, A: Actor, F, C: Actor> {
     config: Option<runtime::ActorConfig>,
     start_timeout: Option<Duration>,
     kill_grace: Duration,
+    runtime: Option<Handle>,
     _child: std::marker::PhantomData<C>,
+}
+
+/// The `Debug` view of a child's start bound: `unbounded` for the default
+/// and for `unbounded_start`, the duration for `start_timeout`.
+struct StartBound(Option<Duration>);
+
+impl std::fmt::Debug for StartBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            None => f.write_str("unbounded"),
+            Some(dur) => std::fmt::Debug::fmt(&dur, f),
+        }
+    }
 }
 
 impl<'ctx, A: Actor, F, C: Actor> std::fmt::Debug for ChildSpawnBuilder<'ctx, A, F, C> {
@@ -1924,7 +2113,7 @@ impl<'ctx, A: Actor, F, C: Actor> std::fmt::Debug for ChildSpawnBuilder<'ctx, A,
             .field("name", &self.name)
             .field("restart_type", &self.restart_type)
             .field("shutdown", &self.shutdown)
-            .field("start_timeout", &self.start_timeout)
+            .field("start_timeout", &StartBound(self.start_timeout))
             .field("kill_grace", &self.kill_grace)
             .finish_non_exhaustive()
     }
@@ -1989,22 +2178,105 @@ where
         self
     }
 
+    /// Runs the child on the Tokio runtime behind `handle` instead of the
+    /// supervisor's. Every restart of the child runs there too, and so does
+    /// everything the child spawns in turn: its own children, its timers and
+    /// its streams. The supervisor keeps the stop ladder of a child it stops
+    /// or restarts: the child's [`Shutdown`] window, the kill grace and the
+    /// settle that follow it, and the restart decisions run on the
+    /// supervisor's runtime. A `Kill` raised from outside that ladder
+    /// (`ActorSystem::kill`, `ActorSystem::kill_by_id`, `stop` with
+    /// `StopReason::Kill` on the child's handle, or the `Kill` step of
+    /// `stop_within`), and the end a gone supervisor leaves a child (if the
+    /// child is a supervisor, its `Shutdown` window, then its kill grace), wait
+    /// on the child's runtime: the kill grace, or the `within` of a
+    /// `stop_within` called with `StopReason::Kill`.
+    ///
+    /// The runtime behind `handle` needs the time driver
+    /// (`Builder::enable_time` or `enable_all`), because the abort timers that
+    /// run on it (the kill grace of a `Kill` from outside the supervisor's
+    /// ladder, and the end a gone supervisor leaves the child) sleep on it.
+    /// Awaiting the builder panics, before the factory
+    /// runs and
+    /// before anything is registered, when the runtime was built without it:
+    /// a placed child would lose its kill grace without a sign. The refusals
+    /// of [`spawn_child`](ActorContext::spawn_child)
+    /// ([`SpawnError::NotASupervisor`], [`SpawnError::SupervisorStopping`]
+    /// and [`SpawnError::DuplicateChild`]) are answered first, so a spawn
+    /// refused for one of those three reasons never panics; any other
+    /// refusal, such as a zero child mailbox capacity or a name already taken
+    /// in the system, is answered after the check and panics first on a
+    /// runtime without the driver. The check asks the runtime whether it
+    /// has been shut down before it asks about the driver, so a runtime that
+    /// has ended passes it (see below) and no panic hook runs for it. With
+    /// `panic = "abort"` there is no probe and so no check at the entry: the
+    /// first timer the crate starts on a runtime without the driver ends the
+    /// process.
+    ///
+    /// When the placed runtime is not running the child:
+    ///
+    /// - **Gone** (the `Runtime` was dropped or shut down): the child is
+    ///   killed. [`spawn_child`](ActorContext::spawn_child) still returns
+    ///   `Ok`, each restart fails at once, and each failure charges the
+    ///   restart budget until it is spent.
+    /// - **Alive but undriven** (a current-thread runtime that nothing is
+    ///   running): no incarnation starts. A child spawned onto it is never
+    ///   confirmed stopped: under a bounded `Shutdown`,
+    ///   [`stop_child`](ActorContext::stop_child) and
+    ///   [`terminate_child`](ActorContext::terminate_child) answer
+    ///   [`SupervisionError::ChildUnresponsive`] for it once its `Shutdown`
+    ///   window, kill grace and settle have passed. A restart onto such a
+    ///   runtime stays pending: the crash that began it is charged once and the
+    ///   wait charges nothing more; [`stop_child`](ActorContext::stop_child)
+    ///   and [`terminate_child`](ActorContext::terminate_child) answer
+    ///   [`SupervisionError::ChildRestarting`] for it until the runtime is
+    ///   driven again or the supervisor stops. Under `OneForAll` and
+    ///   `RestForOne`, with a [`start_timeout`](Self::start_timeout) on the
+    ///   child, a group restart that waits for it cannot finish: once the
+    ///   start timeout, the kill grace and the settle have passed, the
+    ///   supervisor stops with
+    ///   [`SupervisionError::ChildUnresponsive`] for that child.
+    pub fn on_runtime(mut self, handle: &Handle) -> Self {
+        self.runtime = Some(handle.clone());
+        self
+    }
+
     /// Overrides the default [`ActorConfig`](runtime::ActorConfig) for the child.
     pub fn with_config(mut self, config: runtime::ActorConfig) -> Self {
         self.config = Some(config);
         self
     }
 
-    /// Bounds the supervisor's wait for this child's initialization to complete
-    /// during a restart. `None` (default) waits indefinitely, matching
-    /// Erlang/OTP supervisor semantics; setting a bound is a deliberate
-    /// deviation that trades strict parity for a supervisor that can never be
-    /// stalled by one child's hung init. Initial spawning never awaits
-    /// initialization (see [`spawn_child`](ActorContext::spawn_child)), so this
-    /// bound applies only to restarts. A bound beyond 30 years is treated as 30
-    /// years.
+    /// Bounds the wait for the initialization of each restart of this child.
+    /// By default a restart's initialization waits without a bound, under any
+    /// [`Shutdown`], as an Erlang/OTP supervisor's does; a bound is a
+    /// deliberate departure that trades strict parity for a supervisor that
+    /// one child's hung initialization cannot stall. A restart that does not
+    /// finish `pre_start` and `on_started` within `dur` is cut: `Kill` is
+    /// raised on it and its task is aborted once its kill grace has passed.
+    /// The first start of a child is never awaited (see
+    /// [`spawn_child`](ActorContext::spawn_child)), so this bound applies to
+    /// restarts only. A bound beyond 30 years is treated as 30 years. The last
+    /// call between this method and [`unbounded_start`](Self::unbounded_start)
+    /// wins.
     pub fn start_timeout(mut self, dur: Duration) -> Self {
         self.start_timeout = Some(dur);
+        self
+    }
+
+    /// Writes the default out: the initialization of each restart of this
+    /// child waits without a bound, as an Erlang/OTP supervisor's does, under
+    /// any [`Shutdown`]. It undoes an earlier
+    /// [`start_timeout`](Self::start_timeout), and the last call between the
+    /// two wins.
+    ///
+    /// This differs from `start_timeout(Duration::MAX)`: that call is a bound
+    /// of 30 years, which arms a timer that a paused Tokio clock can fire
+    /// once it advances past it, and its [`Debug`](std::fmt::Debug) output
+    /// shows the duration. Here no timer is armed and the
+    /// [`Debug`](std::fmt::Debug) output reads `unbounded`.
+    pub fn unbounded_start(mut self) -> Self {
+        self.start_timeout = None;
         self
     }
 }
@@ -2027,9 +2299,17 @@ where
                 config,
                 start_timeout,
                 kill_grace,
+                runtime,
                 _child,
             } = self;
-            ctx.await_retired_subtree(name.as_deref()).await?;
+            if let Some(placed) = &runtime {
+                // The refusals come first, as in `stop_within`: a spawn that
+                // one of them refuses needs no timer and never panics.
+                ctx.refuse_spawn(name.as_deref().map(ActorId::from).as_ref())?;
+                require_runtime_timers("ChildSpawnBuilder::on_runtime", placed);
+            }
+            let name: Option<Arc<str>> = name.map(Arc::from);
+            ctx.await_retired_subtree(name.as_ref()).await?;
             ctx.spawn_child_internal(
                 factory,
                 name,
@@ -2038,6 +2318,7 @@ where
                 config,
                 start_timeout,
                 kill_grace,
+                runtime,
             )
         })
     }
@@ -2056,6 +2337,11 @@ where
 /// Nothing is registered until the terminal schedule is awaited - dropping a
 /// builder (or the schedule it produces) without awaiting it registers no
 /// timer, and it never fires.
+///
+/// To send after a delay to another actor, or to stop or kill one later, as
+/// Erlang/OTP's `timer:send_after` and `timer:kill_after` do, `tokio::spawn` a
+/// `tokio::time::sleep`, then `notify`, `stop` or `kill_by_id`; a send to an
+/// actor that has stopped returns `Closed`.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -2102,7 +2388,12 @@ impl<'ctx, A: Actor> std::fmt::Debug for ScheduleBuilder<'ctx, A> {
 impl<'ctx, A: Actor> ScheduleBuilder<'ctx, A> {
     /// Schedule a one-shot message at a specific [`Instant`]. An instant in
     /// the past fires at once; one more than 30 years away is treated as 30
-    /// years away, which in practice never fires.
+    /// years away, which in practice never fires. To read the time left of a
+    /// pending timer, as Erlang/OTP's `erlang:read_timer/1` does, keep the
+    /// `Instant` passed here and subtract `Instant::now()`; the result reads
+    /// zero once the instant has passed and does not tell a cancelled timer
+    /// from a pending one, where `erlang:read_timer/1` returns `false` for both
+    /// an expired and a cancelled timer.
     pub fn at(self, when: Instant) -> OneShotSchedule<'ctx, A> {
         let now = Instant::now();
         let when = if when > now {
@@ -2221,7 +2512,7 @@ impl<'ctx, A: Actor> std::future::IntoFuture for RecurringScheduleBuilder<'ctx, 
         if self.interval.is_zero() {
             return std::future::ready(Err(TimerError::ZeroInterval));
         }
-        let id = self.ctx.id_gen.next();
+        let id = self.ctx.ex_mut().id_gen.next();
         let token = CancellationToken::new();
         let cancel_clone = token.clone();
         let handle = self.ctx.self_handle.clone();
@@ -2236,7 +2527,7 @@ impl<'ctx, A: Actor> std::future::IntoFuture for RecurringScheduleBuilder<'ctx, 
         );
         self.ctx
             .spawn_forwarder(ForwarderKind::Timer(id), fut, slot);
-        self.ctx.timers.insert(
+        self.ctx.ex_mut().timers.insert(
             id,
             TimerRegistration {
                 token,
@@ -2249,11 +2540,13 @@ impl<'ctx, A: Actor> std::future::IntoFuture for RecurringScheduleBuilder<'ctx, 
 
 impl<A: Actor> Drop for ActorContext<A> {
     fn drop(&mut self) {
-        for entry in self.timers.values() {
-            entry.token.cancel();
-        }
-        for entry in self.streams.values() {
-            entry.token.cancel();
+        if let Some(extras) = self.extras.as_deref() {
+            for entry in extras.timers.values() {
+                entry.token.cancel();
+            }
+            for entry in extras.streams.values() {
+                entry.token.cancel();
+            }
         }
         // A context dropped before the terminal write ends an incarnation
         // that was dropped from outside: the reason is `Kill`, or a panic
@@ -2301,15 +2594,32 @@ impl TimerRegistration {
 /// inside a catch. When the future panicked too, its own panic is the
 /// task's, and the parked one is logged, naming the actor.
 struct Forwarder<F> {
+    /// The owner's count of forwarder ends (see `Extras::forwarders_done`).
+    done: Arc<AtomicU64>,
+    /// Set once this forwarder's end is counted.
+    counted: bool,
     future: Option<Pin<Box<F>>>,
     slot: PanicSlot,
     owner: ActorId,
-    _status: watch::Sender<StatusValue>,
+    _status: StatusTx,
     _subtree: Arc<SubtreeHold>,
+}
+
+impl<F> Forwarder<F> {
+    /// Counts this forwarder's end once: at its ready poll, or at its drop
+    /// when it ends without one (an abort, a runtime shutdown, an unwind out
+    /// of its poll), which tokio runs before it completes the task.
+    fn count_end(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.done.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 impl<F> Drop for Forwarder<F> {
     fn drop(&mut self) {
+        self.count_end();
         let future = self.future.take();
         let own = catch_sync(move || drop(future)).err();
         let parked = take_parked(&self.slot);
@@ -2594,7 +2904,7 @@ impl<F: Future<Output = Released>> Future for Forwarder<F> {
         // Taken at once, before any conversion or log: a later unwind in
         // this poll finds the slot empty.
         let parked = take_parked(&this.slot);
-        match (polled, parked) {
+        let out = match (polled, parked) {
             (Err(own), parked) => {
                 if let Some(parked) = parked {
                     runtime::log_discarded(&payload_into_string(parked), &this.owner);
@@ -2622,7 +2932,11 @@ impl<F: Future<Output = Released>> Future for Forwarder<F> {
                 std::task::Poll::Ready(ForwarderEnd::Released { run, end })
             }
             (Ok(std::task::Poll::Pending), None) => std::task::Poll::Pending,
+        };
+        if out.is_ready() {
+            this.count_end();
         }
+        out
     }
 }
 
@@ -2762,9 +3076,23 @@ where
                 match item {
                     Some(value) => {
                         let msg: A::Message = StreamEvent::Data(value).into();
-                        if let Err(msg) = handle.forward(msg).await {
+                        // The item waits for a slot in the mailbox and is never
+                        // moved into the wait: a cancel that comes first ends
+                        // the stream, and the item and the stream drop each in
+                        // their own catch, in this poll, as the run's.
+                        let permit = tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                let mut run = release(msg);
+                                runtime::keep_first_of(&mut run, release(stream.take()), handle.id());
+                                return Released { run, end: None };
+                            }
+                            permit = handle.reserve_forward() => permit,
+                        };
+                        let Some(permit) = permit else {
                             return Released::both_at_the_close(msg, stream.take(), handle.id());
-                        }
+                        };
+                        permit.send(msg);
                     }
                     None => break false,
                 }
@@ -2785,12 +3113,26 @@ where
         owner: handle.id().clone(),
     };
     let msg: A::Message = StreamEvent::Finished.into();
-    match handle.forward(msg).await {
-        Ok(()) => Released {
-            run: run.take(),
-            end: None,
-        },
-        Err(msg) => Released {
+    // `Finished` waits for a slot as an item does, and a cancel that comes
+    // first drops it.
+    let permit = tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+            let mut dropped = run.take();
+            runtime::keep_first_of(&mut dropped, release(msg), handle.id());
+            return Released { run: dropped, end: None };
+        }
+        permit = handle.reserve_forward() => permit,
+    };
+    match permit {
+        Some(permit) => {
+            permit.send(msg);
+            Released {
+                run: run.take(),
+                end: None,
+            }
+        }
+        None => Released {
             run: run.take(),
             end: release(msg),
         },
@@ -2852,7 +3194,10 @@ fn adjust_next<A: Actor>(
                 let msg = (factory.as_mut())();
                 match handle.try_forward(msg) {
                     Ok(()) => {}
-                    // The mailbox has no room: this tick is skipped.
+                    // The mailbox has no room: the message made for this tick is
+                    // dropped and the burst pauses here. The timer loop serves
+                    // the same deadline again, with a fresh message, once there
+                    // is room.
                     Err(mpsc::error::TrySendError::Full(tick)) => {
                         if let Some(payload) = release(tick) {
                             return Adjusted::Panicked(payload);
@@ -2869,8 +3214,20 @@ fn adjust_next<A: Actor>(
 }
 
 #[cfg(test)]
+#[path = "forwarder_count_tests.rs"]
+mod forwarder_count_tests;
+
+#[cfg(test)]
 #[path = "forwarder_tests.rs"]
 mod forwarder_tests;
+
+#[cfg(test)]
+#[path = "placement_tests.rs"]
+mod placement_tests;
+
+#[cfg(test)]
+#[path = "skip_policy_tests.rs"]
+mod skip_policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2895,21 +3252,19 @@ mod tests {
     }
 
     fn dummy_ctx() -> ActorContext<Dummy> {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let (system_tx, _system_rx) = tokio::sync::mpsc::channel(1);
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, _stop_rx) = StopLane::new();
         let id = ActorId::from("dummy");
         let handle = ActorHandle::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             "dummy-system".into(),
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         );
         ActorContext::new(
             id,
@@ -2919,41 +3274,9 @@ mod tests {
             None,
             None,
             Some(SupervisionState::new(SupervisionConfig::default())),
+            TurnClock::default(),
+            SubtreeHold::new(None),
         )
-    }
-
-    /// A context dropped outside its task's own poll writes `Kill`, even
-    /// during an unwind of another code path; a written reason stays.
-    async fn the_context_drop_writes_the_reason_of_how_its_task_ended() {
-        let ctx = dummy_ctx();
-        let plane = ctx.self_handle().status_rx();
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _held = ctx;
-            panic!("an unwind that is not the task's own poll");
-        }));
-        assert!(unwound.is_err());
-        assert_eq!(plane.borrow().reason, Some(StopReason::Kill));
-
-        let ctx = dummy_ctx();
-        let plane = ctx.self_handle().status_rx();
-        drop(ctx);
-        assert_eq!(plane.borrow().reason, Some(StopReason::Kill));
-
-        let ctx = dummy_ctx();
-        let plane = ctx.self_handle().status_rx();
-        StatusValue::write_reason(&ctx.status_tx, StopReason::Graceful, false);
-        drop(ctx);
-        assert_eq!(plane.borrow().reason, Some(StopReason::Graceful));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn the_context_drop_writes_the_reason_of_how_its_task_ended_current_thread() {
-        the_context_drop_writes_the_reason_of_how_its_task_ended().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_context_drop_writes_the_reason_of_how_its_task_ended_multi_thread() {
-        the_context_drop_writes_the_reason_of_how_its_task_ended().await;
     }
 
     /// What a [`Timed`] actor is asked.
@@ -2991,6 +3314,7 @@ mod tests {
                 TimedMsg::CancelAfterTheFiring => {
                     let id = ctx.schedule(TimedMsg::Fired).after(Duration::ZERO).await?;
                     let joined = ctx
+                        .ex_mut()
                         .forwarders
                         .join_next_with_id()
                         .await
@@ -3062,32 +3386,9 @@ mod tests {
         assert_eq!(fired, 1, "the message arrives once");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_cancel_after_the_firing_reads_not_found_current_thread() {
-        a_cancel_after_the_firing_reads_not_found().await;
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancel_after_the_firing_reads_not_found_multi_thread() {
         a_cancel_after_the_firing_reads_not_found().await;
-    }
-
-    /// A one-shot timer whose send waits on a full mailbox is cancelled: the
-    /// cancel reads `Ok`, and the message never arrives.
-    async fn a_cancel_while_the_send_waits_reads_ok() {
-        let (answers, fired) = cancel_in_a_turn(TimedMsg::CancelWhileTheSendWaits).await;
-        assert!(matches!(answers.as_slice(), [Ok(())]), "{answers:?}");
-        assert_eq!(fired, 0, "the message never arrives");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_cancel_while_the_send_waits_reads_ok_current_thread() {
-        a_cancel_while_the_send_waits_reads_ok().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancel_while_the_send_waits_reads_ok_multi_thread() {
-        a_cancel_while_the_send_waits_reads_ok().await;
     }
 
     /// The text of the panic a dropped factory's capture raises.
@@ -3213,11 +3514,6 @@ mod tests {
         a_spec_removed_during_the_build_cancels_the_attempt_without_a_panic().await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_spec_removed_during_the_build_cancels_the_attempt_without_a_panic_multi_thread() {
-        a_spec_removed_during_the_build_cancels_the_attempt_without_a_panic().await;
-    }
-
     /// A build that panics after the spec went cancels the attempt too: the
     /// panic is logged, not charged as a factory failure.
     async fn a_build_panic_after_the_spec_went_cancels_the_attempt() {
@@ -3309,11 +3605,6 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_build_panic_after_the_spec_went_cancels_the_attempt_current_thread() {
-        a_build_panic_after_the_spec_went_cancels_the_attempt().await;
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_build_panic_after_the_spec_went_cancels_the_attempt_multi_thread() {
         a_build_panic_after_the_spec_went_cancels_the_attempt().await;
@@ -3364,67 +3655,6 @@ mod tests {
         assert_eq!(lines.len(), 1, "one line: {lines:?}");
     }
 
-    /// While the spec holds the factory, the attempt's reference is not the
-    /// last one: the build's value, or its panic as `FactoryFailed`, is the
-    /// outcome, and the factory lives on with the spec.
-    #[tokio::test]
-    async fn an_attempt_whose_spec_holds_the_factory_builds_or_fails() {
-        let factory: Arc<TestFactory<u32>> = Arc::new(Box::new(|| 7));
-        let (_ctl, io) = crate::actor::supervision::slot_pair(Default::default());
-        let built = build_for_attempt(
-            &Arc::downgrade(&factory),
-            &io,
-            &ActorId::from("sup"),
-            &ActorId::from("c"),
-            2,
-        )
-        .map_err(|outcome| *outcome);
-        assert!(matches!(built, Ok(7)));
-        let failing: Arc<TestFactory<u32>> = Arc::new(Box::new(|| panic!("the factory fails")));
-        let built = build_for_attempt(
-            &Arc::downgrade(&failing),
-            &io,
-            &ActorId::from("sup"),
-            &ActorId::from("c"),
-            2,
-        )
-        .map_err(|outcome| *outcome);
-        match built {
-            Err(RestartOutcome::Failed {
-                reason:
-                    StopReason::Failure(ActorError::Supervision(SupervisionError::FactoryFailed(msg))),
-                ..
-            }) => assert_eq!(msg, "the factory fails"),
-            _ => panic!("expected FactoryFailed"),
-        }
-        assert_eq!(Arc::strong_count(&factory), 1, "the spec's reference stays");
-        assert_eq!(Arc::strong_count(&failing), 1, "the spec's reference stays");
-    }
-
-    /// A spec removed while the attempt builds leaves the attempt the
-    /// factory's last reference: the factory drops in the attempt's own
-    /// catch, and its panic is carried out on the cancelled outcome, with the
-    /// cancel recorded in the cell.
-    #[tokio::test]
-    async fn a_factory_whose_spec_goes_during_the_build_drops_in_the_attempt_with_its_panic() {
-        let panics = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (hold, weak) = removed_during_build(|| 7u32, &panics);
-        let (ctl, io) = crate::actor::supervision::slot_pair(Default::default());
-        let built = build_for_attempt(&weak, &io, &ActorId::from("sup"), &ActorId::from("c"), 2)
-            .map_err(|outcome| *outcome);
-        match built {
-            Err(RestartOutcome::Cancelled {
-                incarnation: 2,
-                drop_panic: Some(payload),
-                ..
-            }) => assert_eq!(payload, CAPTURE_PANIC),
-            _ => panic!("expected a cancel carrying the factory's drop panic"),
-        }
-        assert!(hold.lock().unwrap().is_none());
-        assert_eq!(panics.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(matches!(cell_after(&ctl, io).await, CellOutcome::Cancelled));
-    }
-
     /// The factory's drop and the built value's drop both panic, or the build
     /// panics and the factory's drop panics: each panic is caught on its own,
     /// never inside the unwinding of another, and the factory's is the one
@@ -3470,72 +3700,5 @@ mod tests {
             "the factory's drop ran outside the build's unwind"
         );
         assert!(matches!(cell_after(&ctl, io).await, CellOutcome::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn start_timeout_defaults_to_none() {
-        let mut ctx = dummy_ctx();
-        let builder = ctx.spawn_child(Dummy::default);
-        assert_eq!(builder.start_timeout, None);
-    }
-
-    #[tokio::test]
-    async fn start_timeout_builder_sets_value() {
-        let mut ctx = dummy_ctx();
-        let builder = ctx
-            .spawn_child(Dummy::default)
-            .start_timeout(Duration::from_millis(200));
-        assert_eq!(builder.start_timeout, Some(Duration::from_millis(200)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn skip_catch_up_lands_on_the_first_grid_point_after_now_in_constant_time() {
-        for interval in [Duration::from_millis(1), Duration::from_nanos(1)] {
-            let ctx = dummy_ctx();
-            let handle = ctx.self_handle.clone();
-            let token = CancellationToken::new();
-            let mut factory: Box<MessageFactory<Dummy>> = Box::new(|| ());
-
-            // Paused virtual time, advanced forward instead of subtracted
-            // from `Instant::now()`: subtracting a large `Duration` from an
-            // `Instant` panics once the instant is within that duration of
-            // the platform's own start-of-time (observed on Windows, whose
-            // `Instant` is an unsigned offset from process start).
-            let old_next = Instant::now();
-            time::advance(Duration::from_secs(3600)).await;
-            let now = Instant::now();
-            let mut next = old_next;
-
-            // Wall time, not the paused virtual clock, which would report
-            // zero elapsed regardless of how long `adjust_next` actually ran.
-            let started = std::time::Instant::now();
-            let adjusted = adjust_next(
-                &mut next,
-                interval,
-                MissPolicy::Skip,
-                &token,
-                &handle,
-                &mut factory,
-            );
-            assert!(matches!(adjusted, Adjusted::Next), "Skip sends nothing");
-            let elapsed = started.elapsed();
-
-            assert!(
-                next > now,
-                "the adjusted deadline must be strictly after `now`, interval={interval:?}"
-            );
-            let advanced = next.duration_since(old_next);
-            assert_eq!(
-                advanced.as_nanos() % interval.as_nanos(),
-                0,
-                "the adjusted deadline must land on an exact multiple of the \
-                 interval from the original `next`, interval={interval:?}"
-            );
-            assert!(
-                elapsed < Duration::from_millis(100),
-                "adjust_next must run in constant time regardless of how far \
-                 behind `next` has fallen, interval={interval:?}, took {elapsed:?}"
-            );
-        }
     }
 }

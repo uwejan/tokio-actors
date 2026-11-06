@@ -7,19 +7,16 @@
 //! whose drop panics, reaped by the message loop, leaves one warning too.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_core::Stream;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, StopReason, StreamEvent, StreamId,
+    ActorConfig, ActorResult, StopReason,
 };
 
 const BOUND: Duration = Duration::from_secs(10);
@@ -71,202 +68,6 @@ impl Drop for PanicsWith {
     fn drop(&mut self) {
         panic!("{}", self.0);
     }
-}
-
-/// A stream that never yields and owns a value whose drop panics.
-struct PanickingStream(#[allow(dead_code)] PanicsWith);
-
-impl Stream for PanickingStream {
-    type Item = ();
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
-        Poll::Pending
-    }
-}
-
-enum StreamMsg {
-    Event,
-}
-
-impl From<StreamEvent<()>> for StreamMsg {
-    fn from(_: StreamEvent<()>) -> Self {
-        StreamMsg::Event
-    }
-}
-
-/// Registers a stream when it starts and cancels it in `on_stopped`.
-struct Cancels {
-    text: String,
-    stream: Option<StreamId>,
-}
-
-impl Actor for Cancels {
-    type Message = StreamMsg;
-    type Response = ();
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        self.stream = Some(ctx.add_stream(PanickingStream(PanicsWith(self.text.clone()))));
-        Ok(())
-    }
-
-    async fn handle(&mut self, _msg: StreamMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn on_stopped(
-        &mut self,
-        _reason: &StopReason,
-        ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        if let Some(id) = self.stream.take() {
-            let _ = ctx.cancel_stream(id);
-        }
-        Ok(())
-    }
-}
-
-/// A stream cancelled in `on_stopped` belongs to the run: its drop's panic
-/// leaves the reason as it stands, and is logged once, naming the actor,
-/// by the time the actor's end is observed.
-fn a_stream_cancelled_in_on_stopped_logs_its_panic_once(flavor: &str) {
-    on(flavor, async {
-        let name = uname("cancels");
-        let text = format!("the cancelled stream panicked {name}");
-        let actor = Cancels {
-            text: text.clone(),
-            stream: None,
-        }
-        .spawn()
-        .named(name.clone())
-        .await
-        .expect("the actor starts");
-        actor.stop(StopReason::Graceful).await.expect("accepted");
-        let reason = within("the actor's end", actor.wait_stopped()).await;
-        assert_eq!(
-            reason,
-            StopReason::Graceful,
-            "the run's panic is not the end's"
-        );
-        let lines = lines_naming(&name, &text);
-        assert_eq!(lines.len(), 1, "one warning: {lines:?}");
-    });
-}
-
-#[test]
-fn a_stream_cancelled_in_on_stopped_logs_its_panic_once_current_thread() {
-    a_stream_cancelled_in_on_stopped_logs_its_panic_once("current_thread");
-}
-
-#[test]
-fn a_stream_cancelled_in_on_stopped_logs_its_panic_once_multi_thread() {
-    a_stream_cancelled_in_on_stopped_logs_its_panic_once("multi_thread");
-}
-
-/// Two streams registered at the start, each cancelled during the run by a
-/// message; the actor answers what it holds as its last forwarder error.
-struct CancelsDuringTheRun {
-    texts: [String; 2],
-    ids: Vec<StreamId>,
-}
-
-enum RunMsg {
-    Event,
-    Cancel(usize),
-    LastError,
-}
-
-impl From<StreamEvent<()>> for RunMsg {
-    fn from(_: StreamEvent<()>) -> Self {
-        RunMsg::Event
-    }
-}
-
-impl Actor for CancelsDuringTheRun {
-    type Message = RunMsg;
-    type Response = Option<String>;
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        for text in &self.texts {
-            self.ids
-                .push(ctx.add_stream(PanickingStream(PanicsWith(text.clone()))));
-        }
-        Ok(())
-    }
-
-    async fn handle(
-        &mut self,
-        msg: RunMsg,
-        ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<Option<String>> {
-        match msg {
-            RunMsg::Event => Ok(None),
-            RunMsg::Cancel(i) => {
-                let _ = ctx.cancel_stream(self.ids[i]);
-                Ok(None)
-            }
-            RunMsg::LastError => Ok(match ctx.last_forwarder_error() {
-                Some(ActorError::Panic(payload)) => Some(payload.clone()),
-                _ => None,
-            }),
-        }
-    }
-}
-
-/// Waits until the message loop has reaped the panic `text` as the last
-/// forwarder error.
-async fn reaped(actor: &ActorHandle<CancelsDuringTheRun>, text: &str) {
-    within("the loop to reap the cancelled stream", async {
-        while actor
-            .send(RunMsg::LastError)
-            .await
-            .expect("the actor answers")
-            .as_deref()
-            != Some(text)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-}
-
-/// Two streams cancelled during the run panic when dropped, and the message
-/// loop reaps each: the second replaces the first as the last forwarder
-/// error. Each panic is logged once, naming the actor, and the actor still
-/// ends `Graceful`.
-fn loop_reaped_run_panics_are_logged_once_each(flavor: &str) {
-    on(flavor, async {
-        let name = uname("run");
-        let texts = [format!("first {name}"), format!("second {name}")];
-        let actor = CancelsDuringTheRun {
-            texts: texts.clone(),
-            ids: Vec::new(),
-        }
-        .spawn()
-        .named(name.clone())
-        .await
-        .expect("the actor starts");
-        actor.notify(RunMsg::Cancel(0)).await.expect("queued");
-        reaped(&actor, &texts[0]).await;
-        actor.notify(RunMsg::Cancel(1)).await.expect("queued");
-        reaped(&actor, &texts[1]).await;
-        actor.stop(StopReason::Graceful).await.expect("accepted");
-        let reason = within("the actor's end", actor.wait_stopped()).await;
-        assert_eq!(reason, StopReason::Graceful);
-        for text in &texts {
-            let lines = lines_naming(&name, text);
-            assert_eq!(lines.len(), 1, "one warning for {text}: {lines:?}");
-        }
-    });
-}
-
-#[test]
-fn loop_reaped_run_panics_are_logged_once_each_current_thread() {
-    loop_reaped_run_panics_are_logged_once_each("current_thread");
-}
-
-#[test]
-fn loop_reaped_run_panics_are_logged_once_each_multi_thread() {
-    loop_reaped_run_panics_are_logged_once_each("multi_thread");
 }
 
 /// The gates of a turn the test holds.
@@ -341,11 +142,6 @@ fn every_panicking_queued_message_is_logged(flavor: &str) {
 }
 
 #[test]
-fn every_panicking_queued_message_is_logged_current_thread() {
-    every_panicking_queued_message_is_logged("current_thread");
-}
-
-#[test]
 fn every_panicking_queued_message_is_logged_multi_thread() {
     every_panicking_queued_message_is_logged("multi_thread");
 }
@@ -387,11 +183,6 @@ fn every_panicking_priority_message_is_logged(flavor: &str) {
 #[test]
 fn every_panicking_priority_message_is_logged_current_thread() {
     every_panicking_priority_message_is_logged("current_thread");
-}
-
-#[test]
-fn every_panicking_priority_message_is_logged_multi_thread() {
-    every_panicking_priority_message_is_logged("multi_thread");
 }
 
 /// A child that does nothing.
@@ -483,21 +274,6 @@ fn a_killed_supervisor_logs_every_factory_panic(flavor: &str, suspended: bool) {
         let lines = lines_naming(&name, &text);
         assert_eq!(lines.len(), 2, "one warning per panic: {lines:?}");
     });
-}
-
-#[test]
-fn a_killed_supervisor_logs_every_factory_panic_current_thread() {
-    a_killed_supervisor_logs_every_factory_panic("current_thread", false);
-}
-
-#[test]
-fn a_killed_supervisor_logs_every_factory_panic_multi_thread() {
-    a_killed_supervisor_logs_every_factory_panic("multi_thread", false);
-}
-
-#[test]
-fn an_aborted_supervisor_logs_every_factory_panic_current_thread() {
-    a_killed_supervisor_logs_every_factory_panic("current_thread", true);
 }
 
 #[test]

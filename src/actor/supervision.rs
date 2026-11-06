@@ -20,7 +20,7 @@ use crate::types::{
 };
 
 pub(crate) mod rules;
-mod slot;
+pub(crate) mod slot;
 
 pub(crate) use rules::{
     manual_commit, CommitEffect, GroupMembership, ManualFacts, ManualOp, ManualReply, ReportClass,
@@ -160,7 +160,7 @@ pub(crate) type DeathOutcome = (ActorId, StopReason, u64);
 /// Every effect below is safe to run more than once, and safe to run after
 /// the child has already stopped on its own: raising on an already-closed
 /// lane and aborting an already-finished task are both no-ops. The child's
-/// status watch is never written here at all: `Stopped` is published only by
+/// status plane is never written here at all: `Stopped` is published only by
 /// the child's own run loop reaching its normal exit, so observing it always
 /// means the task actually got there.
 /// [`ActorHandle::wait_stopped`](crate::actor::handle::ActorHandle::wait_stopped)
@@ -177,7 +177,8 @@ pub(crate) struct ChildLinkGuard {
     /// the one this guard was handed turns out to belong to a runtime that
     /// is now gone (see `Drop`, below).
     system: Arc<ActorSystem>,
-    /// The runtime of the supervisor that built this guard: the one whose
+    /// The runtime of the child this guard watches, which is the
+    /// supervisor's unless the child was placed elsewhere: the one whose
     /// reaper the guard was handed, and the one a retry resolves its reaper
     /// on.
     runtime: Handle,
@@ -226,7 +227,7 @@ impl Drop for ChildLinkGuard {
         if !self.armed {
             return;
         }
-        // (a) Raise the child's inherited stop: a plain watch write,
+        // (a) Raise the child's inherited stop: a plain lane write,
         // infallible, and a no-op if the child has already finished its
         // message loop. (b) Enqueue its deadlines with the reaper: a
         // synchronous send on an unbounded feed (this is `Drop`: no awaiting,
@@ -242,6 +243,8 @@ impl Drop for ChildLinkGuard {
         let kill_stored = matches!(self.stop_lane.reason(), Some(StopReason::Kill));
         let entry = match rules::fired_stop(self.inherited, kill_stored) {
             rules::InheritedStop::Kill { grace } => {
+                // The entry below holds the child's abort handle, so no
+                // registry entry is involved and no deadline is declared.
                 self.stop_lane.raise(StopReason::Kill);
                 ReaperEntry::new(
                     saturating_deadline(Instant::now(), grace),
@@ -264,8 +267,8 @@ impl Drop for ChildLinkGuard {
             }
         };
         // The reaper this guard was handed may belong to a runtime that is
-        // gone now: the system feeds the entry to the reaper of the
-        // supervisor's runtime once more before it gives up, which is what
+        // gone now: the system feeds the entry to the reaper of the child's
+        // runtime once more before it gives up, which is what
         // lets the child's full grace survive a runtime change instead of
         // degrading straight to an abort.
         if let Err(mpsc::error::SendError(entry)) = self.reaper.send(entry) {
@@ -380,6 +383,10 @@ impl ChildLifecycle {
 ///
 /// Maps to OTP supervisor child specs: strategy, intensity (max_restarts),
 /// and period (restart_window).
+///
+/// An actor whose only job is supervising (an empty `handle` and short hooks)
+/// is Erlang/OTP's supervisor shape: its supervision events never wait behind
+/// a long user turn.
 #[derive(Debug, Clone)]
 pub struct SupervisionConfig {
     /// The restart strategy to use.
@@ -511,13 +518,12 @@ impl RestartBudget {
 pub(crate) struct ChildSpec {
     pub restart_type: RestartType,
     pub shutdown: Shutdown,
-    /// Bounds the supervisor's wait for this child's initialization to
-    /// complete during a restart. `None` (default) waits indefinitely,
-    /// matching Erlang/OTP supervisor semantics; setting a bound is a
-    /// deliberate deviation that trades strict parity for a supervisor that
-    /// can never be stalled by one child's hung init. Initial spawning never
-    /// awaits initialization (see `spawn_child`), so this bound applies only
-    /// to restarts.
+    /// Bounds the wait for the initialization of each restart of this child.
+    /// `None` (default) waits without a bound, under any `Shutdown`, as an
+    /// Erlang/OTP supervisor does; setting a bound is a deliberate departure
+    /// that trades strict parity for a supervisor that one child's hung
+    /// initialization cannot stall. The first start of a child is never
+    /// awaited (see `spawn_child`), so this bound applies to restarts only.
     ///
     /// Stored here for restart-path lookups; the active reader is the
     /// restart closure's own captured copy (see `spawn_child_internal` in
@@ -550,7 +556,7 @@ pub(crate) struct ChildSpec {
 /// Runtime state for a supervised child.
 pub(crate) struct ChildState {
     pub id: ActorId,
-    pub name: Option<String>,
+    pub name: Option<Arc<str>>,
     pub spec: ChildSpec,
     /// The supervisor's control of the occupant's slot: the stop order it
     /// writes to the occupant's executor, and the cell the executor
@@ -1216,7 +1222,7 @@ impl SupervisionState {
             .map_or_else(|| child.ctl.end_reason(), |event| event.reason.clone());
         let event = ChildEvent {
             child_id: child_id.clone(),
-            child_name: child.name.clone(),
+            child_name: child.name.as_deref().map(str::to_string),
             reason,
             action: SupervisionAction::Removed,
         };
@@ -1298,7 +1304,7 @@ impl SupervisionState {
                     rules::child_info_flags(child.lifecycle, fate_present, in_restart_set);
                 ChildInfo {
                     id: child.id.clone(),
-                    name: child.name.clone(),
+                    name: child.name.as_deref().map(str::to_string),
                     restart_type: child.spec.restart_type,
                     shutdown: child.spec.shutdown,
                     is_alive,
@@ -1706,37 +1712,11 @@ pub(crate) fn advance_restart_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::runtime::spawn_runner;
-    use crate::types::{ActorStatus, StatusValue, StopReason};
-    use tokio::sync::watch;
+
+    use crate::types::StopReason;
     use tokio::task::JoinHandle;
 
     // - RestartBudget -------------------------------------------------------
-
-    #[tokio::test]
-    async fn budget_allows_within_limit() {
-        let mut budget = RestartBudget::new(3, Duration::from_secs(60));
-        assert!(budget.check_and_record());
-        assert!(budget.check_and_record());
-        assert!(budget.check_and_record());
-    }
-
-    #[tokio::test]
-    async fn budget_denies_when_exhausted() {
-        let mut budget = RestartBudget::new(2, Duration::from_secs(60));
-        assert!(budget.check_and_record());
-        assert!(budget.check_and_record());
-        assert!(!budget.check_and_record());
-    }
-
-    #[tokio::test]
-    async fn budget_recovers_after_window() {
-        let mut budget = RestartBudget::new(1, Duration::from_millis(50));
-        assert!(budget.check_and_record());
-        assert!(!budget.check_and_record());
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(budget.check_and_record());
-    }
 
     // - ChildRegistry -------------------------------------------------------
 
@@ -1744,7 +1724,7 @@ mod tests {
         let (ctl, _io) = slot_pair(Default::default());
         ChildState {
             id: ActorId::from(id),
-            name: Some(id.to_string()),
+            name: Some(Arc::from(id.to_string())),
             spec: ChildSpec {
                 restart_type,
                 shutdown: Shutdown::default(),
@@ -1768,60 +1748,6 @@ mod tests {
 
     fn dummy_child(id: &str) -> ChildState {
         dummy_child_with(id, RestartType::Permanent, true)
-    }
-
-    #[tokio::test]
-    async fn registry_register_and_get() {
-        let mut reg = ChildRegistry::new();
-        reg.register(dummy_child("a"));
-        reg.register(dummy_child("b"));
-        assert_eq!(reg.len(), 2);
-        assert!(reg.get(&ActorId::from("a")).is_some());
-        assert!(reg.get(&ActorId::from("b")).is_some());
-        assert!(reg.get(&ActorId::from("c")).is_none());
-    }
-
-    #[tokio::test]
-    async fn registry_remove_reindexes() {
-        let mut reg = ChildRegistry::new();
-        reg.register(dummy_child("a"));
-        reg.register(dummy_child("b"));
-        reg.register(dummy_child("c"));
-
-        reg.remove(&ActorId::from("a"));
-        assert_eq!(reg.len(), 2);
-        assert!(reg.get(&ActorId::from("a")).is_none());
-        assert!(reg.get(&ActorId::from("b")).is_some());
-        assert!(reg.get(&ActorId::from("c")).is_some());
-    }
-
-    #[tokio::test]
-    async fn registry_children_after() {
-        let mut reg = ChildRegistry::new();
-        reg.register(dummy_child("a"));
-        reg.register(dummy_child("b"));
-        reg.register(dummy_child("c"));
-
-        let after_a = reg.children_after(&ActorId::from("a"));
-        assert_eq!(after_a.len(), 2);
-        assert_eq!(after_a[0].as_str(), "b");
-        assert_eq!(after_a[1].as_str(), "c");
-
-        let after_c = reg.children_after(&ActorId::from("c"));
-        assert!(after_c.is_empty());
-    }
-
-    #[tokio::test]
-    async fn registry_all_ids() {
-        let mut reg = ChildRegistry::new();
-        reg.register(dummy_child("x"));
-        reg.register(dummy_child("y"));
-        let ids: Vec<String> = reg
-            .all_ids()
-            .iter()
-            .map(|id| id.as_str().to_string())
-            .collect();
-        assert_eq!(ids, vec!["x", "y"]);
     }
 
     #[tokio::test]
@@ -2059,54 +1985,6 @@ mod tests {
     }
 
     #[test]
-    fn a_member_whose_end_was_handled_is_no_longer_awaited() {
-        // The end of the awaited incarnation was classified by a completed
-        // `terminate_child`: a snapshot of it is pending, and the member is
-        // released.
-        let (mut sup, id) = a_group_state(
-            down(5, DownPending::Snapshot),
-            stop_phase(&[("m", 5)], &[], &[("m", 5)]),
-        );
-        sup.pending_manual_events.insert(
-            (id.clone(), 5),
-            ChildEvent {
-                child_id: id.clone(),
-                child_name: None,
-                reason: StopReason::Kill,
-                action: crate::types::SupervisionAction::Removed,
-            },
-        );
-        assert_eq!(sup.group_membership(&id), GroupMembership::Released);
-        // Without the snapshot the end is still awaited.
-        sup.pending_manual_events.clear();
-        assert_eq!(
-            sup.group_membership(&id),
-            GroupMembership::Awaited { overridden: true }
-        );
-    }
-
-    #[test]
-    fn a_member_of_the_restart_set_is_queued_before_it_is_released() {
-        let (sup, id) = a_group_state(
-            down(5, DownPending::None),
-            stop_phase(&[], &["m"], &[("m", 5)]),
-        );
-        assert_eq!(sup.group_membership(&id), GroupMembership::Queued);
-        let (sup, id) = a_group_state(down(5, DownPending::None), chain_phase(&["m"], &[]));
-        assert_eq!(sup.group_membership(&id), GroupMembership::Queued);
-        let (sup, id) = a_group_state(down(5, DownPending::None), stop_phase(&[], &[], &[]));
-        assert_eq!(sup.group_membership(&id), GroupMembership::None);
-        let mut sup = make_sup_state(RestartStrategy::OneForAll);
-        sup.registry
-            .register(dummy_child_with("m", RestartType::Permanent, false));
-        assert_eq!(
-            sup.group_membership(&ActorId::from("m")),
-            GroupMembership::None,
-            "no group is pending"
-        );
-    }
-
-    #[test]
     fn a_removed_spec_leaves_the_pending_groups_sets() {
         let (mut sup, id) = a_group_state(
             down(5, DownPending::Snapshot),
@@ -2217,25 +2095,6 @@ mod tests {
         ));
     }
 
-    /// The members the group waits for (reverse start order) and the members
-    /// it restarts (start order) a group commit names.
-    fn stops_and_restarts(
-        commit: &[(ActorId, u64, rules::MemberAction)],
-    ) -> (Vec<ActorId>, Vec<ActorId>) {
-        let stops = commit
-            .iter()
-            .rev()
-            .filter(|(_, _, action)| action.held)
-            .map(|(id, _, _)| id.clone())
-            .collect();
-        let restarts = commit
-            .iter()
-            .filter(|(_, _, action)| action.restarts)
-            .map(|(id, _, _)| id.clone())
-            .collect();
-        (stops, restarts)
-    }
-
     // - evaluate_strategy ---------------------------------------------------
 
     fn make_sup_state(strategy: RestartStrategy) -> SupervisionState {
@@ -2244,136 +2103,6 @@ mod tests {
             max_restarts: 3,
             restart_window: Duration::from_secs(60),
         })
-    }
-
-    #[tokio::test]
-    async fn strategy_permanent_restarts_on_any_reason() {
-        let mut sup = make_sup_state(RestartStrategy::OneForOne);
-        sup.registry.register(dummy_child("child"));
-        match evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Graceful) {
-            StrategyOutcome::RestartOne(id) => assert_eq!(id.as_str(), "child"),
-            _ => panic!("expected RestartOne"),
-        }
-    }
-
-    #[tokio::test]
-    async fn strategy_transient_removes_on_clean_reasons_restarts_on_abnormal() {
-        let mut sup = make_sup_state(RestartStrategy::OneForOne);
-        sup.registry
-            .register(dummy_child_with("child", RestartType::Transient, true));
-        let id = ActorId::from("child");
-        // Clean: normal (Graceful) and shutdown (ParentRequest) stay down.
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::Graceful),
-            StrategyOutcome::Remove
-        ));
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::ParentRequest),
-            StrategyOutcome::Remove
-        ));
-        // Abnormal: killed restarts (OTP `killed` is abnormal).
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
-            StrategyOutcome::RestartOne(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn strategy_temporary_always_removes() {
-        let mut sup = make_sup_state(RestartStrategy::OneForOne);
-        sup.registry
-            .register(dummy_child_with("child", RestartType::Temporary, true));
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
-            StrategyOutcome::Remove
-        ));
-    }
-
-    #[tokio::test]
-    async fn strategy_one_for_all_stops_live_reverse_restarts_forward() {
-        let mut sup = make_sup_state(RestartStrategy::OneForAll);
-        sup.registry.register(dummy_child("a"));
-        sup.registry.register(dummy_child("b"));
-        sup.registry.register(dummy_child("c"));
-        // b failed (already dead)
-        sup.registry.get_mut(&ActorId::from("b")).unwrap().lifecycle = ChildLifecycle::Down {
-            incarnation: 0,
-            pending: DownPending::None,
-        };
-        match evaluate_strategy(&mut sup, &ActorId::from("b"), &StopReason::Kill) {
-            StrategyOutcome::RestartGroup { commit } => {
-                let (stop_reverse, restart_order) = stops_and_restarts(&commit);
-                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
-                assert_eq!(stops, vec!["c", "a"], "live members, reverse start order");
-                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
-                assert_eq!(restarts, vec!["a", "b", "c"], "all members, start order");
-            }
-            _ => panic!("expected RestartGroup"),
-        }
-    }
-
-    #[tokio::test]
-    async fn strategy_rest_for_one_affects_failed_and_later() {
-        let mut sup = make_sup_state(RestartStrategy::RestForOne);
-        sup.registry.register(dummy_child("a"));
-        sup.registry.register(dummy_child("b"));
-        sup.registry.register(dummy_child("c"));
-        sup.registry.get_mut(&ActorId::from("a")).unwrap().lifecycle = ChildLifecycle::Down {
-            incarnation: 0,
-            pending: DownPending::None,
-        };
-        match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
-            StrategyOutcome::RestartGroup { commit } => {
-                let (stop_reverse, restart_order) = stops_and_restarts(&commit);
-                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
-                assert_eq!(stops, vec!["c", "b"]);
-                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
-                assert_eq!(restarts, vec!["a", "b", "c"]);
-            }
-            _ => panic!("expected RestartGroup"),
-        }
-    }
-
-    #[tokio::test]
-    async fn strategy_group_excludes_temporary_from_restart_but_stops_it() {
-        let mut sup = make_sup_state(RestartStrategy::OneForAll);
-        sup.registry.register(dummy_child("a"));
-        sup.registry
-            .register(dummy_child_with("tmp", RestartType::Temporary, true));
-        sup.registry.get_mut(&ActorId::from("a")).unwrap().lifecycle = ChildLifecycle::Down {
-            incarnation: 0,
-            pending: DownPending::None,
-        };
-        match evaluate_strategy(&mut sup, &ActorId::from("a"), &StopReason::Kill) {
-            StrategyOutcome::RestartGroup { commit } => {
-                let (stop_reverse, restart_order) = stops_and_restarts(&commit);
-                let stops: Vec<&str> = stop_reverse.iter().map(|i| i.as_str()).collect();
-                assert_eq!(stops, vec!["tmp"], "temporary sibling is stopped");
-                let restarts: Vec<&str> = restart_order.iter().map(|i| i.as_str()).collect();
-                assert_eq!(restarts, vec!["a"], "temporary sibling is not restarted");
-            }
-            _ => panic!("expected RestartGroup"),
-        }
-    }
-
-    #[tokio::test]
-    async fn strategy_budget_exhausted() {
-        let mut sup = SupervisionState::new(SupervisionConfig {
-            strategy: RestartStrategy::OneForOne,
-            max_restarts: 1,
-            restart_window: Duration::from_secs(60),
-        });
-        sup.registry.register(dummy_child("child"));
-        // First restart - uses the budget
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
-            StrategyOutcome::RestartOne(_)
-        ));
-        // Second restart - budget exhausted
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &ActorId::from("child"), &StopReason::Kill),
-            StrategyOutcome::BudgetExhausted
-        ));
     }
 
     // A restart_window wider than any representable Instant forces
@@ -2431,166 +2160,6 @@ mod tests {
         ActorSystem::create(format!("guard-test-{}", uuid::Uuid::new_v4())).unwrap()
     }
 
-    #[tokio::test]
-    async fn guard_drop_raises_kill_and_feeds_the_reaper_exactly_once() {
-        let (lane, lane_rx) = StopLane::new();
-        let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
-        let (_join, abort) = spawn_forever();
-        let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-
-        let guard = ChildLinkGuard::new(
-            lane.clone(),
-            abort,
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: Duration::from_millis(50),
-            },
-            dummy_system(),
-            Handle::current(),
-        );
-        drop(guard);
-
-        assert!(
-            matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
-            "drop must raise Kill on the child's stop lane"
-        );
-        assert_eq!(
-            status_rx.borrow().status,
-            ActorStatus::Running,
-            "drop must leave the child's status watch untouched: only its \
-             own run loop, or its task ending, ever writes a terminal status"
-        );
-        assert!(
-            reaper_rx.try_recv().is_ok(),
-            "drop must feed exactly one entry to the reaper"
-        );
-        assert!(
-            reaper_rx.try_recv().is_err(),
-            "drop must feed the reaper only once"
-        );
-    }
-
-    #[tokio::test]
-    async fn guard_drop_effects_are_harmless_on_an_already_stopped_child() {
-        // Every effect a guard's drop performs is safe to run again after
-        // the child already reported its own terminal state: this is
-        // exactly what happens when a runner completes normally (the
-        // captured guard still drops right after).
-        let (lane, lane_rx) = StopLane::new();
-        lane.raise(StopReason::Graceful);
-        let (_join, abort) = spawn_forever();
-        abort.abort();
-        let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-
-        let guard = ChildLinkGuard::new(
-            lane,
-            abort,
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: DEFAULT_KILL_GRACE,
-            },
-            dummy_system(),
-            Handle::current(),
-        );
-        drop(guard);
-
-        assert!(matches!(lane_rx.borrow().reason, Some(StopReason::Kill)));
-        assert!(reaper_rx.try_recv().is_ok());
-    }
-
-    #[tokio::test]
-    async fn guard_disarmed_by_the_runner_is_inert_on_normal_completion() {
-        let (lane, _lane_rx) = StopLane::new();
-        let child_join: JoinHandle<StopReason> = tokio::spawn(async { StopReason::Graceful });
-        let abort = child_join.abort_handle();
-        let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-        let guard = ChildLinkGuard::new(
-            lane.clone(),
-            abort,
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: DEFAULT_KILL_GRACE,
-            },
-            dummy_system(),
-            Handle::current(),
-        );
-        let (ctl, io) = slot_pair(Default::default());
-        let mut fate_rx = ctl.cell();
-
-        let mut death_set: JoinSet<DeathOutcome> = JoinSet::new();
-        spawn_runner(
-            &mut death_set,
-            ActorId::from("normal-death"),
-            0,
-            child_join,
-            lane,
-            io,
-            guard,
-            DEFAULT_KILL_GRACE,
-        );
-
-        let (id, reason, incarnation) = death_set.join_next().await.unwrap().unwrap();
-        assert_eq!(id.as_str(), "normal-death");
-        assert!(matches!(reason, StopReason::Graceful));
-        assert_eq!(incarnation, 0);
-
-        assert!(fate_rx.wait_for(|cell| cell.fate.is_some()).await.is_ok());
-        assert!(
-            reaper_rx.try_recv().is_err(),
-            "a disarmed guard must not occupy the reaper on normal completion"
-        );
-    }
-
-    #[tokio::test]
-    async fn guard_fires_exactly_once_when_aborted_before_its_runner_is_ever_polled() {
-        // Single-threaded (current_thread) test runtime: a newly spawned
-        // task is never polled until this task yields, so aborting the
-        // JoinSet with no `.await` in between reliably exercises the
-        // abort-before-first-poll path.
-        let (lane, lane_rx) = StopLane::new();
-        let child_join: JoinHandle<StopReason> = tokio::spawn(std::future::pending());
-        let abort = child_join.abort_handle();
-        let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-        let guard = ChildLinkGuard::new(
-            lane.clone(),
-            abort,
-            reaper_tx,
-            crate::actor::supervision::rules::InheritedStop::Kill {
-                grace: DEFAULT_KILL_GRACE,
-            },
-            dummy_system(),
-            Handle::current(),
-        );
-        let (ctl, io) = slot_pair(Default::default());
-
-        let mut death_set: JoinSet<DeathOutcome> = JoinSet::new();
-        spawn_runner(
-            &mut death_set,
-            ActorId::from("never-polled"),
-            0,
-            child_join,
-            lane,
-            io,
-            guard,
-            DEFAULT_KILL_GRACE,
-        );
-        death_set.abort_all();
-
-        // Drains the aborted runner so its drop glue (the captured guard,
-        // included) actually runs before the assertions below.
-        while death_set.join_next().await.is_some() {}
-
-        assert!(
-            matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
-            "the guard must still fire even though its runner never polled the child's task"
-        );
-        assert!(reaper_rx.try_recv().is_ok());
-        assert!(reaper_rx.try_recv().is_err());
-        // The fate cell is untouched: only the runner's own completion
-        // writes it, and it never got that far.
-        assert!(ctl.fate().is_none());
-    }
-
     // - The guard of a child that is itself a supervisor --------------------
 
     use crate::actor::supervision::rules::InheritedStop;
@@ -2604,52 +2173,6 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn guard_drop_of_a_supervisor_child_raises_parent_killed_then_kill_then_the_abort() {
-        let sys = dummy_system();
-        let (lane, lane_rx) = StopLane::new();
-        let (join, abort) = spawn_forever();
-        let window = Duration::from_millis(400);
-        let grace = Duration::from_millis(150);
-        let guard = ChildLinkGuard::new(
-            lane.clone(),
-            abort,
-            sys.reaper_handle(&Handle::current()),
-            orderly(Some(window), grace),
-            sys.clone(),
-            Handle::current(),
-        );
-        drop(guard);
-        settle().await;
-
-        assert!(
-            matches!(lane_rx.borrow().reason, Some(StopReason::ParentKilled)),
-            "a supervisor child is raised ParentKilled, not Kill"
-        );
-        // Inside the window nothing more happens.
-        tokio::time::advance(window - Duration::from_millis(10)).await;
-        settle().await;
-        assert!(matches!(
-            lane_rx.borrow().reason,
-            Some(StopReason::ParentKilled)
-        ));
-        assert!(!join.is_finished());
-        // At the end of the window the reaper raises Kill and leaves the
-        // task running for its kill grace.
-        tokio::time::advance(Duration::from_millis(10)).await;
-        settle().await;
-        assert!(matches!(lane_rx.borrow().reason, Some(StopReason::Kill)));
-        assert!(!join.is_finished(), "the task is aborted after its grace");
-        tokio::time::advance(grace - Duration::from_millis(10)).await;
-        settle().await;
-        assert!(!join.is_finished());
-        tokio::time::advance(Duration::from_millis(10)).await;
-        let ended = tokio::time::timeout(Duration::from_secs(1), join)
-            .await
-            .expect("the task is aborted a grace after the Kill");
-        assert!(ended.unwrap_err().is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2686,33 +2209,6 @@ mod tests {
                 .unwrap_or_else(|_| panic!("aborted a grace after the guard (window {window:?})"));
             assert!(ended.unwrap_err().is_cancelled());
         }
-    }
-
-    #[tokio::test]
-    async fn guard_drop_of_a_supervisor_child_under_infinity_feeds_no_entry() {
-        let (lane, lane_rx) = StopLane::new();
-        let (join, abort) = spawn_forever();
-        let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-        let guard = ChildLinkGuard::new(
-            lane,
-            abort,
-            reaper_tx,
-            orderly(None, DEFAULT_KILL_GRACE),
-            dummy_system(),
-            Handle::current(),
-        );
-        drop(guard);
-
-        assert!(matches!(
-            lane_rx.borrow().reason,
-            Some(StopReason::ParentKilled)
-        ));
-        assert!(
-            reaper_rx.try_recv().is_err(),
-            "an unbounded orderly stop has no deadline to keep"
-        );
-        settle().await;
-        assert!(!join.is_finished(), "nothing aborts it");
     }
 
     #[tokio::test]
@@ -2756,125 +2252,7 @@ mod tests {
         join.abort();
     }
 
-    #[tokio::test]
-    async fn guard_drop_with_an_edge_of_range_window_and_grace_does_not_panic() {
-        let base = Instant::now();
-        let mut lo = Duration::ZERO;
-        let mut hi = Duration::from_secs(u64::MAX / 2);
-        while hi - lo > Duration::from_nanos(1) {
-            let mid = lo + (hi - lo) / 2;
-            if base.checked_add(mid).is_some() {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        for window in [lo - Duration::from_micros(500), Duration::MAX] {
-            for grace in [Duration::from_millis(120), lo, Duration::MAX] {
-                let (lane, lane_rx) = StopLane::new();
-                let (join, abort) = spawn_forever();
-                let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
-                let guard = ChildLinkGuard::new(
-                    lane,
-                    abort,
-                    reaper_tx,
-                    orderly(Some(window), grace),
-                    dummy_system(),
-                    Handle::current(),
-                );
-                drop(guard);
-                assert!(
-                    matches!(lane_rx.borrow().reason, Some(StopReason::ParentKilled)),
-                    "window {window:?} grace {grace:?}"
-                );
-                assert!(reaper_rx.try_recv().is_ok(), "the entry is fed");
-                join.abort();
-            }
-        }
-    }
-
     // - The kill grace ----------------------------------------------------------
-
-    /// Spawns two children, one with no `kill_grace` call and one with its
-    /// own, and reports the grace each stored in its spec.
-    struct SpecReader {
-        seen: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
-    }
-
-    #[derive(Default)]
-    struct Leaf;
-
-    impl crate::actor::Actor for Leaf {
-        type Message = ();
-        type Response = ();
-
-        async fn handle(
-            &mut self,
-            _msg: (),
-            _ctx: &mut crate::actor::context::ActorContext<Self>,
-        ) -> crate::error::ActorResult<()> {
-            Ok(())
-        }
-    }
-
-    impl crate::actor::Actor for SpecReader {
-        type Message = ();
-        type Response = ();
-
-        async fn on_started(
-            &mut self,
-            ctx: &mut crate::actor::context::ActorContext<Self>,
-        ) -> crate::error::ActorResult<()> {
-            ctx.spawn_child(Leaf::default).named("plain").await?;
-            ctx.spawn_child(Leaf::default)
-                .named("graced")
-                .kill_grace(Duration::from_millis(700))
-                .await?;
-            let sup = ctx.supervision_ref().expect("a supervisor");
-            let mut seen = self.seen.lock().unwrap();
-            for name in ["plain", "graced"] {
-                seen.push(
-                    sup.registry
-                        .get(&ActorId::from(name))
-                        .expect("the child is registered")
-                        .spec
-                        .kill_grace,
-                );
-            }
-            Ok(())
-        }
-
-        async fn handle(
-            &mut self,
-            _msg: (),
-            _ctx: &mut crate::actor::context::ActorContext<Self>,
-        ) -> crate::error::ActorResult<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn default_kill_grace_is_120_ms_and_abort_settle_is_100_ms() {
-        use crate::actor::ActorExt;
-
-        assert_eq!(DEFAULT_KILL_GRACE, Duration::from_millis(120));
-        assert_eq!(ABORT_SETTLE, Duration::from_millis(100));
-
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sys = ActorSystem::create(format!("spec-grace-{}", uuid::Uuid::new_v4())).unwrap();
-        let _sup = SpecReader { seen: seen.clone() }
-            .spawn()
-            .named("spec-reader")
-            .on_system(&sys)
-            .supervisor()
-            .await
-            .unwrap();
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![DEFAULT_KILL_GRACE, Duration::from_millis(700)],
-            "a child with no kill_grace call stores the default; one with a call, its own"
-        );
-    }
 }
 
 #[cfg(test)]

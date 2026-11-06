@@ -4,10 +4,16 @@
 pub mod context;
 /// Actor handle for external communication.
 pub mod handle;
+/// The actor's normal mailbox.
+pub(crate) mod mailbox;
+#[cfg(doctest)]
+mod message_bounds;
 /// Panic capture for actor callbacks.
 pub(crate) mod panic;
 /// Runtime configuration and spawning logic.
 pub mod runtime;
+/// The start bound of a spawn, owned by the system.
+mod start_bound;
 /// Subtree tokens: the end of an actor and of everything it spawned.
 pub(crate) mod subtree;
 /// Supervision configuration and child management.
@@ -22,25 +28,54 @@ use tokio::sync::oneshot;
 
 use crate::error::{ActorResult, SpawnError};
 use crate::system::ActorSystem;
-use crate::types::{ChildEvent, Envelope, StopReason};
+use crate::types::{ActorId, ChildEvent, Envelope, StopReason};
 use context::ActorContext;
 use runtime::ActorConfig;
-use supervision::{SupervisionConfig, ABORT_SETTLE, DEFAULT_KILL_GRACE};
+use supervision::{SupervisionConfig, DEFAULT_KILL_GRACE};
 
 /// Primary trait implemented by all actors.
 ///
 /// An actor is a stateful entity that processes messages sequentially.
-/// Each actor runs in its own Tokio task.
+/// Each actor runs in its own Tokio task. The actor's own typed fields hold
+/// what a process dictionary would in Erlang/OTP.
 ///
 /// # The end of an actor
 ///
 /// When an actor's task runs to its end, a supervisor's child factories drop
-/// with its children's teardown; then its name is freed, then everything else
-/// it owned is dropped (its queued messages, its value), and only then does its
-/// status read [`ActorStatus::Stopped`](crate::types::ActorStatus::Stopped).
+/// with its children's teardown; then its name is freed, then the answer to a
+/// request whose handler failed goes out, then everything else it owned is
+/// dropped (its queued messages, its value), and only then does its status
+/// read [`ActorStatus::Stopped`](crate::types::ActorStatus::Stopped).
 /// Its mailbox stays open while `on_stopped` runs, so a message sent then is
 /// accepted and then dropped unhandled with the queued messages; a send after
-/// `on_stopped` returns is refused. Its timers and streams are released from
+/// `on_stopped` returns is refused. A
+/// [`send`](crate::actor::handle::ActorHandle::send),
+/// [`send_priority`](crate::actor::handle::ActorHandle::send_priority),
+/// [`send_timeout`](crate::actor::handle::ActorHandle::send_timeout) or
+/// [`send_priority_timeout`](crate::actor::handle::ActorHandle::send_priority_timeout)
+/// whose slot was taken before the actor ended, and that the actor did not
+/// reply to, is answered with
+/// [`AskError::ResponseDropped`](crate::error::AskError::ResponseDropped) and
+/// the actor's final reason, once that reason is final (a timed form waits for
+/// it within its own deadline, and answers
+/// `AskError::Timeout { enqueued: true }` if the deadline passes first); one
+/// still waiting for room when the mailbox closes is answered
+/// [`AskError::Closed`](crate::error::AskError::Closed); one
+/// the actor had already replied to reads that reply; one whose handler failed
+/// (an `Err` or a panic) is answered
+/// [`AskError::Actor`](crate::error::AskError::Actor) when the actor seals its
+/// stop lane, with its name already free, or
+/// [`AskError::ResponseDropped`](crate::error::AskError::ResponseDropped) with
+/// the final reason when a `Kill`, an abort or the end of the actor's runtime
+/// ends the actor first. A message that was not handled is dropped at the end,
+/// or by its sender as it arrives just after it, also when the actor's runtime
+/// has shut down; one that was already landing in the mailbox as the runtime
+/// shut down, or that reaches the priority lane through a slot reserved
+/// before, is dropped once the last handle to the actor is gone. A reply
+/// channel that a caller made itself and put inside a message (not the one
+/// send makes) is not answered by the crate: it closes when the message is
+/// dropped.
+/// The actor's timers and streams are released from
 /// the close of its mailbox on, which comes once `on_stopped` has returned, the
 /// initialization failed, or a `Kill` ended the run (a `Kill` skips
 /// `on_stopped`): each one when its forwarder next runs, and what a forwarder
@@ -82,13 +117,18 @@ use supervision::{SupervisionConfig, ABORT_SETTLE, DEFAULT_KILL_GRACE};
 /// `send` whose caller is gone) and the factory of a child whose spec the
 /// loop removes (the end of a `Temporary` child, or of a `SimpleOneForOne`
 /// child that is not restarted, a group's absorption of a member's end, the
-/// classification of a manual stop whose call was dropped). A panic in one of them stops the actor as a panic in `handle`
-/// does: with `Failure(Panic(..))`, through `on_stopped` and the ordered stop
-/// of its children; a child's end the turn took and did not deliver is
+/// classification of a manual stop whose call was dropped). A panic in one of
+/// them stops the actor as a panic in `handle` does: with
+/// `Failure(Panic(..))`, through `on_stopped` and the ordered stop of its
+/// children; a child's end the turn took and did not deliver is
 /// delivered once, with the child's name, before `on_stopped`. A factory a
 /// supervision call removes (`delete_child`, a `stop_child` or
-/// `terminate_child` that removes the spec) drops as that call's last step,
-/// so a panic there is a panic of the callback that made the call.
+/// `terminate_child` that removes the spec) drops after that call's last
+/// write to the supervisor's state, so a panic there is a panic of the
+/// callback that made the call. The drop
+/// of a callback's own future once it has completed is part of the
+/// callback: a panic there is a panic of the callback, whatever the
+/// callback returned.
 ///
 /// When an actor's task is aborted, its status never reads `Stopped`: its
 /// status channel closes, which reads as ended, only once its name is free and
@@ -118,15 +158,36 @@ use supervision::{SupervisionConfig, ABORT_SETTLE, DEFAULT_KILL_GRACE};
 /// when a later panic, of the conversion into its `Finished` message or of
 /// that message's drop, is the one reported, or when an abort at the
 /// actor's end drops the forwarder while its `Finished` waits for room and
-/// nothing later panics. The drops of the timers' and streams' tasks at an abort must
-/// finish within the short wait that confirms an abort: one that takes longer leaves the actor
-/// reading as one that does not yield, so a restart waiting for it ends with
-/// `ChildUnresponsive` and `kill_by_id` reports `Unresponsive`. A timer's or
-/// stream's `Drop` should therefore not block. A task whose own poll unwinds
+/// nothing later panics. The drops of the timers' and streams' tasks at an
+/// abort must finish within the short wait that confirms an abort: one that
+/// takes longer leaves the actor reading as one that does not yield, so a
+/// restart waiting for it ends with `ChildUnresponsive` and `kill_by_id`
+/// reports `Unresponsive`. A timer's or stream's `Drop` should therefore not
+/// block. A task whose own poll unwinds
 /// outside every catch ends in the same order as an aborted one, with the
 /// reason `Failure(Panic(..))` instead of `Kill`: its status plane, its
 /// supervisor's report of its end and an awaited spawn whose initialization the
 /// unwind cut (as [`SpawnError::Init`]) read that one reason.
+///
+/// A message sent to an actor's mailbox through a slot reserved before the end
+/// and pushed after it is dropped by its sender, in that push; a panic of that
+/// drop is contained, and logged with the actor's id with the `tracing`
+/// feature. A value already landing in the mailbox as the actor ends, or one
+/// that reaches the priority lane through a slot reserved before the end, is
+/// dropped by a helper task of its system on the actor's runtime while that
+/// runtime runs; with no runtime to run the task, it is dropped when the last
+/// handle to the actor is. Like any
+/// task, that drop runs on one of the runtime's workers and must not block: on
+/// a runtime with one worker, a blocking `Drop` delays everything else the
+/// runtime runs. The end of every helper task is
+/// counted by its system whichever way the task ends; an end by a panic, or by
+/// a cancellation that dropped values, is logged only with the `tracing`
+/// feature. A priority lane's helper task that was handed a slot which its
+/// sender then gave back can stay parked until the last sender of that lane is
+/// dropped, which is bounded by the life of the actor's handles and costs no
+/// CPU. On some Tokio releases a blocked sender that is
+/// handed the slot the actor's last receive freed, and is then dropped, does
+/// not wake the receiver.
 ///
 /// # Compile-time contracts
 ///
@@ -168,6 +229,11 @@ use supervision::{SupervisionConfig, ABORT_SETTLE, DEFAULT_KILL_GRACE};
 /// An actor, and the message and response types it declares, must also be
 /// `'static`: nothing borrowed from outside can be named in `Self`,
 /// `Message`, or `Response`.
+///
+/// An actor's own fields are reachable only from its task. A message type must
+/// be `Send + 'static`, which still admits shared state such as
+/// `Arc<Mutex<T>>`, and handler code can reach statics and thread-locals;
+/// state shared that way is shared.
 ///
 /// ```compile_fail
 /// // error[E0477]: the type `&'a str` does not fulfill the required lifetime
@@ -213,6 +279,13 @@ pub trait Actor: Sized + Send + 'static {
     ///
     /// Implementations that acquire resources must clean up before returning `Err`
     /// (self-cleaning pattern), as `on_stopped` will not be called on init failure.
+    ///
+    /// A `Kill` already on the actor's stop lane when its task first runs ends
+    /// the actor before any start hook begins, so an incarnation's `pre_start`
+    /// may never begin; a `Kill` raised while `pre_start` runs skips
+    /// `on_started`. A counter in `pre_start` can therefore read fewer runs
+    /// than the instances a supervised child's factory built: count the
+    /// instances in the factory instead.
     fn pre_start(
         &mut self,
         _ctx: &mut ActorContext<Self>,
@@ -244,6 +317,12 @@ pub trait Actor: Sized + Send + 'static {
     /// uncaught exception kills the process the same way whether it came from
     /// a `call` or a `cast`). Crash cleanup belongs in [`on_stopped`](Self::on_stopped),
     /// not in `handle` itself.
+    ///
+    /// To pipeline, as the actor model's `become` does, update state, hand the
+    /// rest of the work to a task or a child actor, and take its result later
+    /// as a message. To postpone a message, push it onto a bounded queue in the
+    /// actor's own fields and replay it from `handle` once the state allows;
+    /// the queue sits outside the mailbox bound, so cap it yourself.
     fn handle(
         &mut self,
         msg: Self::Message,
@@ -252,6 +331,12 @@ pub trait Actor: Sized + Send + 'static {
 
     /// Phase 4a: Stop gate. Return `false` to reject graceful/parent-requested stops.
     /// Forced stops (`Failure`, `ParentKilled`, `Cancelled`) bypass this hook entirely.
+    ///
+    /// If it panics, the actor's exit reason is that panic as a `Failure`,
+    /// unless a `Failure` request raised while it ran already stands as the
+    /// reason, which then stays, or a `Kill` raised while it ran ends the actor
+    /// with `Kill`; the panic is recorded as the last error in every case but
+    /// the `Kill`.
     fn pre_stop(
         &mut self,
         _reason: &StopReason,
@@ -262,6 +347,19 @@ pub trait Actor: Sized + Send + 'static {
 
     /// Phase 4b: Cleanup. Release resources, notify peers.
     /// OTP equivalent: `terminate(Reason, State)`.
+    ///
+    /// If it returns `Err` or panics, the actor's exit reason is that failure,
+    /// unless a `Failure` already stands as the reason, which then stays, or a
+    /// `Kill` raised while it ran, which is the final reason.
+    ///
+    /// A caller whose request failed in `handle`, and one whose request is
+    /// still queued when the actor stops, are answered only after this hook
+    /// returns and after the teardown of the actor's children: awaiting such a
+    /// caller from here waits on an answer this hook holds back. A child of
+    /// this actor that is such a caller cannot take this actor's stop request
+    /// while its handler waits for the answer, so this actor's shutdown window
+    /// for it runs out and it is killed instead of stopped in order (under
+    /// `Shutdown::Infinity` the window never runs out).
     fn on_stopped(
         &mut self,
         _reason: &StopReason,
@@ -274,6 +372,15 @@ pub trait Actor: Sized + Send + 'static {
     ///
     /// The [`ChildEvent`] contains the child's identity, stop reason, and the
     /// [`SupervisionAction`](crate::types::SupervisionAction) taken by the runtime.
+    ///
+    /// A child's death, once the task that watches the child has reported it to
+    /// the supervisor's death plane, is received ahead
+    /// of the messages that child sent before it ended and that are still
+    /// queued, because the death plane outranks the priority lane and the
+    /// mailbox: this can run before `handle` sees the child's last messages,
+    /// where Erlang/OTP delivers a child's last messages to a trapping parent
+    /// before its exit by default; an OTP 28 parent that links with the
+    /// priority option gets this order.
     ///
     /// Returning `Err` stops this supervisor with that failure, the same
     /// contract [`handle`](Self::handle) has (OTP: a callback that fails
@@ -290,11 +397,14 @@ pub trait Actor: Sized + Send + 'static {
     /// (a spawn returns
     /// [`SpawnError::SupervisorStopping`]),
     /// and an `Err` returned here, or a panic, makes the supervisor's exit
-    /// reason `Failure` once `on_stopped` has returned, as an `Err` from
-    /// `on_stopped` does, and is recorded as its last error, while the
-    /// remaining deliveries still run. A child whose end comes after the
-    /// supervisor has collected the deaths still pending when its message
-    /// loop ended, one stopped by the supervisor's own teardown included, is
+    /// reason `Failure` once `on_stopped` has returned, unless a `Failure`
+    /// already stands as its exit reason, as an `Err` from `on_stopped` does,
+    /// or a `Kill` raised meanwhile ends the actor with `Kill` and no
+    /// `on_stopped`; the failure is recorded as its last error in every case,
+    /// and the remaining deliveries still run unless that `Kill` ends them. A
+    /// child whose end comes after the supervisor has collected the deaths
+    /// still pending when its message loop ended, one stopped by the
+    /// supervisor's own teardown included, is
     /// not reported here; with the `tracing` feature, such an end with an
     /// unexpected reason is logged as a warning. A supervisor whose
     /// `pre_start` or `on_started` fails receives none: it never ran its
@@ -337,14 +447,55 @@ enum SpawnAck {
     /// Skip the ack entirely: `.await` returns as soon as the task is
     /// spawned, before `pre_start` ever runs.
     Detached,
-    /// Await the init ack, bounded by a deadline; on expiry the task is
-    /// aborted and no lifecycle hook runs.
+    /// Await the init ack, bounded by a deadline; on expiry the start is cut:
+    /// `Kill` is raised on the actor's stop lane and the task is aborted.
     Timeout(Duration),
 }
 
 /// Builder for spawning an actor with optional name, system, config, and supervision.
 ///
 /// Created by [`ActorExt::spawn`]. Implements [`IntoFuture`] so you can `.await` it directly.
+///
+/// # Runtime
+///
+/// The actor runs on the Tokio runtime current at the spawn, and a spawn with
+/// none current returns [`SpawnError::MissingRuntime`] (a configuration with a
+/// zero mailbox capacity is refused first, on any runtime). A runtime built
+/// without the time driver (`Builder::enable_time` or `enable_all`) runs
+/// plain actors (actors with no timer and no supervised child): spawn, send
+/// and a graceful stop need no timer. Everything that sleeps needs the
+/// driver, and on a runtime without it behaves as
+/// follows:
+///
+/// - a recurring or one-shot timer of an actor panics in its own task at its
+///   first poll, and the actor keeps running without it;
+/// - a `Kill` aborts the actor's task at once, with no kill grace, because the
+///   system's reaper panics as soon as it is given an entry and aborts the
+///   tasks it holds as it unwinds;
+/// - a call that bounds its wait on the calling runtime, such as
+///   [`start_timeout`](Self::start_timeout),
+///   [`ActorHandle::stop_within`](crate::actor::handle::ActorHandle::stop_within)
+///   and [`ActorSystem::kill_by_id`](crate::system::ActorSystem::kill_by_id),
+///   panics before it changes anything when the calling runtime has no time
+///   driver (`stop_within` and `kill_by_id` also panic when no runtime is
+///   current); a call that is refused for a reason that needs no timer, or has
+///   no target to act on, answers its error, `Err` or `None`, first, on any
+///   runtime. Two calls panic later.
+///   [`ActorSystem::shutdown_with`](crate::system::ActorSystem::shutdown_with)
+///   on a system with a root panics at its first wait on that root, after the
+///   system has stopped taking registrations.
+///   [`SubtreeObserver::wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended)
+///   changes nothing, and with no runtime current or a runtime without the
+///   time driver it panics at the first moment it needs a timer: the observed
+///   actor has ended and let go of everything it held, and an actor below it
+///   has not ended. While the actor still runs, or is still letting go of
+///   what it held, it waits without a timer, and a subtree that has ended is
+///   answered without one.
+///
+/// A build with `panic = "abort"` cannot recover from any of these panics:
+/// the first timer of the crate on a runtime without the driver ends the
+/// process. Build every runtime that runs more than plain actors with
+/// `enable_all`.
 ///
 /// # Examples
 /// ```no_run
@@ -382,7 +533,7 @@ impl<A: Actor> std::fmt::Debug for SpawnBuilder<A> {
 }
 
 impl<A: Actor> SpawnBuilder<A> {
-    /// Assigns a name to the actor. The name also serves as the [`ActorId`](crate::types::ActorId).
+    /// Assigns a name to the actor. The name also serves as the [`ActorId`].
     /// Named actors are automatically registered in the actor system.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -433,12 +584,79 @@ impl<A: Actor> SpawnBuilder<A> {
     /// Bounds how long `.await` waits for `pre_start`/`on_started` to finish. A
     /// timeout beyond 30 years is treated as 30 years.
     ///
-    /// On expiry the task is aborted immediately: no lifecycle hook runs
-    /// afterward, matching OTP's untrappable `exit(_, kill)` on a start
-    /// timeout. Before the caller gets [`SpawnError::StartTimeout`], this
-    /// bounded-waits for the aborted task's own teardown (including its
-    /// registry guard drop) to finish, so an immediate retry under the same
-    /// name never races a predecessor that is still unwinding.
+    /// On expiry the system cuts the start, as Erlang/OTP kills a process
+    /// whose start times out: it raises `Kill` on the actor's stop lane and
+    /// requests an abort of the task. The abort takes effect when the task
+    /// next suspends, and the task is dropped there. The `Kill` is read before
+    /// each start hook and at each turn boundary, so once the start has timed
+    /// out no hook begins and no message is handled; a hook that is already
+    /// running finishes first if it never yields, and the actor then ends with
+    /// [`StopReason::Kill`]. Before the caller gets
+    /// [`SpawnError::StartTimeout`], this bounded-waits for the aborted task's
+    /// own teardown (including its registry guard drop) to finish, so an
+    /// immediate retry under the same name does not race a predecessor whose
+    /// teardown ends within that short wait.
+    ///
+    /// The bound holds whether or not the caller keeps waiting: the cut is
+    /// carried out by a task of the system on the actor's runtime, so a caller
+    /// that drops the future, or stores it and never polls it again, still
+    /// finds the actor cut once the timeout has passed if its acknowledgment
+    /// was not ready when the system's task checked for it, and its name free
+    /// as soon as the task suspends or reads the `Kill`, whichever comes first:
+    /// the system waits at most 100 ms for that, and a task that does neither
+    /// in that time, one that never yields included, keeps its name longer. A
+    /// caller is told [`SpawnError::StartTimeout`] only for an actor whose
+    /// start the system cut, or when the system's task ended without deciding
+    /// and the actor's end was not final within the abort settle time after the
+    /// deadline; the handle is returned only for an actor that runs.
+    ///
+    /// The caller only waits for the system's answer and has no bound of its
+    /// own. The task of the system runs on the caller's runtime, which is the
+    /// runtime the actor runs on, so the call needs that runtime to be driven,
+    /// not only entered. If that task panics before it answers, the start is
+    /// cut before the answer channel closes and the caller is told
+    /// `StartTimeout`, unless the task had already accepted the actor's
+    /// acknowledgment: then the actor keeps running and the caller receives the
+    /// handle. If the runtime ends first, the actor ends with it and nothing is
+    /// left to abort.
+    ///
+    /// OTP parity: `proc_lib:start` with a timeout (`sync_start` in
+    /// `proc_lib.erl`) kills the new process in the caller's own receive once
+    /// the timeout passes. A caller that died first is covered only by the link
+    /// `start_link` makes, which `proc_lib:start` does not. Here the system
+    /// takes that step, so it holds whether or not the caller goes on waiting,
+    /// and its wait for the aborted task's teardown is at most 100 ms where OTP
+    /// waits for the `'DOWN'` without a limit: two declared departures.
+    ///
+    /// A zero bound acts at once: `Duration::ZERO` spawns the actor, has the
+    /// system cut its start as soon as the system's task for the bound runs,
+    /// whatever the actor's ack, and answers [`SpawnError::StartTimeout`] once
+    /// the abort has settled;
+    /// `pre_start` and `on_started` may already have run.
+    ///
+    /// # Panics
+    /// The `.await` panics when it is first polled on a runtime without the
+    /// time driver (build it with `Builder::enable_time` or `enable_all`),
+    /// before the actor is spawned or registered: the bound sleeps on the
+    /// calling runtime's timers. That is the only runtime the check
+    /// refuses: a calling runtime that is shutting down or has ended passes
+    /// it. A spawn that is refused for a zero mailbox
+    /// capacity, a system that is shutting down or a name already taken is
+    /// answered with that error first, on any runtime; a name taken between
+    /// that look and the claim still panics on a runtime without the driver.
+    /// With no runtime current the spawn returns [`SpawnError::MissingRuntime`]
+    /// as any spawn does. A caller polled by a foreign executor whose runtime
+    /// has ended before the system answered is answered, with a runtime that
+    /// has the time driver current, from what the system had decided (the
+    /// handle if the start was acknowledged, `SpawnError::StartTimeout` if it
+    /// was cut, otherwise the actor's end as `SpawnError::Killed` or
+    /// `SpawnError::Init`, or `SpawnError::StartTimeout` if that end is still
+    /// not final when the abort settle time after the deadline has passed) and
+    /// waits on that runtime's timers only for an end that is not yet final. A
+    /// poll with no runtime context panics, as any Tokio timer does, unless
+    /// the start was acknowledged.
+    /// With `panic = "abort"` there is no check at the entry: the first
+    /// timer the call uses on a runtime without the driver ends the process.
     pub fn start_timeout(mut self, timeout: Duration) -> Self {
         self.ack = SpawnAck::Timeout(timeout);
         self
@@ -466,6 +684,13 @@ impl<A: Actor> SpawnBuilder<A> {
     /// that call. A grace beyond 30 years is capped there, so in practice it
     /// never aborts. A callback that never yields survives the abort as well
     /// and is reported unresponsive.
+    ///
+    /// `kill_grace(Duration::ZERO)` gives Erlang/OTP's kill latency for a
+    /// callback that awaits; a grace beyond any practical bound keeps every turn
+    /// whole, and makes every wait that runs on that grace, its parent's stop
+    /// budget included, last for the grace, which in practice is as long as
+    /// under `Shutdown::Infinity`, while `stop_within(StopReason::Kill, d)`
+    /// still aborts after `d`.
     pub fn kill_grace(mut self, grace: Duration) -> Self {
         self.kill_grace = grace;
         self
@@ -478,27 +703,31 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let id_str = self
-                .name
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // The caller's `String` is copied once into one shared allocation,
+            // which the id, the registry key, the guard and the context all
+            // hold.
+            let name: Option<Arc<str>> = self.name.map(Arc::from);
+            let id_str: ActorId = match &name {
+                Some(name) => ActorId::from_shared(name.clone()),
+                None => ActorId::anonymous(),
+            };
 
             match self.ack {
                 SpawnAck::Detached => runtime::into_actor(
                     id_str,
                     self.actor,
                     self.config,
-                    self.name,
+                    name,
                     self.system,
                     self.kill_grace,
                 ),
                 SpawnAck::Await => {
                     let (tx, rx) = oneshot::channel();
                     let (handle, _join, _subtree) = runtime::spawn_actor(
-                        id_str.into(),
+                        id_str,
                         self.actor,
                         self.config,
-                        self.name,
+                        name,
                         self.system,
                         Some(tx),
                         true,
@@ -514,40 +743,29 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                     }
                 }
                 SpawnAck::Timeout(timeout) => {
+                    // What needs no timer is answered first; the timer check
+                    // comes next, and everything that changes state after it.
+                    runtime::spawn_precheck(&self.config, self.system.as_ref(), name.as_deref())?;
+                    crate::time_probe::require_timers_if_in_runtime("SpawnBuilder::start_timeout");
+                    let requested = self.system.clone();
                     let (tx, rx) = oneshot::channel();
                     let (handle, join, _subtree) = runtime::spawn_actor(
-                        id_str.into(),
+                        id_str.clone(),
                         self.actor,
                         self.config,
-                        self.name,
+                        name,
                         self.system,
                         Some(tx),
                         true,
                         self.kill_grace,
                         None,
                     )?;
-                    match tokio::time::timeout(runtime::bounded_wait(timeout), rx).await {
-                        Ok(Ok(Ok(()))) => Ok(handle),
-                        Ok(Ok(Err(err))) => Err(SpawnError::Init(Box::new(err))),
-                        // Same closed-ack rule as the no-deadline path above.
-                        Ok(Err(_)) => Err(closed_ack_error(&handle).await),
-                        Err(_elapsed) => {
-                            // Unconditional, untrappable: matches OTP's
-                            // exit(_, kill) on a start timeout. No lifecycle
-                            // hook runs; the task is dropped mid-poll.
-                            handle
-                                .stop_lane()
-                                .abort_record()
-                                .abort(&join.abort_handle());
-                            // Bounded wait for the abort to actually finish
-                            // the task's teardown (including its registry
-                            // guard drop) before reporting the timeout, so a
-                            // caller that immediately retries under the same
-                            // name never races a still-unwinding predecessor.
-                            let _ = tokio::time::timeout(ABORT_SETTLE, join).await;
-                            Err(SpawnError::StartTimeout)
-                        }
-                    }
+                    let target = requested.unwrap_or_else(ActorSystem::default);
+                    // Boxed, so only a timed spawn carries the bound's state.
+                    Box::pin(start_bound::bounded_start(
+                        &target, id_str, handle, join, rx, timeout,
+                    ))
+                    .await
                 }
             }
         })
@@ -585,13 +803,17 @@ pub trait ActorExt: Actor + Sized {
     /// `.with_config()` before awaiting.
     ///
     /// By default `.await` acks the actor's initialization: it does not return
-    /// until `pre_start` and `on_started` have both run, with no deadline (OTP
-    /// `start_link` infinity-default parity). An `Err` from either surfaces
+    /// until `pre_start` and `on_started` have both run, with no deadline
+    /// unless one is set. An `Err` from either surfaces
     /// here as [`SpawnError::Init`], unless a `Kill` reaches the actor's end
     /// before its reason is final: the spawn then reads [`SpawnError::Killed`],
     /// as the actor's status plane reads `Kill`. Chain `.detached()` for a
     /// fire-and-forget spawn that returns before initialization runs, or
     /// `.start_timeout(dur)` to bound the wait.
+    ///
+    /// To spawn without waiting, as Erlang/OTP's `spawn_request` does,
+    /// `tokio::spawn` the spawn future (it is `Send`) and `notify` its result
+    /// back to the actor that asked.
     fn spawn(self) -> SpawnBuilder<Self> {
         SpawnBuilder {
             actor: self,

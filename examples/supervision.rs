@@ -57,7 +57,7 @@ impl Actor for UnstableWorker {
     }
 }
 
-/// A supervisor that spawns and monitors an UnstableWorker.
+/// A supervisor that spawns and supervises an UnstableWorker.
 struct WorkerSupervisor;
 
 impl Actor for WorkerSupervisor {
@@ -104,9 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_supervision(sup_config)
         .await?;
 
-    // Let the supervisor spawn the child
-    sleep(Duration::from_millis(50)).await;
-
+    // The awaited spawn ran on_started, so the child already exists
     let status = sup.get_status().await?;
     println!("Supervisor status: {} child(ren)\n", status.child_count);
 

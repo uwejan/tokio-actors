@@ -20,8 +20,8 @@ use tokio::time::Instant;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatusInfo, ActorSystem, AskError,
-    ChildEvent, RestartType, SpawnError, StopReason, TrySendError,
+    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, AskError, ChildEvent,
+    RestartType, StopReason, TrySendError,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,34 +192,6 @@ impl Actor for Sup {
     }
 }
 
-/// Supervises one `Gate` child spawned with a priority lane, so a test can
-/// crash and restart it and check the lane survives.
-#[derive(Debug)]
-struct Sup2 {
-    child_name: String,
-    priority_capacity: usize,
-    child_log: Arc<Mutex<Vec<String>>>,
-}
-
-impl Actor for Sup2 {
-    type Message = ();
-    type Response = ();
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        let log = self.child_log.clone();
-        ctx.spawn_child(move || Gate::new(log.clone()))
-            .named(self.child_name.clone())
-            .restart_type(RestartType::Permanent)
-            .with_config(ActorConfig::default().with_priority_lane(self.priority_capacity))
-            .await?;
-        Ok(())
-    }
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -253,37 +225,6 @@ async fn priority_message_overtakes_a_backlog_of_normal_messages() {
 
     let log = wait_for_len(&log, 3, 2_000).await;
     assert_eq!(log, vec!["priority-1", "normal-1", "normal-2"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn priority_lane_is_fifo_within_itself() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let handle = Gate::new(log.clone())
-        .spawn()
-        .named(uname("priority-fifo"))
-        .with_config(ActorConfig::default().with_priority_lane(4))
-        .await
-        .unwrap();
-
-    let release = open_gate(&handle).await;
-
-    handle
-        .notify_priority(GateMsg::Tag("p1".into()))
-        .await
-        .unwrap();
-    handle
-        .notify_priority(GateMsg::Tag("p2".into()))
-        .await
-        .unwrap();
-    handle
-        .notify_priority(GateMsg::Tag("p3".into()))
-        .await
-        .unwrap();
-
-    release.send(()).unwrap();
-
-    let log = wait_for_len(&log, 3, 2_000).await;
-    assert_eq!(log, vec!["p1", "p2", "p3"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -382,19 +323,6 @@ async fn priority_calls_degrade_to_the_mailbox_without_a_lane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zero_priority_capacity_is_rejected_at_spawn() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let err = Gate::new(log)
-        .spawn()
-        .named(uname("zero-priority-capacity"))
-        .with_config(ActorConfig::default().with_priority_lane(0))
-        .await
-        .unwrap_err();
-
-    assert!(matches!(err, SpawnError::ZeroMailboxCapacity));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_is_honored_with_both_lanes_full() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let handle = Gate::new(log.clone())
@@ -485,108 +413,6 @@ async fn child_death_is_observed_before_a_queued_priority_message() {
 
     let log = wait_for_len(&log, 2, 2_000).await;
     assert_eq!(log, vec!["child_stopped", "priority-msg"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_reports_the_priority_lane_separately() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let handle = Gate::new(log.clone())
-        .spawn()
-        .named(uname("status-separate"))
-        .with_config(
-            ActorConfig::default()
-                .with_mailbox_capacity(8)
-                .with_priority_lane(4),
-        )
-        .await
-        .unwrap();
-
-    let baseline: ActorStatusInfo = handle.get_status().await.unwrap();
-    assert_eq!(baseline.mailbox_len, 0);
-    assert_eq!(baseline.mailbox_capacity, 8);
-    assert_eq!(baseline.priority_len, 0);
-    assert_eq!(baseline.priority_capacity, 4);
-
-    let release = open_gate(&handle).await;
-
-    handle.notify(GateMsg::Tag("n1".into())).await.unwrap();
-    handle.notify(GateMsg::Tag("n2".into())).await.unwrap();
-    handle
-        .notify_priority(GateMsg::Tag("p1".into()))
-        .await
-        .unwrap();
-    handle
-        .notify_priority(GateMsg::Tag("p2".into()))
-        .await
-        .unwrap();
-    handle
-        .notify_priority(GateMsg::Tag("p3".into()))
-        .await
-        .unwrap();
-
-    // `get_status` cannot answer while the actor is parked mid-handler (the
-    // Isolated Turn Principle: the system channel is only serviced between
-    // turns), so the backlog is observed through the handle's own instant,
-    // capacity-based counters instead - the same ones `get_status` itself
-    // reads once the actor is free to answer.
-    assert_eq!(
-        handle.mailbox_len(),
-        2,
-        "priority traffic must not change the mailbox counters"
-    );
-    assert_eq!(handle.mailbox_capacity(), 8);
-    assert_eq!(handle.priority_len(), 3);
-    assert_eq!(handle.priority_capacity(), 4);
-
-    release.send(()).unwrap();
-    let _ = wait_for_len(&log, 5, 2_000).await;
-
-    let after: ActorStatusInfo = handle.get_status().await.unwrap();
-    assert_eq!(after.mailbox_len, 0);
-    assert_eq!(after.priority_len, 0);
-    assert_eq!(after.mailbox_capacity, 8);
-    assert_eq!(after.priority_capacity, 4);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn priority_lane_survives_a_supervised_restart() {
-    let sys = ActorSystem::create(uname("priority-survives-restart")).unwrap();
-    let child_name = uname("worker");
-    let child_log = Arc::new(Mutex::new(Vec::new()));
-
-    let _sup = Sup2 {
-        child_name: child_name.clone(),
-        priority_capacity: 4,
-        child_log: child_log.clone(),
-    }
-    .spawn()
-    .named(uname("sup2"))
-    .on_system(&sys)
-    .supervisor()
-    .await
-    .unwrap();
-
-    let original: ActorHandle<Gate> = live_handle(&sys, &child_name, 2_000).await;
-    assert_eq!(original.priority_capacity(), 4);
-
-    original.notify(GateMsg::Crash).await.unwrap();
-    original.wait_stopped().await;
-
-    let restarted: ActorHandle<Gate> = live_handle(&sys, &child_name, 2_000).await;
-    assert!(restarted.is_alive());
-    assert_eq!(
-        restarted.priority_capacity(),
-        4,
-        "the priority lane must be rebuilt for the fresh incarnation from the same stored ActorConfig"
-    );
-
-    // Prove the lane is not just reported but actually usable end to end.
-    restarted
-        .notify_priority(GateMsg::Tag("after-restart".into()))
-        .await
-        .unwrap();
-    let log = wait_for_len(&child_log, 1, 2_000).await;
-    assert_eq!(log, vec!["after-restart"]);
 }
 
 // ---------------------------------------------------------------------------

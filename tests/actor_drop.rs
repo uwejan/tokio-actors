@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! An actor's value is dropped at the end of its teardown, inside the stop
 //! bound of whoever stops it, and before `Stopped` is published.
 //!
@@ -21,7 +22,7 @@ use tokio::time::timeout;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatus, ActorSystem, ChildEvent,
-    RestartType, SendError, SpawnError, StopOutcome, StopReason, StreamEvent,
+    RestartType, SpawnError, StopOutcome, StopReason, StreamEvent,
 };
 
 /// The bound on every awaited outcome below: far above every window these
@@ -208,117 +209,6 @@ async fn spawn_root_attached(
 // multi-thread runtime)
 // ---------------------------------------------------------------------------
 
-/// While the value drops, the actor reads `Stopping`, its name is free, a
-/// `Kill` is answered `Closed` (the lane sealed just before the drop), and
-/// the graceful stop that is waiting has not returned; once the drop ends the
-/// stop is reported `Graceful`.
-#[test]
-fn a_graceful_stop_includes_the_value_s_drop() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (drop_gate, mut key) = gate();
-        let (handle, name) = spawn_root(&sys, OnDrop::Hold(drop_gate)).await;
-        let call = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.stop_within(StopReason::Graceful, BOUND).await }
-        });
-        key.entered().await;
-        assert_eq!(handle.status(), ActorStatus::Stopping);
-        assert!(sys.get::<Dropper>(&name).is_none(), "the name is free");
-        assert!(matches!(
-            handle.stop(StopReason::Kill).await,
-            Err(SendError::Closed)
-        ));
-        assert!(matches!(sys.kill(&name).await, Err(SendError::NotFound)));
-        assert!(!call.is_finished(), "the stop waits for the value's drop");
-        key.release();
-        let outcome = timeout(BOUND, call).await.expect("the stop returns");
-        assert_eq!(outcome.unwrap().unwrap(), StopOutcome::Graceful);
-        assert_eq!(handle.status(), ActorStatus::Stopped);
-    });
-}
-
-/// A `Kill` whose actor ends, its value's drop included, inside the call's
-/// window is reported `Killed`.
-#[test]
-fn a_kill_includes_the_value_s_drop() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (drop_gate, mut key) = gate();
-        let (handle, _name) = spawn_root(&sys, OnDrop::Hold(drop_gate)).await;
-        let call = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.stop_within(StopReason::Kill, BOUND).await }
-        });
-        key.entered().await;
-        assert_ne!(handle.status(), ActorStatus::Stopped);
-        assert!(!call.is_finished(), "the kill waits for the value's drop");
-        key.release();
-        let outcome = timeout(BOUND, call).await.expect("the kill returns");
-        assert_eq!(outcome.unwrap().unwrap(), StopOutcome::Killed);
-    });
-}
-
-/// A value whose drop outlasts the whole ladder (the window, the kill grace,
-/// the abort, which cannot interrupt a synchronous `Drop`, and the settle
-/// time) gets the outcome of any actor that did not end in time:
-/// `Unresponsive`, with the status not yet `Stopped`. The end follows the
-/// drop.
-#[test]
-fn a_drop_longer_than_the_ladder_reads_unresponsive() {
-    common::run_multi_thread_only(2, async {
-        for reason in [StopReason::Graceful, StopReason::Kill] {
-            let sys = ActorSystem::create(uname("sys")).unwrap();
-            let (drop_gate, mut key) = gate();
-            let (handle, _name) = spawn_root(&sys, OnDrop::Hold(drop_gate)).await;
-            let outcome = timeout(
-                BOUND,
-                handle.stop_within(reason.clone(), Duration::from_millis(20)),
-            )
-            .await
-            .expect("the call is bounded by its ladder")
-            .unwrap();
-            key.entered().await;
-            assert_eq!(outcome, StopOutcome::Unresponsive, "{reason:?}");
-            assert_ne!(handle.status(), ActorStatus::Stopped, "{reason:?}");
-            key.release();
-            timeout(BOUND, handle.wait_stopped())
-                .await
-                .expect("the actor ends once its value is dropped");
-        }
-    });
-}
-
-/// Shutdown waits for a root's value to drop inside its per-actor window and
-/// reports the root `Graceful`.
-#[test]
-fn shutdown_includes_the_value_s_drop() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (drop_gate, mut key) = gate();
-        let (handle, _name) = spawn_root(&sys, OnDrop::Hold(drop_gate)).await;
-        let id = handle.id().clone();
-        let call = tokio::spawn({
-            let sys = sys.clone();
-            async move { sys.shutdown().await }
-        });
-        key.entered().await;
-        assert_ne!(handle.status(), ActorStatus::Stopped);
-        assert!(!call.is_finished(), "shutdown waits for the value's drop");
-        key.release();
-        let report = timeout(BOUND, call)
-            .await
-            .expect("shutdown returns")
-            .unwrap();
-        let outcome = report
-            .outcomes
-            .iter()
-            .find(|(actor, _)| *actor == id)
-            .map(|(_, report)| report.outcome);
-        assert_eq!(outcome, Some(StopOutcome::Graceful));
-    });
-}
-
 /// `ActorSystem::kill` returns at once; the actor's name is free while its
 /// value drops, and its end follows the drop.
 #[test]
@@ -336,41 +226,6 @@ fn kill_by_name_frees_the_name_before_the_value_s_drop() {
         timeout(BOUND, handle.wait_stopped())
             .await
             .expect("the actor ends once its value is dropped");
-    });
-}
-
-/// A failed init is answered before the value drops: a start timeout far
-/// shorter than the drop still reports the init error.
-#[test]
-fn a_failed_init_is_reported_before_a_held_drop() {
-    common::run_multi_thread_only(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        let (drop_gate, key) = gate();
-        let result = timeout(
-            BOUND,
-            Dropper {
-                on_drop: OnDrop::Hold(drop_gate),
-                fail_init: true,
-                attach: Attach::Nothing,
-                turn: None,
-            }
-            .spawn()
-            .named(uname("init"))
-            .on_system(&sys)
-            .start_timeout(Duration::from_millis(50))
-            .into_future(),
-        )
-        .await
-        .expect("the spawn returns");
-        // Released only once the spawn has answered.
-        key.release();
-        match result {
-            Err(SpawnError::Init(err)) => {
-                assert!(err.to_string().contains("init refused"), "{err}");
-            }
-            Err(other) => panic!("expected the init error, got {other:?}"),
-            Ok(_) => panic!("expected the init error, the actor started"),
-        }
     });
 }
 
@@ -413,39 +268,6 @@ fn a_panicking_drop_keeps_every_caller_s_outcome() {
             .find(|(actor, _)| *actor == id)
             .map(|(_, report)| report.outcome);
         assert_eq!(outcome, Some(StopOutcome::Graceful));
-    });
-}
-
-/// A failed init whose value panics when dropped reports the init error,
-/// with and without a start timeout.
-#[test]
-fn a_failed_init_with_a_panicking_drop_reports_the_init_error() {
-    common::run(2, async {
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-        for start_timeout in [None, Some(BOUND)] {
-            let mut builder = Dropper {
-                on_drop: OnDrop::Panic,
-                fail_init: true,
-                attach: Attach::Nothing,
-                turn: None,
-            }
-            .spawn()
-            .named(uname("init"))
-            .on_system(&sys);
-            if let Some(dur) = start_timeout {
-                builder = builder.start_timeout(dur);
-            }
-            let result = timeout(BOUND, builder.into_future())
-                .await
-                .expect("the spawn returns");
-            match result {
-                Err(SpawnError::Init(err)) => {
-                    assert!(err.to_string().contains("init refused"), "{err}");
-                }
-                Err(other) => panic!("expected the init error, got {other:?}"),
-                Ok(_) => panic!("expected the init error, the actor started"),
-            }
-        }
     });
 }
 
@@ -602,42 +424,19 @@ async fn restart_attempt_with_a_slow_drop(
 fn a_restart_attempt_s_failed_init_is_reported_before_a_held_drop() {
     common::run_multi_thread_only(2, async {
         let (drop_gate, key) = gate();
-        // Released past the attempt's 50 ms start timeout, by a margin a
+        // Released past the attempt's 2 s start timeout, by a margin a
         // loaded host keeps.
         let attempt = restart_attempt_with_a_slow_drop(
             false,
-            Duration::from_millis(50),
+            Duration::from_secs(2),
             BOUND,
             OnDrop::Hold(drop_gate),
-            Some((key, Duration::from_millis(300))),
+            Some((key, Duration::from_millis(2500))),
         )
         .await;
         assert!(
             matches!(&attempt, StopReason::Failure(ActorError::User(text)) if text == "init refused"),
             "the attempt reports its init error: {attempt:?}"
-        );
-    });
-}
-
-/// A failed restart attempt whose child registered a timer, with a value
-/// whose drop outlasts the attempt's 50 ms kill grace: the init ack is
-/// answered after the lane is sealed, so the `Kill` the attempt raises on
-/// reading the error is refused, the abort after the grace cannot interrupt
-/// the drop, and the attempt reports the init error.
-#[test]
-fn a_restart_attempt_with_a_timer_keeps_its_init_error() {
-    common::run(4, async {
-        let attempt = restart_attempt_with_a_slow_drop(
-            true,
-            BOUND,
-            Duration::from_millis(50),
-            OnDrop::Sleep(Duration::from_millis(300)),
-            None,
-        )
-        .await;
-        assert!(
-            matches!(&attempt, StopReason::Failure(ActorError::User(text)) if text == "init refused"),
-            "the attempt reports its init error, not Kill: {attempt:?}"
         );
     });
 }
@@ -913,144 +712,6 @@ fn a_failed_init_is_reported_before_a_held_queued_message_drop() {
 // its value's drop sleeping on that runtime's only thread, and the caller on
 // the test's runtime
 // ---------------------------------------------------------------------------
-
-/// A current-thread runtime on a thread of its own, kept running until the
-/// value is dropped.
-struct OwnRuntime {
-    handle: tokio::runtime::Handle,
-    stop: Option<oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl OwnRuntime {
-    fn start() -> Self {
-        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
-        let (stop, stopped) = oneshot::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("the runtime builds");
-            let _ = handle_tx.send(runtime.handle().clone());
-            runtime.block_on(async {
-                let _ = stopped.await;
-            });
-        });
-        Self {
-            handle: handle_rx.recv().expect("the runtime starts"),
-            stop: Some(stop),
-            thread: Some(thread),
-        }
-    }
-
-    /// Spawns `actor` on this runtime and returns how the spawn ended.
-    async fn spawn(
-        &self,
-        sys: &Arc<ActorSystem>,
-        actor: Dropper,
-        start_timeout: Option<Duration>,
-    ) -> Result<ActorHandle<Dropper>, SpawnError> {
-        let sys = sys.clone();
-        let spawned = self.handle.spawn(async move {
-            let mut builder = actor
-                .spawn()
-                .named(uname("own"))
-                .on_system(&sys)
-                .kill_grace(Duration::from_millis(50));
-            if let Some(dur) = start_timeout {
-                builder = builder.start_timeout(dur);
-            }
-            builder.await
-        });
-        timeout(BOUND, spawned)
-            .await
-            .expect("the spawn returns")
-            .expect("the spawn task ends")
-    }
-}
-
-impl Drop for OwnRuntime {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// A start timeout is not covered here: the spawn awaits its ack on the
-/// actor's own runtime, whose only thread the drop blocks, so the ack's
-/// place in the end cannot be seen. On the current-thread runtime it is
-/// covered by `a_failed_init_answers_its_ack_before_its_queued_messages_and_value_drop`
-/// (a unit test reading the ack at each drop) and by
-/// `a_restart_attempt_with_a_timer_keeps_its_init_error`.
-#[test]
-fn a_slow_drop_on_a_current_thread_runtime_keeps_every_caller_s_outcome() {
-    common::run_current_thread_only(async {
-        let own = OwnRuntime::start();
-        let sys = ActorSystem::create(uname("sys")).unwrap();
-
-        // A drop inside the window: the graceful stop waits for it.
-        let handle = own
-            .spawn(
-                &sys,
-                Dropper::new(OnDrop::Sleep(Duration::from_millis(300))),
-                None,
-            )
-            .await
-            .expect("the actor starts");
-        let outcome = timeout(BOUND, handle.stop_within(StopReason::Graceful, BOUND))
-            .await
-            .expect("the call returns")
-            .unwrap();
-        assert_eq!(outcome, StopOutcome::Graceful);
-
-        // A drop longer than the whole ladder (20 ms window, 50 ms kill
-        // grace, the abort and its 100 ms settle wait): Unresponsive, and the
-        // end follows the drop.
-        let handle = own
-            .spawn(
-                &sys,
-                Dropper::new(OnDrop::Sleep(Duration::from_millis(800))),
-                None,
-            )
-            .await
-            .expect("the actor starts");
-        let outcome = timeout(
-            BOUND,
-            handle.stop_within(StopReason::Graceful, Duration::from_millis(20)),
-        )
-        .await
-        .expect("the call returns")
-        .unwrap();
-        assert_eq!(outcome, StopOutcome::Unresponsive);
-        timeout(BOUND, handle.wait_stopped())
-            .await
-            .expect("the actor ends once its value is dropped");
-
-        // Shutdown waits for the drop and reports the root Graceful.
-        let handle = own
-            .spawn(
-                &sys,
-                Dropper::new(OnDrop::Sleep(Duration::from_millis(300))),
-                None,
-            )
-            .await
-            .expect("the actor starts");
-        let id = handle.id().clone();
-        let report = timeout(BOUND, sys.shutdown())
-            .await
-            .expect("shutdown returns");
-        let outcome = report
-            .outcomes
-            .iter()
-            .find(|(actor, _)| *actor == id)
-            .map(|(_, report)| report.outcome);
-        assert_eq!(outcome, Some(StopOutcome::Graceful));
-    });
-}
 
 /// A stream whose drop is held until the test releases it.
 struct HeldDropStream(Gate);

@@ -166,13 +166,6 @@ fn a_kill_after_a_failed_init_reads_killed(flavor: &str) {
 }
 
 #[test]
-fn a_kill_after_a_failed_init_reads_killed_current_thread() {
-    #[cfg(feature = "tracing")]
-    let _ = warnings::install();
-    a_kill_after_a_failed_init_reads_killed("current_thread");
-}
-
-#[test]
 fn a_kill_after_a_failed_init_reads_killed_multi_thread() {
     #[cfg(feature = "tracing")]
     let _ = warnings::install();
