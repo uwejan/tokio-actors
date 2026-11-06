@@ -4,7 +4,7 @@ use tokio_actors::actor::context::ActorContext;
 use tokio_actors::actor::{Actor, ActorExt};
 use tokio_actors::error::SpawnError;
 use tokio_actors::system::ActorSystem;
-use tokio_actors::{ActorConfig, ActorResult};
+use tokio_actors::{ActorConfig, ActorResult, SupervisionConfig};
 
 #[derive(Debug, Default)]
 struct Ping;
@@ -169,4 +169,53 @@ async fn concurrent_spawn_named_no_race() {
 
     assert_eq!(success_count, 1);
     assert_eq!(failure_count, 1);
+}
+
+/// The whole builder chain on a single-threaded runtime: name, system and
+/// config all take effect.
+#[tokio::test]
+async fn named_on_system_with_config() {
+    let sys = ActorSystem::create(format!("sb-full-{}", uuid::Uuid::new_v4())).unwrap();
+    let config = ActorConfig::default().with_mailbox_capacity(32);
+    let h = Ping
+        .spawn()
+        .named("full-chain")
+        .on_system(&sys)
+        .with_config(config)
+        .await
+        .unwrap();
+    assert_eq!(h.mailbox_capacity(), 32);
+    assert!(sys.get::<Ping>("full-chain").is_some());
+}
+
+/// `named` and `on_system` may be chained in either order.
+#[tokio::test]
+async fn builder_chain_order_independent() {
+    let sys = ActorSystem::create(format!("sb-order-{}", uuid::Uuid::new_v4())).unwrap();
+    // named().on_system()
+    let h1 = Ping.spawn().named("order-a").on_system(&sys).await.unwrap();
+    // on_system().named()
+    let h2 = Ping.spawn().on_system(&sys).named("order-b").await.unwrap();
+    assert!(h1.is_alive());
+    assert!(h2.is_alive());
+    assert!(sys.get::<Ping>("order-a").is_some());
+    assert!(sys.get::<Ping>("order-b").is_some());
+}
+
+#[tokio::test]
+async fn supervisor_parent_default() {
+    let h = Ping.spawn().named("sb-sup").supervisor().await.unwrap();
+    assert!(h.is_alive());
+}
+
+#[tokio::test]
+async fn supervised_parent_custom_config() {
+    let sup = SupervisionConfig::one_for_all().max_restarts(10, std::time::Duration::from_secs(60));
+    let h = Ping
+        .spawn()
+        .named("sb-sup-custom")
+        .with_supervision(sup)
+        .await
+        .unwrap();
+    assert!(h.is_alive());
 }

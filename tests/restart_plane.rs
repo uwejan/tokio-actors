@@ -48,7 +48,9 @@ mod common;
 // Timing / waiting helpers
 // ---------------------------------------------------------------------------
 
-const DEADLINE: Duration = Duration::from_secs(10);
+/// The longest a poll for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const DEADLINE: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +62,7 @@ fn uname(base: &str) -> String {
     )
 }
 
+/// Polls `cond` until it holds. The bound only limits how long a real hang takes to report.
 async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -102,6 +105,7 @@ fn alive_as<A: Actor>(sys: &ActorSystem, name: &str) -> bool {
     sys.get::<A>(name).map(|h| h.is_alive()).unwrap_or(false)
 }
 
+/// Polls until `name` resolves in `sys` to a live handle. The bound only limits how long a real hang takes to report.
 async fn live_handle<A: Actor>(sys: &ActorSystem, name: &str) -> ActorHandle<A> {
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -1358,7 +1362,7 @@ impl Actor for IndependentFailureSup {
 }
 
 /// Waits for an event matching `pred` to appear in `events`, polling like
-/// every other wait helper in this file.
+/// every other wait helper in this file. The bound only limits how long a real hang takes to report.
 async fn wait_for_event(events: &EventLog, what: &str, pred: impl Fn(&ChildEvent) -> bool) {
     let deadline = Instant::now() + DEADLINE;
     loop {

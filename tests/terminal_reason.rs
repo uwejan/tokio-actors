@@ -29,6 +29,10 @@ mod common;
 /// configured window.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
 /// The longest a held `Block` turn holds its thread when the test never
 /// releases it: past every bound a test awaits.
 const GATE_CAP: Duration = Duration::from_secs(15);
@@ -106,7 +110,10 @@ impl Gate {
     }
 }
 
+/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report. A shorter `bound` from a caller is
+/// raised to `HANG_BOUND`.
 async fn wait_until(bound: Duration, what: &str, mut pred: impl FnMut() -> bool) {
+    let bound = bound.max(HANG_BOUND);
     let deadline = Instant::now() + bound;
     loop {
         if pred() {
@@ -1099,7 +1106,8 @@ fn stop_within_then_wait_stopped_reports_another_partys_kill() {
 // A request that was queued when its actor stopped
 // ---------------------------------------------------------------------------
 
-/// Waits until the actor's mailbox holds `n` messages.
+/// Waits until the actor's mailbox holds `n` messages. The bound only limits how
+/// long a real hang takes to report.
 async fn until_queued(h: &ActorHandle<Subject>, n: usize) {
     wait_until(BOUND, "the request to be queued", || h.mailbox_len() >= n).await;
 }

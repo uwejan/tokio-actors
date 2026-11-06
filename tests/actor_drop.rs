@@ -339,8 +339,9 @@ fn kill_by_name_frees_the_name_before_the_value_s_drop() {
     });
 }
 
-/// A failed init is answered before the value drops: a start timeout far
-/// shorter than the drop still reports the init error.
+/// A failed init is answered before the value drops: the drop is held until
+/// the spawn has answered, so an answer that waited for the drop would only
+/// come as the start timeout, and the spawn must report the init error.
 #[test]
 fn a_failed_init_is_reported_before_a_held_drop() {
     common::run_multi_thread_only(2, async {
@@ -357,7 +358,7 @@ fn a_failed_init_is_reported_before_a_held_drop() {
             .spawn()
             .named(uname("init"))
             .on_system(&sys)
-            .start_timeout(Duration::from_millis(50))
+            .start_timeout(Duration::from_secs(2))
             .into_future(),
         )
         .await
@@ -602,14 +603,14 @@ async fn restart_attempt_with_a_slow_drop(
 fn a_restart_attempt_s_failed_init_is_reported_before_a_held_drop() {
     common::run_multi_thread_only(2, async {
         let (drop_gate, key) = gate();
-        // Released past the attempt's 50 ms start timeout, by a margin a
+        // Released past the attempt's 2 s start timeout, by a margin a
         // loaded host keeps.
         let attempt = restart_attempt_with_a_slow_drop(
             false,
-            Duration::from_millis(50),
+            Duration::from_secs(2),
             BOUND,
             OnDrop::Hold(drop_gate),
-            Some((key, Duration::from_millis(300))),
+            Some((key, Duration::from_millis(2500))),
         )
         .await;
         assert!(

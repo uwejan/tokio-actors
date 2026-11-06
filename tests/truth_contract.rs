@@ -13,6 +13,11 @@ use tokio::time::{sleep, Instant};
 
 mod common;
 
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, Shutdown, StopReason,
@@ -479,14 +484,11 @@ async fn dropped_terminate_child_future_stops_a_vetoing_child_body(paused: bool)
     // cannot read the crate's constants, so they are named here once.
     const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
     const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
-    // The child's window, the Kill step, the abort and a margin; on a real-time
-    // runtime a hang bound past that.
-    let precise = Duration::from_millis(200)
-        + ASSUMED_KILL_GRACE
-        + ASSUMED_ABORT_SETTLE
-        + Duration::from_millis(500);
+    // The child's window, the Kill step and the abort, on the exact instant of
+    // the paused clock; on a real-time runtime a hang bound past that.
+    let precise = Duration::from_millis(200) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE;
     let bound = if paused {
-        precise
+        precise + PAUSED_SLACK
     } else {
         precise + Duration::from_secs(10)
     };
@@ -788,7 +790,9 @@ impl Actor for GSup {
         })
         .named(self.b.clone())
         .restart_type(RestartType::Permanent)
-        .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+        // The override lands inside this window, whatever the host does
+        // between a's event and the override.
+        .shutdown(Shutdown::Timeout(Duration::from_millis(2200)))
         .await?;
 
         Ok(())

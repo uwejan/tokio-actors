@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Instant};
 
 use crate::actor::context::ActorContext;
+use crate::actor::runtime::own_unwind_tests::{panic_at_the_end_of, Gate, OpensOnDrop, SlowDrop};
 use crate::actor::runtime::{spawn_actor, ActorConfig};
 use crate::actor::supervision::{
     rules, slot_pair, slot_pair_for, ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState,
@@ -23,8 +24,8 @@ use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult, SupervisionError};
 use crate::system::read_status;
 use crate::types::{
-    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartType, Shutdown, StatusValue,
-    StopReason, SupervisionAction,
+    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartType, Shutdown, StatusRx,
+    StopReason, StreamEvent, SupervisionAction,
 };
 
 static UNIQ: AtomicUsize = AtomicUsize::new(0);
@@ -58,7 +59,7 @@ struct Probe {
     /// The runner stand-in writes the child's verdict before it fails.
     verdict_first: AtomicBool,
     /// The child's status plane, as its supervisor's slot holds it.
-    plane: Mutex<Option<tokio::sync::watch::Receiver<StatusValue>>>,
+    plane: Mutex<Option<StatusRx>>,
     /// Whether the plane read `Stopped` or closed when the child's value was
     /// dropped.
     saw_the_end_at_drop: AtomicBool,
@@ -168,6 +169,48 @@ impl Drop for Vetoer {
             }
         }
         self.probe.ended.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A child that vetoes every request to stop and keeps a stream whose drop
+/// is held by a gate.
+struct HeldChild {
+    probe: Arc<Probe>,
+    gate: Arc<Gate>,
+}
+
+enum HeldChildMsg {
+    Event,
+}
+
+impl From<StreamEvent<()>> for HeldChildMsg {
+    fn from(_event: StreamEvent<()>) -> Self {
+        HeldChildMsg::Event
+    }
+}
+
+impl Actor for HeldChild {
+    type Message = HeldChildMsg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.add_stream(SlowDrop {
+            gate: self.gate.clone(),
+        });
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        _msg: HeldChildMsg,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        self.probe.pre_stops.fetch_add(1, Ordering::SeqCst);
+        false
     }
 }
 
@@ -300,6 +343,9 @@ enum Cmd {
     /// Registers a vetoing worker, with this policy and kill grace, whose
     /// runner is the failing stand-in.
     AdoptWorker(String, Shutdown, Duration),
+    /// Registers a vetoing child with this kill grace and a stream whose drop
+    /// the gate holds, whose runner is the failing stand-in.
+    AdoptHeld(String, Duration, Arc<Gate>),
     /// Registers a child that is itself a supervisor, with this policy and
     /// kill grace and this behavior, whose runner is the failing stand-in.
     AdoptSupervisor(String, Shutdown, Duration, Arc<Shape>),
@@ -357,7 +403,7 @@ impl Sup {
             id.clone(),
             child,
             config,
-            Some(name.clone()),
+            Some(Arc::from(name.clone())),
             Some(system.clone()),
             None,
             false,
@@ -418,7 +464,7 @@ impl Sup {
         let predecessor = ctl.predecessor(subtree);
         sup.registry.register(ChildState {
             id,
-            name: Some(name),
+            name: Some(Arc::from(name)),
             spec: ChildSpec {
                 restart_type: RestartType::Temporary,
                 shutdown,
@@ -445,6 +491,20 @@ impl Actor for Sup {
         ctx: &mut ActorContext<Self>,
     ) -> ActorResult<Self::Response> {
         match cmd {
+            Cmd::AdoptHeld(name, grace, gate) => {
+                let child = HeldChild {
+                    probe: self.probe.clone(),
+                    gate,
+                };
+                self.adopt(
+                    ctx,
+                    name,
+                    child,
+                    ActorConfig::default(),
+                    (Shutdown::Timeout(Duration::from_secs(5)), grace, false),
+                )?;
+                Ok(Ok(()))
+            }
             Cmd::AdoptWith(name, grace) => {
                 let vetoer = Vetoer {
                     probe: self.probe.clone(),
@@ -472,7 +532,7 @@ impl Actor for Sup {
                         probe: self.probe.clone(),
                     },
                     ActorConfig::default(),
-                    Some(name.clone()),
+                    Some(Arc::from(name.clone())),
                     Some(system.clone()),
                     None,
                     false,
@@ -546,7 +606,7 @@ impl Actor for Sup {
                     .insert(task.id(), (id.clone(), incarnation, TaskPlane::Restart));
                 sup.registry.register(ChildState {
                     id,
-                    name: Some(name),
+                    name: Some(Arc::from(name)),
                     spec: ChildSpec {
                         restart_type: RestartType::Temporary,
                         shutdown: Shutdown::Timeout(Duration::from_millis(if hung {
@@ -580,7 +640,7 @@ impl Actor for Sup {
                     let id = ActorId::from(name.clone());
                     sup.registry.register(ChildState {
                         id,
-                        name: Some(name.clone()),
+                        name: Some(Arc::from(name.clone())),
                         spec: ChildSpec {
                             restart_type: RestartType::Permanent,
                             shutdown: Shutdown::Timeout(Duration::from_secs(5)),
@@ -846,9 +906,9 @@ async fn rig_adopting(adopt: impl FnOnce(String) -> Cmd) -> Rig {
     }
 }
 
-/// The child has been asked to stop and vetoed once: its stop is ordered.
+/// The child has been asked to stop and vetoed once: its stop is ordered. The bound only limits how long a real hang takes to report.
 async fn until_vetoed(rig: &Rig) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while rig.probe.pre_stops.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "the child never saw the request");
         sleep(Duration::from_millis(5)).await;
@@ -868,6 +928,15 @@ async fn make_busy(rig: &Rig) {
     child.notify(()).await.expect("the child takes the message");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !rig.probe.in_turn.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the child never began the turn");
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Waits until `probe` reports that a turn of its child began. The bound only limits how long a real hang takes to report.
+async fn until_in_turn(probe: &Probe) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !probe.in_turn.load(Ordering::SeqCst) {
         assert!(Instant::now() < deadline, "the child never began the turn");
         sleep(Duration::from_millis(1)).await;
     }
@@ -1456,6 +1525,61 @@ async fn lost_runner_verdict_waits_the_childs_own_kill_grace() {
 
 // A stuck turn holds a worker until the test ends it and the waits are timed
 // against it, so the body runs on a multi-threaded runtime only.
+/// The incarnation of a lost runner unwinds from its own poll at the end of
+/// its task while a forwarder of its still runs the slow drop of a stream, so
+/// its subtree outlives the task and its plane stays open. The caller
+/// waiting on it is told `ChildUnresponsive` no sooner than the
+/// incarnation's bound (the grace the guard's entry owes plus the settle
+/// time) and within a margin of it, and not when the drop ends; the drop ends
+/// afterwards and the supervisor keeps one verdict.
+async fn a_lost_runners_incarnation_with_a_forwarder_still_dropping_is_judged_at_its_bound() {
+    let bound = OWN_GRACE + ABORT_SETTLE;
+    let gate = Gate::new();
+    let _opens = OpensOnDrop(gate.clone());
+    let rig = rig_adopting(|name| Cmd::AdoptHeld(name, OWN_GRACE, gate.clone())).await;
+    let child = crate::system::ActorSystem::default()
+        .get::<HeldChild>(&rig.name)
+        .expect("the child is registered");
+    child
+        .send(HeldChildMsg::Event)
+        .await
+        .expect("the child has started");
+    panic_at_the_end_of(&rig.name);
+    let call = {
+        let sup = rig.sup.clone();
+        let name = rig.name.clone();
+        tokio::spawn(async move { sup.send(Cmd::Terminate(name)).await })
+    };
+    until_vetoed(&rig).await;
+    let failed_at = Instant::now();
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("the supervisor answers");
+    let took = failed_at.elapsed();
+    let text = answer.expect_err("the call reports what it saw");
+    assert!(text.contains("ChildUnresponsive"), "{text}");
+    assert!(
+        took >= bound,
+        "the verdict waits the child's bound: {took:?}"
+    );
+    assert!(
+        took < bound + STALL_SLACK,
+        "and within a margin of it: {took:?}"
+    );
+    gate.open();
+}
+
+// The drop holds a worker until the test opens the gate, so the body runs on
+// a multi-threaded runtime only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_runners_incarnation_with_a_forwarder_still_dropping_is_judged_at_its_bound_multi_thread(
+) {
+    a_lost_runners_incarnation_with_a_forwarder_still_dropping_is_judged_at_its_bound().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_runner_verdict_waits_the_childs_own_kill_grace_multi_thread() {
     lost_runner_verdict_waits_the_childs_own_kill_grace().await;
@@ -1662,7 +1786,7 @@ async fn a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic() {
         .get::<Vetoer>(&name)
         .expect("the child is registered");
     child.notify(()).await.expect("busy turn");
-    sleep(Duration::from_millis(30)).await;
+    until_in_turn(&probe).await;
     let _ = sup.send(Cmd::FailAttemptThenStop).await;
     let done = timeout(Duration::from_secs(5), sup.wait_stopped()).await;
     assert!(done.is_ok(), "the supervisor's teardown never finished");
@@ -1732,7 +1856,7 @@ async fn a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt
         .get::<Vetoer>(&newer)
         .expect("the child is registered");
     child.notify(()).await.expect("busy turn");
-    sleep(Duration::from_millis(30)).await;
+    until_in_turn(&probe).await;
     let _ = sup.send(Cmd::FailAttemptThenStop).await;
     let done = timeout(Duration::from_secs(5), sup.wait_stopped()).await;
     assert!(
@@ -1784,7 +1908,7 @@ async fn a_final_collection_is_not_held_by_the_replacement_of_a_lost_attempt() {
         .get::<Vetoer>(&x)
         .expect("the child is registered");
     child.notify(()).await.expect("busy turn");
-    sleep(Duration::from_millis(30)).await;
+    until_in_turn(&probe).await;
     // The loop routes the attempt's JoinError: a replacement task follows
     // the live incarnation in the death plane, the ledger stays Restarting.
     let _ = sup.send(Cmd::FailOnly).await;

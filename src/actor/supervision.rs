@@ -20,7 +20,7 @@ use crate::types::{
 };
 
 pub(crate) mod rules;
-mod slot;
+pub(crate) mod slot;
 
 pub(crate) use rules::{
     manual_commit, CommitEffect, GroupMembership, ManualFacts, ManualOp, ManualReply, ReportClass,
@@ -160,7 +160,7 @@ pub(crate) type DeathOutcome = (ActorId, StopReason, u64);
 /// Every effect below is safe to run more than once, and safe to run after
 /// the child has already stopped on its own: raising on an already-closed
 /// lane and aborting an already-finished task are both no-ops. The child's
-/// status watch is never written here at all: `Stopped` is published only by
+/// status plane is never written here at all: `Stopped` is published only by
 /// the child's own run loop reaching its normal exit, so observing it always
 /// means the task actually got there.
 /// [`ActorHandle::wait_stopped`](crate::actor::handle::ActorHandle::wait_stopped)
@@ -177,7 +177,8 @@ pub(crate) struct ChildLinkGuard {
     /// the one this guard was handed turns out to belong to a runtime that
     /// is now gone (see `Drop`, below).
     system: Arc<ActorSystem>,
-    /// The runtime of the supervisor that built this guard: the one whose
+    /// The runtime of the child this guard watches, which is the
+    /// supervisor's unless the child was placed elsewhere: the one whose
     /// reaper the guard was handed, and the one a retry resolves its reaper
     /// on.
     runtime: Handle,
@@ -226,7 +227,7 @@ impl Drop for ChildLinkGuard {
         if !self.armed {
             return;
         }
-        // (a) Raise the child's inherited stop: a plain watch write,
+        // (a) Raise the child's inherited stop: a plain lane write,
         // infallible, and a no-op if the child has already finished its
         // message loop. (b) Enqueue its deadlines with the reaper: a
         // synchronous send on an unbounded feed (this is `Drop`: no awaiting,
@@ -242,6 +243,8 @@ impl Drop for ChildLinkGuard {
         let kill_stored = matches!(self.stop_lane.reason(), Some(StopReason::Kill));
         let entry = match rules::fired_stop(self.inherited, kill_stored) {
             rules::InheritedStop::Kill { grace } => {
+                // The entry below holds the child's abort handle, so no
+                // registry entry is involved and no deadline is declared.
                 self.stop_lane.raise(StopReason::Kill);
                 ReaperEntry::new(
                     saturating_deadline(Instant::now(), grace),
@@ -264,8 +267,8 @@ impl Drop for ChildLinkGuard {
             }
         };
         // The reaper this guard was handed may belong to a runtime that is
-        // gone now: the system feeds the entry to the reaper of the
-        // supervisor's runtime once more before it gives up, which is what
+        // gone now: the system feeds the entry to the reaper of the child's
+        // runtime once more before it gives up, which is what
         // lets the child's full grace survive a runtime change instead of
         // degrading straight to an abort.
         if let Err(mpsc::error::SendError(entry)) = self.reaper.send(entry) {
@@ -380,6 +383,10 @@ impl ChildLifecycle {
 ///
 /// Maps to OTP supervisor child specs: strategy, intensity (max_restarts),
 /// and period (restart_window).
+///
+/// An actor whose only job is supervising (an empty `handle` and short hooks)
+/// is Erlang/OTP's supervisor shape: its supervision events never wait behind
+/// a long user turn.
 #[derive(Debug, Clone)]
 pub struct SupervisionConfig {
     /// The restart strategy to use.
@@ -511,13 +518,12 @@ impl RestartBudget {
 pub(crate) struct ChildSpec {
     pub restart_type: RestartType,
     pub shutdown: Shutdown,
-    /// Bounds the supervisor's wait for this child's initialization to
-    /// complete during a restart. `None` (default) waits indefinitely,
-    /// matching Erlang/OTP supervisor semantics; setting a bound is a
-    /// deliberate deviation that trades strict parity for a supervisor that
-    /// can never be stalled by one child's hung init. Initial spawning never
-    /// awaits initialization (see `spawn_child`), so this bound applies only
-    /// to restarts.
+    /// Bounds the wait for the initialization of each restart of this child.
+    /// `None` (default) waits without a bound, under any `Shutdown`, as an
+    /// Erlang/OTP supervisor does; setting a bound is a deliberate departure
+    /// that trades strict parity for a supervisor that one child's hung
+    /// initialization cannot stall. The first start of a child is never
+    /// awaited (see `spawn_child`), so this bound applies to restarts only.
     ///
     /// Stored here for restart-path lookups; the active reader is the
     /// restart closure's own captured copy (see `spawn_child_internal` in
@@ -550,7 +556,7 @@ pub(crate) struct ChildSpec {
 /// Runtime state for a supervised child.
 pub(crate) struct ChildState {
     pub id: ActorId,
-    pub name: Option<String>,
+    pub name: Option<Arc<str>>,
     pub spec: ChildSpec,
     /// The supervisor's control of the occupant's slot: the stop order it
     /// writes to the occupant's executor, and the cell the executor
@@ -1216,7 +1222,7 @@ impl SupervisionState {
             .map_or_else(|| child.ctl.end_reason(), |event| event.reason.clone());
         let event = ChildEvent {
             child_id: child_id.clone(),
-            child_name: child.name.clone(),
+            child_name: child.name.as_deref().map(str::to_string),
             reason,
             action: SupervisionAction::Removed,
         };
@@ -1298,7 +1304,7 @@ impl SupervisionState {
                     rules::child_info_flags(child.lifecycle, fate_present, in_restart_set);
                 ChildInfo {
                     id: child.id.clone(),
-                    name: child.name.clone(),
+                    name: child.name.as_deref().map(str::to_string),
                     restart_type: child.spec.restart_type,
                     shutdown: child.spec.shutdown,
                     is_alive,
@@ -1707,8 +1713,7 @@ pub(crate) fn advance_restart_chain(
 mod tests {
     use super::*;
     use crate::actor::runtime::spawn_runner;
-    use crate::types::{ActorStatus, StatusValue, StopReason};
-    use tokio::sync::watch;
+    use crate::types::{ActorStatus, StatusTx, StatusValue, StopReason};
     use tokio::task::JoinHandle;
 
     // - RestartBudget -------------------------------------------------------
@@ -1729,7 +1734,7 @@ mod tests {
         assert!(!budget.check_and_record());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn budget_recovers_after_window() {
         let mut budget = RestartBudget::new(1, Duration::from_millis(50));
         assert!(budget.check_and_record());
@@ -1744,7 +1749,7 @@ mod tests {
         let (ctl, _io) = slot_pair(Default::default());
         ChildState {
             id: ActorId::from(id),
-            name: Some(id.to_string()),
+            name: Some(Arc::from(id.to_string())),
             spec: ChildSpec {
                 restart_type,
                 shutdown: Shutdown::default(),
@@ -2434,7 +2439,7 @@ mod tests {
     #[tokio::test]
     async fn guard_drop_raises_kill_and_feeds_the_reaper_exactly_once() {
         let (lane, lane_rx) = StopLane::new();
-        let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (_join, abort) = spawn_forever();
         let (reaper_tx, mut reaper_rx) = mpsc::unbounded_channel();
 
@@ -2457,7 +2462,7 @@ mod tests {
         assert_eq!(
             status_rx.borrow().status,
             ActorStatus::Running,
-            "drop must leave the child's status watch untouched: only its \
+            "drop must leave the child's status plane untouched: only its \
              own run loop, or its task ending, ever writes a terminal status"
         );
         assert!(

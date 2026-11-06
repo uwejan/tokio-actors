@@ -40,10 +40,21 @@ fn recorder() -> EventLog {
 /// paused clock, where an outcome lands on its instant.
 const HANG_BOUND: Duration = Duration::from_secs(10);
 
-/// The upper bound of an outcome that lands at `precise` on the paused clock.
-fn upper(paused: bool, precise: Duration) -> Duration {
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
+/// The time between a `Kill` and the abort when a spawn builder sets no
+/// `kill_grace`. An integration test cannot read the crate's constant, so the
+/// value is named here once.
+const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
+
+/// The upper bound of an outcome that lands at `exact` on the paused clock:
+/// that instant plus [`PAUSED_SLACK`]; a hang bound on a real-time runtime.
+fn upper(paused: bool, exact: Duration) -> Duration {
     if paused {
-        precise
+        exact + PAUSED_SLACK
     } else {
         HANG_BOUND
     }
@@ -398,7 +409,7 @@ async fn wedged_child_is_aborted_only_after_its_grace(paused: bool) {
         "the reaper must honor the leaf's grace window before aborting, took {elapsed:?}"
     );
     assert!(
-        elapsed < upper(paused, Duration::from_secs(1)),
+        elapsed < upper(paused, ASSUMED_KILL_GRACE),
         "the reaper must not take drastically longer than the grace window, took {elapsed:?}"
     );
 }
@@ -462,7 +473,7 @@ async fn escalated_timeout_kill_cascades_the_same_as_configured_kill(paused: boo
     top.wait_stopped().await;
 
     assert!(
-        wait_until(upper_ms(paused, 500), || sys
+        wait_until(upper_ms(paused, 0), || sys
             .get::<Node>(&leaf_name)
             .is_none())
         .await,
@@ -470,12 +481,12 @@ async fn escalated_timeout_kill_cascades_the_same_as_configured_kill(paused: boo
          escalated Kill, not left waiting out its own unrelated Shutdown policy"
     );
     // The whole stop, counted from the request: mid's 50 ms window, then its
-    // escalated Kill, which mid obeys and cascades to the leaf at once; the
-    // bound adds a kill grace and a settle time of margin and more. A ladder
-    // that gave mid more than its window ends past it on the paused clock.
+    // escalated Kill, which mid obeys and cascades to the leaf at once. A
+    // ladder that gave mid more than its window ends past it on the paused
+    // clock.
     let took = stopping.elapsed();
     assert!(
-        took < upper(paused, Duration::from_millis(500)),
+        took < upper(paused, Duration::from_millis(50)),
         "the escalated stop and its cascade took {took:?}"
     );
 }

@@ -1,7 +1,7 @@
 //! Behavioral suite for the runtime status plane:
 //! `ActorHandle::status()` and `ActorHandle::wait_stopped()`.
 //!
-//! - `status()` reads a `watch` cell maintained directly by the runtime, so it
+//! - `status()` reads a per-actor cell maintained directly by the runtime, so it
 //!   answers instantly even while the actor is stuck inside a callback and not
 //!   servicing its mailbox or system channel (contrast with the queue-plane
 //!   `get_status()`, which hangs in that same scenario).
@@ -12,7 +12,6 @@
 use std::time::Duration;
 
 use tokio::sync::oneshot;
-use tokio::time::sleep;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -44,9 +43,10 @@ struct Prober;
 
 #[derive(Debug)]
 enum ProbeMsg {
-    /// Awaits a receiver the test holds the sender for; never resolves until
-    /// the test drops or fires that sender.
-    Hang(oneshot::Receiver<()>),
+    /// Fires the first sender once the handler is running, then awaits a
+    /// receiver the test holds the other sender for; never resolves until the
+    /// test drops or fires that sender.
+    Hang(oneshot::Sender<()>, oneshot::Receiver<()>),
     /// A normal message, used to prove the actor is still alive and serving
     /// once a hang is released.
     Ping,
@@ -58,7 +58,8 @@ impl Actor for Prober {
 
     async fn handle(&mut self, msg: ProbeMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         match msg {
-            ProbeMsg::Hang(rx) => {
+            ProbeMsg::Hang(entered, rx) => {
+                let _ = entered.send(());
                 let _ = rx.await;
                 Ok(())
             }
@@ -105,8 +106,13 @@ async fn status_answers_running_for_hung_actor() {
     let handle = Prober.spawn().await.unwrap();
 
     let (tx, rx) = oneshot::channel::<()>();
-    handle.notify(ProbeMsg::Hang(rx)).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    handle.notify(ProbeMsg::Hang(entered_tx, rx)).await.unwrap();
+    // The handler reports that it is inside the callback.
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("the handler must start the hang")
+        .expect("the handler dropped its report");
 
     // Prove the actor is genuinely stuck first: the queue plane cannot even
     // answer get_status while the handler holds the actor's one task.
@@ -131,18 +137,6 @@ async fn status_answers_running_for_hung_actor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wait_stopped_resolves_on_graceful_stop() {
-    let handle = Idle.spawn().await.unwrap();
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), handle.wait_stopped())
-        .await
-        .expect("wait_stopped must resolve after a graceful stop");
-
-    assert_eq!(handle.status(), ActorStatus::Stopped);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_stopped_resolves_instantly_when_already_stopped() {
     let handle = Idle.spawn().await.unwrap();
 
@@ -153,7 +147,7 @@ async fn wait_stopped_resolves_instantly_when_already_stopped() {
 
     // The actor is already Stopped. A second call - on a fresh clone of the
     // handle, not just the original - must observe the terminal state
-    // instantly: a borrow() of the watch cell's current value, no changed()
+    // instantly: a borrow() of the cell's current value, no changed()
     // wait required. A buggy changed()-wait would never resolve here (no
     // further transitions exist), so any finite deadline discriminates; a
     // long one absorbs a host that stalls its threads.

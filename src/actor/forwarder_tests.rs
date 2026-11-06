@@ -14,19 +14,20 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
-use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     adjust_next, oneshot_forward, recurring_loop, stream_forward, take_parked, ActorContext,
-    Adjusted, MessageFactory, PanicSlot, Released,
+    Adjusted, ForwarderKind, MessageFactory, PanicSlot, Released, StreamRegistration,
 };
 use crate::actor::handle::ActorHandle;
+use crate::actor::subtree::SubtreeHold;
 use crate::actor::{Actor, ActorEnvelope};
-use crate::error::ActorResult;
+use crate::error::{ActorError, ActorResult};
 use crate::types::{
-    ActorId, ActorStatus, Envelope, MissPolicy, StatusValue, StopLane, StreamEvent,
+    ActorId, ActorStatus, Envelope, MissPolicy, StatusTx, StatusValue, StopLane, StreamEvent,
+    TurnClock,
 };
 
 /// Records its drop, then panics.
@@ -107,21 +108,22 @@ impl Actor for FinishedSink {
 }
 
 /// A handle on a bare one-slot mailbox, and the mailbox's receiver.
-fn handle_of<A: Actor>() -> (ActorHandle<A>, mpsc::Receiver<ActorEnvelope<A>>) {
-    let (tx, rx) = mpsc::channel(1);
-    let (system_tx, _) = mpsc::channel(1);
-    let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+fn handle_of<A: Actor>() -> (
+    ActorHandle<A>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<A>>,
+) {
+    let (tx, rx) = crate::actor::mailbox::test_channel(1);
+    let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
     let (stop_lane, _) = StopLane::new();
     let handle = ActorHandle::new(
         ActorId::from("forwarder-sink"),
         tx,
-        system_tx,
         stop_lane,
         1,
         status_rx,
         "forwarder-tests".into(),
         None,
-        Arc::new(AtomicBool::new(false)),
+        Some(Arc::new(AtomicBool::new(false))),
     );
     (handle, rx)
 }
@@ -190,7 +192,12 @@ async fn releases_at_the_close<F: std::future::Future<Output = Released>>(
 }
 
 /// Fills the one slot of an open mailbox, so a forwarder's next send waits.
-fn full<A: Actor>(filler: A::Message) -> (ActorHandle<A>, mpsc::Receiver<ActorEnvelope<A>>) {
+fn full<A: Actor>(
+    filler: A::Message,
+) -> (
+    ActorHandle<A>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<A>>,
+) {
     let (handle, rx) = handle_of::<A>();
     assert!(handle.try_forward(filler).is_ok(), "the slot is filled");
     (handle, rx)
@@ -206,7 +213,7 @@ async fn until_idle() {
 /// refused message and what the forwarder owns are released at the close.
 async fn refused_at_the_close(
     task: tokio::task::JoinHandle<Released>,
-    mut rx: mpsc::Receiver<ActorEnvelope<Sink>>,
+    mut rx: crate::actor::mailbox::MailRx<ActorEnvelope<Sink>>,
     dropped: &AtomicBool,
 ) {
     until_idle().await;
@@ -454,7 +461,7 @@ async fn a_recurring_timer_with_a_tick_due_at_the_close_never_calls_its_factory(
 /// is read only after the stream ended; owns a bomb.
 struct EndsClosing {
     _bomb: Bomb,
-    rx: Arc<Mutex<mpsc::Receiver<ActorEnvelope<Sink>>>>,
+    rx: Arc<Mutex<crate::actor::mailbox::MailRx<ActorEnvelope<Sink>>>>,
 }
 
 impl Stream for EndsClosing {
@@ -802,9 +809,9 @@ fn ticking(
     })
 }
 
-/// Waits, by observation, until the factory was called `n` times.
+/// Waits, by observation, until the factory was called `n` times. The bound only limits how long a real hang takes to report.
 async fn until_called(ticks: &Ticks, n: usize) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while ticks.calls.load(Ordering::SeqCst) < n {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -1031,4 +1038,341 @@ async fn a_one_shot_whose_claim_was_lost_never_sends_current_thread() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_one_shot_whose_claim_was_lost_never_sends_multi_thread() {
     a_one_shot_whose_claim_was_lost_never_sends().await;
+}
+
+/// A stream's item waits for room in the full mailbox and the stream is
+/// cancelled: the item is never sent, and the stream drops in the
+/// forwarder's poll, its drop's panic reported as the run's.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cancel_while_a_stream_send_waits_drops_the_item_and_the_stream() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (handle, mut rx) = full::<Sink>(Msg::Data);
+    let token = CancellationToken::new();
+    let slot = PanicSlot::default();
+    let task = tokio::spawn(stream_forward(
+        Owned {
+            bomb: Bomb(dropped.clone()),
+            items: 1,
+        },
+        handle,
+        token.clone(),
+        slot.clone(),
+    ));
+    until_idle().await;
+    assert!(!task.is_finished(), "the send waits for room");
+    assert!(!dropped.load(Ordering::SeqCst));
+    token.cancel();
+    let released = tokio::time::timeout(Duration::from_secs(3600), task)
+        .await
+        .expect("the forwarder ends")
+        .expect("the forwarder's own drops are caught");
+    assert!(dropped.load(Ordering::SeqCst), "the stream was dropped");
+    assert!(
+        released
+            .run
+            .as_deref()
+            .is_some_and(|p| p.contains("panicked when dropped")),
+        "{:?}",
+        released.run
+    );
+    assert!(released.end.is_none());
+    assert!(
+        take_parked(&slot).is_none(),
+        "the stream was released, not left"
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Envelope::Message {
+            payload: Msg::Data,
+            ..
+        })
+    ));
+    assert!(rx.try_recv().is_err(), "the item was never sent");
+}
+
+/// The stream ended and was dropped; its `Finished` waits for room in the
+/// full mailbox and the registration is cancelled: `Finished` is never sent.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cancel_while_a_finished_waits_drops_it() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (handle, mut rx) = full::<Sink>(Msg::Data);
+    let token = CancellationToken::new();
+    let task = tokio::spawn(stream_forward(
+        Owned {
+            bomb: Bomb(dropped.clone()),
+            items: 0,
+        },
+        handle,
+        token.clone(),
+        PanicSlot::default(),
+    ));
+    until_idle().await;
+    assert!(!task.is_finished(), "Finished waits for room");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the ended stream drops before its Finished"
+    );
+    token.cancel();
+    let released = tokio::time::timeout(Duration::from_secs(3600), task)
+        .await
+        .expect("the forwarder ends")
+        .expect("the forwarder's own drops are caught");
+    assert!(
+        released
+            .run
+            .as_deref()
+            .is_some_and(|p| p.contains("panicked when dropped")),
+        "{:?}",
+        released.run
+    );
+    assert!(released.end.is_none());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Envelope::Message {
+            payload: Msg::Data,
+            ..
+        })
+    ));
+    assert!(rx.try_recv().is_err(), "Finished was never sent");
+}
+
+/// A context on a bare mailbox, for driving the end of its forwarders by
+/// hand.
+fn bare_context() -> (
+    ActorContext<Sink>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<Sink>>,
+) {
+    let (handle, rx) = handle_of::<Sink>();
+    let (status_tx, _status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+    let ctx = ActorContext::new(
+        ActorId::from("forwarder-end"),
+        handle,
+        tokio::runtime::Handle::current(),
+        status_tx,
+        None,
+        None,
+        None,
+        TurnClock::default(),
+        SubtreeHold::new(None),
+    );
+    (ctx, rx)
+}
+
+/// A drop a forwarder made once it had seen the mailbox closed is the end's
+/// when its stream is still registered as the end begins, and the run's when
+/// the stream was cancelled during the run. The end classifies it by the
+/// registration alone, whatever the forwarder did about its own cancel.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drop_made_after_the_close_is_classified_by_the_registration() {
+    const DROP: &str = "a drop made after the close";
+    for cancelled in [false, true] {
+        let (mut ctx, _rx) = bare_context();
+        let id = ctx.ex_mut().id_gen.next_stream_id();
+        ctx.ex_mut().streams.insert(
+            id,
+            StreamRegistration {
+                token: CancellationToken::new(),
+            },
+        );
+        ctx.spawn_forwarder(
+            ForwarderKind::Stream(id),
+            async {
+                Released {
+                    run: None,
+                    end: Some(DROP.to_string()),
+                }
+            },
+            PanicSlot::default(),
+        );
+        if cancelled {
+            ctx.cancel_stream(id).expect("the stream is registered");
+        }
+        // The forwarder ends by itself, before the end begins.
+        while ctx
+            .ex()
+            .forwarders_done
+            .as_ref()
+            .map_or(0, |done| done.load(Ordering::Acquire))
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        let end = ctx.end_forwarders().await;
+        if cancelled {
+            assert_eq!(end, None, "a cancelled stream's drop is not the end's");
+            assert!(
+                matches!(ctx.last_forwarder_error(), Some(ActorError::Panic(text)) if text == DROP),
+                "it is the last forwarder error: {:?}",
+                ctx.last_forwarder_error()
+            );
+        } else {
+            assert_eq!(
+                end.as_deref(),
+                Some(DROP),
+                "a registered stream's drop is the end's"
+            );
+            assert!(
+                ctx.last_forwarder_error().is_none(),
+                "{:?}",
+                ctx.last_forwarder_error()
+            );
+        }
+    }
+}
+
+#[cfg(feature = "tracing")]
+mod captured {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{span, Event, Level, Metadata, Subscriber};
+
+    /// Collects every WARN event as one line of `name=value` pairs.
+    #[derive(Clone, Default)]
+    pub(super) struct Warnings {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Warnings {
+        /// Makes this the subscriber of the calling thread until the guard
+        /// drops.
+        pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(self.clone())
+        }
+
+        pub(super) fn lines(&self) -> Vec<String> {
+            self.lines.lock().unwrap().clone()
+        }
+    }
+
+    struct Text(String);
+
+    impl Visit for Text {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    impl Subscriber for Warnings {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            self.lines.lock().unwrap().push(text.0);
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+}
+
+/// How a stream that ended during the run, with a panicking drop, has its
+/// `Finished` end.
+#[cfg(feature = "tracing")]
+#[derive(Clone, Copy, Debug)]
+enum FinishedEnds {
+    /// The mailbox has room: `Finished` is delivered.
+    Delivered,
+    /// The mailbox is full and then closes: `Finished` is refused.
+    Refused,
+    /// The mailbox is full and the registration is cancelled.
+    Cancelled,
+    /// The mailbox is full and the forwarder is aborted before it reports.
+    Aborted,
+}
+
+/// Runs the forwarder of a stream that ends during the run with a panicking
+/// drop, ends its `Finished` as `how`, and returns what the forwarder
+/// reported (nothing when it was aborted) with the lines it logged as a panic
+/// that went unreported.
+#[cfg(feature = "tracing")]
+async fn an_ended_stream_whose_finished_ends(how: FinishedEnds) -> (Option<Released>, Vec<String>) {
+    let warnings = captured::Warnings::default();
+    let _installed = warnings.install();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (handle, mut rx) = match how {
+        FinishedEnds::Delivered => handle_of::<Sink>(),
+        _ => full::<Sink>(Msg::Data),
+    };
+    let token = CancellationToken::new();
+    let task = tokio::spawn(stream_forward(
+        Owned {
+            bomb: Bomb(dropped.clone()),
+            items: 0,
+        },
+        handle,
+        token.clone(),
+        PanicSlot::default(),
+    ));
+    let released = if let FinishedEnds::Delivered = how {
+        Some(task.await.expect("the forwarder's own drops are caught"))
+    } else {
+        until_idle().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "{how:?}: the stream dropped"
+        );
+        assert!(!task.is_finished(), "{how:?}: Finished waits for room");
+        match how {
+            FinishedEnds::Refused => rx.close(),
+            FinishedEnds::Cancelled => token.cancel(),
+            _ => task.abort(),
+        }
+        match task.await {
+            Ok(released) => Some(released),
+            Err(err) => {
+                assert!(err.is_cancelled(), "{how:?}: {err:?}");
+                None
+            }
+        }
+    };
+    drop(rx);
+    let lines = warnings
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("ended before reporting"))
+        .collect();
+    (released, lines)
+}
+
+/// A forwarder that reports an ended stream's drop panic, with `Finished` or
+/// with the release of a refused or cancelled `Finished`, has handed the
+/// panic over: it is not logged as one the forwarder ended without reporting.
+/// A forwarder aborted before it reports does log it, once.
+#[cfg(feature = "tracing")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_drop_panic_a_forwarder_reports_is_not_logged_as_unreported() {
+    for how in [
+        FinishedEnds::Delivered,
+        FinishedEnds::Refused,
+        FinishedEnds::Cancelled,
+    ] {
+        let (released, lines) = an_ended_stream_whose_finished_ends(how).await;
+        let released = released.expect("the forwarder reports");
+        assert!(
+            released
+                .run
+                .as_deref()
+                .is_some_and(|p| p.contains("panicked when dropped")),
+            "{how:?}: {:?}",
+            released.run
+        );
+        assert!(lines.is_empty(), "{how:?}: {lines:?}");
+    }
+    let (released, lines) = an_ended_stream_whose_finished_ends(FinishedEnds::Aborted).await;
+    assert!(released.is_none(), "an aborted forwarder reports nothing");
+    assert_eq!(lines.len(), 1, "logged once: {lines:?}");
 }

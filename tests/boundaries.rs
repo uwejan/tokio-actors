@@ -7,8 +7,9 @@
 //! the representable range), `Duration::MAX`}. Counts are crossed with their
 //! own edge values. Each `#[test]` loops over the whole value set of one
 //! parameter group; every failure message names the parameter and the value.
-//! The tests run one at a time, so a panic raised in a spawned task is
-//! reported by the test that caused it.
+//! The tests run in parallel, and each runs its runtimes on threads named
+//! after the test, so a panic raised in a spawned task is reported by the
+//! test that caused it.
 //!
 //! What a cell asserts:
 //! - A deadline built from a caller duration is capped at 30 years, so a
@@ -95,8 +96,6 @@ use tokio_actors::{
     StopReason, StopReport, SupervisionConfig, SystemConfig, TimerError,
 };
 
-mod common;
-
 // ---------------------------------------------------------------------------
 // Values, bounds and helpers
 // ---------------------------------------------------------------------------
@@ -107,23 +106,27 @@ const THIRTY_YEARS: Duration = Duration::from_secs(86_400 * 365 * 30);
 /// derives.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
 /// How long a cell that must not fire is observed on a running clock.
 const QUIET: Duration = Duration::from_millis(250);
 
-/// The wait after an abort before the unresponsive verdict, and the margin on
-/// top of a configured grace. An integration test cannot read the crate's
-/// constants, so each value is named here once.
-const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
-const MARGIN: Duration = Duration::from_millis(500);
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// grace a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
 
-/// The upper bound of a timed outcome: `precise` where an outcome lands on
-/// its exact instant (the paused clock), and a hang bound past it on a
-/// real-time runtime, loose enough for a host that stalls its threads.
-fn upper(paused: bool, precise: Duration) -> Duration {
+/// The upper bound of a timed outcome: its `exact` instant plus
+/// [`PAUSED_SLACK`] on the paused clock, where an outcome lands on its
+/// instant, and a hang bound past it on a real-time runtime, loose enough for
+/// a host that stalls its threads.
+fn upper(paused: bool, exact: Duration) -> Duration {
     if paused {
-        precise
+        exact + PAUSED_SLACK
     } else {
-        precise + BOUND
+        exact + BOUND
     }
 }
 
@@ -140,15 +143,9 @@ fn uname(base: &str) -> String {
 /// The prefix of every failure message: the parameter and the value.
 fn cell(parameter: &str, label: &str) -> String {
     let row = format!("parameter {parameter}, value {label}");
-    *CURRENT_ROW
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = row.clone();
+    with_record(|record| record.row = row.clone());
     row
 }
-
-/// The row most recently started: a panic raised in a thread that cannot name
-/// its row, such as the test's own, is reported with it.
-static CURRENT_ROW: Mutex<String> = Mutex::new(String::new());
 
 /// Stands for the largest duration `Instant::checked_add` accepts, less
 /// 500 us, measured at the moment a call receives it: `resolve` turns it into
@@ -251,15 +248,16 @@ async fn within<T>(at: &str, what: &str, fut: impl IntoFuture<Output = T>) -> T 
     within_for(BOUND, at, what, fut).await
 }
 
+/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report.
 async fn wait_until(at: &str, what: &str, mut pred: impl FnMut() -> bool) {
-    let deadline = Instant::now() + BOUND;
+    let deadline = Instant::now() + HANG_BOUND;
     loop {
         if pred() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "{at}: timed out after {BOUND:?} waiting for: {what}"
+            "{at}: timed out after {HANG_BOUND:?} waiting for: {what}"
         );
         sleep(Duration::from_millis(2)).await;
     }
@@ -288,28 +286,74 @@ async fn stop_quietly<A: Actor>(at: &str, handle: &ActorHandle<A>, reason: StopR
 
 // ---- Panics ----------------------------------------------------------------
 
-/// The tests of this file run one at a time, so the panics recorded below
-/// belong to the test that holds the lock.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Panics raised anywhere but in this file's own assertions: a panic inside a
-/// spawned task is caught by the runtime, so only a hook sees every one.
-static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn drain_panics() -> Vec<String> {
-    std::mem::take(
-        &mut *PANICS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    )
+/// What one test has seen: the row it most recently started, and the panics
+/// raised on its threads anywhere but in this file's own assertions (a panic
+/// inside a spawned task is caught by the runtime, so only a hook sees every
+/// one).
+#[derive(Default)]
+struct Record {
+    row: String,
+    panics: Vec<String>,
 }
 
-/// Takes the lock that serializes the tests and starts an empty panic record.
-fn begin() -> MutexGuard<'static, ()> {
-    static ONCE: Once = Once::new();
-    let guard = SERIAL
+/// The records of the tests running now, keyed by the name of the test's
+/// thread. Every runtime a test builds names its threads the same, so a panic
+/// on any of them reaches the record of the test that raised it.
+static RECORDS: Mutex<Vec<(String, Record)>> = Mutex::new(Vec::new());
+
+fn owner() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn records() -> MutexGuard<'static, Vec<(String, Record)>> {
+    RECORDS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Runs `f` on the record of the calling test, if it has one.
+fn with_record<R>(f: impl FnOnce(&mut Record) -> R) -> Option<R> {
+    let name = owner();
+    records()
+        .iter_mut()
+        .find(|(key, _)| *key == name)
+        .map(|(_, record)| f(record))
+}
+
+fn drain_panics() -> Vec<String> {
+    with_record(|record| std::mem::take(&mut record.panics)).unwrap_or_default()
+}
+
+/// A test's record, removed when the test ends. The last check runs there: a
+/// panic recorded after the test's final check fails the test.
+struct Begun;
+
+impl Drop for Begun {
+    fn drop(&mut self) {
+        let name = owner();
+        let record = {
+            let mut all = records();
+            let at = all.iter().position(|(key, _)| *key == name);
+            at.map(|at| all.remove(at).1)
+        };
+        if !std::thread::panicking() {
+            if let Some(record) = record {
+                assert!(
+                    record.panics.is_empty(),
+                    "a panic was recorded after the last check: {:?}",
+                    record.panics
+                );
+            }
+        }
+    }
+}
+
+/// Starts the calling test's record and installs the panic hook once.
+fn begin() -> Begun {
+    static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -317,25 +361,31 @@ fn begin() -> MutexGuard<'static, ()> {
                 .location()
                 .is_some_and(|place| place.file().ends_with("boundaries.rs"));
             if !own {
-                let row = CURRENT_ROW
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                eprintln!("[boundaries] a panic was raised after starting: {row}");
-                PANICS
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(format!("{info} (after starting: {row})"));
+                let name = owner();
+                let mut all = records();
+                // A thread no test owns cannot name its row: every running
+                // test hears of it.
+                let known = all.iter().any(|(key, _)| *key == name);
+                for (key, record) in all.iter_mut() {
+                    if *key == name || !known {
+                        eprintln!(
+                            "[boundaries] a panic was raised after starting: {}",
+                            record.row
+                        );
+                        record
+                            .panics
+                            .push(format!("{info} (after starting: {})", record.row));
+                    }
+                }
             }
             previous(info);
         }));
     });
-    let left = drain_panics();
-    assert!(
-        left.is_empty(),
-        "a panic was recorded after the previous test's last check: {left:?}"
-    );
-    guard
+    let mut all = records();
+    let name = owner();
+    all.retain(|(key, _)| *key != name);
+    all.push((name, Record::default()));
+    Begun
 }
 
 /// Fails if a panic escaped since the previous check.
@@ -346,9 +396,35 @@ fn assert_no_panic(at: &str) {
 
 // ---- Paused clock ------------------------------------------------------------
 
+/// Runs `body` on a Tokio runtime whose flavor is chosen by the
+/// `TOKIO_ACTORS_TEST_FLAVOR` environment variable (`current_thread` selects a
+/// single-threaded runtime, anything else a multi-threaded one), with its
+/// threads named after the calling test.
+fn run<F: Future<Output = ()>>(workers: usize, body: F) {
+    let runtime = if std::env::var("TOKIO_ACTORS_TEST_FLAVOR").as_deref() == Ok("current_thread") {
+        tokio::runtime::Builder::new_current_thread()
+            .thread_name(owner())
+            .enable_all()
+            .build()
+            .expect("failed to build current-thread test runtime")
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if workers > 0 {
+            builder.worker_threads(workers);
+        }
+        builder
+            .thread_name(owner())
+            .enable_all()
+            .build()
+            .expect("failed to build multi-thread test runtime")
+    };
+    runtime.block_on(body);
+}
+
 /// Runs `body` on a current-thread runtime whose clock is paused.
 fn run_paused<F: Future<Output = ()>>(body: F) {
     tokio::runtime::Builder::new_current_thread()
+        .thread_name(owner())
         .enable_all()
         .start_paused(true)
         .build()
@@ -756,8 +832,8 @@ async fn timed_send(
 
 #[test]
 fn boundary_send_timeout() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for priority in [false, true] {
             let parameter = send_parameter(priority);
             for (label, d) in durations() {
@@ -985,8 +1061,8 @@ async fn finish_ticker(at: &str, handle: &ActorHandle<Ticker>) {
 
 #[test]
 fn boundary_every() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for (builder, parameter) in [(false, "every"), (true, "every_with")] {
             for policy in [MissPolicy::Skip, MissPolicy::Delay, MissPolicy::CatchUp] {
                 for (label, d) in durations() {
@@ -1118,8 +1194,8 @@ fn boundary_every() {
 
 #[test]
 fn boundary_schedule() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         // `after`: a deadline built from the delay, capped at 30 years.
         for (label, d) in durations() {
             let at = cell("schedule.after", label);
@@ -1277,8 +1353,8 @@ fn at_label(parameter: &str, label: &str) -> String {
 
 #[test]
 fn boundary_stop_within() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for (label, d) in durations() {
             // A cooperative actor, asked to stop gracefully: it is never
             // unresponsive, and it is stopped when the call returns.
@@ -1506,7 +1582,7 @@ async fn boundary_kill_grace_rows(paused: bool) {
             }
             if is_small(d) {
                 within_for(
-                    upper(paused, d + ASSUMED_ABORT_SETTLE + MARGIN),
+                    upper(paused, d),
                     &at,
                     "a parked target to be aborted within its grace",
                     handle.wait_stopped(),
@@ -1583,7 +1659,7 @@ async fn boundary_kill_grace_rows(paused: bool) {
             .unwrap_or_else(|err| panic!("{at}: the kill was refused: {err:?}"));
         if is_small(d) {
             within_for(
-                upper(paused, d + ASSUMED_ABORT_SETTLE + MARGIN),
+                upper(paused, d),
                 &at,
                 "a parked child to be aborted within its grace",
                 child.wait_stopped(),
@@ -1647,8 +1723,8 @@ async fn boundary_kill_grace_rows(paused: bool) {
 
 #[test]
 fn boundary_kill_grace() {
-    let _serial = begin();
-    common::run(0, boundary_kill_grace_rows(false));
+    let _begun = begin();
+    run(0, boundary_kill_grace_rows(false));
     run_paused(async {
         // On a paused clock a grace of 30 years or more aborts a parked turn
         // at the 30 year cap.
@@ -1703,7 +1779,7 @@ fn boundary_kill_grace() {
 
 #[test]
 fn boundary_kill_grace_paused() {
-    let _serial = begin();
+    let _begun = begin();
     run_paused(boundary_kill_grace_rows(true));
     assert_no_panic("kill_grace rows, paused clock");
 }
@@ -1714,8 +1790,8 @@ fn boundary_kill_grace_paused() {
 
 #[test]
 fn boundary_start_timeout() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         // SpawnBuilder::start_timeout: the first initialization hangs.
         for (label, d) in durations() {
             let at = cell("SpawnBuilder::start_timeout", label);
@@ -1913,8 +1989,8 @@ fn policy_system(timeout: Duration, per_actor_timeout: Duration) -> Arc<ActorSys
 
 #[test]
 fn boundary_shutdown_timeouts() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for (label, d) in durations() {
             // Shutdown::Timeout on a worker child that vetoes the graceful
             // stop of its supervisor.
@@ -2417,8 +2493,8 @@ fn boundary_shutdown_timeouts() {
 
 #[test]
 fn boundary_turn_warning_threshold() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for (label, d) in durations() {
             let at = cell("turn warning threshold", label);
             let d = resolve(d);
@@ -2599,8 +2675,8 @@ async fn budgeted_sup(
 
 #[test]
 fn boundary_restart_window() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         for (count_label, count) in [("0", 0u32), ("1", 1), ("3", 3), ("u32::MAX", u32::MAX)] {
             for (label, window) in durations() {
                 let parameter = format!("max_restarts {count_label} with a restart window");
@@ -2772,8 +2848,8 @@ impl Actor for Idle {
 
 #[test]
 fn boundary_mailbox_capacity() {
-    let _serial = begin();
-    common::run(0, async {
+    let _begun = begin();
+    run(0, async {
         let max = tokio::sync::Semaphore::MAX_PERMITS;
         let capacities = [
             ("0", 0usize),

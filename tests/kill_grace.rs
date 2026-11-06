@@ -7,8 +7,8 @@
 //! `handle` when its `Kill` is raised, so only the abort can end it. Timing is
 //! asserted by ordering and by margins derived from the configured grace: a
 //! target's stop is observed no sooner than its whole grace after an instant
-//! read before its `Kill` was raised, and before its grace, the wait after an
-//! abort and a margin have passed. Every awaited outcome is wrapped in
+//! read before its `Kill` was raised, and no later than the abort its grace
+//! schedules. Every awaited outcome is wrapped in
 //! `tokio::time::timeout`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -34,25 +34,32 @@ const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
 /// The wait after an abort before the Unresponsive verdict, named here once.
 const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
 
-/// The margin on top of a configured grace and the wait after an abort.
-const MARGIN: Duration = Duration::from_millis(500);
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// grace a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
 
 /// The bound on every outcome a test awaits that is not derived from a
 /// configured grace.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
 /// The longest a `Block` turn holds its thread when the test never releases
 /// it: past every bound a test awaits.
 const GATE_CAP: Duration = Duration::from_secs(15);
 
-/// The upper bound of a timed outcome: `precise` where an outcome lands on
-/// its exact instant (the paused clock), and a hang bound past it on a
-/// real-time runtime, loose enough for a host that stalls its threads.
-fn upper(paused: bool, precise: Duration) -> Duration {
+/// The upper bound of a timed outcome: its `exact` instant plus
+/// [`PAUSED_SLACK`] on the paused clock, where an outcome lands on its
+/// instant, and a hang bound past it on a real-time runtime, loose enough for
+/// a host that stalls its threads.
+fn upper(paused: bool, exact: Duration) -> Duration {
     if paused {
-        precise
+        exact + PAUSED_SLACK
     } else {
-        precise + BOUND
+        exact + BOUND
     }
 }
 
@@ -71,7 +78,10 @@ async fn within<T>(bound: Duration, what: &str, fut: impl std::future::Future<Ou
     }
 }
 
+/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report. A shorter `bound` from a caller is
+/// raised to `HANG_BOUND`.
 async fn wait_until(bound: Duration, what: &str, mut pred: impl FnMut() -> bool) {
+    let bound = bound.max(HANG_BOUND);
     let deadline = Instant::now() + bound;
     loop {
         if pred() {
@@ -103,6 +113,11 @@ struct Probe {
     /// `init_gate`.
     hang_restart_init: AtomicBool,
     init_gate: Notify,
+    /// While set, an instance's `pre_stop` reports `pre_stop_entered` and then
+    /// never returns.
+    hold_pre_stop: AtomicBool,
+    /// Set when an instance entered a held `pre_stop`.
+    pre_stop_entered: AtomicBool,
     /// Messages answered.
     pings: AtomicUsize,
     /// While set, a `Block` turn holds its thread (for at most `GATE_CAP`).
@@ -131,7 +146,7 @@ enum Msg {
     /// set: a turn that never reaches a boundary and cannot be aborted until
     /// it ends.
     Block,
-    /// A 200 ms turn that yields.
+    /// A turn that yields at the probe's gate until the test opens it.
     Nap,
     /// Queued behind a turn and never handled: dropping it panics.
     Bomb(#[allow(dead_code)] PanicOnDrop),
@@ -168,6 +183,14 @@ impl Actor for Worker {
         Ok(())
     }
 
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        if self.probe.hold_pre_stop.load(Ordering::SeqCst) {
+            self.probe.pre_stop_entered.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        true
+    }
+
     async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         match msg {
             Msg::Ping => {
@@ -186,7 +209,7 @@ impl Actor for Worker {
             Msg::Crash => Err(ActorError::user("crash on command")),
             Msg::Nap => {
                 self.probe.parked.store(true, Ordering::SeqCst);
-                sleep(Duration::from_millis(200)).await;
+                self.probe.gate.notified().await;
                 Ok(())
             }
             Msg::Bomb(_) => Ok(()),
@@ -329,7 +352,7 @@ async fn park(handle: &ActorHandle<Worker>, probe: &Arc<Probe>) {
 }
 
 /// The target is `Stopped` no earlier than `grace` after `killed_at`, and
-/// before its grace, the wait after an abort and a margin have passed.
+/// no later than the abort that its grace schedules.
 /// `killed_at` is read before the call that raises the `Kill`, so the abort's
 /// grace starts at or after it: a stop observed sooner than `grace` after it
 /// is an abort that did not wait out the target's grace, however late the
@@ -340,7 +363,7 @@ async fn runs_then_is_aborted(
     grace: Duration,
     paused: bool,
 ) {
-    let bound = upper(paused, grace + ASSUMED_ABORT_SETTLE + MARGIN);
+    let bound = upper(paused, grace);
     within(
         bound.saturating_sub(killed_at.elapsed()),
         "the target to be aborted once its kill grace passed",
@@ -438,7 +461,7 @@ async fn zero_kill_grace_aborts_at_once_and_is_not_a_verdict_body(paused: bool) 
     sys.kill(&zero_name).await.unwrap();
     sys.kill(&long_name).await.unwrap();
     within(
-        upper(paused, ASSUMED_ABORT_SETTLE + MARGIN),
+        upper(paused, Duration::ZERO),
         "the zero-grace root to be aborted",
         zero.wait_stopped(),
     )
@@ -628,17 +651,14 @@ fn a_graceful_stop_that_meets_a_kill_reports_aborted() {
         let name = uname("root");
         let handle = spawn_root(&sys, &name, &probe, None).await;
         park(&handle, &probe).await;
-        let call = {
-            let handle = handle.clone();
-            tokio::spawn(async move {
-                handle
-                    .stop_within(StopReason::Graceful, Duration::from_secs(5))
-                    .await
-            })
-        };
-        sleep(Duration::from_millis(10)).await;
+        // The call raises its Graceful before its first await, so one poll
+        // places it ahead of the kill.
+        let mut call =
+            std::pin::pin!(handle.stop_within(StopReason::Graceful, Duration::from_secs(5)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(call.as_mut(), &mut cx).is_pending());
         sys.kill(&name).await.unwrap();
-        let outcome = within(BOUND, "stop_within", call).await.unwrap().unwrap();
+        let outcome = within(BOUND, "stop_within", call).await.unwrap();
         assert_eq!(outcome, StopOutcome::Aborted);
 
         // The shutdown's first step while another caller kills the actor.
@@ -655,15 +675,20 @@ fn a_graceful_stop_that_meets_a_kill_reports_aborted() {
         .unwrap();
         // A 1 s kill grace: the shutdown takes its snapshot of the roots long
         // before the backstop can abort the root.
+        // The root's graceful stop hangs in its `pre_stop`, which says when the
+        // shutdown's first step reached it.
         let probe = Arc::new(Probe::default());
+        probe.hold_pre_stop.store(true, Ordering::SeqCst);
         let name = uname("root");
-        let handle = spawn_root(&sys, &name, &probe, Some(Duration::from_secs(1))).await;
-        park(&handle, &probe).await;
+        let _handle = spawn_root(&sys, &name, &probe, Some(Duration::from_secs(1))).await;
         let shutdown = {
             let sys = sys.clone();
             tokio::spawn(async move { sys.shutdown().await })
         };
-        sleep(Duration::from_millis(10)).await;
+        wait_until(BOUND, "the shutdown's stop to reach the root", || {
+            probe.pre_stop_entered.load(Ordering::SeqCst)
+        })
+        .await;
         sys.kill(&name).await.unwrap();
         let report = within(BOUND, "shutdown", shutdown).await.unwrap();
         assert_eq!(report.outcomes.len(), 1);
@@ -693,13 +718,14 @@ fn a_panic_in_a_queued_message_s_drop_still_ends_graceful() {
             .notify(Msg::Bomb(PanicOnDrop(dropped.clone())))
             .await
             .unwrap();
-        let outcome = within(
-            BOUND,
-            "stop_within",
-            handle.stop_within(StopReason::Graceful, Duration::from_secs(5)),
-        )
-        .await
-        .unwrap();
+        // The turn waits at the gate while the Bomb is queued and the stop is
+        // raised (the call raises before its first await); then it ends.
+        let mut stop =
+            std::pin::pin!(handle.stop_within(StopReason::Graceful, Duration::from_secs(5)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(stop.as_mut(), &mut cx).is_pending());
+        probe.gate.notify_one();
+        let outcome = within(BOUND, "stop_within", stop).await.unwrap();
         assert!(
             dropped.load(Ordering::SeqCst),
             "the queued message's drop ran, and panicked"
@@ -818,8 +844,7 @@ async fn child_kill_grace_survives_restarts_body(paused: bool) {
 
 /// Each case: a target with a 600 ms grace parked in `handle`; the entry point
 /// raises its `Kill`; the target is `Stopped` no sooner than its grace after
-/// the call and before its grace, the wait after an abort and a margin have
-/// passed.
+/// the call and no later than the abort its grace schedules.
 const OWN_GRACE: Duration = Duration::from_millis(600);
 
 async fn parked_root(sys: &Arc<ActorSystem>, base: &str) -> (String, ActorHandle<Worker>) {
@@ -986,7 +1011,7 @@ fn stop_within_kill_keeps_its_own_window_over_the_target_s_grace() {
         let outcome = within(
             BOUND,
             "stop_within(Kill) to return",
-            handle.stop_within(StopReason::Kill, Duration::from_secs(2)),
+            handle.stop_within(StopReason::Kill, Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -1019,167 +1044,229 @@ fn largest_addable() -> Duration {
 /// runtime, so only a hook sees it.
 static OVERFLOW_PANICS: AtomicUsize = AtomicUsize::new(0);
 
+/// Counts overflow panics once for the whole binary: the parts below run in
+/// parallel and share the count, which no part may see grow.
 fn count_overflow_panics() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if info.to_string().contains("overflow") {
-            OVERFLOW_PANICS.fetch_add(1, Ordering::SeqCst);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.to_string().contains("overflow") {
+                OVERFLOW_PANICS.fetch_add(1, Ordering::SeqCst);
+            }
+            previous(info);
+        }));
+    });
+}
+
+/// The three graces of the edge: thirty years (inside the range), the largest
+/// the clock accepts from now, and `Duration::MAX`.
+#[derive(Clone, Copy)]
+enum Edge {
+    ThirtyYears,
+    LargestAddable,
+    Max,
+}
+
+impl Edge {
+    fn grace(self) -> Duration {
+        match self {
+            Edge::ThirtyYears => Duration::from_secs(86_400 * 365 * 30),
+            Edge::LargestAddable => largest_addable(),
+            Edge::Max => Duration::MAX,
         }
-        previous(info);
-    }));
+    }
+}
+
+/// A root with an edge-of-range grace: kill by name, kill by id, stop with
+/// Kill and the shutdown's Kill step.
+async fn edge_of_range_roots(grace: Duration) {
+    for entry in 0..4usize {
+        let sys = ActorSystem::create_with(
+            uname("edge-root"),
+            SystemConfig {
+                shutdown_policy: ShutdownPolicy {
+                    timeout: Duration::from_secs(1),
+                    per_actor_timeout: Duration::from_millis(50),
+                },
+                ..SystemConfig::default()
+            },
+        )
+        .unwrap();
+        let probe = Arc::new(Probe::default());
+        let name = uname("root");
+        let handle = worker(&probe, false)
+            .spawn()
+            .named(&name)
+            .on_system(&sys)
+            .kill_grace(grace)
+            .await
+            .unwrap();
+        park(&handle, &probe).await;
+        let caller: Option<tokio::task::JoinHandle<()>> = match entry {
+            0 => {
+                sys.kill(&name).await.unwrap();
+                None
+            }
+            1 => {
+                let (sys, id) = (sys.clone(), handle.id().clone());
+                Some(tokio::spawn(async move {
+                    sys.kill_by_id(&id).await;
+                }))
+            }
+            2 => {
+                handle.stop(StopReason::Kill).await.unwrap();
+                None
+            }
+            _ => {
+                let sys = sys.clone();
+                Some(tokio::spawn(async move {
+                    sys.shutdown().await;
+                }))
+            }
+        };
+        // Nothing is aborted within the horizon of the test.
+        sleep(Duration::from_millis(600)).await;
+        assert_ne!(handle.status(), ActorStatus::Stopped, "entry {entry}");
+        // The turn ends and the target leaves at its next boundary.
+        probe.gate.notify_one();
+        within(
+            BOUND,
+            "the target to end at its boundary",
+            handle.wait_stopped(),
+        )
+        .await;
+        if let Some(caller) = caller {
+            within(BOUND, "the calling path to return", caller)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// A supervised child with an edge-of-range grace: the supervisor's
+/// `Shutdown::Kill` ladder, a killed supervisor's link guard, and a restart
+/// attempt's start timeout.
+async fn edge_of_range_children(grace: Duration) {
+    for entry in 0..3usize {
+        let sys = ActorSystem::create(uname("edge-child")).unwrap();
+        let probe = Arc::new(Probe::default());
+        let sup = spawn_sup(&sys, &probe, false).await;
+        let name = uname("child");
+        let shutdown = if entry == 0 {
+            Shutdown::Kill
+        } else {
+            Shutdown::Timeout(Duration::from_secs(5))
+        };
+        // Long enough that a loaded scheduler always polls the
+        // restarted incarnation into its hung init before the start
+        // timeout raises its Kill: the subject is the grace, not the
+        // start timeout.
+        let start_timeout = (entry == 2).then_some(Duration::from_secs(2));
+        let answer = sup
+            .send(Cmd::Spawn {
+                name: name.clone(),
+                grace,
+                shutdown,
+                start_timeout,
+            })
+            .await
+            .unwrap();
+        answer.expect("the child spawns");
+        let child = registered(&sys, &name).await;
+        match entry {
+            0 => {
+                park(&child, &probe).await;
+                sup.notify(Cmd::Terminate(name.clone())).await.unwrap();
+            }
+            1 => {
+                park(&child, &probe).await;
+                sup.stop(StopReason::Kill).await.unwrap();
+            }
+            _ => {
+                // The restart's init hangs past its start timeout, so
+                // the attempt kills the new incarnation.
+                probe.hang_restart_init.store(true, Ordering::SeqCst);
+                child.notify(Msg::Crash).await.unwrap();
+                within(BOUND, "the crashed incarnation", child.wait_stopped()).await;
+                wait_until(BOUND, "the restart to be attempted", || {
+                    probe.built.load(Ordering::SeqCst) == 2
+                })
+                .await;
+            }
+        }
+        // Past the start timeout for entry 2, so its Kill was raised and
+        // only the edge-of-range grace keeps the incarnation running.
+        let horizon = start_timeout.unwrap_or_default() + Duration::from_millis(600);
+        sleep(horizon).await;
+        if entry < 2 {
+            assert_ne!(child.status(), ActorStatus::Stopped, "child entry {entry}");
+            probe.gate.notify_one();
+            within(
+                BOUND,
+                "the child to end at its boundary",
+                child.wait_stopped(),
+            )
+            .await;
+        } else {
+            let hung = sys.get::<Worker>(&name).expect("the restarted incarnation");
+            assert_ne!(hung.status(), ActorStatus::Stopped, "child entry {entry}");
+            probe.hang_restart_init.store(false, Ordering::SeqCst);
+            probe.init_gate.notify_waiters();
+            // Released from its init, the incarnation ends instead of
+            // being adopted: the start timeout's Kill, held by its
+            // lane through the edge-of-range grace, is what ends it.
+            within(BOUND, "the hung incarnation to end", hung.wait_stopped()).await;
+        }
+    }
+}
+
+fn edge_of_range_never_panics(edge: Edge, roots: bool) {
+    count_overflow_panics();
+    common::run(2, async move {
+        let before = OVERFLOW_PANICS.load(Ordering::SeqCst);
+        let grace = edge.grace();
+        if roots {
+            edge_of_range_roots(grace).await;
+        } else {
+            edge_of_range_children(grace).await;
+        }
+        assert_eq!(
+            OVERFLOW_PANICS.load(Ordering::SeqCst),
+            before,
+            "no path overflowed an instant with an edge-of-range grace"
+        );
+    });
 }
 
 #[test]
 fn edge_of_range_kill_grace_never_panics() {
-    count_overflow_panics();
-    common::run(2, async {
-        let thirty_years = Duration::from_secs(86_400 * 365 * 30);
-        for grace in [thirty_years, largest_addable(), Duration::MAX] {
-            // A root: kill by name, kill by id, stop with Kill and the
-            // shutdown's Kill step.
-            for entry in 0..4usize {
-                let sys = ActorSystem::create_with(
-                    uname("edge-root"),
-                    SystemConfig {
-                        shutdown_policy: ShutdownPolicy {
-                            timeout: Duration::from_secs(1),
-                            per_actor_timeout: Duration::from_millis(50),
-                        },
-                        ..SystemConfig::default()
-                    },
-                )
-                .unwrap();
-                let probe = Arc::new(Probe::default());
-                let name = uname("root");
-                let handle = worker(&probe, false)
-                    .spawn()
-                    .named(&name)
-                    .on_system(&sys)
-                    .kill_grace(grace)
-                    .await
-                    .unwrap();
-                park(&handle, &probe).await;
-                let caller: Option<tokio::task::JoinHandle<()>> = match entry {
-                    0 => {
-                        sys.kill(&name).await.unwrap();
-                        None
-                    }
-                    1 => {
-                        let (sys, id) = (sys.clone(), handle.id().clone());
-                        Some(tokio::spawn(async move {
-                            sys.kill_by_id(&id).await;
-                        }))
-                    }
-                    2 => {
-                        handle.stop(StopReason::Kill).await.unwrap();
-                        None
-                    }
-                    _ => {
-                        let sys = sys.clone();
-                        Some(tokio::spawn(async move {
-                            sys.shutdown().await;
-                        }))
-                    }
-                };
-                // Nothing is aborted within the horizon of the test.
-                sleep(Duration::from_millis(600)).await;
-                assert_ne!(handle.status(), ActorStatus::Stopped, "entry {entry}");
-                // The turn ends and the target leaves at its next boundary.
-                probe.gate.notify_one();
-                within(
-                    BOUND,
-                    "the target to end at its boundary",
-                    handle.wait_stopped(),
-                )
-                .await;
-                if let Some(caller) = caller {
-                    within(BOUND, "the calling path to return", caller)
-                        .await
-                        .unwrap();
-                }
-            }
+    edge_of_range_never_panics(Edge::Max, false);
+}
 
-            // A supervised child: the supervisor's `Shutdown::Kill` ladder, a
-            // killed supervisor's link guard, and a restart attempt's start
-            // timeout.
-            for entry in 0..3usize {
-                let sys = ActorSystem::create(uname("edge-child")).unwrap();
-                let probe = Arc::new(Probe::default());
-                let sup = spawn_sup(&sys, &probe, false).await;
-                let name = uname("child");
-                let shutdown = if entry == 0 {
-                    Shutdown::Kill
-                } else {
-                    Shutdown::Timeout(Duration::from_secs(5))
-                };
-                // Long enough that a loaded scheduler always polls the
-                // restarted incarnation into its hung init before the start
-                // timeout raises its Kill: the subject is the grace, not the
-                // start timeout.
-                let start_timeout = (entry == 2).then_some(Duration::from_secs(2));
-                let answer = sup
-                    .send(Cmd::Spawn {
-                        name: name.clone(),
-                        grace,
-                        shutdown,
-                        start_timeout,
-                    })
-                    .await
-                    .unwrap();
-                answer.expect("the child spawns");
-                let child = registered(&sys, &name).await;
-                match entry {
-                    0 => {
-                        park(&child, &probe).await;
-                        sup.notify(Cmd::Terminate(name.clone())).await.unwrap();
-                    }
-                    1 => {
-                        park(&child, &probe).await;
-                        sup.stop(StopReason::Kill).await.unwrap();
-                    }
-                    _ => {
-                        // The restart's init hangs past its start timeout, so
-                        // the attempt kills the new incarnation.
-                        probe.hang_restart_init.store(true, Ordering::SeqCst);
-                        child.notify(Msg::Crash).await.unwrap();
-                        within(BOUND, "the crashed incarnation", child.wait_stopped()).await;
-                        wait_until(BOUND, "the restart to be attempted", || {
-                            probe.built.load(Ordering::SeqCst) == 2
-                        })
-                        .await;
-                    }
-                }
-                // Past the start timeout for entry 2, so its Kill was raised and
-                // only the edge-of-range grace keeps the incarnation running.
-                let horizon = start_timeout.unwrap_or_default() + Duration::from_millis(600);
-                sleep(horizon).await;
-                if entry < 2 {
-                    assert_ne!(child.status(), ActorStatus::Stopped, "child entry {entry}");
-                    probe.gate.notify_one();
-                    within(
-                        BOUND,
-                        "the child to end at its boundary",
-                        child.wait_stopped(),
-                    )
-                    .await;
-                } else {
-                    let hung = sys.get::<Worker>(&name).expect("the restarted incarnation");
-                    assert_ne!(hung.status(), ActorStatus::Stopped, "child entry {entry}");
-                    probe.hang_restart_init.store(false, Ordering::SeqCst);
-                    probe.init_gate.notify_waiters();
-                    // Released from its init, the incarnation ends instead of
-                    // being adopted: the start timeout's Kill, held by its
-                    // lane through the edge-of-range grace, is what ends it.
-                    within(BOUND, "the hung incarnation to end", hung.wait_stopped()).await;
-                }
-            }
-        }
-        assert_eq!(
-            OVERFLOW_PANICS.load(Ordering::SeqCst),
-            0,
-            "no path overflowed an instant with an edge-of-range grace"
-        );
-    });
+#[test]
+fn edge_of_range_kill_grace_never_panics_roots_max() {
+    edge_of_range_never_panics(Edge::Max, true);
+}
+
+#[test]
+fn edge_of_range_kill_grace_never_panics_children_largest_addable() {
+    edge_of_range_never_panics(Edge::LargestAddable, false);
+}
+
+#[test]
+fn edge_of_range_kill_grace_never_panics_roots_largest_addable() {
+    edge_of_range_never_panics(Edge::LargestAddable, true);
+}
+
+#[test]
+fn edge_of_range_kill_grace_never_panics_children_thirty_years() {
+    edge_of_range_never_panics(Edge::ThirtyYears, false);
+}
+
+#[test]
+fn edge_of_range_kill_grace_never_panics_roots_thirty_years() {
+    edge_of_range_never_panics(Edge::ThirtyYears, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,7 +1324,7 @@ fn kill_backstop_fires_while_another_runtime_hosts_a_never_driven_reaper() {
     rt.block_on(async {
         sys.kill(&name).await.expect("the kill is accepted");
         within(
-            upper(false, grace + ASSUMED_ABORT_SETTLE + MARGIN),
+            upper(false, grace + ASSUMED_ABORT_SETTLE),
             "the root to be aborted by the reaper of its own runtime",
             handle.wait_stopped(),
         )
@@ -1267,7 +1354,7 @@ fn kill_from_a_throwaway_runtime_still_aborts_a_parked_target() {
         .expect("the kill is accepted");
     rt.block_on(async {
         within(
-            upper(false, grace + ASSUMED_ABORT_SETTLE + MARGIN),
+            upper(false, grace + ASSUMED_ABORT_SETTLE),
             "the root to be aborted on its own runtime",
             handle.wait_stopped(),
         )

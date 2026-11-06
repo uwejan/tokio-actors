@@ -47,6 +47,28 @@ where
     }
 }
 
+// A bare anonymous spawn (no name, no explicit system) registers with
+// `ActorSystem::default()` as a root, and the registration outlives the only
+// handle the spawn returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_spawn_registers() {
+    let handle = Idle.spawn().await.expect("spawn succeeds");
+    let id = handle.id().clone();
+
+    let sys = ActorSystem::default();
+    assert!(
+        sys.get_by_id::<Idle>(&id).is_some(),
+        "bare anonymous spawn must register with the default system"
+    );
+
+    drop(handle);
+
+    let recovered = sys
+        .get_by_id::<Idle>(&id)
+        .expect("registration outlives the original handle");
+    let _ = recovered.status();
+}
+
 // Zombie end-to-end: a bare spawn with its only external handle dropped is
 // still enumerable, statusable, and killable through its system, and any
 // handle obtained before the drop still observes the kill.

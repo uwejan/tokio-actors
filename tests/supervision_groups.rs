@@ -53,8 +53,9 @@ mod common;
 // Timing constants: deadlines are generous, polling is tight.
 // ---------------------------------------------------------------------------
 
-/// Upper bound for any single wait. Tests fail loudly on expiry.
-const DEADLINE: Duration = Duration::from_secs(10);
+/// The longest a poll for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const DEADLINE: Duration = Duration::from_secs(60);
 /// Poll interval for event-based waiting.
 const POLL: Duration = Duration::from_millis(10);
 /// Settling window after a wait condition first holds; used to detect
@@ -121,7 +122,7 @@ fn spawn_max_sampler(counter: &InstanceCounter) -> tokio::task::JoinHandle<()> {
 // Event-based waiting helpers
 // ---------------------------------------------------------------------------
 
-/// Polls `cond` every `POLL` until it holds or `DEADLINE` expires (panic).
+/// Polls `cond` every `POLL` until it holds or `DEADLINE` expires (panic). The bound only limits how long a real hang takes to report.
 async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
@@ -150,7 +151,7 @@ fn all_alive<A: Actor>(names: &[String]) -> bool {
 
 /// Polls the default-system registry until `name` resolves to a live handle,
 /// then returns that handle. Handles are invalidated by restarts, so tests
-/// re-lookup before every interaction instead of caching.
+/// re-lookup before every interaction instead of caching. The bound only limits how long a real hang takes to report.
 async fn live_handle<A: Actor>(name: &str) -> ActorHandle<A> {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
@@ -1313,6 +1314,11 @@ impl Actor for HangChild {
 /// unanswered for at least this long, far beyond any scheduling delay.
 const HANG_BOUND: Duration = Duration::from_secs(1);
 
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
 /// Supervisor for the hung-init test: a normal crash trigger (a) plus a
 /// permanently-hung sibling (b) bounded by `start_timeout` on restart.
 struct HangGroupSup {
@@ -1475,7 +1481,7 @@ async fn one_for_all_hung_init_escalates_body(paused: bool) {
     assert!(
         max_latency
             < if paused {
-                HANG_BOUND / 2
+                PAUSED_SLACK
             } else {
                 // The exact bound is pinned on the paused clock; on real time only
                 // a supervisor that stopped answering fails.
@@ -1776,8 +1782,8 @@ fn one_for_all_down_member_rejoins_and_budget_charged_once() {
 // member's ledger forever. Before its own crash forms the group, b is
 // already bouncing independently (`stop_child`) and its attempt hangs in its
 // initialization; the group orders the attempt, which ends strictly during
-// the group's teardown of the slow sibling c, exactly the interleaving that
-// used to leave b stuck `Restarting` and c permanently queued behind it.
+// the group's teardown of the slow sibling c. Neither may be left stuck: b
+// in `Restarting`, or c queued behind it.
 // ---------------------------------------------------------------------------
 
 /// Group member whose restart attempt (but never its initial spawn) hangs in
@@ -2059,9 +2065,9 @@ fn group_chain_survives_a_member_restart_failing_mid_group_stop() {
         // recovery from the still-failing middle of the sequence. `b_calls`
         // reaching 3 is unambiguous: it only increments from inside a
         // successfully-entered `on_started`, and the chain-revival attempt is
-        // the only possible source of a 3rd call (the wedge's signature is
-        // this count getting stuck at 2 forever - see the `wait_for` deadline
-        // panic that produces on unfixed code). `counter.live() == 3` confirms
+        // the only possible source of a 3rd call (a wedged member leaves this
+        // count at 2, and the `wait_for` deadline then panics).
+        // `counter.live() == 3` confirms
         // every member (including c, and the hung bounce instance's replacement)
         // is back to a genuinely live instance, not just constructed.
         wait_for(

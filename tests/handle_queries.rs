@@ -1,7 +1,6 @@
-use tokio::time::Duration;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, ActorSystem, StopReason,
+    ActorConfig, ActorResult, ActorSystem,
 };
 
 #[derive(Default, Debug)]
@@ -39,33 +38,6 @@ impl Actor for TestActor {
             Msg::Get => Ok(Resp::Value(self.value)),
         }
     }
-}
-
-#[tokio::test]
-async fn is_alive_returns_true_when_actor_running() {
-    let actor = TestActor::default()
-        .spawn()
-        .named("hq-alive-true")
-        .await
-        .unwrap();
-    assert!(actor.is_alive(), "Actor should be alive after spawning");
-}
-
-#[tokio::test]
-async fn is_alive_returns_false_after_stop() {
-    let actor = TestActor::default()
-        .spawn()
-        .named("hq-alive-false")
-        .await
-        .unwrap();
-    actor.stop(StopReason::Graceful).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), actor.wait_stopped())
-        .await
-        .expect("the stopped actor stops");
-    assert!(
-        !actor.is_alive(),
-        "Actor should not be alive after stopping"
-    );
 }
 
 #[tokio::test]

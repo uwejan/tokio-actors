@@ -74,9 +74,10 @@ struct Worker;
 
 #[derive(Clone)]
 enum WorkerMsg {
-    /// Parks the handler on a never-ready future, so the mailbox slot it
-    /// occupied is never returned and the actor never revisits its loop.
-    Hang,
+    /// Raises the flag, then parks the handler on a never-ready future: the
+    /// flag shows the handler took the message and freed its mailbox slot,
+    /// and the actor never revisits its loop.
+    Hang(Arc<AtomicBool>),
     /// Waits at the gate until the test opens it, then replies with `7`.
     Gated(Arc<Gate>),
     /// Replies immediately with the given value.
@@ -89,7 +90,8 @@ impl Actor for Worker {
 
     async fn handle(&mut self, msg: WorkerMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         match msg {
-            WorkerMsg::Hang => {
+            WorkerMsg::Hang(entered) => {
+                entered.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 unreachable!("pending() never resolves")
             }
@@ -114,12 +116,23 @@ async fn full_mailbox_with_hung_handler_times_out_unenqueued() {
         .await
         .unwrap();
 
-    // Dequeued almost immediately (the mailbox starts empty with one free
-    // slot); parks the handler on `pending()` forever.
-    handle.notify(WorkerMsg::Hang).await.unwrap();
-    // Give the actor task a chance to actually pull `Hang` out of the
-    // mailbox and start awaiting it before we refill the single slot.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Dequeued as soon as the actor runs (the mailbox starts empty with one
+    // free slot); parks the handler on `pending()` forever.
+    let entered = Arc::new(AtomicBool::new(false));
+    handle
+        .notify(WorkerMsg::Hang(entered.clone()))
+        .await
+        .unwrap();
+    // The handler raises the flag once it holds the message, so the single
+    // slot is free again before the test refills it.
+    let waited = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            waited.elapsed() < GATE_CAP,
+            "the handler never took the message"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 
     // Takes the only mailbox slot. It can never be dequeued: the handler is
     // wedged inside the first message's `handle()` call for good.

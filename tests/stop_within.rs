@@ -38,6 +38,11 @@ const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
 /// paused clock, where an outcome lands on its instant.
 const HANG_BOUND: Duration = Duration::from_secs(10);
 
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
 /// The longest a [`NeverYields`] turn holds its thread when the test never
 /// releases it: past every bound a test awaits.
 const GATE_CAP: Duration = Duration::from_secs(15);
@@ -229,7 +234,7 @@ async fn always_vetoing_actor_is_killed_by_the_deadline(paused: bool) {
 
     assert_eq!(outcome, StopOutcome::Killed);
     let bound = if paused {
-        within + ASSUMED_KILL_GRACE * 3
+        within + PAUSED_SLACK
     } else {
         HANG_BOUND
     };
@@ -476,6 +481,37 @@ async fn edge_of_range_within_does_not_panic() {
         let outcome = handle.stop_within(StopReason::Graceful, d).await.unwrap();
         assert_eq!(outcome, StopOutcome::Graceful, "attempt {step}");
     }
+}
+
+/// The same edge for a `Kill`, whose caller waits for the end with the
+/// duration itself: on the paused clock the call reads the instant the test
+/// measured, so the deadline lands in the last millisecond of the range on
+/// every run.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn edge_of_range_kill_within_does_not_panic_paused() {
+    let handle = Cooperative
+        .spawn()
+        .named(uname("edge-of-range-kill"))
+        .await
+        .unwrap();
+    let base = Instant::now();
+    let mut lo = Duration::ZERO;
+    let mut hi = Duration::from_secs(u64::MAX / 2);
+    while hi - lo > Duration::from_nanos(1) {
+        let mid = lo + (hi - lo) / 2;
+        if base.checked_add(mid).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let d = lo - Duration::from_micros(500);
+
+    let outcome = handle.stop_within(StopReason::Kill, d).await.unwrap();
+    assert!(
+        matches!(outcome, StopOutcome::Killed | StopOutcome::Graceful),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

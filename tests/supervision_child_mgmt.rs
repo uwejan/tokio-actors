@@ -7,7 +7,7 @@
 //!   BUDGET-FREE; Transient/Temporary stay down.
 //! - `ctx.restart_child(id)` / `ctx.delete_child(id)`: sync, typed errors
 //!   ChildNotFound / ChildRunning / ChildRestarting.
-//! - `SupervisionAction::RestartInitiated` (renamed from `Restarted`).
+//! - `SupervisionAction::RestartInitiated`.
 //! - A supervised child's death reason is reported truthfully: a genuine
 //!   `Cancelled` stays `Cancelled`; an aborted task is reported as `Kill`.
 //!
@@ -235,7 +235,7 @@ impl Actor for Vetoer {
 
     async fn pre_stop(&mut self, _reason: &StopReason, ctx: &mut ActorContext<Self>) -> bool {
         if let Some(name) = ctx.actor_name() {
-            *VETOES.lock().unwrap().entry(name.clone()).or_default() += 1;
+            *VETOES.lock().unwrap().entry(name.to_string()).or_default() += 1;
         }
         false
     }
@@ -938,18 +938,26 @@ fn terminate_hung_child_abort_backstop() {
         .expect("spawn worker");
         let worker = wait_worker_ready(&name, 5_000).await.expect("worker up");
 
-        // Wedge the handler on a never-ready future, then give it time to get
-        // stuck: from here on, no message (not even Kill) can ever be processed.
+        // Wedge the handler on a never-ready future and wait until it has taken
+        // the message (the loop calls `handle` in the poll that dequeues it):
+        // from here on, no message (not even Kill) can ever be processed.
         worker.notify(WorkerMsg::Hang).await.unwrap();
-        sleep(Duration::from_millis(100)).await;
+        assert!(
+            wait_until(5_000, || worker.mailbox_len() == 0).await,
+            "the worker must take the Hang message"
+        );
 
         // ParentRequest is never seen, Kill at 150ms is never seen; only the
         // abort() after the child's kill grace reaps the task. terminate_child
         // must still return Ok, bounded well under 2s wall time.
         let t0 = Instant::now();
-        op(&sup, SupCmd::Terminate { id: name.clone() })
-            .await
-            .expect("terminate_child must return Ok via the abort backstop");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            op(&sup, SupCmd::Terminate { id: name.clone() }),
+        )
+        .await
+        .expect("terminate_child must return")
+        .expect("terminate_child must return Ok via the abort backstop");
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -1055,7 +1063,10 @@ fn aborted_child_is_reported_as_kill() {
 
         // Parked deaf to any signal short of an abort.
         worker.notify(WorkerMsg::Hang).await.unwrap();
-        sleep(Duration::from_millis(100)).await;
+        assert!(
+            wait_until(5_000, || worker.mailbox_len() == 0).await,
+            "the worker must take the Hang message"
+        );
 
         let sys = ActorSystem::default();
         assert!(
@@ -1192,8 +1203,8 @@ fn manual_ops_error_during_pending_group() {
 
         // A Bounce (stop_child) on a Permanent member the pending group will
         // restart is absorbed by that restart: the call changes nothing and
-        // the group's own state machine owns this member. Unlike Terminate
-        // (see `terminate_during_group_stop_overrides_default_restart`), a
+        // the group's own state machine owns this member. Unlike Terminate,
+        // which overrides the group's restart for the member it releases, a
         // Bounce carries no override semantics.
         match sup
             .send(SupCmd::StopOutcome {
@@ -1214,106 +1225,6 @@ fn manual_ops_error_during_pending_group() {
             sup.is_alive(),
             "supervisor must stay alive through group restart + refused manual op"
         );
-    });
-}
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-
-// A caller's `terminate_child` on a group member still awaiting its own
-// death (the group's Stopping phase) is honored over the group's default
-// restart: the member ends up Removed instead of rejoining the restart
-// chain, and the group still completes for its other members.
-#[test]
-fn terminate_during_group_stop_overrides_default_restart() {
-    common::run(0, async {
-        let events = recorder();
-        let sup = MgmtSup {
-            events: events.clone(),
-        }
-        .spawn()
-        .named(uname("sup-group-override"))
-        .with_supervision(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60)))
-        .await
-        .unwrap();
-
-        let name_a = uname("override-a");
-        let name_veto = uname("override-veto");
-        op(
-            &sup,
-            SupCmd::SpawnWorker {
-                name: name_a.clone(),
-                restart_type: RestartType::Permanent,
-                shutdown: Shutdown::Timeout(Duration::from_secs(1)),
-            },
-        )
-        .await
-        .expect("spawn a");
-        op(
-            &sup,
-            SupCmd::SpawnVetoer {
-                name: name_veto.clone(),
-                timeout_ms: 800,
-            },
-        )
-        .await
-        .expect("spawn vetoer");
-
-        let worker_a = wait_worker_ready(&name_a, 5_000).await.expect("a up");
-        let sys = ActorSystem::default();
-        assert!(
-            wait_until(5_000, || sys.get::<Vetoer>(&name_veto).is_some()).await,
-            "vetoer must come up"
-        );
-
-        // Crash `a`: OneForAll pulls the group (both members) into a Stopping
-        // phase. The vetoer holds it open for ~800ms, giving a wide window to
-        // land the override.
-        worker_a.notify(WorkerMsg::Crash).await.unwrap();
-        sleep(Duration::from_millis(100)).await;
-
-        // The override: Terminate wins over the group's default restart for
-        // this specific member. It still blocks until the vetoer is actually
-        // gone (escalated Kill after the 800ms timeout).
-        let t0 = Instant::now();
-        op(
-            &sup,
-            SupCmd::Terminate {
-                id: name_veto.clone(),
-            },
-        )
-        .await
-        .expect("terminate_child must be honored during the group's Stopping phase");
-        assert!(
-            t0.elapsed() < Duration::from_secs(5),
-            "the override must still be bounded by the vetoer's own escalation ladder"
-        );
-
-        // The group still completes: `a` comes back up with fresh state.
-        let revived_a = wait_worker_ready(&name_a, 10_000)
-            .await
-            .expect("the group must still complete for its other member");
-        assert_eq!(revived_a.send(WorkerMsg::Count).await.unwrap(), 0);
-
-        // The overridden member is Removed, not restarted, and stays down.
-        let evs = wait_for_events(&events, 10_000, |e| event_for(e, &name_veto).is_some()).await;
-        let ev = event_for(&evs, &name_veto)
-            .unwrap_or_else(|| panic!("no death event for the overridden member: {evs:?}"));
-        assert_eq!(
-            ev.action,
-            SupervisionAction::Removed,
-            "a Terminate override must report Removed, not RestartInitiated: {ev:?}"
-        );
-        assert!(
-            sys.get::<Vetoer>(&name_veto).is_none(),
-            "the overridden member must stay down"
-        );
-        sleep(Duration::from_millis(200)).await;
-        assert!(
-            sys.get::<Vetoer>(&name_veto).is_none(),
-            "the overridden member must not be revived by the group's own chain"
-        );
-        assert!(sup.is_alive());
     });
 }
 

@@ -7,15 +7,13 @@
 //! one-way flag, a `Defunct` system is not poisoned forever:
 //! `ActorSystem::reactivate` returns it to `Active`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorResult, ActorSystem, ShutdownPolicy, SpawnError,
+    ActorResult, ActorSystem, ShutdownPolicy, SpawnError, StopReason,
 };
 
 #[derive(Default)]
@@ -74,72 +72,70 @@ async fn reactivate_on_a_never_shut_down_system_is_a_no_op_failure() {
     );
 }
 
+/// Holds its graceful stop in `pre_stop` until the test opens the gate, so a
+/// shutdown stays in flight for exactly as long as the test wants.
+struct Held {
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl Actor for Held {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        self.gate.notified().await;
+        true
+    }
+}
+
+/// Opens the gate when dropped, also while a failed assertion unwinds.
+struct OpensOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reactivate_refused_while_shutdown_is_in_flight() {
-    enum Msg {
-        Hang,
-    }
-
-    #[derive(Default)]
-    struct Hung {
-        entered: Arc<AtomicBool>,
-    }
-
-    impl Actor for Hung {
-        type Message = Msg;
-        type Response = ();
-
-        async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-            match msg {
-                Msg::Hang => {
-                    self.entered.store(true, Ordering::SeqCst);
-                    std::future::pending::<()>().await;
-                    unreachable!("pending() never resolves")
-                }
-            }
-        }
-    }
-
     let sys = ActorSystem::create(uname("mid-flight")).unwrap();
 
-    let entered = Arc::new(AtomicBool::new(false));
-    let handle = Hung {
-        entered: entered.clone(),
-    }
-    .spawn()
-    .named("hung-root")
-    .on_system(&sys)
-    .await
-    .unwrap();
-    handle.notify(Msg::Hang).await.unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let _opens = OpensOnDrop(gate.clone());
+    Held { gate: gate.clone() }
+        .spawn()
+        .named("held-root")
+        .on_system(&sys)
+        .await
+        .unwrap();
 
-    let deadline = Instant::now() + Duration::from_millis(2_000);
-    while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(entered.load(Ordering::SeqCst), "actor must have hung");
-
+    // Neither bound can end the shutdown before the gate opens.
     let policy = ShutdownPolicy {
-        timeout: Duration::from_millis(300),
-        per_actor_timeout: Duration::from_millis(100),
+        timeout: Duration::from_secs(60),
+        per_actor_timeout: Duration::from_secs(60),
     };
-    let shutdown_task = tokio::spawn({
-        let sys = sys.clone();
-        async move { sys.shutdown_with(policy).await }
-    });
-
-    // Shutdown flips to `ShuttingDown` synchronously at entry, well before
-    // this sleep elapses.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The first poll of the call moves the system to `ShuttingDown` and
+    // counts the shutdown as in flight; the held root keeps it in flight
+    // until the test opens the gate.
+    let mut shutdown = Box::pin(sys.shutdown_with(policy));
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(pending, "a shutdown with a held root cannot end at once");
     assert!(
         !sys.reactivate(),
         "reactivate must be refused while a shutdown is still in flight"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), shutdown_task)
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
         .await
-        .expect("shutdown must not hang")
-        .expect("shutdown task must not panic");
+        .expect("shutdown must not hang");
 
     assert!(
         sys.reactivate(),

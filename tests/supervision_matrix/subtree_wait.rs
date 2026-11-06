@@ -454,7 +454,7 @@ impl Actor for Top {
                 ));
             }
             TopMsg::TerminateAbandoned => {
-                let _ = timeout(Duration::from_millis(20), ctx.terminate_child(p_name)).await;
+                let _ = timeout(Duration::ZERO, ctx.terminate_child(p_name)).await;
                 self.probe.note("terminate_abandoned");
             }
             TopMsg::DeleteSpawn => {

@@ -6,14 +6,22 @@
 //! completions), then the verdict signal (an incarnation given the Unresponsive
 //! verdict), then the forwarder plane (timer and stream completions), then the
 //! priority lane (present only on an actor spawned with one), then the user
-//! mailbox. This ordering is deliberate, not incidental: it mirrors the OTP
-//! spirit of signals and supervisor traffic pre-empting ordinary message-queue
-//! processing, so a stop/kill request is honored, a child's death is observed,
-//! and a priority message is received even while the mailbox is full, and
-//! `get_status` answers without waiting behind user traffic. Every branch is
-//! only ever observed at a turn boundary - between two callbacks, never during
-//! one - so none of this races or cancels a callback already in progress (the
-//! Isolated Turn Principle).
+//! mailbox. This ordering is deliberate, not incidental: a stop or kill
+//! request is observed, a child's death is observed, and (on an actor spawned
+//! with a priority lane) a priority message is received even while the mailbox
+//! is full, and `get_status` answers without waiting behind user traffic.
+//! Every branch is only ever observed at a turn boundary, between two
+//! callbacks and never during one, so none of this races or cancels a callback
+//! already in progress. A callback that is still awaiting is cancelled only by
+//! the abort that backs a `Kill`, by the abort of a start that outruns its
+//! `start_timeout` (or whose timeout bound panics before it decides), and by
+//! the end of the actor's runtime. The abort that backs a `Kill` is issued
+//! once the kill grace has passed since the `Kill` was raised; for a
+//! `stop_within` call whose reason is `Kill`, once its window has passed in
+//! the grace's place; when more than one call raised a `Kill` on the same
+//! actor, once the earliest of their deadlines has passed; and at once on a
+//! runtime built without the time driver (with `panic = "abort"` the first timer the system uses on such a
+//! runtime ends the process instead).
 //!
 //! The priority lane is served ahead of the mailbox at every turn, so a
 //! priority flood at or above the rate the actor consumes it starves the normal
@@ -48,12 +56,19 @@
 //! expired is not evaluated: it is recorded as down, and the supervisor stops
 //! with an unresponsive-child failure, so its own supervisor decides.
 //!
-//! The stop lane itself is a `watch` signal, not a channel: raising it is
-//! synchronous and infallible, severity only ever increases, and multiple
-//! raises that land between two turn boundaries coalesce into the single
-//! highest-severity, latest state - the loop is guaranteed at least one fresh
-//! observation per distinct severity level reached, never one per individual
-//! raise.
+//! The stop lane itself is a cell in state that the actor's task and its
+//! handles share, not a channel. Raising it is synchronous and never waits for
+//! capacity. Once the actor has run its `on_stopped` or gone past it (it does
+//! not run under a `Kill` or after a start that failed), a raise other than
+//! `Kill` is refused; a `Kill` is accepted until the actor seals the lane at
+//! the end of its teardown, and every raise is refused after that, as it is
+//! once the actor's task is gone. Severity never decreases. Raises that
+//! land between two turn boundaries coalesce into one observation of the
+//! strongest request (of two at the same severity, the one of higher rank,
+//! otherwise the later one), so the loop observes that one request and not one
+//! per raise, and a request that a stronger one overtakes before the loop reads
+//! is never observed. A raise at the same severity after the loop has observed
+//! the first is observed again.
 //!
 //! A supervised child's death is delivered through its own per-incarnation fate
 //! cell, populated by that incarnation's runner task living in the supervisor's
@@ -61,8 +76,10 @@
 //! capacity - so however many children die in the same instant, none of their
 //! fates are lost waiting for room. The runner, the death-plane task that
 //! awaits the incarnation's exit, also owns that incarnation's stop ladder: any
-//! stop committed for the incarnation, from any origin, is escalated by the
-//! runner, so no caller future and no detached timer owns any step of it. A
+//! stop the supervisor orders for the incarnation, from any origin, is
+//! escalated by the runner, so no caller future and no detached timer owns any
+//! step of it; a bounded stop called on the child's handle is escalated by a
+//! task the system owns. A
 //! task dying with `StopReason::Kill` never awaits its own children: it drops
 //! its supervision state, and each live child's link guard acts for itself. A
 //! worker has Kill raised on its lane and is aborted by the system's reaper
@@ -107,12 +124,16 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Duration, Instant};
 
-use crate::actor::panic::{catch_callback, catch_sync, payload_into_string};
-use crate::actor::subtree::{SubtreeHold, SubtreeLink, SubtreeWatch};
+use crate::actor::mailbox::{MailRx, QueueRx};
+use crate::actor::panic::{
+    catch_callback, catch_hook, catch_sync, contain_waker_panic, discard, payload_into_string,
+    send_contained, AnswerHold,
+};
+use crate::actor::subtree::{SubtreeHold, SubtreeLink, SubtreeWatch, SystemPlane};
 use crate::actor::supervision::rules::{init_kill_check, InitStep, TeardownAction};
 use crate::actor::supervision::{
     advance_restart_chain, await_cell, evaluate_strategy, rules, run_ladder, CellOutcome,
@@ -127,10 +148,11 @@ use crate::actor::{
     Actor, ActorEnvelope,
 };
 use crate::error::{ActorError, SpawnError, SupervisionError};
+use crate::helper::{EndGuard, HelperKind};
 use crate::system::{ActorSystem, RegistryGuard};
 use crate::types::{
     ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildFate, ChildStoppedInternal, Envelope,
-    LaneState, RestartStrategy, RestartType, Shutdown, StatusValue, StopLane, StopReason,
+    LaneRx, RestartStrategy, RestartType, Shutdown, StatusTx, StatusValue, StopLane, StopReason,
     StopSeverity, SupervisionAction, SystemMessage, TurnClock,
 };
 
@@ -139,7 +161,10 @@ use crate::types::{
 pub struct MailboxConfig {
     /// The maximum number of messages the mailbox can hold. A value above
     /// [`tokio::sync::Semaphore::MAX_PERMITS`] is clamped to it at spawn
-    /// time instead of being rejected.
+    /// time instead of being rejected. The default is 64. A larger value is a
+    /// per-actor opt-in: a capacity of `usize::MAX` never makes a sender wait,
+    /// so a producer that outruns the actor grows the queue until memory runs
+    /// out.
     pub capacity: usize,
     /// The priority lane's bounded capacity. `None` (the default) means the
     /// actor has no priority lane at all, in which case every `*_priority`
@@ -183,8 +208,8 @@ impl MailboxConfig {
     /// picks a message, including normal messages the same sender sent earlier.
     /// No message, priority or not, interrupts a callback already in progress.
     /// The run loop receives, highest first: the stop lane, the system channel,
-    /// the supervision branches (restart plane, death plane, verdict signal,
-    /// forwarders), this lane, and the normal mailbox; a stop request never
+    /// the restart plane, the death plane, the verdict signal, the forwarder
+    /// plane, this lane, and the normal mailbox; a stop request never
     /// travels on this lane.
     ///
     /// # Starvation
@@ -208,6 +233,10 @@ impl MailboxConfig {
     /// [`ActorHandle::priority_capacity`](crate::actor::handle::ActorHandle::priority_capacity)),
     /// and, being bounded, a full lane applies backpressure (`Full`, a
     /// timeout) instead of growing without limit.
+    /// It also differs in who may use it: any holder of this actor's handle can
+    /// send on the lane, where Erlang/OTP lets a sender use priority only
+    /// through an alias the receiver created for it, so the receiver chooses
+    /// who may.
     ///
     /// There is no default capacity, and a capacity of `0` is rejected at
     /// spawn time with
@@ -239,7 +268,10 @@ impl<'a> From<&'a ActorConfig> for ActorConfig {
 impl ActorConfig {
     /// Sets the mailbox capacity. A value above
     /// [`tokio::sync::Semaphore::MAX_PERMITS`] is clamped to it at spawn
-    /// time instead of being rejected.
+    /// time instead of being rejected. The default is 64. A larger value is a
+    /// per-actor opt-in: a capacity of `usize::MAX` never makes a sender wait,
+    /// so a producer that outruns the actor grows the queue until memory runs
+    /// out.
     pub fn with_mailbox_capacity(mut self, capacity: usize) -> Self {
         self.mailbox.capacity = capacity;
         self
@@ -269,8 +301,8 @@ impl ActorConfig {
     /// picks a message, including normal messages the same sender sent earlier.
     /// No message, priority or not, interrupts a callback already in progress.
     /// The run loop receives, highest first: the stop lane, the system channel,
-    /// the supervision branches (restart plane, death plane, verdict signal,
-    /// forwarders), this lane, and the normal mailbox; a stop request never
+    /// the restart plane, the death plane, the verdict signal, the forwarder
+    /// plane, this lane, and the normal mailbox; a stop request never
     /// travels on this lane.
     ///
     /// # Starvation
@@ -294,6 +326,10 @@ impl ActorConfig {
     /// [`ActorHandle::priority_capacity`](crate::actor::handle::ActorHandle::priority_capacity)),
     /// and, being bounded, a full lane applies backpressure (`Full`, a
     /// timeout) instead of growing without limit.
+    /// It also differs in who may use it: any holder of this actor's handle can
+    /// send on the lane, where Erlang/OTP lets a sender use priority only
+    /// through an alias the receiver created for it, so the receiver chooses
+    /// who may.
     ///
     /// There is no default capacity, and a capacity of `0` is rejected at
     /// spawn time with
@@ -334,7 +370,7 @@ pub(crate) fn into_actor<A: Actor>(
     id: impl Into<ActorId>,
     actor: A,
     config: impl Into<ActorConfig>,
-    name: Option<String>,
+    name: Option<Arc<str>>,
     system: Option<Arc<ActorSystem>>,
     kill_grace: Duration,
 ) -> Result<ActorHandle<A>, SpawnError> {
@@ -369,8 +405,8 @@ pub(crate) fn into_actor<A: Actor>(
 ///
 /// `is_root` distinguishes a top-level `SpawnBuilder` spawn (`true`) from a
 /// supervised child (`false`, `spawn_child` and its restart path). System
-/// shutdown only signals roots directly; a root's own supervision cascade
-/// takes its children down in turn.
+/// shutdown walks the roots; a root's own supervision cascade takes its
+/// children down in turn.
 ///
 /// `kill_grace` is the time the actor is given, after a `Kill` is raised on
 /// it, to reach its next turn boundary before its task is aborted. It is
@@ -389,54 +425,136 @@ pub(crate) fn into_actor<A: Actor>(
 /// never keeps any of them alive.
 type SpawnOutcome<A> = (ActorHandle<A>, JoinHandle<StopReason>, SubtreeWatch);
 
-/// What [`spawn_actor_parts`] returns: a [`SpawnOutcome`]'s parts with a
-/// sender of the status plane.
+/// What [`spawn_actor_parts_in`] returns: a [`SpawnOutcome`]'s parts with a
+/// sender of the status plane when the caller asked to keep one.
 type SpawnParts<A> = (
     ActorHandle<A>,
     JoinHandle<StopReason>,
-    watch::Sender<StatusValue>,
+    Option<StatusTx>,
     SubtreeWatch,
 );
+
+/// The refusal a mailbox configuration earns before anything is created.
+fn mailbox_config_error(config: &ActorConfig) -> Result<(), SpawnError> {
+    if config.mailbox.capacity == 0 || config.mailbox.priority_capacity == Some(0) {
+        return Err(SpawnError::ZeroMailboxCapacity);
+    }
+    Ok(())
+}
+
+/// What a spawn answers before it creates or claims anything, in the order
+/// the spawn itself answers it: a zero mailbox capacity, then (with a runtime
+/// current) a system that is not taking registrations, then a name that
+/// is already taken. Reads the registry and the system phase without
+/// claiming. A spawn that must also check the calling runtime's timers calls
+/// this first, so that what needs no timer is answered as it is without one.
+pub(crate) fn spawn_precheck(
+    config: &ActorConfig,
+    system: Option<&Arc<ActorSystem>>,
+    name: Option<&str>,
+) -> Result<(), SpawnError> {
+    mailbox_config_error(config)?;
+    if Handle::try_current().is_err() {
+        return Ok(());
+    }
+    // A default system nothing has created holds no name and takes spawns.
+    let target = match system {
+        Some(system) => Some(system.clone()),
+        None => ActorSystem::get_named("default"),
+    };
+    match target {
+        Some(target) => target.precheck_spawn(name),
+        None => Ok(()),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_actor<A: Actor>(
     id: ActorId,
     actor: A,
     config: ActorConfig,
-    name: Option<String>,
+    name: Option<Arc<str>>,
     system: Option<Arc<ActorSystem>>,
     ack: Option<oneshot::Sender<Result<(), ActorError>>>,
     is_root: bool,
     kill_grace: Duration,
     subtree: Option<SubtreeLink>,
 ) -> Result<SpawnOutcome<A>, SpawnError> {
-    let (handle, join, _status, subtree) = spawn_actor_parts(
-        id, actor, config, name, system, ack, is_root, kill_grace, subtree,
+    spawn_actor_in(
+        id, actor, config, name, system, ack, is_root, kill_grace, subtree, None,
+    )
+}
+
+/// [`spawn_actor`] on the runtime behind `placement` instead of the current
+/// one, which every task, timer and registry entry of the actor then uses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_actor_in<A: Actor>(
+    id: ActorId,
+    actor: A,
+    config: ActorConfig,
+    name: Option<Arc<str>>,
+    system: Option<Arc<ActorSystem>>,
+    ack: Option<oneshot::Sender<Result<(), ActorError>>>,
+    is_root: bool,
+    kill_grace: Duration,
+    subtree: Option<SubtreeLink>,
+    placement: Option<&Handle>,
+) -> Result<SpawnOutcome<A>, SpawnError> {
+    let (handle, join, _, subtree) = spawn_actor_parts_in(
+        id, actor, config, name, system, ack, is_root, kill_grace, subtree, placement, false,
     )?;
     Ok((handle, join, subtree))
 }
 
 /// [`spawn_actor`], also returning a sender of the actor's status plane:
 /// held by a caller, it keeps the plane open past the actor's own senders.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_actor_parts<A: Actor>(
     id: ActorId,
     actor: A,
     config: ActorConfig,
-    name: Option<String>,
+    name: Option<Arc<str>>,
     system: Option<Arc<ActorSystem>>,
     ack: Option<oneshot::Sender<Result<(), ActorError>>>,
     is_root: bool,
     kill_grace: Duration,
     subtree: Option<SubtreeLink>,
+) -> Result<
+    (
+        ActorHandle<A>,
+        JoinHandle<StopReason>,
+        StatusTx,
+        SubtreeWatch,
+    ),
+    SpawnError,
+> {
+    let (handle, join, status, subtree) = spawn_actor_parts_in(
+        id, actor, config, name, system, ack, is_root, kill_grace, subtree, None, true,
+    )?;
+    let status = status.expect("a spawn asked to keep a sender returns one");
+    Ok((handle, join, status, subtree))
+}
+
+/// [`spawn_actor`] on the runtime behind `placement`, the current one when it
+/// is `None`, returning a sender of the actor's status plane when
+/// `keep_status` is set.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_actor_parts_in<A: Actor>(
+    id: ActorId,
+    actor: A,
+    config: ActorConfig,
+    name: Option<Arc<str>>,
+    system: Option<Arc<ActorSystem>>,
+    ack: Option<oneshot::Sender<Result<(), ActorError>>>,
+    is_root: bool,
+    kill_grace: Duration,
+    subtree: Option<SubtreeLink>,
+    placement: Option<&Handle>,
+    keep_status: bool,
 ) -> Result<SpawnParts<A>, SpawnError> {
+    mailbox_config_error(&config)?;
     let mailbox_capacity = config.mailbox.capacity;
-    if mailbox_capacity == 0 {
-        return Err(SpawnError::ZeroMailboxCapacity);
-    }
-    if config.mailbox.priority_capacity == Some(0) {
-        return Err(SpawnError::ZeroMailboxCapacity);
-    }
     // Clamped, not rejected: a capacity above what the channel
     // implementation can represent is over-provisioning, not a
     // configuration error, so `usize::MAX` stays a valid "as large as this
@@ -446,7 +564,19 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
         .mailbox
         .priority_capacity
         .map(|cap| cap.min(tokio::sync::Semaphore::MAX_PERMITS));
-    let handle = Handle::try_current().map_err(|_| SpawnError::MissingRuntime)?;
+    let handle = match placement {
+        Some(placed) => placed.clone(),
+        None => Handle::try_current().map_err(|_| SpawnError::MissingRuntime)?,
+    };
+    // What the mailbox and the run loop need to know about the runtime, read
+    // once here from the handle the task is spawned on, which is the placement
+    // runtime when the spawn names one: how many worker threads it has and
+    // whether it is a current-thread runtime.
+    let workers = handle.metrics().num_workers();
+    let same_thread = matches!(
+        handle.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
 
     // Every spawn always resolves to a concrete system (bare anonymous
     // spawns join `ActorSystem::default()` as roots, same as named spawns
@@ -455,7 +585,11 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
     // `ActorId`.
     let target_system = system.clone().unwrap_or_else(ActorSystem::default);
 
-    let (tx, rx) = mpsc::channel(mailbox_capacity);
+    let (tx, rx) = crate::actor::mailbox::channel(
+        mailbox_capacity,
+        crate::actor::mailbox::lanes_for(workers),
+        Some(id.clone()),
+    );
     // A priority lane is a second, independent bounded channel, built only
     // when the config asks for one; `priority_rx` travels into the run loop
     // below, `priority_tx` into the handle callers use to reach it.
@@ -466,20 +600,19 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
         }
         None => (None, None),
     };
-    let (system_tx, system_rx) = mpsc::channel::<SystemMessage>(64);
-    let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Initializing));
     let (stop_lane, stop_rx) = StopLane::new();
+    let (status_tx, status_rx) = stop_lane.abort_record().status_channel();
     let abort_record = stop_lane.abort_record().clone();
+    let system_plane = SystemPlane::new(abort_record.clone(), id.clone(), target_system.clone());
     let actor_handle = ActorHandle::new(
         id.clone(),
         tx,
-        system_tx,
         stop_lane,
         mailbox_capacity,
         status_rx,
-        target_system.name().into(),
+        target_system.shared_name(),
         priority_tx,
-        Arc::new(AtomicBool::new(false)),
+        priority_capacity.map(|_| Arc::new(AtomicBool::new(false))),
     );
 
     // Owned by the run loop (the writer) and the registry entry (the
@@ -487,10 +620,39 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
     // touches this clock's shared threshold cell.
     let turn_clock = TurnClock::new(target_system.turn_threshold_cell());
 
+    // The registration comes first, before the context and the subtree hold
+    // exist, so a spawn the registry refuses creates no hold and leaves the
+    // parent's stop budget as it was. The guard is built at once, so
+    // anything that unwinds before the task exists unregisters the actor.
+    // The name-claim happens BEFORE the task is spawned; the AbortHandle
+    // does not exist yet at this point (it only exists once `handle.spawn`
+    // returns a JoinHandle), so it is attached in a second step just below.
+    //
+    // `ActorContext::new` below runs with the ORIGINAL `system`
+    // argument (possibly `None`), so a bare-spawned actor's `ctx.system`
+    // stays `None`; this is harmless because every downstream spawn path
+    // re-applies the same default-system fallback.
+    let registration_seq = target_system.register_actor::<A>(
+        &id,
+        name.as_ref(),
+        &actor_handle,
+        is_root,
+        turn_clock.clone(),
+        kill_grace,
+        handle.clone(),
+    )?;
+    let guard = RegistryGuard::new(
+        target_system.clone(),
+        id.clone(),
+        name.clone(),
+        registration_seq,
+    )
+    .with_status(status_tx.clone());
+
     let supervision = config.supervision.map(SupervisionState::new);
     let subtree = SubtreeHold::with_record(subtree, abort_record);
     let subtree_watch = subtree.watch();
-    let mut context = ActorContext::new(
+    let context = ActorContext::new(
         id.clone(),
         actor_handle.clone(),
         handle.clone(),
@@ -498,59 +660,41 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
         system,
         name.clone(),
         supervision,
+        turn_clock.clone(),
+        subtree.clone(),
     );
-    context.set_subtree(subtree.clone());
-    context.set_turn_clock(turn_clock.clone());
     if let Some(sup) = context.supervision_ref() {
         sup.verdicts.set_supervisor(id.clone());
     }
 
-    // The name-claim happens BEFORE the task is spawned; the AbortHandle
-    // does not exist yet at this point (it only exists once `handle.spawn`
-    // returns a JoinHandle), so it is attached in a second step just below.
-    //
-    // `ActorContext::new` above already ran with the ORIGINAL `system`
-    // argument (possibly `None`), so a bare-spawned actor's `ctx.system`
-    // stays `None`; this is harmless because every downstream spawn path
-    // re-applies the same default-system fallback.
-    let registration_seq = target_system.register_actor::<A>(
-        &id,
-        name.as_deref(),
-        &actor_handle,
-        is_root,
-        turn_clock.clone(),
-        kill_grace,
-        handle.clone(),
-    )?;
-    let guard = Some(
-        RegistryGuard::new(
-            target_system.clone(),
-            id.clone(),
-            name.clone(),
-            registration_seq,
-        )
-        .with_status(status_tx.clone())
-        .with_subtree(subtree.clone()),
-    );
+    let guard = Some(guard.with_subtree(subtree.clone()));
 
     let marker = context.task_marker();
+    #[cfg(test)]
     let abort_reason = AbortReason::new(status_tx.clone(), marker.clone(), id.clone());
+    #[cfg(not(test))]
+    let abort_reason = AbortReason::new(status_tx.clone(), marker.clone());
+    // Taken before the original moves into the run loop's parameters: a caller
+    // that asked to keep a sender of the plane holds the one extra.
+    let kept_status = keep_status.then(|| status_tx.clone());
     let join = handle.spawn(MarkedRun::new(
         marker,
-        run_actor(
-            subtree.clone(),
-            status_tx.clone(),
-            CaughtDrop::new(actor, |actor, _| end_value(actor), id.clone()),
-            CaughtDrop::new(context, end_context, id.clone()),
-            CaughtDrop::new(rx, end_queue, id.clone()),
-            CaughtDrop::new(priority_rx, end_lane, id.clone()),
-            abort_reason,
-            system_rx,
+        run_actor(Box::new(RunParts {
+            _subtree: subtree.clone(),
+            status: status_tx,
+            actor_slot: CaughtDrop::new(actor, |actor, _| end_value(actor), id.clone()),
+            ctx_slot: CaughtDrop::new(context, end_context, id.clone()),
+            mailbox_slot: QueueSlot::new(Some(rx), &target_system, id.clone()),
+            priority_slot: QueueSlot::new(priority_rx, &target_system, id.clone()),
+            _abort_reason: abort_reason,
+            system_rx: system_plane,
             stop_rx,
             turn_clock,
-            guard,
-            ack,
-        ),
+            registry_guard: guard,
+            ack: AnswerHold::new(ack),
+            workers,
+            same_thread,
+        })),
     ));
 
     // Attach the abort handle to the just-created registry entries. Any
@@ -558,7 +702,7 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
     // the entry as not-yet-abortable (see `AnyActorHandle::abort`).
     target_system.attach_abort(&id, name.as_deref(), join.abort_handle(), registration_seq);
 
-    Ok((actor_handle, join, status_tx, subtree_watch))
+    Ok((actor_handle, join, kept_status, subtree_watch))
 }
 
 /// Spawns the runner task for one child incarnation into the supervisor's
@@ -636,7 +780,10 @@ pub(crate) fn spawn_runner(
 /// supervision state drop with its children's teardown, then the actor's
 /// name is freed, then everything else it owned is dropped (its queued
 /// messages, its value, its context), then `Stopped` is published and its
-/// status plane closes, then its subtree ends. The name is free before the
+/// status plane closes, then its subtree ends. The answer to a request whose
+/// handler failed goes out in between, once the name is free and the stop lane
+/// is sealed and before the queued messages drop, unless a `Kill` ended the
+/// actor (see `HeldAnswer`). The name is free before the
 /// queued messages, the value and the context drop; the timers and streams
 /// are released from the mailbox's close on (the close comes once
 /// `on_stopped` has returned, the initialization failed, or a `Kill` ended
@@ -660,56 +807,70 @@ pub(crate) fn spawn_runner(
 ///
 /// - Returning: `system_rx` once the message loop is over (or the init
 ///   failed), then the tail releases `registry_guard` (the name is freed),
-///   the forwarders, `stop_rx` after sealing the lane, `ack` (answered for a
+///   the forwarders, `stop_rx` after sealing the lane, the held answer of a
+///   failed request (sent, or dropped under a `Kill`), `ack` (answered for a
 ///   failed init), `mailbox_slot` and `priority_slot` (the queued messages,
 ///   one at a time), `actor_slot` and `ctx_slot`, publishes `Stopped`
 ///   through `status`, and the return drops `turn_clock`, `status` and
 ///   `_subtree`, last to first. No await follows the seal.
 /// - Aborted while suspended, or unwound by this task's own panic: the
-///   body's locals, then the parameters last to first, so `ack`,
+///   body's locals (the held answer's sender among them, so its caller waits
+///   for the reason, which is written once the name is free), then the
+///   parameters last to first, so `ack`,
 ///   `registry_guard`, `turn_clock`, `stop_rx`, `system_rx`, `_abort_reason`
 ///   (the reason is written: the name is free, and no queued message has
 ///   dropped), `priority_slot`, `mailbox_slot`, `ctx_slot`, `actor_slot`,
 ///   `status`, `_subtree`; whichever of them the tail already released is
-///   skipped.
+///   skipped. The sender of the start ack, the held answer and the sender of
+///   the request in hand each sit in an [`AnswerHold`], which releases it
+///   inside a catch: waking the caller of a spawn or of a request, whose waker
+///   may panic, adds no second panic to an unwind.
 /// - Aborted before the first poll: first to last, so `_subtree`, `status`,
 ///   `actor_slot`, `ctx_slot` (the context writes the reason), `mailbox_slot`,
 ///   `priority_slot`, `_abort_reason`, `system_rx`, `stop_rx`, `turn_clock`,
 ///   `registry_guard`, `ack`. The ack is answered last there, after the
 ///   queued messages drop: an awaited spawn with a start timeout is bounded
-///   by that timeout and the settle wait after its abort.
+///   by that timeout and the settle wait after its abort. When no handle
+///   outside the actor is left, the last reference to the incarnation's abort
+///   block drops with `stop_rx` instead of `system_rx`, still before
+///   `turn_clock`, `registry_guard` and `ack`.
 ///
 /// The comments on `_subtree`, `status` and `registry_guard` say how each
 /// path keeps the order.
-#[allow(clippy::too_many_arguments)]
-async fn run_actor<A: Actor>(
+/// The run loop's inputs, boxed so the run-loop future stores each of them
+/// once: an `async fn` keeps every parameter twice (the unresumed state's copy
+/// and the body's moved-in copy), and this box is the only parameter. The
+/// fields keep the parameter order, so every documented drop order is the
+/// same: before the first poll the box drops whole, its fields first to last;
+/// from the first poll on they are the body's bindings, dropped last to first.
+pub(crate) struct RunParts<A: Actor> {
     // The actor's hold on its subtree token, declared first. On return and
-    // on an abort while suspended it is the last parameter dropped, after
-    // `status`, so the subtree ends after the status plane. On an abort
-    // before the first poll it is the first parameter dropped, while the
-    // context and the registry guard still hold the subtree: the guard,
-    // declared after everything the actor owns, releases the last hold
-    // after it freed the name.
+    // on an abort while suspended it is the last parameter dropped, so the
+    // subtree outlives the actor value, the context and the queued
+    // messages. On an abort before the first poll it is the first parameter
+    // dropped, while the context and the registry guard still hold the
+    // subtree: the guard, declared after everything the actor owns,
+    // releases the last hold after it freed the name.
     _subtree: Arc<SubtreeHold>,
     // A sender of the status plane, declared second: the tail publishes
     // `Stopped` through it once everything the actor owned is dropped. On
-    // return and on an abort while suspended it is dropped after every other
-    // parameter but `_subtree`, so the plane closes after the actor value,
-    // the context and the queued messages are gone and the name is free. On
-    // an abort before the first poll the registry guard holds the plane open
+    // return and on an abort while suspended it is dropped after every
+    // parameter declared below it, so the plane stays open until the actor
+    // value, the context and the queued messages are gone. On an abort
+    // before the first poll the registry guard holds the plane open
     // the same way it holds the subtree. Each timer and stream forwarder
     // holds both signals too, so the plane and the subtree also outlive the
     // forwarders' futures.
-    status: watch::Sender<StatusValue>,
+    status: StatusTx,
     // Everything the actor owns, each in a `CaughtDrop`: dropped any way
     // other than by the tail below (an abort, before or after the first
     // poll, or the task's own unwind), its drop still catches every panic,
     // so drop glue never unwinds and the task ends as the abort or the
     // unwind does.
-    mut actor_slot: CaughtDrop<A>,
-    mut ctx_slot: CaughtDrop<ActorContext<A>>,
-    mut mailbox_slot: CaughtDrop<mpsc::Receiver<ActorEnvelope<A>>>,
-    mut priority_slot: CaughtDrop<Option<mpsc::Receiver<ActorEnvelope<A>>>>,
+    actor_slot: CaughtDrop<A>,
+    ctx_slot: CaughtDrop<ActorContext<A>>,
+    mailbox_slot: QueueSlot<MailRx<ActorEnvelope<A>>>,
+    priority_slot: QueueSlot<mpsc::Receiver<ActorEnvelope<A>>>,
     // Declared right after the queues, never a local of the body: on an abort
     // while suspended, or this task's own unwind, the parameters drop last to
     // first, so it writes the abort reason after `ack` and `registry_guard`
@@ -718,20 +879,55 @@ async fn run_actor<A: Actor>(
     // the reason could meet the name still registered. On return the seal
     // wrote the reason first and it writes nothing.
     _abort_reason: AbortReason,
-    mut system_rx: mpsc::Receiver<SystemMessage>,
-    mut stop_rx: watch::Receiver<LaneState>,
+    system_rx: SystemPlane,
+    stop_rx: LaneRx,
     turn_clock: TurnClock,
     // Declared after everything the actor owns: on an abort before the first
     // poll it frees the name, then releases its status sender and its
     // subtree hold, after the value, the context and the queued messages
     // are dropped.
     registry_guard: Option<RegistryGuard>,
-    mut ack: Option<oneshot::Sender<Result<(), ActorError>>>,
-) -> StopReason {
+    // The start ack, in a guard: the task's own unwind drops it with the other
+    // parameters, and the caller's waker it wakes then must not add a second
+    // panic to the unwind.
+    ack: AnswerHold<Result<(), ActorError>>,
+    // What the run loop needs to know about the runtime its task runs on, read
+    // once at the spawn from the handle the task is spawned on (the placement
+    // runtime when the spawn names one): how many worker threads it has, and
+    // whether it is a current-thread runtime. The two are separate facts: a
+    // multi-thread runtime with one worker has one worker and is not a
+    // current-thread runtime. Declared last and plain values: they own
+    // nothing, so no drop order depends on them.
+    workers: usize,
+    same_thread: bool,
+}
+
+async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
+    // Moved out of the box field by field, in declaration order; the empty
+    // box is freed at the end of the block.
+    let RunParts {
+        _subtree,
+        status,
+        mut actor_slot,
+        mut ctx_slot,
+        mut mailbox_slot,
+        mut priority_slot,
+        _abort_reason,
+        mut system_rx,
+        mut stop_rx,
+        turn_clock,
+        registry_guard,
+        mut ack,
+        workers,
+        same_thread,
+    } = {
+        let parts = parts;
+        *parts
+    };
     let actor = actor_slot.get_mut();
     let ctx = ctx_slot.get_mut();
-    let mailbox = mailbox_slot.get_mut();
-    let priority = priority_slot.get_mut();
+    let mailbox = mailbox_slot.mailbox_mut();
+    let priority = priority_slot.lane_mut();
 
     // Phase 1 + 2: pre_start/on_started validation (fail-fast gate). A panic
     // is a failed init, exactly like `Err` (self-cleaning contract:
@@ -754,7 +950,7 @@ async fn run_actor<A: Actor>(
 
         // Phase 1: pre_start validation.
         turn_clock.begin();
-        let phase1 = match catch_callback(actor.pre_start(ctx)).await {
+        let phase1 = match catch_hook(|| actor.pre_start(ctx)).await {
             Ok(result) => result,
             Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
         };
@@ -769,7 +965,7 @@ async fn run_actor<A: Actor>(
 
         // Phase 2: on_started initialization.
         turn_clock.begin();
-        let phase2 = match catch_callback(actor.on_started(ctx)).await {
+        let phase2 = match catch_hook(|| actor.on_started(ctx)).await {
             Ok(result) => result,
             Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
         };
@@ -785,6 +981,10 @@ async fn run_actor<A: Actor>(
     // collection or the children's teardown meets (a child factory, the
     // supervision state); applied once the children are stopped.
     let mut teardown_panic: Option<String> = None;
+    // The answer to the request whose handler failed, held to the lane's seal
+    // (see `HeldAnswer`). A body local, not a parameter: an abort or an unwind
+    // drops it with the body, before the name is freed.
+    let mut held: HeldAnswer<A::Response> = HeldAnswer::new();
 
     let mut stop_reason = if killed_in_init {
         StopReason::Kill
@@ -795,7 +995,7 @@ async fn run_actor<A: Actor>(
                 // Success ack: right after the Running transition, before the
                 // actor ever touches its mailbox.
                 if let Some(tx) = ack.take() {
-                    let _ = tx.send(Ok(()));
+                    let _ = send_contained(tx, Ok(()));
                 }
                 StopReason::Graceful
             }
@@ -816,94 +1016,241 @@ async fn run_actor<A: Actor>(
         // breaks once BOTH have reported closed (the system channel's own
         // close keeps its immediate break, unrelated to either lane).
         let mut mailbox_closed = false;
+        // Cleared when the loop ends, on every path (an abort included).
+        let lane_slot = SlotHold(ctx.stop_lane().abort_record().clone());
+        let mut drain = ReplyDrain::new();
+        let mut fp_skip: u32 = 0;
+        // The turn quantum (see `TURN_QUANTUM`): whether the next fast-path
+        // take starts a run, when the run started, the last clock read, takes
+        // since that read, and how many takes between reads.
+        let mut run_fresh = true;
+        let mut turn_start = std::time::Instant::now();
+        let mut last_read = turn_start;
+        let mut q_takes: u32 = 0;
+        let mut q_stride: u32 = 8;
+        // `workers` and `same_thread` come from the spawn (see `RunParts`):
+        // `same_thread` is whether a requester that is not a runtime task is
+        // woken on this thread (see `ReplyDrain`).
+        #[cfg(test)]
+        loop_facts::record(ctx.actor_id(), workers, same_thread);
         loop {
+            let fp_off = fp_skip_step(&mut fp_skip);
+            // A requester answered by this poll runs once the poll ends: end it
+            // here when a backlog would otherwise keep the poll going.
+            if drain.0 != 0 {
+                if mailbox.is_empty() && priority.as_ref().is_none_or(|lane| lane.is_empty()) {
+                    drain = ReplyDrain::new();
+                } else if drain.step() {
+                    #[cfg(test)]
+                    hand_backs::bump(ctx.actor_id());
+                    if same_thread {
+                        // One thread: the requester (a `block_on` body among
+                        // them) runs only once this task leaves the queue.
+                        defer_armed(lane_slot.0.reader(), || {
+                            hand_back_idle(&stop_rx, &system_rx, ctx, priority)
+                        })
+                        .await;
+                    } else {
+                        hand_back(lane_slot.0.reader(), || {
+                            hand_back_idle(&stop_rx, &system_rx, ctx, priority)
+                        })
+                        .await;
+                    }
+                    // The hand-back gave the worker up: the run starts over.
+                    run_fresh = true;
+                }
+            }
+            // Turn boundary fast path: every branch above the mailbox reads
+            // idle by the check its own poll would make, in the select's
+            // branch order (see `UpperBranch`), so the biased select below
+            // would take the mailbox: take it here without registering on
+            // the branches above. Anything else, an empty mailbox, or a
+            // receive that is not ready now runs the select.
+            if !tokio::task::coop::has_budget_remaining() {
+                if workers <= 1 {
+                    defer_armed(lane_slot.0.reader(), || {
+                        hand_back_idle(&stop_rx, &system_rx, ctx, priority)
+                    })
+                    .await;
+                } else {
+                    requeue().await;
+                }
+                run_fresh = true;
+            }
+            if !fp_off
+                && !mailbox_closed
+                && !mailbox.is_empty()
+                && upper_idle(&stop_rx, &system_rx, ctx, priority)
+            {
+                if let Some(env) = poll_now(mailbox).await {
+                    #[cfg(test)]
+                    fast_path_turns::bump();
+                    if run_fresh {
+                        run_fresh = false;
+                        turn_start = std::time::Instant::now();
+                        last_read = turn_start;
+                        q_takes = 0;
+                    }
+                    let mut gave_back = false;
+                    match watch_yield(
+                        dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held),
+                        &mut gave_back,
+                    )
+                    .await
+                    {
+                        ControlFlow::Continue(()) => {
+                            if gave_back {
+                                // The handler gave the worker back: the senders
+                                // and the driver had their turn, and the run of
+                                // takes starts over.
+                                run_fresh = true;
+                                continue;
+                            }
+                            let mut pace = false;
+                            q_takes += 1;
+                            if q_takes >= q_stride {
+                                q_takes = 0;
+                                let now = std::time::Instant::now();
+                                q_stride = if now.duration_since(last_read) > TURN_QUANTUM / 4 {
+                                    1
+                                } else {
+                                    8
+                                };
+                                last_read = now;
+                                if now.duration_since(turn_start) >= TURN_QUANTUM {
+                                    pace = true;
+                                }
+                            }
+                            if pace {
+                                if workers <= 1 {
+                                    defer_armed(lane_slot.0.reader(), || {
+                                        hand_back_idle(&stop_rx, &system_rx, ctx, priority)
+                                    })
+                                    .await;
+                                } else {
+                                    requeue().await;
+                                }
+                                run_fresh = true;
+                            }
+                            continue;
+                        }
+                        ControlFlow::Break(reason) => {
+                            stop_reason = reason;
+                            break;
+                        }
+                    }
+                }
+            }
+            // The select may wait: the next fast-path take starts a new run.
+            run_fresh = true;
+            q_takes = 0;
             tokio::select! {
                 biased;
 
                 // Stop lane - highest priority, ahead of the system channel
                 // and the mailbox alike. Only ever observed here, at the top
-                // of the loop between two `handle` invocations, so it never
-                // races or cancels an in-flight handler.
-                changed = stop_rx.changed() => {
-                    match changed {
-                        Ok(()) => {
-                            let reason = stop_rx.borrow_and_update().reason.clone();
-                            let Some(reason) = reason else { continue };
-                            // Tier 3 (Kill): bypass ALL callbacks (brutal_kill parity)
-                            if matches!(reason, StopReason::Kill) {
-                                stop_reason = StopReason::Kill;
-                                break;
+                // of the loop between two `handle` invocations, so the signal
+                // itself never interrupts a callback in progress.
+                () = tokio::task::coop::cooperative(lane_changed(&stop_rx, lane_slot.0.reader())) => {
+                    let reason = stop_rx.borrow_and_update().reason.clone();
+                    let Some(reason) = reason else { continue };
+                    // Tier 3 (Kill): not vetoable; no callback begins once it is read
+                    if matches!(reason, StopReason::Kill) {
+                        stop_reason = StopReason::Kill;
+                        break;
+                    }
+                    // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable.
+                    // A pre_stop panic lets the stop proceed as a Failure.
+                    if matches!(reason, StopReason::Graceful | StopReason::ParentRequest) {
+                        turn_clock.begin();
+                        let pre_stop_result =
+                            catch_hook(|| actor.pre_stop(&reason, ctx)).await;
+                        turn_clock.end();
+                        // Read without marking the lane's current version as
+                        // seen: only the `select!` arm's own `changed()` may
+                        // consume a version, so a same-severity raise that
+                        // landed while `pre_stop` was in flight (and is still
+                        // unseen here) keeps `changed()` armed and re-fires
+                        // this gate on the next iteration instead of being
+                        // lost to a veto.
+                        //
+                        // The lane is monotone (see `StopLane::raise`), so
+                        // `latest` is never lower-severity than `reason`: it is
+                        // either unchanged or a higher tier raised while
+                        // `pre_stop` was in flight. Precedence, in order: a
+                        // `Kill` observed here wins over an accept, a veto, or
+                        // a panic alike (a Kill is not vetoable and begins no callback); a
+                        // `pre_stop` panic is recorded and wins over an accept,
+                        // a veto, or a forced reason raised meanwhile (the
+                        // panic already happened, and masking it would
+                        // silently drop a real failure), except that a
+                        // `Failure` raised meanwhile stays the exit reason,
+                        // as an earlier failure does for `on_stopped`;
+                        // otherwise a forced
+                        // reason (Failure, ParentKilled or Cancelled) wins over
+                        // an accept or a veto, though `on_stopped` still runs
+                        // for it.
+                        let latest = stop_rx.borrow().reason.clone();
+                        if matches!(latest, Some(StopReason::Kill)) {
+                            // The panic of `pre_stop`, if any, is not
+                            // recorded. Its payload is dropped here, inside a
+                            // catch: the payload's own drop may panic, and a
+                            // drop left to the `break` would unwind out of
+                            // the task's poll, so the task would end by its
+                            // own unwind instead of by the `Kill`.
+                            if let Err(payload) = pre_stop_result {
+                                discard(payload);
                             }
-                            // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable.
-                            // A pre_stop panic lets the stop proceed as a Failure.
-                            if matches!(reason, StopReason::Graceful | StopReason::ParentRequest) {
-                                turn_clock.begin();
-                                let pre_stop_result =
-                                    catch_callback(actor.pre_stop(&reason, ctx)).await;
-                                turn_clock.end();
-                                // Read without marking the lane's current version as
-                                // seen: only the `select!` arm's own `changed()` may
-                                // consume a version, so a same-severity raise that
-                                // landed while `pre_stop` was in flight (and is still
-                                // unseen here) keeps `changed()` armed and re-fires
-                                // this gate on the next iteration instead of being
-                                // lost to a veto.
-                                //
-                                // The lane is monotone (see `StopLane::raise`), so
-                                // `latest` is never lower-severity than `reason`: it is
-                                // either unchanged or a higher tier raised while
-                                // `pre_stop` was in flight. Precedence, in order: a
-                                // `Kill` observed here wins over an accept, a veto, or
-                                // a panic alike (Kill bypasses every callback); a
-                                // `pre_stop` panic is recorded and wins over an accept,
-                                // a veto, or a forced reason raised meanwhile (the
-                                // panic already happened, and masking it would
-                                // silently drop a real failure); otherwise a forced
-                                // reason (Failure, ParentKilled or Cancelled) wins over
-                                // an accept or a veto, though `on_stopped` still runs
-                                // for it.
-                                let latest = stop_rx.borrow().reason.clone();
-                                if matches!(latest, Some(StopReason::Kill)) {
-                                    stop_reason = StopReason::Kill;
-                                    break;
-                                }
-                                match pre_stop_result {
-                                    Err(payload) => {
-                                        let err =
-                                            ActorError::Panic(payload_into_string(payload));
-                                        ctx.record_failure(err.clone());
-                                        stop_reason = StopReason::Failure(err);
-                                        break;
-                                    }
-                                    Ok(accepted) => match latest {
-                                        Some(r) if StopSeverity::of(&r) == StopSeverity::Forced => {
-                                            stop_reason = r;
-                                            break;
-                                        }
-                                        _ if accepted => {
-                                            stop_reason = reason;
-                                            break;
-                                        }
-                                        _ => continue, // Actor rejected the stop; a
-                                            // later same-severity raise bumps the
-                                            // generation and re-fires this gate.
-                                    },
-                                }
-                            }
-                            // Tier 2 (Failure/ParentKilled/Cancelled): non-vetoable, on_stopped still runs
-                            stop_reason = reason;
+                            stop_reason = StopReason::Kill;
                             break;
                         }
-                        Err(_) => break, // stop lane closed: no sender can ever reach us
+                        match pre_stop_result {
+                            Err(payload) => {
+                                let err =
+                                    ActorError::Panic(payload_into_string(payload));
+                                ctx.record_failure(err.clone());
+                                stop_reason = match latest {
+                                    Some(standing @ StopReason::Failure(_)) => standing,
+                                    _ => StopReason::Failure(err),
+                                };
+                                break;
+                            }
+                            Ok(accepted) => match latest {
+                                Some(r) if StopSeverity::of(&r) == StopSeverity::Forced => {
+                                    stop_reason = r;
+                                    break;
+                                }
+                                // The lane only strengthens: a request of higher
+                                // rank that landed while `pre_stop` ran is the
+                                // reason the actor stops with, and `pre_stop`
+                                // is not asked again.
+                                _ if accepted => {
+                                    stop_reason = latest.unwrap_or(reason);
+                                    break;
+                                }
+                                _ => continue, // Actor rejected the stop; a
+                                    // later same-severity raise bumps the
+                                    // generation and re-fires this gate.
+                            },
+                        }
                     }
+                    // Tier 2 (Failure/ParentKilled/Cancelled): non-vetoable, on_stopped still runs
+                    stop_reason = reason;
+                    break;
                 }
 
                 // System channel - priority over user messages
                 sys_msg = system_rx.recv() => {
                     match sys_msg {
-                        Some(SystemMessage::GetStatus(reply_tx)) => {
+                        Some(SystemMessage::GetStatus(request)) => {
                             let info = build_status_info(ctx);
-                            let _ = reply_tx.send(info);
+                            answer_status(
+                                request,
+                                info,
+                                same_thread,
+                                &mut fp_skip,
+                                &mut drain,
+                            );
                         }
                         None => break, // system channel closed
                     }
@@ -923,7 +1270,7 @@ async fn run_actor<A: Actor>(
                             if let Some(sup) = ctx.supervision_mut() {
                                 sup.task_owner.remove(&task);
                             }
-                            match handle_restart_outcome(actor, ctx, outcome).await {
+                            match Box::pin(handle_restart_outcome(actor, ctx, outcome)).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -941,7 +1288,7 @@ async fn run_actor<A: Actor>(
                             // reported at once as a failed attempt when none
                             // was.
                             if let (Some(outcome), _) = ctx.lost_restart_task(err) {
-                                match handle_restart_outcome(actor, ctx, outcome).await {
+                                match Box::pin(handle_restart_outcome(actor, ctx, outcome)).await {
                                     ControlFlow::Continue(()) => {}
                                     ControlFlow::Break(reason) => {
                                         stop_reason = reason;
@@ -955,7 +1302,7 @@ async fn run_actor<A: Actor>(
                                 sup.task_owner.remove(&task);
                             }
                             let event = ChildStoppedInternal { child_id, reason: child_reason, incarnation };
-                            match handle_child_stopped(actor, ctx, event).await {
+                            match Box::pin(handle_child_stopped(actor, ctx, event)).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1009,7 +1356,7 @@ async fn run_actor<A: Actor>(
                 envelope = recv_optional(priority), if priority.is_some() => {
                     match envelope {
                         Some(env) => {
-                            match dispatch(actor, ctx, env, &turn_clock).await {
+                            match dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1037,7 +1384,7 @@ async fn run_actor<A: Actor>(
                 envelope = mailbox.recv(), if !mailbox_closed => {
                     match envelope {
                         Some(env) => {
-                            match dispatch(actor, ctx, env, &turn_clock).await {
+                            match dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1060,6 +1407,8 @@ async fn run_actor<A: Actor>(
             }
         }
 
+        drop(lane_slot);
+
         // The final deliveries, then Phase 4: on_stopped (terminate/2 parity:
         // runs on failures and panics, skipped only for Kill / brutal_kill).
         // A supervisor first delivers, once each, the child deaths still
@@ -1076,7 +1425,16 @@ async fn run_actor<A: Actor>(
             // supervisor, whose collection must see the deaths of the turn
             // that ended its loop.
             if ctx.supervision_ref().is_some() {
-                match final_drain(actor, ctx, &stop_rx, &stop_reason, &mut teardown_panic).await {
+                // Boxed: only a supervisor's teardown pays for this state.
+                match Box::pin(final_drain(
+                    actor,
+                    ctx,
+                    &stop_rx,
+                    &stop_reason,
+                    &mut teardown_panic,
+                ))
+                .await
+                {
                     FinalOutcome::Killed => stop_reason = StopReason::Kill,
                     FinalOutcome::Done { pending } => pending_exit = pending,
                 }
@@ -1095,7 +1453,7 @@ async fn run_actor<A: Actor>(
         }
         if !matches!(stop_reason, StopReason::Kill) {
             turn_clock.begin();
-            let stopped = catch_callback(actor.on_stopped(&stop_reason, ctx)).await;
+            let stopped = catch_hook(|| actor.on_stopped(&stop_reason, ctx)).await;
             turn_clock.end();
             // A failed final delivery makes the exit reason a failure once
             // `on_stopped` has returned; `on_stopped`'s own result is applied
@@ -1106,7 +1464,10 @@ async fn run_actor<A: Actor>(
             match stopped {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    stop_reason = StopReason::Failure(err);
+                    // A cleanup error must not mask the original failure.
+                    if !matches!(stop_reason, StopReason::Failure(_)) {
+                        stop_reason = StopReason::Failure(err);
+                    }
                 }
                 Err(payload) => {
                     let panic_err = ActorError::Panic(payload_into_string(payload));
@@ -1138,7 +1499,7 @@ async fn run_actor<A: Actor>(
     // and the lane seals only just before the queued messages and the actor
     // value are dropped. The receiver stays alive until then.
     drop(system_rx);
-    ctx.self_handle().stop_lane().close_to_non_kill();
+    ctx.stop_lane().close_to_non_kill();
 
     // Close (not drop - the receivers stay alive for the explicit drop
     // further down) the two user lanes at this exact same point: every
@@ -1152,7 +1513,13 @@ async fn run_actor<A: Actor>(
     // handled, once this task returns.
     mailbox.close();
     if let Some(priority) = priority.as_mut() {
-        priority.close();
+        // The lane is tokio's bounded channel, and closing it wakes the
+        // senders parked for room, whose wakers belong to their own tasks: a
+        // panic of one stays in this call, and the reason is still the one
+        // decided. Tokio ends its wake at that waker, so the senders behind it
+        // may stay unwoken, and their futures find the lane closed at their
+        // next poll.
+        contain_waker_panic("priority lane", Some(ctx.actor_id()), || priority.close());
     }
 
     // Phase 5: Stop all children (reverse start order, a pool all at once,
@@ -1165,8 +1532,12 @@ async fn run_actor<A: Actor>(
     // inversion one level down, without this task ever awaiting the subtree
     // it is discarding.
     let actor_id = ctx.actor_id().clone();
+    // Boxed, and skipped without a supervision state, where it returns
+    // `Done` at once: only a supervisor's teardown pays for this state.
     if !matches!(stop_reason, StopReason::Kill)
-        && stop_all_children(ctx, &mut stop_rx, &mut teardown_panic).await == Teardown::Killed
+        && ctx.supervision_ref().is_some()
+        && Box::pin(stop_all_children(ctx, &mut stop_rx, &mut teardown_panic)).await
+            == Teardown::Killed
     {
         stop_reason = StopReason::Kill;
     }
@@ -1215,10 +1586,21 @@ async fn run_actor<A: Actor>(
     // observed above or is read here, and every request from here on is
     // refused with `Closed`, just before the queued messages and the actor
     // value are dropped. The receiver is dropped with it.
-    if let Some(StopReason::Kill) = ctx.self_handle().stop_lane().seal() {
+    if let Some(StopReason::Kill) = ctx.stop_lane().seal() {
         stop_reason = StopReason::Kill;
     }
     drop(stop_rx);
+
+    // The reason is final here and the name is free. The answer to the
+    // request whose handler failed goes out now, unless a `Kill` ended the
+    // actor: a caller that looks the actor up by name on reading the answer
+    // finds nothing or the next incarnation, never this one. It is sent before
+    // the reason is written, so a caller that finds its queue closed reads the
+    // answer after the reason (`ActorHandle::send`), and a `Kill` accepted
+    // before the seal is the reason the caller reads.
+    held.deliver(&stop_reason);
+    #[cfg(test)]
+    end_hooks::run(end_hooks::ANSWER, &actor_id);
 
     // The reason is final here, written into the status plane once: a panic
     // in a forwarder's drop at the end (see above) already made any reason
@@ -1238,8 +1620,15 @@ async fn run_actor<A: Actor>(
     // `Killed` from the plane, one answer, and the init's error is logged
     // once with the actor's id.
     if let Some(tx) = ack.take() {
-        if let Err(err) = init_result {
-            if matches!(stop_reason, StopReason::Kill) {
+        match init_result {
+            Err(err) if !matches!(stop_reason, StopReason::Kill) => {
+                let _ = send_contained(tx, Err(err));
+            }
+            // A failed init that a `Kill` reached before the seal: the ack is
+            // dropped unanswered. The drop wakes the spawn's caller, whose
+            // waker belongs to the caller's task, and a panic of it stays out
+            // of this task, which ends with the reason it has.
+            Err(err) => {
                 #[cfg(feature = "tracing")]
                 caught_log!(warn,
                     actor_id = %actor_id,
@@ -1248,9 +1637,12 @@ async fn run_actor<A: Actor>(
                 );
                 #[cfg(not(feature = "tracing"))]
                 let _ = err;
-                drop(tx);
-            } else {
-                let _ = tx.send(Err(err));
+                contain_waker_panic("start ack", Some(&actor_id), move || drop(tx));
+            }
+            // An init a `Kill` cut before it began: the ack is dropped
+            // unanswered, contained the same way.
+            Ok(()) => {
+                contain_waker_panic("start ack", Some(&actor_id), move || drop(tx));
             }
         }
     }
@@ -1290,13 +1682,27 @@ async fn run_actor<A: Actor>(
     stop_reason
 }
 
+/// The run loop's hold on its waker slot: clears the slot when it drops, so
+/// a waker registered by the loop never outlives the loop.
+struct SlotHold(crate::actor::subtree::AbortRecord);
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        self.0.reader().clear();
+    }
+}
+
 /// The reason, `Failure(Panic(UNCAUGHT_PANIC))`, written for a task whose own
 /// poll unwound past every catch: every call of user code is caught, so only
 /// the crate's own code unwinds there. The task ends in the order of an abort
 /// while suspended, with this reason instead of `Kill`: its status plane, the
 /// runner or restart attempt that joins it, and an awaited spawn whose
-/// initialization the unwind cut (as `SpawnError::Init`) read it. The
-/// payload is logged by whoever joins the task.
+/// initialization the unwind cut (as `SpawnError::Init`) read it. The end is
+/// recorded on the status plane as a panic with this message. With the
+/// `tracing` feature the supervisor that joins the task also logs the payload
+/// in a warning; without it the crate does not log the payload. A process
+/// that wants every panic payload in its log installs a hook with
+/// `std::panic::set_hook`.
 pub(crate) const UNCAUGHT_PANIC: &str = "the actor's task panicked outside every catch";
 
 /// Set while this actor task's own future is being polled, and cleared after
@@ -1305,6 +1711,13 @@ pub(crate) const UNCAUGHT_PANIC: &str = "the actor's task panicked outside every
 /// task's state that writes the reason reads it to tell this task's own
 /// unwind, inside its poll, from an abort, a shutdown, or a runtime dropped
 /// during an unrelated unwind, which drop the task outside its poll.
+///
+/// Every access is `Relaxed`. Every clone lives inside the task's one future
+/// and none leaves it, so each read is either on the thread that is polling
+/// the task, where it sees that thread's own store, or in the future's drop
+/// glue outside a poll, which the `Send` contract of the future orders after
+/// the last poll's clearing store. No other thread reads the flag, and
+/// nothing waits on it, so no stronger order has a reader to serve.
 #[derive(Clone, Default)]
 pub(crate) struct TaskMarker(Arc<AtomicBool>);
 
@@ -1312,7 +1725,7 @@ impl TaskMarker {
     /// The reason of a task dropped before its reason was written: a panic
     /// when this task's own poll is unwinding, `Kill` otherwise.
     pub(crate) fn abort_reason(&self) -> StopReason {
-        if self.0.load(Ordering::SeqCst) && std::thread::panicking() {
+        if self.0.load(Ordering::Relaxed) && std::thread::panicking() {
             StopReason::Failure(ActorError::Panic(UNCAUGHT_PANIC.to_string()))
         } else {
             StopReason::Kill
@@ -1343,7 +1756,7 @@ struct ClearMarker<'a>(&'a AtomicBool);
 
 impl Drop for ClearMarker<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1352,7 +1765,7 @@ impl<F: Future> Future for MarkedRun<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
         let this = self.get_mut();
-        this.marker.0.store(true, Ordering::SeqCst);
+        this.marker.0.store(true, Ordering::Relaxed);
         let _clear = ClearMarker(&this.marker.0);
         this.inner.as_mut().poll(cx)
     }
@@ -1362,20 +1775,28 @@ impl<F: Future> Future for MarkedRun<F> {
 /// is written: `Kill`, or a panic for this task's own unwind
 /// ([`TaskMarker::abort_reason`]). See `run_actor`'s `_abort_reason`.
 pub(crate) struct AbortReason {
-    status: watch::Sender<StatusValue>,
+    status: StatusTx,
     marker: TaskMarker,
-    /// The actor, for the hook tests observe the write through.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The actor, for the hook tests observe the write through. A build that
+    /// is not a test build keeps no id here, so a spawn takes no reference
+    /// count for it.
+    #[cfg(test)]
     owner: ActorId,
 }
 
 impl AbortReason {
-    fn new(status: watch::Sender<StatusValue>, marker: TaskMarker, owner: ActorId) -> Self {
+    #[cfg(test)]
+    fn new(status: StatusTx, marker: TaskMarker, owner: ActorId) -> Self {
         Self {
             status,
             marker,
             owner,
         }
+    }
+
+    #[cfg(not(test))]
+    fn new(status: StatusTx, marker: TaskMarker) -> Self {
+        Self { status, marker }
     }
 }
 
@@ -1393,12 +1814,17 @@ impl Drop for AbortReason {
 /// Hooks tests attach by point and actor id: [`REASON`](end_hooks::REASON)
 /// runs just before an abort guard writes its reason,
 /// [`NAME`](end_hooks::NAME) just before a registry guard frees the name,
-/// [`NAME_FREED`](end_hooks::NAME_FREED) just after it freed the name, and
+/// [`NAME_FREED`](end_hooks::NAME_FREED) just after it freed the name,
+/// [`ANSWER`](end_hooks::ANSWER) just after the answer to a failed request is
+/// sent, before the reason is written,
 /// [`WALK`](end_hooks::WALK) in a supervisor's teardown, before it orders a
-/// child that is still in its registry to stop (keyed by the supervisor).
+/// child that is still in its registry to stop (keyed by the supervisor), and
+/// [`TURN`](end_hooks::TURN) in a turn, after the handler returned and before
+/// the turn applies its outcome, while the request's sender is still held.
 #[cfg(test)]
 pub(crate) mod end_hooks {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use crate::types::ActorId;
@@ -1406,7 +1832,9 @@ pub(crate) mod end_hooks {
     pub(crate) const REASON: &str = "reason";
     pub(crate) const NAME: &str = "name";
     pub(crate) const NAME_FREED: &str = "name freed";
+    pub(crate) const ANSWER: &str = "answer";
     pub(crate) const WALK: &str = "walk";
+    pub(crate) const TURN: &str = "turn";
 
     type Hook = Box<dyn Fn() + Send + Sync>;
 
@@ -1415,18 +1843,31 @@ pub(crate) mod end_hooks {
         HOOKS.get_or_init(Default::default)
     }
 
+    /// How many hooks are attached at [`TURN`]. Every turn of every actor
+    /// reads it, so a turn with none attached takes no lock.
+    static TURN_HOOKS: AtomicUsize = AtomicUsize::new(0);
+
     /// Runs `hook` once, at `point` of the actor `id`.
     pub(crate) fn attach(
         point: &'static str,
         id: ActorId,
         hook: impl Fn() + Send + Sync + 'static,
     ) {
-        hooks().lock().unwrap().insert((point, id), Box::new(hook));
+        let replaced = hooks().lock().unwrap().insert((point, id), Box::new(hook));
+        if point == TURN && replaced.is_none() {
+            TURN_HOOKS.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn run(point: &'static str, id: &ActorId) {
+        if point == TURN && TURN_HOOKS.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         let hook = hooks().lock().unwrap().remove(&(point, id.clone()));
         if let Some(hook) = hook {
+            if point == TURN {
+                TURN_HOOKS.fetch_sub(1, Ordering::SeqCst);
+            }
             hook();
         }
     }
@@ -1515,26 +1956,233 @@ impl<T> Drop for CaughtDrop<T> {
 }
 
 /// Drops a value, catching a panic its drop raises.
-fn end_value<T>(value: T) -> Option<String> {
+pub(crate) fn end_value<T>(value: T) -> Option<String> {
     catch_drop(move || drop(value)).err()
+}
+
+/// An actor's mailbox or priority lane as the run loop holds it, with the
+/// system whose helper slot takes the receiver if the queue ends with a slot
+/// still out. Dropped any way other than by [`end`](Self::end) (an abort or
+/// the task's own unwind), it ends the queue the same way, every panic
+/// caught, like a [`CaughtDrop`].
+pub(crate) struct QueueSlot<R: QueueRx> {
+    rx: Option<R>,
+    /// Held only while there is a receiver to hand off.
+    system: Option<Arc<ActorSystem>>,
+    owner: ActorId,
+}
+
+impl<R: QueueRx> QueueSlot<R> {
+    pub(crate) fn new(rx: Option<R>, system: &Arc<ActorSystem>, owner: ActorId) -> Self {
+        let system = rx.is_some().then(|| system.clone());
+        Self { rx, system, owner }
+    }
+
+    /// The mailbox's receiver, held until the end.
+    fn mailbox_mut(&mut self) -> &mut R {
+        self.rx.as_mut().expect("the mailbox is held until its end")
+    }
+
+    /// The lane's receiver, which the loop lets go of when every sender of
+    /// the lane is gone, and which an actor without the lane never had.
+    fn lane_mut(&mut self) -> &mut Option<R> {
+        &mut self.rx
+    }
+
+    /// Ends the queue now; returns the first panic a drop raised.
+    fn end(&mut self) -> Option<String> {
+        let rx = self.rx.take()?;
+        let panic = match self.system.take() {
+            Some(system) => end_queue_late(rx, &system, &self.owner),
+            None => end_queue(rx, &self.owner),
+        };
+        #[cfg(test)]
+        crate::actor::handle::late_slot_tests::between_queue_ends(&self.owner);
+        panic
+    }
+}
+
+impl<R: QueueRx> Drop for QueueSlot<R> {
+    fn drop(&mut self) {
+        let panic = self.end();
+        #[cfg(feature = "tracing")]
+        if let Some(payload) = &panic {
+            caught_log!(warn,
+                actor_id = %self.owner,
+                panic = %payload,
+                "a drop at the abort or the unwind of the actor's task panicked; the task ends as the abort or the unwind does"
+            );
+        }
+        #[cfg(not(feature = "tracing"))]
+        let _ = panic;
+    }
 }
 
 /// Closes a queue and drops the messages still in it one at a time, each
 /// drop caught, so a second panicking message never panics inside the
 /// unwinding of the first.
-fn end_queue<T>(mut rx: mpsc::Receiver<T>, owner: &ActorId) -> Option<String> {
-    rx.close();
+///
+/// The close is followed by a full fence, then the drain. A requester pushes
+/// its message and then reads whether the queue is closed behind the same
+/// fence (see `ActorHandle::send`): in the order of the two fences, either
+/// the requester's push comes before the end's fence and the drain sees the
+/// message, or the end's close comes before the requester's fence and the
+/// requester sees the queue closed. No request is left unseen by both.
+///
+/// The mailbox is covered the same way: its one queue is drained after the
+/// end's fence, so a request racing the close is in the drain's reach or
+/// sees the close.
+///
+/// Returns the first panic of the drain's drops and whether a value can still
+/// arrive.
+fn close_and_drain<R: QueueRx>(rx: &mut R, owner: &ActorId) -> (Option<String>, bool) {
+    // Closing a tokio channel wakes the senders parked for room, whose wakers
+    // belong to their own tasks: a panic of one stays in this call, and the
+    // drain below still runs. Tokio ends its wake at that waker, so the
+    // senders behind it may stay unwoken and find the queue closed at their
+    // next poll.
+    contain_waker_panic("queue close", Some(owner), || rx.close());
+    std::sync::atomic::fence(Ordering::SeqCst);
     let mut first = None;
-    while let Ok(message) = rx.try_recv() {
-        keep_first_of(&mut first, end_value(message), owner);
+    loop {
+        match rx.try_recv_one() {
+            Ok(message) => keep_first_of(&mut first, end_value(message), owner),
+            Err(open) => return (first, open),
+        }
+    }
+}
+
+/// Ends a queue that cannot have a slot out for a sender that is still to
+/// push: closed, drained, dropped.
+pub(crate) fn end_queue<R: QueueRx>(mut rx: R, owner: &ActorId) -> Option<String> {
+    let (mut first, _) = close_and_drain(&mut rx, owner);
+    keep_first_of(&mut first, end_value(rx), owner);
+    first
+}
+
+/// Ends a queue that senders may still push into through a slot reserved
+/// before the close.
+///
+/// A request pushed through such a slot answers itself: its requester reads
+/// the closed queue after its push and takes the actor's final reason from
+/// the status plane (see `ActorHandle::send`), so no caller waits on this
+/// end. What else arrives through a slot (a notification, a timer's message)
+/// is dropped by the crate when the slot is used or given back, outside the end
+/// order, and `wait_stopped` does not wait for it. The mailbox's queue
+/// closes for good here, so a push from then on fails and its sender drops the
+/// message in that push; a lane keeps taking what its permits send. While a
+/// value can still arrive (a push already landing in the mailbox, a permit out
+/// on a lane), the receiver goes to a helper task of the system that drops
+/// what arrives. With no runtime to run that task, or a runtime that is
+/// closing, the receiver drops here and a value that lands later is dropped
+/// when the last sender is. On some Tokio releases
+/// a blocked sender that is handed the slot the actor's last receive freed, and
+/// is then dropped, does not wake the receiver, so the helper stays parked
+/// until the queue's last sender is dropped.
+pub(crate) fn end_queue_late<R: QueueRx>(
+    mut rx: R,
+    system: &ActorSystem,
+    owner: &ActorId,
+) -> Option<String> {
+    let (mut first, open) = close_and_drain(&mut rx, owner);
+    // The queue is empty, and a value can still arrive only through a push
+    // that is landing (the mailbox, closed for good) or a permit that is out
+    // (a lane): hand the receiver to a task that drops what arrives.
+    if open {
+        if let Ok(rt) = Handle::try_current() {
+            // The slot records the task's end, whichever way it ends.
+            let task_owner = owner.clone();
+            drop(
+                system.spawn_helper(&rt, HelperKind::LateDrain, Some(owner.clone()), |end| {
+                    drain_late(LateDrain::new(rx, task_owner, end))
+                }),
+            );
+            return first;
+        }
     }
     keep_first_of(&mut first, end_value(rx), owner);
     first
 }
 
-/// [`end_queue`] for the priority lane, which only some actors have.
-fn end_lane<T>(rx: Option<mpsc::Receiver<T>>, owner: &ActorId) -> Option<String> {
-    rx.and_then(|rx| end_queue(rx, owner))
+/// Closes a queue, then drops what it holds one value at a time, each drop
+/// caught; returns the first panic.
+fn end_remaining<R: QueueRx>(mut rx: R, owner: &ActorId) -> Option<String> {
+    let (mut first, _) = close_and_drain(&mut rx, owner);
+    keep_first_of(&mut first, end_value(rx), owner);
+    first
+}
+
+/// What the drain of a closed queue holds: the receiver, dropped under catch
+/// however the task ends. If the task is dropped before it ends, the values it
+/// still holds go with it unsettled, and the slot records their number.
+struct LateDrain<R: QueueRx> {
+    rx: CaughtDrop<R>,
+    end: Option<EndGuard>,
+}
+
+impl<R: QueueRx> LateDrain<R> {
+    fn new(rx: R, owner: ActorId, end: EndGuard) -> Self {
+        Self {
+            rx: CaughtDrop::new(rx, end_remaining, owner),
+            end: Some(end),
+        }
+    }
+}
+
+impl<R: QueueRx> Drop for LateDrain<R> {
+    fn drop(&mut self) {
+        // Runs before the fields drop, so the receiver still holds what the
+        // task never took.
+        if let Some(end) = self.end.take() {
+            let dropped = self.rx.value.as_ref().map_or(0, QueueRx::queued);
+            end.cancelled(dropped);
+        }
+    }
+}
+
+/// Drops what still arrives after its queue closed. On a lane: what a sender
+/// pushes through a slot it reserved before the close, until every slot is
+/// used or given back, or no sender is left. On the mailbox, whose end closed
+/// its queue for good: the push that was landing, until none is.
+/// It waits on the receiver alone, so it needs no timer and runs on a
+/// runtime without a time driver. Every drop is caught and a panic is
+/// logged with the actor's id, and whatever the receiver still holds when
+/// the task ends, however it ends, is dropped under the same catch.
+async fn drain_late<R: QueueRx>(mut late: LateDrain<R>) {
+    let owner = late.rx.owner.clone();
+    let rx = late.rx.get_mut();
+    let drained = catch_callback(async {
+        while let Some(message) = std::future::poll_fn(|cx| rx.poll_recv_one(cx)).await {
+            if let Some(payload) = end_value(message) {
+                log_late_drop(&payload, &owner);
+            }
+            if rx.free_units() == rx.all_units() {
+                break;
+            }
+        }
+    })
+    .await;
+    let end = late.end.take().expect("the guard is held until the end");
+    match drained {
+        Ok(()) => end.finished(),
+        Err(payload) => {
+            let payload = payload_into_string(payload);
+            end.panicked(&payload);
+        }
+    }
+}
+
+/// Logs, with the `tracing` feature, a panic raised while dropping a value
+/// that arrived through a slot reserved before its queue closed.
+pub(crate) fn log_late_drop(payload: &str, owner: &ActorId) {
+    #[cfg(feature = "tracing")]
+    caught_log!(warn,
+        actor_id = %owner,
+        panic = %payload,
+        "a drop of a value that arrived after its queue closed panicked; the panic is contained"
+    );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (payload, owner);
 }
 
 /// Drops a supervisor's state: its child factories one at a time, each drop
@@ -1560,12 +2208,12 @@ fn end_context<A: Actor>(mut ctx: ActorContext<A>, owner: &ActorId) -> Option<St
 
 /// Writes the actor's final reason into its status plane, once: a plane
 /// that already carries a reason keeps it.
-fn write_final_reason(status: &watch::Sender<StatusValue>, reason: &StopReason) {
+fn write_final_reason(status: &StatusTx, reason: &StopReason) {
     StatusValue::write_reason(status, reason.clone(), false);
 }
 
 /// Publishes `Stopped` on a plane whose reason is already written.
-pub(crate) fn publish_stopped(status: &watch::Sender<StatusValue>) {
+pub(crate) fn publish_stopped(status: &StatusTx) {
     status.send_if_modified(|value| {
         value.status = ActorStatus::Stopped;
         true
@@ -1619,8 +2267,9 @@ enum SupervisionEvent {
 /// nothing currently in flight on any plane, so this is safe to use as a
 /// `select!` branch without ever turning into a busy poll.
 async fn next_supervision_event<A: Actor>(ctx: &mut ActorContext<A>) -> Option<SupervisionEvent> {
-    let (planes, forwarders) = ctx.supervision_planes_mut();
-    let forwarders_pending = !forwarders.is_empty();
+    ctx.note_forwarders_polled();
+    let (planes, mut forwarders) = ctx.supervision_planes_mut();
+    let forwarders_pending = forwarders.as_ref().is_some_and(|f| !f.is_empty());
     match planes {
         Some((restart_set, death_set, verdicts)) => {
             let restart_pending = !restart_set.is_empty();
@@ -1637,7 +2286,7 @@ async fn next_supervision_event<A: Actor>(ctx: &mut ActorContext<A>) -> Option<S
                     d.map(SupervisionEvent::Death)
                 }
                 _ = verdicts.notified() => Some(SupervisionEvent::Verdict),
-                f = forwarders.join_next_with_id(), if forwarders_pending => {
+                f = join_forwarder(forwarders), if forwarders_pending => {
                     f.map(SupervisionEvent::Forwarder)
                 }
             }
@@ -1646,11 +2295,20 @@ async fn next_supervision_event<A: Actor>(ctx: &mut ActorContext<A>) -> Option<S
             if !forwarders_pending {
                 return std::future::pending::<Option<SupervisionEvent>>().await;
             }
-            forwarders
-                .join_next_with_id()
+            join_forwarder(forwarders.take())
                 .await
                 .map(SupervisionEvent::Forwarder)
         }
+    }
+}
+
+/// The next forwarder completion; pends forever with no forwarder plane.
+async fn join_forwarder(
+    forwarders: Option<&mut JoinSet<ForwarderEnd>>,
+) -> Option<Result<(tokio::task::Id, ForwarderEnd), JoinError>> {
+    match forwarders {
+        Some(set) => set.join_next_with_id().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1663,23 +2321,35 @@ async fn dispatch<A: Actor>(
     ctx: &mut ActorContext<A>,
     envelope: ActorEnvelope<A>,
     turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
 ) -> ControlFlow<StopReason> {
     match envelope {
         Envelope::Message { payload, responder } => {
+            // The request's sender is held in a guard for the turn: it is
+            // answered below, or handed to `held` for a failed request, and if
+            // this task unwinds first, its caller's waker is woken inside a
+            // catch and adds no second panic to the unwind.
+            let mut responder = AnswerHold::new(responder);
             // `begin` and `end` bracket the callback exactly, on every
             // outcome (normal return, an `Err`, or a caught panic), since
             // `catch_callback` always completes normally here rather than
             // unwinding through this function.
             turn_clock.begin();
-            let outcome = catch_callback(actor.handle(payload, ctx)).await;
+            let outcome = catch_hook(|| actor.handle(payload, ctx)).await;
             turn_clock.end();
+            #[cfg(test)]
+            end_hooks::run(end_hooks::TURN, ctx.actor_id());
             match outcome {
                 Ok(Ok(response)) => {
                     // A response nobody receives (a notify, or a send whose
                     // caller is gone) is dropped here, and its drop is user
                     // code: caught, its panic is a panic of the turn.
-                    let undelivered = match responder {
-                        Some(tx) => tx.send(Ok(response)).err(),
+                    let undelivered = match responder.take() {
+                        Some(tx) => {
+                            drain.replied();
+                            send_contained(tx, Ok(response)).err()
+                        }
                         None => Some(Ok(response)),
                     };
                     match undelivered.and_then(end_value) {
@@ -1694,10 +2364,11 @@ async fn dispatch<A: Actor>(
                 Ok(Err(err)) => {
                     // Cast-exception parity: an `Err` from `handle` stops
                     // the actor identically on the notify and send paths. The
-                    // send path additionally has a caller to notify, so that
-                    // delivery happens first when a responder is present.
-                    if let Some(tx) = responder {
-                        let _ = tx.send(Err(err.clone()));
+                    // send path additionally has a caller to notify, and its
+                    // answer is held until the actor's name is free and its
+                    // lane is sealed (see `HeldAnswer`).
+                    if let Some(tx) = responder.take() {
+                        held.hold(tx, err.clone());
                     }
                     ctx.record_failure(err.clone());
                     ControlFlow::Break(StopReason::Failure(err))
@@ -1708,10 +2379,10 @@ async fn dispatch<A: Actor>(
                     // arm above): the only difference is the panic payload
                     // has to be caught and wrapped here instead of being
                     // handed back verbatim. A send() caller still receives it
-                    // as a matchable error before the actor stops.
+                    // as a matchable error, once the actor has ended.
                     let err = ActorError::Panic(payload_into_string(payload));
-                    if let Some(tx) = responder {
-                        let _ = tx.send(Err(err.clone()));
+                    if let Some(tx) = responder.take() {
+                        held.hold(tx, err.clone());
                     }
                     ctx.record_failure(err.clone());
                     ControlFlow::Break(StopReason::Failure(err))
@@ -1719,6 +2390,437 @@ async fn dispatch<A: Actor>(
             }
         }
     }
+}
+
+/// The answer to the one request whose handler failed (an `Err` or a panic),
+/// held by the run loop to the seal of its stop lane.
+///
+/// A caller reads a crash the way an Erlang/OTP `gen_server:call` caller does,
+/// through its monitor, after the process is dead: the answer goes out when
+/// the actor's reason is final, with its name free and its lane sealed, so a
+/// caller that looks the actor up by name on reading it finds no registration
+/// or the next incarnation, never this one. Until then the request is
+/// unanswered, like a request that is still queued. A `Kill` that ends the
+/// actor first, and a task that ends without reaching the seal (an abort, the
+/// end of its runtime, its own unwind), drop the sender unanswered, and the
+/// caller reads the final reason from the status plane. The sender is held in
+/// an [`AnswerHold`], so the drop that wakes the caller never panics into an
+/// unwind of the task. The slot is boxed, so an actor that never fails a
+/// request holds one pointer.
+struct HeldAnswer<R> {
+    slot: Option<Box<HeldReply<R>>>,
+}
+
+/// A failed request's reply channel and the error its caller is answered with.
+type HeldReply<R> = (AnswerHold<Result<R, ActorError>>, ActorError);
+
+impl<R> HeldAnswer<R> {
+    const fn new() -> Self {
+        Self { slot: None }
+    }
+
+    /// Keeps the answer for the seal. The loop ends at the failed request, so
+    /// at most one is held.
+    fn hold(&mut self, tx: oneshot::Sender<Result<R, ActorError>>, err: ActorError) {
+        debug_assert!(
+            self.slot.is_none(),
+            "a loop that failed ends at the request"
+        );
+        self.slot = Some(Box::new((AnswerHold::new(Some(tx)), err)));
+    }
+
+    /// Sends the held answer unless a `Kill` ended the actor: its caller then
+    /// reads the final reason, `Kill`, from the status plane.
+    fn deliver(&mut self, final_reason: &StopReason) {
+        if let Some(held) = self.slot.take() {
+            let (mut answer, err) = *held;
+            if let Some(tx) = answer.take() {
+                if matches!(final_reason, StopReason::Kill) {
+                    // Dropping the sender wakes the caller, who then reads
+                    // `Kill`; a panic from that caller's waker stays out of
+                    // this task.
+                    contain_waker_panic("reply", None, move || drop(tx));
+                } else {
+                    let _ = send_contained(tx, Err(err));
+                }
+            }
+        }
+    }
+}
+
+/// How many turns the run loop may run, once a reply is known to stand alone,
+/// before it hands the thread back once.
+const REPLY_DRAIN_TURNS: u32 = 3;
+
+/// How many turns after a status reply the run loop does not take the turn
+/// boundary fast path: for these turns it runs the select, which reads every
+/// branch in order, and then returns to the fast path. Only a reply to a
+/// requester outside every runtime task opens the window (a thread of its
+/// own, or a body driven by `block_on`, a `#[tokio::main]` or a
+/// `#[tokio::test]`), and a reply inside the window restarts the count. Such
+/// a client reaches the actor while it drains a backlog; the window makes the
+/// actor read the system channel and every other branch in order for these
+/// turns instead of taking the mailbox directly. A reply to a requester that
+/// is a runtime task opens no window: its reply is marked for the hand-back
+/// instead (see `ReplyDrain`). Each request carries its requester's kind, so
+/// the kind a reply reads is that of the request it answers.
+const STATUS_FAST_PATH_OFF_TURNS: u32 = 32;
+
+/// Answers one status request and records what the reply owes the loop: the
+/// fast path window follows a reply to a requester outside every runtime
+/// task, and the hand-back follows a delivered reply to a runtime task, or to
+/// any requester on a current-thread runtime. A requester that is gone is
+/// owed no hand-back.
+fn answer_status(
+    request: crate::types::StatusRequest,
+    info: ActorStatusInfo,
+    same_thread: bool,
+    fp_skip: &mut u32,
+    drain: &mut ReplyDrain,
+) {
+    let crate::types::StatusRequest { reply, task } = request;
+    let delivered = send_contained(reply, info).is_ok();
+    if !task {
+        *fp_skip = STATUS_FAST_PATH_OFF_TURNS;
+    }
+    if delivered && (task || same_thread) {
+        drain.replied();
+    }
+}
+
+/// The longest a run of fast-path turns holds the worker before the loop
+/// gives it up (a requeue, or the armed deferral on one worker), so a worker
+/// shared with hot actors reaches its periodic driver poll (timers, I/O)
+/// within the runtime's maintenance interval of such turns even when
+/// handlers are slow. A run is measured from its first take and starts over
+/// whenever the worker was given up.
+const TURN_QUANTUM: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Waits like `hand_back` but through tokio's deferral (`yield_now`): the
+/// worker runs the rest of its queue, and parks and polls its drivers when
+/// it has nothing else, before the task runs again. The wake slot is armed,
+/// so a stop request or a status query that lands meanwhile wakes it at once.
+async fn defer_armed(slot: &crate::types::WakeSlot, mut idle: impl FnMut() -> bool) {
+    let mut yielded = std::pin::pin!(tokio::task::yield_now());
+    std::future::poll_fn(|cx| {
+        slot.register(cx.waker());
+        if !idle() {
+            return Poll::Ready(());
+        }
+        yielded.as_mut().poll(cx)
+    })
+    .await;
+    slot.disarm();
+}
+
+/// Ends a turn with the task queued again at the back of its worker's run
+/// queue: the task wakes itself and returns pending once, so the tasks
+/// already runnable on the worker, the senders the takes woke among them,
+/// run before it, and the worker does not wait for an idle moment or poll
+/// its drivers first, as a `tokio::task::yield_now` would.
+async fn requeue() {
+    let mut queued = false;
+    std::future::poll_fn(|cx| {
+        if queued {
+            return Poll::Ready(());
+        }
+        queued = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Polls a turn's future and records whether it returned pending, that is,
+/// whether the task gave its worker back while the turn ran.
+async fn watch_yield<F: Future>(turn: F, yielded: &mut bool) -> F::Output {
+    let mut turn = std::pin::pin!(turn);
+    std::future::poll_fn(|cx| {
+        let polled = turn.as_mut().poll(cx);
+        if polled.is_pending() {
+            *yielded = true;
+        }
+        polled
+    })
+    .await
+}
+
+/// Starts a turn: whether the fast path is off for it, and counts the turn
+/// off the window a status reply opened.
+#[inline(always)]
+fn fp_skip_step(skip: &mut u32) -> bool {
+    let off = *skip > 0;
+    if off {
+        *skip -= 1;
+    }
+    off
+}
+
+/// What the run loop remembers about the requesters it answered.
+///
+/// Which requesters a status reply marks: a requester that is a runtime task
+/// is marked on every runtime: on the actor's own runtime the reply queues it
+/// on the actor's worker, and a task of another runtime costs at most one
+/// needless yield per lone reply; a requester that is not a task (a body
+/// driven by `block_on`, a `#[tokio::main]` or `#[tokio::test]` body) is
+/// marked only on a current-thread runtime, where the body runs on the
+/// actor's own thread and waits for the poll to end. On a multi-thread runtime such a requester is
+/// woken from another thread and does not wait for this poll, so its reply is
+/// not marked. A reply to a call is always marked. A reply whose requester is
+/// gone is marked for nobody: nothing waits for it.
+///
+/// A requester woken by a reply sent from this task is queued on this
+/// worker, and runs only when this task's poll ends; with a backlog that is
+/// the task's whole cooperative budget, so a status query or a call would
+/// wait behind every message the poll still drains. When a reply stands
+/// alone, with no reply on the turn after it, the loop therefore runs
+/// `REPLY_DRAIN_TURNS` more turns and then hands the thread back once at a
+/// turn boundary, if a lane still holds messages. Replies on consecutive
+/// turns come from many requesters, each woken in turn and queued ahead of
+/// the last, so no one is left behind the whole backlog and the loop keeps
+/// draining. A loop with nothing queued at a boundary is about to wait
+/// anyway, so the state is dropped there. Nothing here moves a signal or
+/// changes which branch is read first: the hand-back is a suspension
+/// between two turns, after which the loop reads every branch in order.
+///
+/// One word, zero while no reply is pending, so the turns that answer
+/// nobody read it and change nothing: the turns left before the hand-back
+/// while one is due, otherwise `PENDING` (a reply was seen and the turn
+/// after it is awaited) with `REPLIED` set when the turn that just ran
+/// replied.
+struct ReplyDrain(u32);
+
+impl ReplyDrain {
+    /// The turn that just ran sent a reply.
+    const REPLIED: u32 = 1 << 31;
+    /// A reply was seen; the turn after it decides whether it stood alone.
+    const PENDING: u32 = 1 << 30;
+    /// The turns left before the hand-back.
+    const LEFT: u32 = Self::PENDING - 1;
+
+    const fn new() -> Self {
+        Self(0)
+    }
+
+    /// A reply was sent.
+    fn replied(&mut self) {
+        self.0 |= Self::REPLIED;
+    }
+
+    /// Advances the state at a turn boundary with a backlog; whether the
+    /// loop should hand the thread back now.
+    fn step(&mut self) -> bool {
+        let s = self.0;
+        if s & Self::LEFT != 0 {
+            self.0 = (s & Self::LEFT) - 1;
+            self.0 == 0
+        } else if s & Self::REPLIED != 0 {
+            self.0 = Self::PENDING;
+            false
+        } else {
+            self.0 = REPLY_DRAIN_TURNS;
+            false
+        }
+    }
+}
+
+/// Hands the thread back for one scheduler round, the way a poll whose
+/// cooperative budget ran out does: the task is queued again behind the
+/// tasks already runnable on this worker, and a requester just woken runs
+/// first. While handed back the loop waits like a loop in its select: the
+/// wake slot is armed, so a stop request or a status query that lands now
+/// wakes it at once instead of waiting for the worker's next idle moment,
+/// and `idle` is read after the arming, so one that landed before it ends
+/// the hand-back immediately.
+async fn hand_back(slot: &crate::types::WakeSlot, mut idle: impl FnMut() -> bool) {
+    let mut yielded = std::pin::pin!(requeue());
+    std::future::poll_fn(|cx| {
+        slot.register(cx.waker());
+        if !idle() {
+            return Poll::Ready(());
+        }
+        yielded.as_mut().poll(cx)
+    })
+    .await;
+    slot.disarm();
+}
+
+/// The run loop's select branches above the mailbox, one variant per branch.
+/// The fast path reads each one's clause in `branch_idle`, whose match is
+/// exhaustive, and every supervision event maps to one of them
+/// (`SupervisionEvent::branch`), so a new plane or branch does not compile
+/// until its clause is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpperBranch {
+    Stop,
+    System,
+    Restart,
+    Death,
+    Verdict,
+    Forwarder,
+    Priority,
+}
+
+impl UpperBranch {
+    /// The select's branch order, highest first; the mailbox follows.
+    const ORDER: [UpperBranch; 7] = [
+        UpperBranch::Stop,
+        UpperBranch::System,
+        UpperBranch::Restart,
+        UpperBranch::Death,
+        UpperBranch::Verdict,
+        UpperBranch::Forwarder,
+        UpperBranch::Priority,
+    ];
+}
+
+impl SupervisionEvent {
+    /// The select branch this event arrives on.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn branch(&self) -> UpperBranch {
+        match self {
+            SupervisionEvent::Restart(_) => UpperBranch::Restart,
+            SupervisionEvent::Death(_) => UpperBranch::Death,
+            SupervisionEvent::Verdict => UpperBranch::Verdict,
+            SupervisionEvent::Forwarder(_) => UpperBranch::Forwarder,
+        }
+    }
+}
+
+/// The branches that end a reply's hand-back: a stop request and a system
+/// message must not wait behind it. The other planes hold standing state
+/// (a supervisor's running children, its timers, a priority backlog), which
+/// reads busy while it is merely non-empty, so they do not decide whether the
+/// requester a reply woke gets its turn.
+const HAND_BACK_EXIT: [UpperBranch; 2] = [UpperBranch::Stop, UpperBranch::System];
+
+/// Whether none of the [`HAND_BACK_EXIT`] branches has anything for the run
+/// loop now.
+fn hand_back_idle<A: Actor>(
+    stop_rx: &LaneRx,
+    system_rx: &SystemPlane,
+    ctx: &mut ActorContext<A>,
+    priority: &Option<mpsc::Receiver<ActorEnvelope<A>>>,
+) -> bool {
+    HAND_BACK_EXIT
+        .into_iter()
+        .all(|branch| branch_idle(branch, stop_rx, system_rx, ctx, priority))
+}
+
+/// Whether every select branch above the mailbox reads idle now, read in the
+/// select's branch order.
+fn upper_idle<A: Actor>(
+    stop_rx: &LaneRx,
+    system_rx: &SystemPlane,
+    ctx: &mut ActorContext<A>,
+    priority: &Option<mpsc::Receiver<ActorEnvelope<A>>>,
+) -> bool {
+    UpperBranch::ORDER
+        .into_iter()
+        .all(|branch| branch_idle(branch, stop_rx, system_rx, ctx, priority))
+}
+
+/// One branch's clause: idle exactly when the select's poll of that branch
+/// would pend.
+fn branch_idle<A: Actor>(
+    branch: UpperBranch,
+    stop_rx: &LaneRx,
+    system_rx: &SystemPlane,
+    ctx: &mut ActorContext<A>,
+    priority: &Option<mpsc::Receiver<ActorEnvelope<A>>>,
+) -> bool {
+    match branch {
+        // No unseen version.
+        UpperBranch::Stop => matches!(stop_rx.has_changed(), Ok(false)),
+        // Not opened, or opened, taken by the run loop, empty and open. A
+        // plane opened and not yet taken reads busy, so the select's branch
+        // takes its receiver and answers.
+        UpperBranch::System => system_rx.is_idle(),
+        UpperBranch::Restart => {
+            let (planes, _) = ctx.supervision_planes_mut();
+            planes.is_none_or(|(restart, _, _)| restart.is_empty())
+        }
+        UpperBranch::Death => {
+            let (planes, _) = ctx.supervision_planes_mut();
+            planes.is_none_or(|(_, death, _)| death.is_empty())
+        }
+        // A supervisor's branch polls its verdict signal whenever any plane
+        // holds a task, the forwarder plane included, so it reads idle only
+        // with every plane empty.
+        UpperBranch::Verdict => {
+            let (planes, forwarders) = ctx.supervision_planes_mut();
+            planes.is_none_or(|(restart, death, _)| {
+                restart.is_empty() && death.is_empty() && forwarders.is_none_or(|f| f.is_empty())
+            })
+        }
+        // A supervisor reads its forwarder plane by emptiness, as the
+        // verdict clause does; any other actor by the forwarder end count,
+        // without the plane's lock.
+        UpperBranch::Forwarder => {
+            if ctx.supervision_ref().is_some() {
+                let (_, forwarders) = ctx.supervision_planes_mut();
+                forwarders.is_none_or(|f| f.is_empty())
+            } else {
+                ctx.forwarders_idle()
+            }
+        }
+        UpperBranch::Priority => priority
+            .as_ref()
+            .is_none_or(|lane| lane.is_empty() && !lane.is_closed()),
+    }
+}
+
+/// The stop lane's next unseen version, woken through the run loop's
+/// single-reader slot: armed before the second read, so a raise that lands
+/// between the reads is seen by it, and one that lands after wakes the loop.
+/// The slot is disarmed when this future drops (the select dropping its
+/// branches), so no raise wakes the loop during a callback. The version is
+/// marked seen by the branch's own `borrow_and_update`.
+fn lane_changed<'a>(rx: &'a LaneRx, slot: &'a crate::types::WakeSlot) -> LaneChanged<'a> {
+    LaneChanged { rx, slot }
+}
+
+struct LaneChanged<'a> {
+    rx: &'a LaneRx,
+    slot: &'a crate::types::WakeSlot,
+}
+
+impl LaneChanged<'_> {
+    fn unseen(&self) -> bool {
+        matches!(self.rx.has_changed(), Ok(true))
+    }
+}
+
+impl Future for LaneChanged<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if self.unseen() {
+            return Poll::Ready(());
+        }
+        self.slot.register(cx.waker());
+        if self.unseen() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for LaneChanged<'_> {
+    fn drop(&mut self) {
+        self.slot.disarm();
+    }
+}
+
+/// The mailbox's next message if one is ready now, through the task's own
+/// context (so the cooperative budget applies); `None` when it is empty,
+/// closed or not ready, which the select then decides. Never waits.
+fn poll_now<T>(rx: &mut MailRx<T>) -> impl Future<Output = Option<T>> + '_ {
+    std::future::poll_fn(move |cx| match rx.poll_recv(cx) {
+        Poll::Ready(Some(value)) => Poll::Ready(Some(value)),
+        Poll::Ready(None) | Poll::Pending => Poll::Ready(None),
+    })
 }
 
 /// Awaits `rx`'s next value when it is `Some`, or pends forever when it is
@@ -1923,7 +3025,7 @@ async fn deliver_child_event<A: Actor>(
 ) -> ControlFlow<StopReason> {
     let clock = ctx.turn_clock();
     clock.begin();
-    let delivered = catch_callback(actor.on_child_stopped(event, ctx)).await;
+    let delivered = catch_hook(|| actor.on_child_stopped(event, ctx)).await;
     clock.end();
     match delivered {
         Ok(Ok(())) => ControlFlow::Continue(()),
@@ -1969,9 +3071,10 @@ async fn handle_child_stopped<A: Actor>(
     ctx: &mut ActorContext<A>,
     event: ChildStoppedInternal,
 ) -> ControlFlow<StopReason> {
+    // The report in hand is held apart from the worklist, so the worklist
+    // allocates only when a second report queues behind it.
     let mut work: VecDeque<ChildStoppedInternal> = VecDeque::new();
-    work.push_back(event);
-    let flow = handle_worklist(actor, ctx, &mut work).await;
+    let flow = handle_worklist(actor, ctx, Some(event), &mut work).await;
     if flow.is_break() {
         // The loop ends with reports still in the worklist: they are
         // collected for their own deliveries.
@@ -1982,13 +3085,16 @@ async fn handle_child_stopped<A: Actor>(
     flow
 }
 
-/// Runs the worklist of [`handle_child_stopped`] until it is empty.
+/// Runs the worklist of [`handle_child_stopped`] until it is empty: `first`
+/// is handled before anything in `work`, and a report pushed back to the
+/// front of `work` is handled next.
 async fn handle_worklist<A: Actor>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
+    mut first: Option<ChildStoppedInternal>,
     work: &mut VecDeque<ChildStoppedInternal>,
 ) -> ControlFlow<StopReason> {
-    while let Some(ev) = work.pop_front() {
+    while let Some(ev) = first.take().or_else(|| work.pop_front()) {
         // Manual-completion delivery: `stop_child`/`terminate_child` already
         // classified this exact incarnation's disposition the moment its real
         // fate was observed (see `ActorContext::manual_stop_child`) and
@@ -2134,7 +3240,7 @@ async fn handle_worklist<A: Actor>(
                 let child_name = ctx
                     .supervision_ref()
                     .and_then(|sup| sup.registry.get(&ev.child_id))
-                    .and_then(|child| child.name.clone());
+                    .and_then(|child| child.name.as_deref().map(str::to_string));
                 let mut removed = None;
                 if steps.manual_override {
                     removed = prune_spec_if_needed(ctx, &ev.child_id);
@@ -2145,9 +3251,9 @@ async fn handle_worklist<A: Actor>(
                     return ControlFlow::Break(StopReason::Failure(err));
                 }
                 let child_event = ChildEvent {
-                    child_id: ev.child_id.clone(),
+                    child_id: ev.child_id,
                     child_name,
-                    reason: ev.reason.clone(),
+                    reason: ev.reason,
                     action,
                 };
                 deliver_child_event(actor, ctx, &child_event).await?;
@@ -2169,11 +3275,11 @@ async fn handle_worklist<A: Actor>(
                 let child_name = ctx
                     .supervision_ref()
                     .and_then(|sup| sup.registry.get(&ev.child_id))
-                    .and_then(|child| child.name.clone());
+                    .and_then(|child| child.name.as_deref().map(str::to_string));
                 let child_event = ChildEvent {
-                    child_id: ev.child_id.clone(),
+                    child_id: ev.child_id,
                     child_name,
-                    reason: ev.reason.clone(),
+                    reason: ev.reason,
                     action: SupervisionAction::BudgetExhausted,
                 };
                 deliver_child_event(actor, ctx, &child_event).await?;
@@ -2187,7 +3293,7 @@ async fn handle_worklist<A: Actor>(
         let child_name = ctx
             .supervision_ref()
             .and_then(|sup| sup.registry.get(&ev.child_id))
-            .and_then(|child| child.name.clone());
+            .and_then(|child| child.name.as_deref().map(str::to_string));
 
         let outcome = ctx
             .supervision_mut()
@@ -2269,9 +3375,9 @@ async fn handle_worklist<A: Actor>(
         }
 
         let child_event = ChildEvent {
-            child_id: ev.child_id.clone(),
+            child_id: ev.child_id,
             child_name,
-            reason: ev.reason.clone(),
+            reason: ev.reason,
             action,
         };
         deliver_child_event(actor, ctx, &child_event).await?;
@@ -2323,7 +3429,7 @@ async fn retry_group<A: Actor>(
                 child_name: sup
                     .registry
                     .get(&failed.child_id)
-                    .and_then(|child| child.name.clone()),
+                    .and_then(|child| child.name.as_deref().map(str::to_string)),
                 reason: failed.reason.clone(),
                 action: SupervisionAction::RestartInitiated,
             },
@@ -2648,7 +3754,7 @@ async fn handle_released<A: Actor>(
     ctx: &mut ActorContext<A>,
     mut released: VecDeque<ChildStoppedInternal>,
 ) -> ControlFlow<StopReason> {
-    let flow = handle_worklist(actor, ctx, &mut released).await;
+    let flow = handle_worklist(actor, ctx, None, &mut released).await;
     if flow.is_break() {
         if let Some(sup) = ctx.supervision_mut() {
             sup.owed.extend(released);
@@ -2860,7 +3966,7 @@ fn absorb_records(
             continue;
         };
         let life = child.lifecycle;
-        let name = child.name.clone();
+        let name = child.name.as_deref().map(str::to_string);
         let prune =
             rules::group_member_end(child.spec.restart_type) == rules::MemberEnd::PruneAndRemove;
         let ChildLifecycle::Down { incarnation: n, .. } = life else {
@@ -3273,9 +4379,126 @@ fn record_restart_outcome(
 #[path = "end_order_tests.rs"]
 mod end_order_tests;
 
+/// How many turns the calling thread's run loops took the turn boundary fast
+/// path.
+#[cfg(test)]
+pub(crate) mod fast_path_turns {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TURNS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        TURNS.with(|t| t.set(t.get() + 1));
+    }
+
+    pub(crate) fn read() -> u32 {
+        TURNS.with(Cell::get)
+    }
+}
+
+/// The worker count and the current-thread flag each actor's run loop
+/// started with.
+#[cfg(test)]
+pub(crate) mod loop_facts {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::types::ActorId;
+
+    static FACTS: OnceLock<Mutex<HashMap<ActorId, (usize, bool)>>> = OnceLock::new();
+
+    fn facts() -> &'static Mutex<HashMap<ActorId, (usize, bool)>> {
+        FACTS.get_or_init(Default::default)
+    }
+
+    pub(super) fn record(id: &ActorId, workers: usize, same_thread: bool) {
+        facts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.clone(), (workers, same_thread));
+    }
+
+    /// What the latest run loop of `id` started with, if one has.
+    pub(crate) fn read(id: &ActorId) -> Option<(usize, bool)> {
+        facts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .copied()
+    }
+
+    /// Forgets what `id`'s run loops started with.
+    pub(crate) fn forget(id: &ActorId) {
+        facts().lock().unwrap_or_else(|p| p.into_inner()).remove(id);
+    }
+}
+
+/// How many times each actor's run loop handed the thread back after a
+/// reply.
+#[cfg(test)]
+pub(crate) mod hand_backs {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::types::ActorId;
+
+    static COUNTS: OnceLock<Mutex<HashMap<ActorId, u32>>> = OnceLock::new();
+
+    fn counts() -> &'static Mutex<HashMap<ActorId, u32>> {
+        COUNTS.get_or_init(Default::default)
+    }
+
+    pub(super) fn bump(id: &ActorId) {
+        *counts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(id.clone())
+            .or_insert(0) += 1;
+    }
+
+    pub(crate) fn read(id: &ActorId) -> u32 {
+        counts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[path = "hand_back_flavor_tests.rs"]
+mod hand_back_flavor_tests;
+
+#[cfg(test)]
+#[path = "runtime_facts_tests.rs"]
+mod runtime_facts_tests;
+
+#[cfg(test)]
+#[path = "ack_waker_tests.rs"]
+mod ack_waker_tests;
+
+#[cfg(test)]
+#[path = "status_sender_tests.rs"]
+mod status_sender_tests;
+
+#[cfg(test)]
+#[path = "status_fast_path_tests.rs"]
+mod status_fast_path_tests;
+
+#[cfg(test)]
+#[path = "bounded_run.rs"]
+mod bounded_run;
+
 #[cfg(test)]
 #[path = "own_unwind_tests.rs"]
-mod own_unwind_tests;
+pub(crate) mod own_unwind_tests;
+
+#[cfg(test)]
+#[path = "worklist_order_tests.rs"]
+mod worklist_order_tests;
 
 #[cfg(test)]
 mod keep_first_tests {
@@ -3543,7 +4766,7 @@ fn next_settled(cells: &mut [Option<CellWait>]) -> impl Future<Output = (usize, 
 async fn settle_children<A: Actor>(
     ctx: &mut ActorContext<A>,
     waits: Vec<StopWait>,
-    stop_rx: &mut watch::Receiver<LaneState>,
+    stop_rx: &mut LaneRx,
     drop_panic: &mut Option<String>,
 ) -> Teardown {
     let supervisor = ctx.actor_id().clone();
@@ -3563,7 +4786,6 @@ async fn settle_children<A: Actor>(
     }
     let mut settled: Vec<Option<CellOutcome>> = targets.iter().map(|_| None).collect();
     let mut reported = vec![false; targets.len()];
-    let mut lane_open = true;
     if kill_stored(stop_rx) {
         return Teardown::Killed;
     }
@@ -3596,11 +4818,10 @@ async fn settle_children<A: Actor>(
             // into the `Kill` path. Only a stored `Kill` ends the wait: the
             // lane holds nothing else new once it is narrowed, and a version
             // the loop never consumed is consumed here.
-            changed = stop_rx.changed(), if lane_open => {
+            changed = stop_rx.changed() => {
                 match changed {
                     Ok(()) if kill_stored(stop_rx) => return Teardown::Killed,
                     Ok(()) => {}
-                    Err(_) => lane_open = false,
                 }
             }
             (index, outcome) = next_settled(&mut cells), if cells_pending => {
@@ -3714,7 +4935,7 @@ fn begin_child_stop(id: &ActorId, child: &ChildState, action: TeardownAction) ->
 /// the previous one settled.
 async fn stop_all_children<A: Actor>(
     ctx: &mut ActorContext<A>,
-    stop_rx: &mut watch::Receiver<LaneState>,
+    stop_rx: &mut LaneRx,
     drop_panic: &mut Option<String>,
 ) -> Teardown {
     let (strategy, order, factories) = match ctx.supervision_mut() {
@@ -3808,7 +5029,7 @@ enum FinalOutcome {
 }
 
 /// Whether the stop lane holds a `Kill`, read without consuming it.
-fn kill_stored(stop_rx: &watch::Receiver<LaneState>) -> bool {
+fn kill_stored(stop_rx: &LaneRx) -> bool {
     matches!(stop_rx.borrow().reason, Some(StopReason::Kill))
 }
 
@@ -3822,7 +5043,7 @@ fn collect_report(
     let name = sup
         .registry
         .get(&report.child_id)
-        .and_then(|child| child.name.clone())
+        .and_then(|child| child.name.as_deref().map(str::to_string))
         .or_else(|| {
             sup.pending_manual_events
                 .get(&(report.child_id.clone(), report.incarnation))
@@ -4089,7 +5310,7 @@ fn collect_restart_outcome(
 async fn final_drain<A: Actor>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
-    stop_rx: &watch::Receiver<LaneState>,
+    stop_rx: &LaneRx,
     accepted: &StopReason,
     drop_panic: &mut Option<String>,
 ) -> FinalOutcome {
@@ -4112,23 +5333,26 @@ async fn final_drain<A: Actor>(
             sup.final_delivery = true;
         }
         clock.begin();
-        let result = catch_callback(actor.on_child_stopped(&event, ctx)).await;
+        let result = catch_hook(|| actor.on_child_stopped(&event, ctx)).await;
         clock.end();
         if let Some(sup) = ctx.supervision_mut() {
             sup.final_delivery = false;
         }
+        // An earlier failure stands, whether the delivery returns an error or
+        // panics.
+        let failed = matches!(accepted, StopReason::Failure(_))
+            || matches!(pending, Some(StopReason::Failure(_)));
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 ctx.record_failure(err.clone());
-                pending = Some(StopReason::Failure(err));
+                if !failed {
+                    pending = Some(StopReason::Failure(err));
+                }
             }
             Err(payload) => {
                 let err = ActorError::Panic(payload_into_string(payload));
                 ctx.record_failure(err.clone());
-                // A panic never masks an earlier failure.
-                let failed = matches!(accepted, StopReason::Failure(_))
-                    || matches!(pending, Some(StopReason::Failure(_)));
                 if !failed {
                     pending = Some(StopReason::Failure(err));
                 }
@@ -4185,8 +5409,8 @@ pub(crate) fn bounded_wait(dur: Duration) -> Duration {
 fn build_status_info<A: Actor>(ctx: &ActorContext<A>) -> ActorStatusInfo {
     let (child_count, name) = ctx
         .supervision_ref()
-        .map(|sup| (sup.registry.len(), ctx.actor_name().cloned()))
-        .unwrap_or((0, ctx.actor_name().cloned()));
+        .map(|sup| (sup.registry.len(), ctx.actor_name().map(str::to_string)))
+        .unwrap_or((0, ctx.actor_name().map(str::to_string)));
     let handle = ctx.self_handle();
 
     ActorStatusInfo {
@@ -4206,6 +5430,43 @@ fn build_status_info<A: Actor>(ctx: &ActorContext<A>) -> ActorStatusInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An actor that never fails a request holds one pointer for the answer it
+    /// may have to hold.
+    #[test]
+    fn the_held_answer_slot_is_one_pointer() {
+        assert_eq!(
+            std::mem::size_of::<HeldAnswer<u64>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    /// A held answer is sent unless a `Kill` ended the actor, in which case
+    /// its sender is dropped unanswered.
+    #[test]
+    fn a_held_answer_is_sent_unless_a_kill_ended_the_actor() {
+        let held_answer = |reason: StopReason| {
+            let mut held = HeldAnswer::<u32>::new();
+            let (tx, mut rx) = oneshot::channel();
+            held.hold(tx, ActorError::user("the handler failed"));
+            held.deliver(&reason);
+            rx.try_recv()
+        };
+        assert!(matches!(
+            held_answer(StopReason::Failure(ActorError::user("the handler failed"))),
+            Ok(Err(ActorError::User(_)))
+        ));
+        assert!(matches!(
+            held_answer(StopReason::Graceful),
+            Ok(Err(ActorError::User(_)))
+        ));
+        assert!(matches!(
+            held_answer(StopReason::Kill),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        let mut empty = HeldAnswer::<u32>::new();
+        empty.deliver(&StopReason::Kill);
+    }
 
     #[tokio::test]
     async fn saturating_deadline_matches_plain_addition_within_range() {
@@ -4292,7 +5553,7 @@ mod tests {
             let (ctl, _io) = slot_pair(Default::default());
             sup.registry.register(ChildState {
                 id: ActorId::from(*id),
-                name: Some((*id).to_string()),
+                name: Some(Arc::from((*id).to_string())),
                 spec: ChildSpec {
                     restart_type: RestartType::Permanent,
                     shutdown: Shutdown::default(),
@@ -4394,7 +5655,7 @@ mod task_marker_tests {
     /// and the runner's reading of the join (`joined_reason`) is the plane's
     /// reason, one value with one text.
     async fn an_unwind_of_the_task_s_own_poll_reads_one_panic() {
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let marker = TaskMarker::default();
         let guard = AbortReason::new(status_tx.clone(), marker.clone(), ActorId::from("unwound"));
         let join = tokio::spawn(MarkedRun::new(marker, async move {
@@ -4411,7 +5672,7 @@ mod task_marker_tests {
         let want = StopReason::Failure(ActorError::Panic(UNCAUGHT_PANIC.to_string()));
         assert_eq!(plane, Some(want.clone()), "the plane reads the panic");
         assert_eq!(
-            crate::actor::supervision::joined_reason(res, plane, None),
+            crate::actor::supervision::joined_reason(res, || plane, None),
             want,
             "the runner reads the plane's reason"
         );
@@ -4430,7 +5691,7 @@ mod task_marker_tests {
     /// The guard of a task aborted while suspended writes `Kill`, and the
     /// runner reads `Kill`.
     async fn an_abort_of_a_suspended_task_reads_kill() {
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let marker = TaskMarker::default();
         let guard = AbortReason::new(status_tx.clone(), marker.clone(), ActorId::from("aborted"));
         let join = tokio::spawn(MarkedRun::new(marker, async move {
@@ -4445,7 +5706,7 @@ mod task_marker_tests {
         let plane = status_rx.borrow().reason.clone();
         assert_eq!(plane, Some(StopReason::Kill));
         assert_eq!(
-            crate::actor::supervision::joined_reason(res, plane, None),
+            crate::actor::supervision::joined_reason(res, || plane, None),
             StopReason::Kill
         );
     }
@@ -4458,5 +5719,193 @@ mod task_marker_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_abort_of_a_suspended_task_reads_kill_multi_thread() {
         an_abort_of_a_suspended_task_reads_kill().await;
+    }
+}
+
+#[cfg(test)]
+mod upper_branch_tests {
+    use super::{SupervisionEvent, UpperBranch};
+
+    impl UpperBranch {
+        fn doc_name(self) -> &'static str {
+            match self {
+                UpperBranch::Stop => "stop lane",
+                UpperBranch::System => "system channel",
+                UpperBranch::Restart => "restart plane",
+                UpperBranch::Death => "death plane",
+                UpperBranch::Verdict => "verdict signal",
+                UpperBranch::Forwarder => "forwarder plane",
+                UpperBranch::Priority => "priority lane",
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_path_clauses_follow_the_documented_reception_order() {
+        let src = include_str!("runtime.rs");
+        let head = "Reception order, highest first:";
+        let start = src
+            .find(head)
+            .expect("the module docs state the reception order")
+            + head.len();
+        let end = start
+            + src[start..]
+                .find(';')
+                .expect("the order ends with a semicolon");
+        let listed: Vec<String> = src[start..end]
+            .replace("//!", " ")
+            .split(',')
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let mut expected: Vec<String> = UpperBranch::ORDER
+            .iter()
+            .map(|b| b.doc_name().to_string())
+            .collect();
+        expected.push("mailbox".to_string());
+        assert_eq!(listed, expected);
+        assert!(UpperBranch::ORDER.contains(&SupervisionEvent::Verdict.branch()));
+    }
+}
+
+#[cfg(test)]
+mod reply_drain_tests {
+    use super::*;
+
+    /// The turns before which the loop would hand the thread back, when turn
+    /// `i` sends a reply exactly if `replies[i]` and a lane always holds
+    /// messages.
+    fn hand_backs(replies: &[bool]) -> Vec<usize> {
+        let mut drain = ReplyDrain::new();
+        let mut at = Vec::new();
+        for (i, replied) in replies.iter().enumerate() {
+            if drain.0 != 0 && drain.step() {
+                at.push(i);
+            }
+            if *replied {
+                drain.replied();
+            }
+        }
+        at
+    }
+
+    fn status_info() -> ActorStatusInfo {
+        ActorStatusInfo {
+            id: ActorId::from("status".to_string()),
+            name: None,
+            status: ActorStatus::Running,
+            mailbox_len: 0,
+            mailbox_capacity: 1,
+            priority_len: 0,
+            priority_capacity: 0,
+            child_count: 0,
+            timer_count: 0,
+            stream_count: 0,
+        }
+    }
+
+    /// What answering one status request leaves behind: whether the window
+    /// opened and whether the reply is marked for the hand-back.
+    fn answered(task: bool, same_thread: bool, requester_gone: bool) -> (bool, bool) {
+        let (reply, requester) = oneshot::channel();
+        let keep = (!requester_gone).then_some(requester);
+        let mut fp_skip = 0;
+        let mut drain = ReplyDrain::new();
+        answer_status(
+            crate::types::StatusRequest { reply, task },
+            status_info(),
+            same_thread,
+            &mut fp_skip,
+            &mut drain,
+        );
+        drop(keep);
+        (
+            fp_skip == STATUS_FAST_PATH_OFF_TURNS,
+            drain.0 & ReplyDrain::REPLIED != 0,
+        )
+    }
+
+    /// A reply to a requester that is gone marks no drain, whatever the
+    /// requester's kind or the runtime's flavor; the window follows the
+    /// requester's kind alone.
+    #[test]
+    fn a_reply_to_a_gone_requester_marks_no_drain() {
+        for task in [true, false] {
+            for same_thread in [true, false] {
+                let (window, marked) = answered(task, same_thread, true);
+                assert!(!marked, "task {task}, same thread {same_thread}");
+                assert_eq!(window, !task);
+            }
+        }
+    }
+
+    /// A delivered reply is marked for a task requester anywhere and for any
+    /// requester on a current-thread runtime; the window opens for a requester
+    /// outside every task.
+    #[test]
+    fn a_delivered_status_reply_marks_the_drain_by_requester_kind() {
+        assert_eq!(answered(true, false, false), (false, true));
+        assert_eq!(answered(true, true, false), (false, true));
+        assert_eq!(answered(false, true, false), (true, true));
+        assert_eq!(answered(false, false, false), (true, false));
+    }
+
+    /// The hand-back ends for a stop request or a system message and for
+    /// nothing else: a supervisor's running children, its timers and a
+    /// priority backlog are standing state, not an event, and must not skip
+    /// the one hand-back a lone reply is promised.
+    #[test]
+    fn the_hand_back_exit_reads_only_the_stop_lane_and_the_system_channel() {
+        assert_eq!(
+            HAND_BACK_EXIT,
+            [UpperBranch::Stop, UpperBranch::System],
+            "the exit test names the two branches that must interrupt it"
+        );
+        assert_eq!(
+            HAND_BACK_EXIT,
+            UpperBranch::ORDER[..2],
+            "and they are the two highest branches of the select"
+        );
+        for standing in [
+            UpperBranch::Restart,
+            UpperBranch::Death,
+            UpperBranch::Verdict,
+            UpperBranch::Forwarder,
+            UpperBranch::Priority,
+        ] {
+            assert!(!HAND_BACK_EXIT.contains(&standing), "{standing:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_reply_is_followed_by_one_hand_back_after_the_allowance() {
+        let mut replies = vec![true];
+        replies.extend([false; 20]);
+        // The reply, one quiet turn that shows it stood alone, the allowance.
+        assert_eq!(hand_backs(&replies), vec![2 + REPLY_DRAIN_TURNS as usize]);
+    }
+
+    #[test]
+    fn replies_on_consecutive_turns_never_come_due() {
+        assert!(hand_backs(&[true; 1000]).is_empty());
+    }
+
+    #[test]
+    fn every_lone_reply_among_quiet_turns_comes_due() {
+        let mut replies = Vec::new();
+        for _ in 0..5 {
+            replies.push(true);
+            replies.extend([false; 9]);
+        }
+        let at = hand_backs(&replies);
+        assert_eq!(at.len(), 5);
+        assert!(at.iter().all(|i| i % 10 == 2 + REPLY_DRAIN_TURNS as usize));
+    }
+
+    #[test]
+    fn a_reply_during_the_allowance_does_not_restart_it() {
+        let mut replies = vec![true, false, false, true];
+        replies.extend([false; 20]);
+        let at = hand_backs(&replies);
+        assert_eq!(at[0], 2 + REPLY_DRAIN_TURNS as usize);
     }
 }

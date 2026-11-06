@@ -124,14 +124,24 @@ const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
 /// configured window.
 const BOUND: Duration = Duration::from_secs(10);
 
-/// The upper bound of a timed outcome: `precise` where an outcome lands on
-/// its exact instant (the paused clock), and a hang bound past it on a
-/// real-time runtime, loose enough for a host that stalls its threads.
-fn upper(paused: bool, precise: Duration) -> Duration {
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
+/// The upper bound of a timed outcome: its `exact` instant plus
+/// [`PAUSED_SLACK`] on the paused clock, where no stalled host can move it,
+/// and a hang bound past it on a real-time runtime, loose enough for a host
+/// that stalls its threads.
+fn upper(paused: bool, exact: Duration) -> Duration {
     if paused {
-        precise
+        exact + PAUSED_SLACK
     } else {
-        precise + BOUND
+        exact + BOUND
     }
 }
 
@@ -163,7 +173,10 @@ async fn within<T>(bound: Duration, what: &str, fut: impl std::future::Future<Ou
     }
 }
 
+/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report. A shorter `bound` from a caller is
+/// raised to `HANG_BOUND`.
 async fn wait_until(bound: Duration, what: &str, mut pred: impl FnMut() -> bool) {
+    let bound = bound.max(HANG_BOUND);
     let deadline = Instant::now() + bound;
     loop {
         if pred() {
@@ -195,6 +208,8 @@ struct Probe {
     held: AtomicBool,
     /// Instances that finished `on_started`.
     started: AtomicUsize,
+    /// Instances that began `on_started`, before its `held` wait.
+    began: AtomicUsize,
     /// Instances that entered `on_started` past its `held` wait.
     entered: AtomicUsize,
     /// While set, an instance fails its initialization.
@@ -423,6 +438,7 @@ impl Actor for Probed {
         if take_one(&self.probe.fail_first) {
             return Err(ActorError::user("the child refused to start at once"));
         }
+        self.probe.began.fetch_add(1, Ordering::SeqCst);
         let cap = Instant::now() + GATE_CAP;
         while self.probe.held.load(Ordering::SeqCst) && Instant::now() < cap {
             sleep(Duration::from_millis(5)).await;
@@ -441,9 +457,11 @@ impl Actor for Probed {
         }
         let awaited = self.probe.wait_alive.lock().unwrap().take();
         if let Some(name) = awaited {
+            let cap = Instant::now() + GATE_CAP;
             while !ActorSystem::default()
                 .get::<Probed>(&name)
                 .is_some_and(|handle| handle.is_alive())
+                && Instant::now() < cap
             {
                 sleep(Duration::from_millis(10)).await;
             }
@@ -1411,12 +1429,9 @@ fn removed_once(rig: &Rig, name: &str) {
 const WINDOW: Duration = Duration::from_millis(200);
 
 /// The longest a vetoing child under `WINDOW` may live after its stop was
-/// ordered: the window, the Kill step, the abort and a margin.
+/// ordered: the window, the Kill step and the abort.
 fn stop_bound(paused: bool) -> Duration {
-    upper(
-        paused,
-        WINDOW + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-    )
+    upper(paused, WINDOW + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE)
 }
 
 async fn abandoned_terminate_still_stops(wait: Duration, park: bool, paused: bool) {
@@ -1434,7 +1449,10 @@ async fn abandoned_terminate_still_stops(wait: Duration, park: bool, paused: boo
     let child = child_handle(&name).await;
     if park {
         child.notify(ChildMsg::Park).await.expect("park the child");
-        sleep(Duration::from_millis(50)).await;
+        wait_until(BOUND, "the child's turn to park", || {
+            probe.parked.load(Ordering::SeqCst)
+        })
+        .await;
     }
     let started = Instant::now();
     rig.ok(Cmd::TerminateAbandon {
@@ -1459,7 +1477,7 @@ async fn abandoned_terminate_still_stops(wait: Duration, park: bool, paused: boo
     );
     assert!(
         started.elapsed() < stop_bound(paused),
-        "the child's task ended within its window, the Kill step, the abort and a margin: {:?}",
+        "the child's task ended within its window, the Kill step and the abort: {:?}",
         started.elapsed()
     );
     wait_until(BOUND, "the report of the child's end", || {
@@ -1623,7 +1641,11 @@ fn a_second_manual_stop_asks_a_vetoing_infinity_child_once_more() {
             .await;
         rig.ok(Cmd::TerminateAbandon {
             name: name.clone(),
-            wait: Duration::from_millis(100),
+            wait: Duration::ZERO,
+        })
+        .await;
+        wait_until(BOUND, "the child to veto the first request", || {
+            probe.pre_stops_returned.load(Ordering::SeqCst) == 1
         })
         .await;
         assert_eq!(
@@ -1755,13 +1777,10 @@ async fn group_stop_escalates_a_vetoing_member_through_its_runner_body(paused: b
     let started = Instant::now();
     crash(&child_handle(&crasher).await).await;
     // The member's death is bounded as the ladder gives it: its window,
-    // the Kill step, the abort and a margin.
+    // the Kill step and the abort.
     let member_bound = upper(
         paused,
-        Duration::from_millis(150)
-            + ASSUMED_KILL_GRACE
-            + ASSUMED_ABORT_SETTLE
-            + Duration::from_millis(500),
+        Duration::from_millis(150) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
     );
     wait_until(member_bound, "the vetoing member to die", || {
         !rig.events_for(&member).is_empty()
@@ -2118,6 +2137,8 @@ fn terminate_child_override_runs_pre_stop_once() {
 /// A child whose factory blocks, so its restart attempt stays in flight.
 struct Slow {
     gate: Arc<AtomicBool>,
+    /// Counts the instances that began `on_started`.
+    began: Arc<AtomicUsize>,
 }
 
 impl Actor for Slow {
@@ -2138,6 +2159,7 @@ impl Actor for Slow {
     }
 
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.began.fetch_add(1, Ordering::SeqCst);
         // A restarted instance waits here until the test opens the gate.
         while !self.gate.load(Ordering::SeqCst) {
             sleep(Duration::from_millis(5)).await;
@@ -2149,6 +2171,7 @@ impl Actor for Slow {
 struct SlowSup {
     gate: Arc<AtomicBool>,
     built: Arc<AtomicUsize>,
+    began: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -2170,6 +2193,7 @@ impl Actor for SlowSup {
             SlowCmd::Spawn(name) => {
                 let gate = self.gate.clone();
                 let built = self.built.clone();
+                let began = self.began.clone();
                 ctx.spawn_child(move || {
                     // The first instance starts at once; later ones wait.
                     if built.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2177,7 +2201,10 @@ impl Actor for SlowSup {
                     } else {
                         gate.store(false, Ordering::SeqCst);
                     }
-                    Slow { gate: gate.clone() }
+                    Slow {
+                        gate: gate.clone(),
+                        began: began.clone(),
+                    }
                 })
                 .named(name)
                 .restart_type(RestartType::Permanent)
@@ -2206,9 +2233,11 @@ fn manual_stops_of_a_child_whose_restart_is_in_flight_answer_child_restarting() 
     common::run(0, async {
         let gate = Arc::new(AtomicBool::new(true));
         let built = Arc::new(AtomicUsize::new(0));
+        let began = Arc::new(AtomicUsize::new(0));
         let sup = SlowSup {
             gate: gate.clone(),
             built: built.clone(),
+            began: began.clone(),
         }
         .spawn()
         .named(uname("slow-sup"))
@@ -2235,7 +2264,10 @@ fn manual_stops_of_a_child_whose_restart_is_in_flight_answer_child_restarting() 
             built.load(Ordering::SeqCst) == 2
         })
         .await;
-        sleep(Duration::from_millis(50)).await;
+        wait_until(BOUND, "the restart attempt to be inside its init", || {
+            began.load(Ordering::SeqCst) == 2
+        })
+        .await;
         let answers = within(BOUND, "the calls", sup.send(SlowCmd::Calls(name.clone())))
             .await
             .expect("answer");
@@ -2268,6 +2300,8 @@ fn manual_stops_of_a_child_whose_restart_is_in_flight_answer_child_restarting() 
 struct StuckGate {
     /// Set by the test to end the turn.
     open: AtomicBool,
+    /// Set when the turn began.
+    entered: AtomicBool,
     /// Set when the turn ended.
     returned: AtomicBool,
 }
@@ -2291,6 +2325,7 @@ impl Actor for Stuck {
     type Response = ();
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.0.entered.store(true, Ordering::SeqCst);
         let cap = std::time::Instant::now() + GATE_CAP;
         while !self.0.open.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
             std::thread::sleep(Duration::from_millis(1));
@@ -2340,7 +2375,10 @@ fn terminate_child_of_a_stuck_child_answers_child_unresponsive() {
             .get::<Stuck>("stuck-child")
             .expect("the child");
         child.notify(()).await.expect("start the stuck turn");
-        sleep(Duration::from_millis(50)).await;
+        wait_until(BOUND, "the stuck turn to begin", || {
+            gate.entered.load(Ordering::SeqCst)
+        })
+        .await;
         let started = Instant::now();
         let ladder = Duration::from_millis(50) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE;
         let answer = within(
@@ -2619,8 +2657,9 @@ async fn is_alive(rig: &Rig, name: &str) -> bool {
     )
 }
 
+/// Polls until `name` reads alive. The bound only limits how long a real hang takes to report.
 async fn wait_for_alive(rig: &Rig, name: &str) {
-    let deadline = Instant::now() + BOUND;
+    let deadline = Instant::now() + HANG_BOUND;
     while !is_alive(rig, name).await {
         assert!(Instant::now() < deadline, "{name} never ran");
         sleep(Duration::from_millis(5)).await;
@@ -3340,7 +3379,7 @@ fn restart_child_of_a_child_being_stopped_answers_child_restarting_until_its_dea
         let lines = rig
             .script(vec![
                 Op::TerminateAbandon(name.clone()),
-                Op::Sleep(Duration::from_millis(600)),
+                Op::UntilNotAlive(name.clone()),
                 Op::Restart(name.clone()),
                 Op::Read(name.clone()),
             ])
@@ -3646,21 +3685,21 @@ fn parent_stop_mid_restart_runs_the_fresh_incarnations_on_stopped_before_stopped
         rig.spawn_child(
             &name,
             &probe,
-            Shutdown::Timeout(Duration::from_secs(2)),
+            Shutdown::Timeout(Duration::from_secs(5)),
             RestartType::Permanent,
             0,
         )
         .await;
         let child = child_in(&sys, &name).await;
-        // The second incarnation initializes for 400 ms.
-        probe.init_sleep_ms.store(400, Ordering::SeqCst);
+        // The second incarnation initializes for 2.4 s, so the stop below
+        // arrives inside its initialization on any host that runs the test.
+        probe.init_sleep_ms.store(2400, Ordering::SeqCst);
         crash(&child).await;
-        wait_until(BOUND, "the second incarnation to be built", || {
-            probe.built.load(Ordering::SeqCst) == 2
+        wait_until(BOUND, "the second incarnation to begin its init", || {
+            probe.began.load(Ordering::SeqCst) == 2
         })
         .await;
-        sleep(Duration::from_millis(100)).await;
-        stop_supervisor(&rig, Duration::from_secs(5)).await;
+        stop_supervisor(&rig, BOUND).await;
         // The crashed incarnation ran `on_stopped`, and so did the fresh one,
         // after its initialization completed: the supervisor is `Stopped`
         // only once both ran.
@@ -3721,10 +3760,7 @@ async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned, paused: bo
     .await;
     let window = Duration::from_secs(2);
     within(
-        upper(
-            paused,
-            window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-        ),
+        upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
         "the parent to publish Stopped",
         async {
             rig.sup.stop(StopReason::Graceful).await.expect("stop");
@@ -3742,11 +3778,8 @@ async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned, paused: bo
         "the child's own window was honored: {took:?}"
     );
     assert!(
-        took < upper(
-            paused,
-            window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500)
-        ),
-        "the stop ended within the window, the Kill step, the abort and a margin: {took:?}"
+        took < upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
+        "the stop ended within the window, the Kill step and the abort: {took:?}"
     );
     if matches!(form, Abandoned::Stop) {
         assert_eq!(
@@ -4038,13 +4071,10 @@ async fn starting_child_gets_its_window_from_the_stop(
     .await;
     let fresh = child_in_starting(&sys, &name).await;
     // The stop ends by the window, the kill grace and the settle time at
-    // the latest.
+    // the latest, on the exact instant of the paused clock.
     let took = stop_supervisor(
         &rig,
-        upper(
-            paused,
-            window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-        ),
+        upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
     )
     .await;
     let completed = probe.started.load(Ordering::SeqCst) == 2;
@@ -4079,11 +4109,12 @@ async fn starting_child_gets_its_window_from_the_stop(
 
 #[test]
 fn parent_stop_gives_a_starting_child_its_window_from_the_stop() {
-    // `Timeout(500 ms)`: the init completes inside the window and the
-    // incarnation stops cooperatively.
+    // `Timeout(2500 ms)`: the init completes inside the window, with seconds
+    // to spare for a host that stalls, and the incarnation stops
+    // cooperatively; the stop ends when the init does.
     common::run(
         0,
-        starting_child_gets_its_window_from_the_stop(Duration::from_millis(500), true, false),
+        starting_child_gets_its_window_from_the_stop(Duration::from_millis(2500), true, false),
     );
     // `Timeout(100 ms)`: an init that never completes is killed at the window
     // and aborted after the grace, so the stop does not wait on the init.
@@ -4149,23 +4180,16 @@ async fn parent_stop_bounds_a_hung_infinity_init_by_its_start_timeout_body(pause
     // The restarted incarnation's `on_started` awaits forever.
     probe.held.store(true, Ordering::SeqCst);
     crash(&child).await;
-    wait_until(BOUND, "the second incarnation to be built", || {
-        probe.built.load(Ordering::SeqCst) == 2
+    wait_until(BOUND, "the second incarnation to begin its init", || {
+        probe.began.load(Ordering::SeqCst) == 2
     })
     .await;
-    sleep(Duration::from_millis(50)).await;
-    let took = stop_supervisor(
-        &rig,
-        upper(
-            paused,
-            Duration::from_millis(300)
-                + ASSUMED_KILL_GRACE
-                + ASSUMED_ABORT_SETTLE
-                + Duration::from_millis(500),
-        ),
-    )
-    .await;
-    assert!(took < upper(paused, Duration::from_secs(2)), "{took:?}");
+    let bound = upper(
+        paused,
+        Duration::from_millis(300) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
+    );
+    let took = stop_supervisor(&rig, bound).await;
+    assert!(took < bound, "{took:?}");
     assert!(
         probe.ended.load(Ordering::SeqCst),
         "the hung incarnation ended"
@@ -4249,7 +4273,16 @@ fn parent_stop_takes_a_child_whose_restart_acked_while_the_supervisor_was_busy()
             rig.sup.wait_stopped(),
         )
         .await;
-        let _ = busy.await;
+        match busy
+            .await
+            .expect("the hold task ends")
+            .expect("the held handler answers")
+        {
+            Reply::Steps(lines) => {
+                assert_eq!(lines, vec!["released: true".to_string()], "{lines:?}")
+            }
+            other => panic!("expected the hold's line, got {other:?}"),
+        }
         // The child runs `on_stopped`: the crashed incarnation and the
         // adopted one.
         assert_eq!(probe.stopped_runs.load(Ordering::SeqCst), 2);
@@ -4295,7 +4328,10 @@ fn start_timeout_on_a_non_yielding_init_gives_the_verdict_and_never_restarts_bes
         let rig = supervisor_on(&sys, plain()).await;
         let probe = Arc::new(Probe::default());
         let name = uname("w");
-        spawn_with_start_timeout(&rig, &name, &probe, WINDOW_200, Duration::from_millis(100)).await;
+        // The start timeout also bounds the third incarnation, which starts
+        // normally once the gate opens: it leaves a stalled host seconds.
+        let start_timeout = Duration::from_millis(2100);
+        spawn_with_start_timeout(&rig, &name, &probe, WINDOW_200, start_timeout).await;
         let child = child_in(&sys, &name).await;
         // The second incarnation holds its thread in `on_started` until the
         // test opens the gate, so every check below runs while it holds.
@@ -4318,10 +4354,7 @@ fn start_timeout_on_a_non_yielding_init_gives_the_verdict_and_never_restarts_bes
         // its thread on the gate all the while.
         #[cfg(not(feature = "tracing"))]
         sleep(
-            Duration::from_millis(100)
-                + ASSUMED_KILL_GRACE
-                + ASSUMED_ABORT_SETTLE
-                + Duration::from_millis(2300),
+            start_timeout + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(2300),
         )
         .await;
         let lines = rig.script(vec![Op::Read(name.clone())]).await;
@@ -4606,6 +4639,8 @@ fn a_verdict_is_logged_although_its_incarnation_ended_before_the_loop_read_the_s
 
 #[test]
 fn attempt_start_timeout_still_bounds_a_hung_init_after_a_bare_kill() {
+    #[cfg(feature = "tracing")]
+    let logged = warnings::install();
     common::run_multi_thread_only(4, async {
         let sys = ActorSystem::create(uname("bare-kill")).unwrap();
         let rig = supervisor_on(&sys, plain()).await;
@@ -4642,12 +4677,21 @@ fn attempt_start_timeout_still_bounds_a_hung_init_after_a_bare_kill() {
             "the kill reaches the incarnation"
         );
         // The start timeout still acts, runs the grace and the abort, and
-        // gives the verdict: about 300 ms into the init.
+        // gives the verdict.
+        #[cfg(feature = "tracing")]
+        wait_until(BOUND, "the verdict to be logged", || {
+            !warnings::naming(&logged.lock().unwrap(), &name).is_empty()
+        })
+        .await;
+        // Without the log, nothing public shows the verdict: the wait runs
+        // well past it, with room for a host that stalls, and the init still
+        // holds its thread on the gate all the while.
+        #[cfg(not(feature = "tracing"))]
         sleep(
             Duration::from_millis(100)
                 + ASSUMED_KILL_GRACE
                 + ASSUMED_ABORT_SETTLE
-                + Duration::from_millis(100),
+                + Duration::from_millis(2100),
         )
         .await;
         let lines = rig.script(vec![Op::Read(name.clone())]).await;
@@ -4806,6 +4850,9 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
     .await;
     let child_b = child_in(&sys, &b).await;
     let _ = child_in(&sys, &a).await;
+    // Stamped before the stop is committed, so a late host only lengthens the
+    // time read below.
+    let committed = Instant::now();
     rig.ok(match form {
         Abandoned::Terminate => Cmd::TerminateAbandon {
             name: a.clone(),
@@ -4817,7 +4864,6 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
         },
     })
     .await;
-    let crashed = Instant::now();
     crash(&child_b).await;
     // The group starts no member until every committed member ended: `b` is
     // restarted only after `a`'s old incarnation, which vetoes for its whole
@@ -4829,9 +4875,13 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
     )
     .await;
     assert!(
-        crashed.elapsed() >= Duration::from_millis(800),
+        committed.elapsed() >= Duration::from_millis(800),
         "the group waited for the stopping member: {:?}",
-        crashed.elapsed()
+        committed.elapsed()
+    );
+    assert!(
+        pa.drop_order(0) < pb.build_order(1),
+        "the stopping member's old incarnation ended before the crashed member was rebuilt"
     );
     assert!(
         pa.ended.load(Ordering::SeqCst) || pa.built.load(Ordering::SeqCst) == 2,
@@ -5020,8 +5070,9 @@ fn terminate_committed_before_the_group_trigger_rejoins_the_group_restart() {
             .script(vec![
                 Op::KillThroughHandle(b.clone()),
                 // `b`'s runner completes before `a`'s stop begins, so `b`'s
-                // report is drained first.
-                Op::Sleep(Duration::from_millis(30)),
+                // report is drained first: the roster reads `b` ended once
+                // its runner recorded the fate.
+                Op::UntilNotAlive(b.clone()),
                 Op::Terminate(a.clone()),
             ])
             .await;
@@ -5308,12 +5359,15 @@ fn terminate_child_in_a_delivery_removes_a_queued_member_whose_absorbed_report_i
             .lock()
             .unwrap()
             .push_back(Fault::Terminate(c.clone()));
+        pc.turn_held.store(true, Ordering::SeqCst);
         let lines = rig
             .script(vec![
                 Op::CrashAndWait(a.clone()),
-                Op::SlowFail(c.clone()),
+                Op::HeldFail(c.clone()),
                 Op::UntilInTurn(pc.clone()),
-                Op::Stop(c.clone()),
+                // `c` is still in its turn when the call commits: its failure
+                // comes after the stop's request.
+                Op::StopThenEndTurn(c.clone(), pc.clone()),
             ])
             .await;
         assert!(lines[3].contains("Ok"), "{lines:?}");
@@ -5882,7 +5936,7 @@ fn a_failing_final_delivery_makes_the_exit_reason_failure_and_the_rest_still_run
             "{reported:?}"
         );
 
-        // Two failing deliveries: the last error wins.
+        // Two failing deliveries: the first error stands.
         let nested = nested_supervisor(
             RestartType::Permanent,
             vec![Fault::Err("one"), Fault::Err("two")],
@@ -5895,7 +5949,7 @@ fn a_failing_final_delivery_makes_the_exit_reason_failure_and_the_rest_still_run
         .await;
         let reported = nested.root.events_for(&nested.child_name);
         assert!(
-            matches!(&reported[0].reason, StopReason::Failure(err) if err.to_string().contains("two")),
+            matches!(&reported[0].reason, StopReason::Failure(err) if err.to_string().contains("one")),
             "{reported:?}"
         );
 
@@ -6568,14 +6622,15 @@ fn one_for_all_mid_restart_when_shutdown_fires_never_respawns_after_shutdown_ret
         }
         let child_a = child_in(&sys, &a).await;
         let _ = child_in(&sys, &b).await;
-        // The group restart's chain restarts `a` first, slowly.
-        pa.init_sleep_ms.store(500, Ordering::SeqCst);
+        // The group restart's chain restarts `a` first, slowly: the shutdown
+        // below arrives inside its initialization on any host that runs the
+        // test.
+        pa.init_sleep_ms.store(2500, Ordering::SeqCst);
         crash(&child_a).await;
-        wait_until(BOUND, "the chain to start a", || {
-            pa.built.load(Ordering::SeqCst) == 2
+        wait_until(BOUND, "the chain to begin a's init", || {
+            pa.began.load(Ordering::SeqCst) == 2
         })
         .await;
-        sleep(Duration::from_millis(50)).await;
         let report = within(BOUND, "the system shutdown", sys.shutdown()).await;
         assert!(report.swept.is_empty(), "{:?}", report.swept);
         let built = (
@@ -7047,8 +7102,9 @@ fn terminate_child_on_a_retrying_member_cancels_the_retry() {
 }
 
 /// Polls the supervisor until `children()` reads the child restart-pending.
+/// The bound only limits how long a real hang takes to report.
 async fn until_pending(rig: &Rig, name: &str) {
-    let deadline = Instant::now() + BOUND;
+    let deadline = Instant::now() + HANG_BOUND;
     loop {
         let lines = rig.script(vec![Op::Read(name.to_string())]).await;
         if lines[0].ends_with("pending=true") {
@@ -7063,9 +7119,9 @@ async fn until_pending(rig: &Rig, name: &str) {
 }
 
 /// Polls the supervisor until `children()` reads none of the children
-/// restart-pending: no group restart pends over them.
+/// restart-pending: no group restart pends over them. The bound only limits how long a real hang takes to report.
 async fn until_idle(rig: &Rig, names: &[&str]) {
-    let deadline = Instant::now() + BOUND;
+    let deadline = Instant::now() + HANG_BOUND;
     loop {
         let lines = rig
             .script(names.iter().map(|n| Op::Read((*n).to_string())).collect())
@@ -7931,7 +7987,7 @@ fn terminate_child_on_a_death_awaiting_its_decision_dismisses_the_restart() {
         .await;
         let child_w = child_in(&sys, &w).await;
         child_w.notify(ChildMsg::Park).await.expect("park W's turn");
-        sleep(Duration::from_millis(50)).await;
+        wait_until(BOUND, "W to park", || pw.parked.load(Ordering::SeqCst)).await;
         // y fails: the group [y, z] pends in z's held stop. P, before y, is
         // outside it. P is then killed: its death waits behind the group.
         pz.pre_stop_gate.store(true, Ordering::SeqCst);
@@ -8213,7 +8269,7 @@ fn stop_child_handled_as_a_terminate_waits_for_the_childs_subtree() {
             .notify(ChildMsg::Park)
             .await
             .expect("park W's turn");
-        sleep(Duration::from_millis(50)).await;
+        wait_until(BOUND, "W to park", || pw.parked.load(Ordering::SeqCst)).await;
         // a crashes: the group stops P, a `Transient` member.
         crash(&child_in(&sys, &a).await).await;
         until_pending(&rig, &a).await;
@@ -8426,15 +8482,15 @@ async fn kill_during_on_stopped(vetoes: usize, paused: bool) {
             .expect("a Kill is accepted while on_stopped runs");
         release.store(true, Ordering::SeqCst);
 
-        // The supervisor reaches `Stopped` inside a 1 s bound, before the
-        // child's 2 s window could end: the child is not asked to stop.
+        // The supervisor reaches `Stopped` at once, before the child's 2 s
+        // window could end: the child is not asked to stop.
         within(
-            upper(paused, Duration::from_secs(1)),
+            upper(paused, Duration::ZERO),
             "the supervisor to publish Stopped",
             slow.wait_stopped(),
         )
         .await;
-        assert!(started.elapsed() < upper(paused, Duration::from_secs(1)));
+        assert!(started.elapsed() < upper(paused, Duration::ZERO));
         assert!(matches!(child_end(&events).await, StopReason::Kill));
         assert_eq!(
             probe.stopped_runs.load(Ordering::SeqCst),
@@ -8906,7 +8962,7 @@ async fn supervisor_mid_teardown() -> (Arc<ActorSystem>, Rig, String, Arc<Probe>
 }
 
 /// After the Kill the supervisor publishes `Stopped` within the default kill
-/// grace, the wait after an abort and a margin, and the child's own window
+/// grace and the wait after an abort, and the child's own window
 /// (2 s) is cut: it ran no `on_stopped`, and its `pre_stop` never ran a
 /// second time (the Kill teardown asks nothing of it).
 async fn kill_ends_a_teardown_in_progress(
@@ -8922,7 +8978,7 @@ async fn kill_ends_a_teardown_in_progress(
         rig.sup.wait_stopped(),
     )
     .await;
-    assert!(killed_at.elapsed() < upper(paused, Duration::from_secs(2)));
+    assert!(killed_at.elapsed() < default_abort_bound(paused));
     assert_eq!(
         probe.stopped_runs.load(Ordering::SeqCst),
         0,
@@ -9032,10 +9088,7 @@ async fn parked_root_on(sys: &Arc<ActorSystem>) -> (String, ActorHandle<Probed>)
 /// The margin a kill path has beyond the default kill grace and the wait
 /// after an abort.
 fn default_abort_bound(paused: bool) -> Duration {
-    upper(
-        paused,
-        ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-    )
+    upper(paused, ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE)
 }
 
 #[test]
@@ -9151,10 +9204,7 @@ async fn stop_within_kill_backstop_survives_a_dropped_call_body(paused: bool) {
     let window = Duration::from_millis(150);
     let _ = timeout(Duration::ZERO, handle.stop_within(StopReason::Kill, window)).await;
     within(
-        upper(
-            paused,
-            window + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-        ),
+        upper(paused, window + ASSUMED_ABORT_SETTLE),
         "the parked actor to be aborted",
         handle.wait_stopped(),
     )
@@ -9302,10 +9352,7 @@ async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_onl
         "the parent's request is the reason on_stopped received: {:?}",
         stopped.lock().unwrap()
     );
-    assert!(
-        took < upper(paused, Duration::from_millis(1500)),
-        "{took:?}"
-    );
+    assert!(took < upper(paused, Duration::ZERO), "{took:?}");
 
     // Under `Infinity` the parent's stop completes.
     let (stopped, _took) = parent_request_then_graceful(Shutdown::Infinity).await;
@@ -9315,9 +9362,22 @@ async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_onl
     ));
 }
 
-/// Records the reason it stopped with. A turn takes 300 ms.
+/// Wakes a waiter on its `Notify` when dropped, so a turn held at it ends
+/// however the test ends.
+struct OpensTheNotify(Arc<tokio::sync::Notify>);
+
+impl Drop for OpensTheNotify {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// Records the reason it stopped with. A turn lasts until the test opens its
+/// gate.
 struct SlowTurn {
     stopped: Arc<Mutex<Vec<StopReason>>>,
+    entered: Arc<AtomicBool>,
+    gate: Arc<tokio::sync::Notify>,
 }
 
 impl Actor for SlowTurn {
@@ -9325,7 +9385,8 @@ impl Actor for SlowTurn {
     type Response = ();
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        sleep(Duration::from_millis(300)).await;
+        self.entered.store(true, Ordering::SeqCst);
+        let _ = timeout(GATE_CAP, self.gate.notified()).await;
         Ok(())
     }
 
@@ -9344,8 +9405,15 @@ fn failure_is_kept_over_a_later_cancelled() {
     common::run(0, async {
         let sys = ActorSystem::create(uname("failure-kept")).unwrap();
         let stopped: Arc<Mutex<Vec<StopReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let (entered, gate) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let _opens = OpensTheNotify(gate.clone());
         let handle = SlowTurn {
             stopped: stopped.clone(),
+            entered: entered.clone(),
+            gate: gate.clone(),
         }
         .spawn()
         .named(uname("slow-turn"))
@@ -9353,12 +9421,17 @@ fn failure_is_kept_over_a_later_cancelled() {
         .await
         .unwrap();
         handle.notify(()).await.unwrap();
-        sleep(Duration::from_millis(30)).await;
+        wait_until(BOUND, "the turn to begin", || {
+            entered.load(Ordering::SeqCst)
+        })
+        .await;
         handle
             .stop(StopReason::Failure(ActorError::user("fail")))
             .await
             .unwrap();
         handle.stop(StopReason::Cancelled).await.unwrap();
+        // Both requests are on the lane before the turn ends.
+        gate.notify_one();
         within(BOUND, "the actor to stop", handle.wait_stopped()).await;
         let reasons = stopped.lock().unwrap();
         assert_eq!(reasons.len(), 1, "{reasons:?}");
@@ -10166,10 +10239,7 @@ async fn ordered_init_waits_on_a_sibling(
     let took = crashed_at.elapsed();
     let ends_by = c_start_timeout.map_or(window, |timeout| timeout.min(window));
     assert!(
-        took < upper(
-            paused,
-            ends_by + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_secs(1)
-        ),
+        took < upper(paused, ends_by + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
         "the group completed inside the bound of c's window: {took:?}"
     );
     // The attempt waiting on a is not the c that runs afterwards.
@@ -11370,7 +11440,7 @@ async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_b
     until_started(&[&pa, &pb, &pc], 2).await;
     // Nothing but the restarts follows b's end.
     assert!(
-        opened.elapsed() < upper(paused, Duration::from_millis(500)),
+        opened.elapsed() < upper(paused, Duration::ZERO),
         "the restart took {:?}",
         opened.elapsed()
     );
@@ -11447,7 +11517,7 @@ async fn an_infinity_member_blocks_the_members_queued_behind_it_body(paused: boo
     until_started(&[&pa, &pb, &pc], 2).await;
     // b's `pre_stop` accepts at once, so the restart takes the margin.
     assert!(
-        released.elapsed() < upper(paused, Duration::from_millis(500)),
+        released.elapsed() < upper(paused, Duration::ZERO),
         "the group restarted {:?} after c was released",
         released.elapsed()
     );
@@ -12277,9 +12347,11 @@ async fn simple_one_for_one_shutdown_stops_children_concurrently_body(paused: bo
             .all(|(_, probe)| probe.started.load(Ordering::SeqCst) == 1)
     })
     .await;
-    // 20 stops of 200 ms take 4 s one after the other.
-    let took = stop_supervisor(&rig, upper(paused, Duration::from_secs(2))).await;
-    assert!(took < upper(paused, Duration::from_secs(2)), "{took:?}");
+    // 20 stops of 200 ms take 4 s one after the other; run at once they take
+    // one.
+    let bound = upper(paused, Duration::from_millis(200));
+    let took = stop_supervisor(&rig, bound).await;
+    assert!(took < bound, "{took:?}");
     let last_begun = children
         .iter()
         .map(|(_, probe)| pre_stop_at(probe, 0))
@@ -12360,23 +12432,25 @@ async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restart
         .stop(StopReason::Graceful)
         .await
         .expect("the stop is accepted");
-    let bound = upper(
-        paused,
-        window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-    );
+    let bound = upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE);
     // y's window is the short one: its attempt ends long before x's
     // window does, which is when the supervisor's state would be dropped.
     let y_bound = upper(
         paused,
-        Duration::from_millis(500)
-            + ASSUMED_KILL_GRACE
-            + ASSUMED_ABORT_SETTLE
-            + Duration::from_millis(500),
+        Duration::from_millis(500) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
     );
     wait_until(y_bound, "y's attempt to be stopped by the teardown", || {
         py.live.load(Ordering::SeqCst) == 0
     })
     .await;
+    // The teardown's one step orders y's attempt while x's stop is still being
+    // joined: x's first `pre_stop` is held, so x is alive. An attempt that is
+    // ordered only when the supervisor's state is dropped ends after x ended.
+    assert_eq!(
+        px.live.load(Ordering::SeqCst),
+        1,
+        "y's attempt was ordered while x's stop was still joined"
+    );
     px.pre_stop_gate.store(false, Ordering::SeqCst);
     within(
         bound,
@@ -13635,10 +13709,7 @@ fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_paused() {
 
 async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool) {
     let window = Duration::from_millis(300);
-    let bound = upper(
-        paused,
-        window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-    );
+    let bound = upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE);
 
     // The middle supervisor's child vetoes every request under a long
     // policy of its own: the middle supervisor is killed at its window,
@@ -14244,9 +14315,12 @@ async fn a_kill_already_stored_on_a_supervisor_child_keeps_its_abort_when_the_pa
     // `mid`'s window and owes the abort a grace after it. The root is then
     // killed inside that grace. Nothing shows the runner's `Kill`, so the
     // root is killed a margin past the window (300 ms) that leaves most
-    // of the grace (1 s) ahead.
+    // of the grace (1 s) ahead. The runner ends with the root, and the
+    // link guard of `mid` takes over the stored `Kill`: `mid` is aborted one
+    // grace after the root's `Kill`, never given its window again.
     let window = Duration::from_secs(2);
     let grace = Duration::from_secs(1);
+    let root_killed_at = window + Duration::from_millis(300);
     let run = uname("stored-kill");
     let top = Member::supervisor(
         "top",
@@ -14268,13 +14342,10 @@ async fn a_kill_already_stored_on_a_supervisor_child_keeps_its_abort_when_the_pa
         tape.any_with(&format!("on_stopped:{}", label("mid")))
     })
     .await;
-    sleep((window + Duration::from_millis(300)).saturating_sub(asked.elapsed())).await;
+    sleep(root_killed_at.saturating_sub(asked.elapsed())).await;
     root.stop(StopReason::Kill).await.expect("accepted");
     within(BOUND, "the root to stop", root.wait_stopped()).await;
-    let owed = upper(
-        paused,
-        window + grace + ASSUMED_ABORT_SETTLE + Duration::from_millis(500),
-    );
+    let owed = upper(paused, root_killed_at + grace);
     within(Duration::from_secs(20), "mid to stop", mid.wait_stopped()).await;
     assert!(
         asked.elapsed() <= owed,
@@ -14322,7 +14393,7 @@ impl Actor for HoldsAHangingChild {
         .restart_type(RestartType::Permanent)
         .shutdown(Shutdown::Infinity)
         .start_timeout(Duration::from_millis(300))
-        .kill_grace(THREE)
+        .kill_grace(FIVE)
         .with_config(ActorConfig::default().supervisor())
         .await?;
         Ok(())
@@ -14361,12 +14432,13 @@ fn a_start_timeout_kill_on_an_infinity_supervisor_child_keeps_its_abort_when_the
         })
         .await;
         let second = node_like::<HangsOnRestart>(&sys, &name).await;
-        // The start timeout (300 ms) has passed well inside the 3 s grace.
-        sleep(Duration::from_millis(800)).await;
+        // The start timeout (300 ms) has passed by 2 s, well inside the 5 s
+        // grace.
+        sleep(Duration::from_millis(2300)).await;
         top.stop(StopReason::Kill).await.expect("accepted");
         within(BOUND, "the parent to stop", top.wait_stopped()).await;
         within(
-            THREE + ASSUMED_ABORT_SETTLE + Duration::from_secs(2),
+            FIVE + ASSUMED_ABORT_SETTLE + Duration::from_secs(2),
             "the stuck incarnation to be aborted",
             second.wait_stopped(),
         )

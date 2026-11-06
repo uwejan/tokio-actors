@@ -23,15 +23,6 @@ async fn create_with_custom_config() {
 }
 
 #[test]
-fn shutdown_policy_has_per_actor_timeout() {
-    let policy = ShutdownPolicy {
-        timeout: Duration::from_secs(30),
-        per_actor_timeout: Duration::from_secs(5),
-    };
-    assert_eq!(policy.per_actor_timeout, Duration::from_secs(5));
-}
-
-#[test]
 fn system_config_default() {
     let config = SystemConfig::default();
     assert_eq!(config.shutdown_policy.timeout, Duration::from_secs(30));

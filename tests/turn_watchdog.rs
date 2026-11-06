@@ -73,7 +73,7 @@ struct HeldTurnState {
 impl HeldTurn {
     fn block(&self) {
         *self.0.began.lock().unwrap() = Some(std::time::Instant::now());
-        let deadline = std::time::Instant::now() + BOUND;
+        let deadline = std::time::Instant::now() + HANG_BOUND;
         while !self.0.open.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -351,8 +351,13 @@ async fn threshold_set_on_the_default_system_at_runtime_takes_effect() {
 /// How long a test waits for a condition before it fails.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report.
 async fn until(what: &str, mut pred: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + BOUND;
+    let deadline = tokio::time::Instant::now() + HANG_BOUND;
     while !pred() {
         assert!(
             tokio::time::Instant::now() < deadline,

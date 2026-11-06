@@ -1,30 +1,31 @@
 //! Actor system providing named actor registration and coordinated shutdown.
 //!
-//! Internal module; the public pieces are re-exported at the crate root.
+//! The actor registry and coordinated shutdown; the public types are also
+//! re-exported at the crate root.
 
 use std::any::{Any, TypeId};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-#[cfg(any(test, feature = "tracing"))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::actor::handle::ActorHandle;
+use crate::actor::handle::{ActorHandle, SubtreeObserver};
+use crate::actor::panic::{contain_waker_panic, send_contained};
 use crate::actor::runtime::{bounded_wait, saturating_deadline};
 use crate::actor::subtree::{AbortRecord, SubtreeHold};
 use crate::actor::supervision::{rules, ABORT_SETTLE};
 use crate::actor::Actor;
 use crate::error::{SendError, SpawnError};
+use crate::helper::HelperKind;
 use crate::types::{
-    ActorId, ActorStatus, RaiseResult, ShutdownReport, StatusValue, StopLane, StopOutcome,
+    ActorId, ActorStatus, RaiseResult, ShutdownReport, StatusRx, StatusTx, StopLane, StopOutcome,
     StopReason, StopReport, TurnClock,
 };
 
@@ -45,16 +46,21 @@ fn systems() -> &'static DashMap<String, Arc<ActorSystem>> {
 /// Policy controlling how [`ActorSystem::shutdown`] behaves.
 #[derive(Debug, Clone)]
 pub struct ShutdownPolicy {
-    /// The shutdown's global deadline, counted from the call. After it, all
-    /// remaining actors are force-stopped: a shutdown can run on for the
-    /// longest kill grace among the roots it forces plus the abort settle time,
-    /// then the longest kill grace among the leftovers it forces plus the abort
-    /// settle time, and that time once more plus the abort settle time for a
-    /// leftover whose abort, scheduled with the system, is issued late. A
-    /// sweep already started by another call that has not
-    /// completed, a dropped call included, holds an earlier deadline, which
-    /// then bounds this call's leftovers too. A timeout beyond 30 years is
-    /// treated as 30 years.
+    /// The shutdown's global deadline, counted from the call's first poll.
+    /// After it, all remaining actors are force-stopped: a shutdown can run on
+    /// for the longest kill grace among the roots it forces plus the abort
+    /// settle time, then the longest kill grace among the leftovers it forces
+    /// plus the abort settle time, and, for either of those two steps, that
+    /// time once more plus the abort settle time when the abort of an actor it
+    /// forces, scheduled with the system, is issued late. The system holds one
+    /// sweep deadline, the earliest of the deadlines of the sweeps that have
+    /// started, each taken as no earlier than the moment its sweep begins, and
+    /// clears it when the last shutdown in flight ends, provided a shutdown has
+    /// completed since the system was last `Active`. Until then, a held
+    /// deadline that is earlier than this call's own bounds this call's
+    /// leftovers too, whether the sweep that set it is still running, was cut
+    /// short or has completed. A timeout beyond 30 years is treated as 30
+    /// years.
     ///
     /// Default: 30 seconds.
     pub timeout: Duration,
@@ -127,13 +133,13 @@ struct AnyActorHandle {
     handle: Box<dyn Any + Send + Sync>,
     /// Clone of the actor's stop lane. Enough on its own to signal a stop or
     /// kill without downcasting, and cheap to clone out of a `DashMap` `Ref`
-    /// before an `.await` (raising it is synchronous and infallible anyway).
+    /// before an `.await` (raising it is synchronous and never waits for capacity anyway).
     stop_lane: StopLane,
     /// Runtime status plane, threaded straight through from the
-    /// `ActorHandle`: the watch channel is created before the actor's task
+    /// `ActorHandle`: the cell is created before the actor's task
     /// is spawned, so this is always available at registration time (unlike
     /// `abort`, below).
-    status_rx: watch::Receiver<StatusValue>,
+    status_rx: StatusRx,
     /// This actor's turn clock, handed in at registration time (the clock
     /// lives with the run loop and this registry entry, never with
     /// `ActorHandle`): backs [`ActorSystem::turn_elapsed`] and
@@ -147,8 +153,8 @@ struct AnyActorHandle {
     abort: Option<AbortHandle>,
     /// True for actors registered via the top-level `SpawnBuilder` path;
     /// false for supervised children (`spawn_child` and its restart path).
-    /// System shutdown only signals roots directly - each root's own
-    /// supervision cascade takes its subtree down in turn.
+    /// System shutdown walks the roots; each root's own supervision cascade
+    /// takes its subtree down in turn.
     is_root: bool,
     /// Monotonic registration counter (deliberately not a wall-clock
     /// timestamp): shutdown stops roots in reverse registration order, and a
@@ -163,6 +169,12 @@ struct AnyActorHandle {
     /// when that runtime next polls the task, so the kill backstop is
     /// scheduled on this runtime's reaper and on no other.
     runtime: Handle,
+    /// The earliest deadline any `Kill` raised on this incarnation asked for,
+    /// in nanoseconds since the system's epoch; `0` when none did. Every
+    /// raiser records its deadline here before it raises, so an attach that
+    /// finds the `Kill` already raised arms the abort for the earliest of
+    /// them. See [`raise_kill_declared`].
+    kill_due: u64,
 }
 
 impl AnyActorHandle {
@@ -185,6 +197,17 @@ impl AnyActorHandle {
             registration_seq,
             kill_grace,
             runtime,
+            kill_due: 0,
+        }
+    }
+
+    /// Keeps the earlier of the recorded deadline and `window` (or the kill
+    /// grace) after `now`.
+    fn declare_kill(&mut self, now: u64, window: Option<Duration>) {
+        let after = window.unwrap_or(self.kill_grace);
+        let due = now.saturating_add(u64::try_from(after.as_nanos()).unwrap_or(u64::MAX));
+        if self.kill_due == 0 || due < self.kill_due {
+            self.kill_due = due;
         }
     }
 
@@ -197,6 +220,74 @@ impl AnyActorHandle {
     }
 }
 
+/// Names the registry entry a `Kill` raiser targets.
+#[derive(Clone, Copy)]
+pub(crate) enum KillKey<'a> {
+    Id(&'a ActorId),
+    Name(&'a str),
+}
+
+/// What [`raise_kill_declared`] did.
+pub(crate) struct KillRaised {
+    /// The lane's answer to the `Kill`.
+    pub(crate) result: RaiseResult,
+    /// The abort handle the registry held after the raise, when the raise was
+    /// accepted and `system` was given: absent in the window before the task's
+    /// handle is attached, and for an incarnation already gone.
+    pub(crate) abort: Option<AbortHandle>,
+}
+
+/// The one way a `Kill` is raised on an actor the registry holds. In this
+/// order, it declares the deadline of the `Kill` on the registry entry `key`
+/// names (`window` from now, or the entry's kill grace when `None`), raises
+/// the `Kill` on `lane`, and, when the raise is accepted, schedules the abort
+/// of the task through the reaper of the entry's own runtime. The entry is
+/// matched by `status_rx`, never by the id or name alone, so a later
+/// incarnation under the same id or name is neither declared on nor armed. An
+/// entry whose abort handle is not attached yet is armed by the attach, after
+/// the earliest deadline declared on it.
+///
+/// With `step` the raise goes through the call's step cell, which counts the
+/// raiser in flight first; `between` runs after that and before the raise.
+/// Without `step`, `between` runs just before the raise. With no `system`
+/// (the caller found none) nothing is declared and nothing is armed: the
+/// `Kill` is still raised.
+///
+/// Never call it while holding a registry guard: the declaration takes a
+/// write lock on the same shard.
+pub(crate) fn raise_kill_declared(
+    system: Option<&ActorSystem>,
+    key: KillKey<'_>,
+    status_rx: &StatusRx,
+    lane: &StopLane,
+    window: Option<Duration>,
+    step: Option<&StopStep>,
+    between: impl FnOnce(),
+) -> KillRaised {
+    if let Some(system) = system {
+        match key {
+            KillKey::Id(id) => system.declare_kill(id, status_rx, window),
+            KillKey::Name(name) => system.declare_kill_by_name(name, status_rx, window),
+        }
+    }
+    let result = match step {
+        Some(step) => step.raise_kill(lane, between),
+        None => {
+            between();
+            lane.try_raise(StopReason::Kill)
+        }
+    };
+    let abort = match system {
+        Some(system) if result != RaiseResult::Refused => {
+            #[cfg(test)]
+            system.run_after_kill_raise();
+            system.arm_raised_kill(key, status_rx, lane.abort_record(), window)
+        }
+        _ => None,
+    };
+    KillRaised { result, abort }
+}
+
 // ---------------------------------------------------------------------------
 // RegistryGuard - drop-based auto-unregister
 // ---------------------------------------------------------------------------
@@ -204,7 +295,7 @@ impl AnyActorHandle {
 pub(crate) struct RegistryGuard {
     system: Arc<ActorSystem>,
     id: ActorId,
-    name: Option<String>,
+    name: Option<Arc<str>>,
     /// The registration this guard owns. Removal on drop is checked against
     /// this sequence (see [`ActorSystem::unregister_by_id`]/
     /// [`ActorSystem::unregister_by_name`]) so a stale teardown - one whose
@@ -216,7 +307,7 @@ pub(crate) struct RegistryGuard {
     /// A sender of the actor's status plane. Released after `drop`
     /// unregistered the actor: on every path that drops the guard last, the
     /// plane reads as ended only once the name is free.
-    _status: Option<watch::Sender<StatusValue>>,
+    _status: Option<StatusTx>,
     /// The actor's hold on its subtree token. Declared last, so it is
     /// released after `drop` unregistered the actor and after the status
     /// sender: the subtree ends only once the name is free.
@@ -227,7 +318,7 @@ impl RegistryGuard {
     pub(crate) fn new(
         system: Arc<ActorSystem>,
         id: ActorId,
-        name: Option<String>,
+        name: Option<Arc<str>>,
         registration_seq: u64,
     ) -> Self {
         Self {
@@ -241,7 +332,7 @@ impl RegistryGuard {
     }
 
     /// Makes the guard hold a sender of the actor's status plane as well.
-    pub(crate) fn with_status(mut self, status: watch::Sender<StatusValue>) -> Self {
+    pub(crate) fn with_status(mut self, status: StatusTx) -> Self {
         self._status = Some(status);
         self
     }
@@ -278,7 +369,8 @@ impl Drop for RegistryGuard {
 ///
 /// `Active` accepts registrations. `shutdown`/`shutdown_with` moves the
 /// system to `ShuttingDown` immediately and to `Defunct` once the last
-/// shutdown in flight has completed; both reject new registrations with
+/// shutdown in flight has ended, if a shutdown has completed since the system
+/// was last `Active`; both reject new registrations with
 /// [`SpawnError::SystemShuttingDown`]. Unlike a plain one-way flag, `Defunct`
 /// is not permanent: [`ActorSystem::reactivate`] moves it back to `Active`,
 /// so a system's name is never poisoned forever.
@@ -307,40 +399,110 @@ impl SystemPhase {
     }
 }
 
+/// Shard count of `ActorSystem::by_name` and `ActorSystem::by_id`.
+///
+/// A `DashMap` grows one shard at a time: the shard that passes seven eighths
+/// of its table doubles it while holding its write lock, so every register,
+/// lookup and unregister on that shard waits for the rehash. The default shard
+/// count follows the CPUs the process may use (a process limited to one CPU
+/// gets 4 shards), which makes each rehash cover a quarter of the registry.
+/// A constant count keeps each rehash to `1 / REGISTRY_SHARDS` of the entries
+/// whatever the affinity: a table growth holds one shard's write lock while it
+/// rehashes only that shard's entries, so a spawn that waits on a rehash waits
+/// for a small share of the table, never for the whole of a large one.
+/// Registration still goes through one shard's
+/// entry API, so the id and name uniqueness checks are unchanged. The count is
+/// a power of two, as `DashMap` requires.
+const REGISTRY_SHARDS: usize = 256;
+
+/// An empty registry map with `REGISTRY_SHARDS` shards and no preallocated
+/// table. An idle `ActorSystem` holds the shard locks and empty shard tables
+/// of its two registry maps, a fixed cost at any CPU count.
+fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
+    DashMap::with_capacity_and_shard_amount(0, REGISTRY_SHARDS)
+}
+
 // ---------------------------------------------------------------------------
 // ActorSystem
 // ---------------------------------------------------------------------------
 
 /// A named actor registry with coordinated shutdown.
 ///
+/// An actor reaches only the actors whose handles it holds, except through its
+/// system, which knows every registered actor by id; among its calls, `get` and
+/// `get_by_id` return a typed handle to a registered actor of the type asked
+/// for (`get` only for a named one), `actor_ids`, `registered` and
+/// `actor_status` read the registry, `stop` and `kill` act on a named actor,
+/// and `kill_by_id` on any registered id.
+///
 /// `ActorSystem` is a phone book, not a runtime. It does not create or own a
 /// Tokio runtime. Actors spawn on whatever runtime is current via
-/// `Handle::try_current()`.
+/// `Handle::try_current()`, and a supervised child on the runtime its
+/// builder names with
+/// [`on_runtime`](crate::actor::context::ChildSpawnBuilder::on_runtime), which
+/// must have the time driver unless it has already ended.
+/// A runtime built without the Tokio time driver
+/// (`Builder::enable_time` or `enable_all`) runs plain actors (actors with no
+/// timer and no supervised child), but timers, the kill grace and every bound
+/// on a wait sleep on the driver: see
+/// [`SpawnBuilder`](crate::actor::SpawnBuilder) for what each does without
+/// it. A spawn with `start_timeout` panics when first polled on a calling
+/// runtime without the driver, and `stop_within`, `kill_by_id` and
+/// `kill_by_id_with_observer` panic when first polled on one without it or
+/// with none current, in each case before anything changes; a call that, when
+/// first looked at, has nothing to wait for (a spawn refused for its mailbox
+/// capacity, its system or its name, a target that does not take the request,
+/// an id nothing holds) answers first,
+/// on any runtime, and a name taken between that look and the claim still
+/// panics on a runtime without the driver.
+/// `shutdown_with` panics at its first wait on a root, after the system has
+/// entered shutdown.
+/// [`SubtreeObserver::wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended)
+/// changes nothing, and on a calling runtime without the driver or with none
+/// current it panics at the first moment it needs a timer: the observed actor
+/// has ended and let go of everything it held, and an actor below it has not
+/// ended. It waits without a timer while the actor still runs or is still
+/// letting go of what it held, and answers a subtree that has ended without
+/// one. With `panic = "abort"` the entry checks cannot tell whether a runtime
+/// has the driver, so the first timer a call uses on a runtime without it ends
+/// the process.
 pub struct ActorSystem {
     name: String,
-    by_name: DashMap<String, AnyActorHandle>,
+    /// `name` as one shared allocation, handed to every handle's identity.
+    shared_name: Arc<str>,
+    by_name: DashMap<Arc<str>, AnyActorHandle>,
     by_id: DashMap<ActorId, AnyActorHandle>,
     shutdown_policy: ShutdownPolicy,
     /// `Active` until `shutdown`/`shutdown_with` is called (moves to
     /// `ShuttingDown`, then to `Defunct` once the last shutdown in flight has
-    /// completed). Every change happens under `registration_gate`'s exclusive
-    /// side.
+    /// ended, if a shutdown has completed since the system was last `Active`).
+    /// Every change happens under `registration_gate`'s exclusive side.
     /// `register_actor` rejects every registration attempt in either
-    /// non-`Active` phase with `SpawnError::SystemShuttingDown` (OTP
-    /// application-controller parity). Not a one-way flag:
+    /// non-`Active` phase with `SpawnError::SystemShuttingDown`. Not a one-way
+    /// flag:
     /// [`ActorSystem::reactivate`] moves a `Defunct` system back to `Active`.
     phase: AtomicU8,
     /// Makes a registration atomic with every phase change, and counts the
     /// shutdowns in flight: `register_actor` holds the shared side from its
     /// phase check through its inserts, and every phase change takes the
     /// exclusive side. A shutdown raises the count as it leaves `Active` and
-    /// lowers it when it ends, storing `Defunct` only if it completed and was
-    /// the last in flight; `reactivate` returns to `Active` only from
-    /// `Defunct` with no shutdown in flight. A registration therefore either
-    /// lands before a shutdown's phase change, and is in that shutdown's
-    /// first snapshot, or sees a phase other than `Active` and is refused,
-    /// for as long as any shutdown is in flight.
+    /// lowers it when it ends; the last one to end stores `Defunct` if a
+    /// shutdown has completed since the system was last `Active`
+    /// (`completed_since_active`), whichever order they ended in.
+    /// `reactivate` returns to `Active` only from `Defunct` with no shutdown
+    /// in flight. A registration therefore either lands before a shutdown's
+    /// phase change, and is in that shutdown's first snapshot, or sees a
+    /// phase other than `Active` and is refused, for as long as any shutdown
+    /// is in flight.
     registration_gate: std::sync::RwLock<usize>,
+    /// Whether a shutdown has completed since the system was last `Active`.
+    /// Set by each shutdown that completes, cleared only by `reactivate`, and
+    /// read by the shutdown that lowers the count to zero, which then stores
+    /// `Defunct`. While it is set the system is never `Active` again without
+    /// a `reactivate`, so every root registered before the first of those
+    /// shutdowns was stopped by the one that completed. Read and written only
+    /// under `registration_gate`'s exclusive side.
+    completed_since_active: AtomicBool,
     /// Source of `AnyActorHandle::registration_seq`.
     registration_seq: AtomicU64,
     /// Source of every child incarnation token this system ever hands out -
@@ -352,6 +514,10 @@ pub struct ActorSystem {
     /// its runtime's first use and replaced when its task has finished (see
     /// [`reaper_handle`](Self::reaper_handle)).
     reaper: Mutex<HashMap<tokio::runtime::Id, ReaperSlot>>,
+    /// The slots every helper task of this system is spawned through (the
+    /// reaper, the turn-watchdog sweep, the drain of a closed queue's late
+    /// values), one per runtime: each helper's end is recorded there.
+    helpers: crate::helper::HelperSlots,
     /// Stuck-turn watchdog threshold, in nanoseconds; `0` means off. Shared
     /// (via [`turn_threshold_cell`](Self::turn_threshold_cell)) directly with
     /// every actor's [`TurnClock`], so a change here takes effect for
@@ -366,6 +532,10 @@ pub struct ActorSystem {
     /// registry, so a test can delay that re-read.
     #[cfg(test)]
     after_kill_raise: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once right after a registry `Kill`'s deadline is declared, so a
+    /// test can read the entry and the actor's lane at that exact point.
+    #[cfg(test)]
+    after_kill_declaration: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Runs at each point where a shutdown is about to act on one root, so a
     /// test can change the registry at that exact point. Kept until cleared.
     #[cfg(test)]
@@ -397,12 +567,21 @@ pub struct ActorSystem {
     /// the sweep's sole job is emitting a `tracing::warn!`.
     #[cfg(feature = "tracing")]
     sweep_spawned: Arc<AtomicBool>,
-    /// The earliest global deadline of a final sweep that started and whose
-    /// shutdown has not completed: its deadline entries stand, so every
-    /// sweep, one already waiting included, bounds and reports its leftovers
-    /// by it. A watch, so a sweep's waits see it lowered while they run.
-    /// Cleared when the last shutdown in flight completes.
+    /// The runtimes the sweep's spawn found without the time driver, so a
+    /// spawn on such a runtime does not probe it again. Bounded: cleared when
+    /// full.
+    #[cfg(feature = "tracing")]
+    timerless_runtimes: Mutex<std::collections::HashSet<tokio::runtime::Id>>,
+    /// The earliest global deadline of a final sweep that started, held while
+    /// that sweep runs and after its shutdown completed or was cut short: its
+    /// deadline entries stand, so every sweep, one already waiting included,
+    /// bounds and reports its leftovers by it. A watch, so a sweep's waits see
+    /// it lowered while they run. Cleared when the last shutdown in flight
+    /// ends, provided a shutdown has completed since the system was last
+    /// `Active`.
     sweep_deadline: watch::Sender<Option<Instant>>,
+    /// The instant `AnyActorHandle::kill_due` counts from.
+    epoch: Instant,
 }
 
 impl std::fmt::Debug for ActorSystem {
@@ -432,15 +611,18 @@ impl ActorSystem {
         }
 
         Self {
+            shared_name: Arc::from(name.as_str()),
             name,
-            by_name: DashMap::new(),
-            by_id: DashMap::new(),
+            by_name: registry_map(),
+            by_id: registry_map(),
             shutdown_policy,
             phase: AtomicU8::new(SystemPhase::Active.as_u8()),
             registration_gate: std::sync::RwLock::new(0),
+            completed_since_active: AtomicBool::new(false),
             registration_seq: AtomicU64::new(0),
             incarnation_seq: AtomicU64::new(0),
             reaper: Mutex::new(HashMap::new()),
+            helpers: crate::helper::HelperSlots::default(),
             turn_warning_threshold_nanos: Arc::new(AtomicU64::new(threshold_to_nanos(
                 turn_warning_threshold,
             ))),
@@ -448,6 +630,8 @@ impl ActorSystem {
             after_kill_lookup: Mutex::new(None),
             #[cfg(test)]
             after_kill_raise: Mutex::new(None),
+            #[cfg(test)]
+            after_kill_declaration: Mutex::new(None),
             #[cfg(test)]
             ladder_hook: Mutex::new(None),
             #[cfg(test)]
@@ -460,7 +644,10 @@ impl ActorSystem {
             shutdown_at_the_gate: AtomicBool::new(false),
             #[cfg(feature = "tracing")]
             sweep_spawned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "tracing")]
+            timerless_runtimes: Mutex::new(std::collections::HashSet::new()),
             sweep_deadline: watch::channel(None).0,
+            epoch: Instant::now(),
         }
     }
 
@@ -471,6 +658,9 @@ impl ActorSystem {
     #[allow(clippy::should_implement_trait)]
     pub fn default() -> Arc<ActorSystem> {
         let reg = systems();
+        if let Some(found) = reg.get("default") {
+            return found.value().clone();
+        }
         reg.entry("default".to_string())
             .or_insert_with(|| {
                 Arc::new(Self::empty(
@@ -539,29 +729,52 @@ impl ActorSystem {
         &self.name
     }
 
+    /// This system's name as a shared string.
+    pub(crate) fn shared_name(&self) -> Arc<str> {
+        self.shared_name.clone()
+    }
+
     // - Actor lookup -------------------------------------------------------
 
     /// Looks up a named actor, returning a typed handle.
     ///
-    /// Returns `None` if the name is not registered or if the registered actor
-    /// is a different type (type mismatch is silent, matching OTP's
-    /// `whereis/1 -> undefined` semantics).
+    /// Returns `None` if the name is not registered (as Erlang/OTP's `whereis/1`
+    /// returns `undefined`) or if the registered actor is of a different type.
+    ///
+    /// A handle is bound to one incarnation of the actor: after a supervised
+    /// restart the name resolves to the next incarnation's handle, so a
+    /// caller that talks to a restartable actor looks it up by name for each
+    /// call rather than keeping a handle. The name stays registered to an
+    /// incarnation until its teardown ends, including the time after its
+    /// message loop ended, when the handle's
+    /// [`is_alive`](ActorHandle::is_alive) reads `false` and a send returns
+    /// `Closed`; a caller that meets that window waits with
+    /// [`wait_stopped`](ActorHandle::wait_stopped) on the handle it holds and
+    /// looks the name up again. A lookup right after a crashing request was
+    /// answered (`AskError::Actor`) never finds that incarnation: the answer
+    /// is sent once the name is free. A lookup that finds nothing while a
+    /// supervisor restarts the actor reads as Erlang/OTP's `undefined` in the
+    /// same window; retry after a short delay. For an actor that nothing
+    /// restarts, `None` is final.
     pub fn get<A: Actor>(&self, name: &str) -> Option<ActorHandle<A>> {
         self.by_name.get(name).and_then(|e| e.downcast::<A>())
     }
 
     /// Looks up an actor by [`ActorId`], returning a typed handle.
     ///
-    /// Returns `None` if the ID is not registered or if the registered actor
-    /// is a different type (type mismatch is silent, matching OTP's
-    /// `whereis/1 -> undefined` semantics - the same contract as
-    /// [`get`](Self::get), keyed by ID instead of by name).
+    /// Returns `None` if the ID is not registered or if the registered actor is
+    /// of a different type, the same contract as [`get`](Self::get), keyed by
+    /// ID instead of by name.
+    /// To reach an actor by a key of your own, as Erlang/OTP's `via` registries
+    /// do, keep a map from that key to its `ActorId` and resolve it with this
+    /// call.
     ///
     /// An `ActorId` is stable across restarts: a supervised child keeps the
     /// same ID from incarnation to incarnation even though its `ActorHandle`
     /// is replaced underneath it, so an ID captured once (for example from
-    /// [`ChildInfo::id`](crate::types::ChildInfo)) remains a valid lookup key
-    /// for the lifetime of the child's spec.
+    /// [`ChildInfo::id`](crate::types::ChildInfo)) names the child for the
+    /// lifetime of its spec; a lookup answers `None` while no incarnation of it
+    /// is registered.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -597,8 +810,9 @@ impl ActorSystem {
     /// Stops a named actor gracefully.
     ///
     /// Delivered through the actor's stop lane (see the `runtime` module
-    /// docs): a synchronous, infallible signal observed ahead of the system
-    /// channel and the mailbox alike, at the actor's next turn boundary.
+    /// docs): a synchronous signal that never waits for capacity, observed
+    /// ahead of the system channel and the mailbox alike, at the actor's next
+    /// turn boundary.
     ///
     /// # Errors
     /// - [`SendError::NotFound`] if no actor is registered under `name`,
@@ -621,7 +835,11 @@ impl ActorSystem {
         }
     }
 
-    /// Force-kills a named actor, bypassing all lifecycle callbacks.
+    /// Force-kills a named actor: `pre_stop` cannot veto it, and no lifecycle
+    /// callback begins once the actor reads the `Kill`; one already running
+    /// finishes, or is aborted when it next yields once the kill grace has
+    /// passed (at once when the actor's runtime has no time driver); one that
+    /// never yields survives the abort.
     ///
     /// Same stop-lane delivery as [`stop`](Self::stop), at `Kill` severity.
     /// The actor leaves its message loop at its next turn boundary; if it
@@ -631,7 +849,10 @@ impl ActorSystem {
     /// scheduled by the system: dropping this future never cancels it. While
     /// the actor is registered the `Kill` is accepted, including while it
     /// runs `on_stopped` and while its children are being stopped. The name
-    /// leaves the registry once the actor's children are stopped, before its
+    /// leaves the registry once the actor's children are stopped (an actor
+    /// ending by `Kill` does not wait for them: as its links drop, a worker
+    /// child is raised `Kill` and a supervisor child `ParentKilled`, which can
+    /// come after the name has left), before its
     /// stop lane is sealed and before its queued messages and its value are
     /// dropped (an aborted actor's when its task ends); from then on this
     /// answers `NotFound`. A `Kill` accepted after the actor left the
@@ -654,54 +875,133 @@ impl ActorSystem {
         };
         #[cfg(test)]
         self.run_after_kill_lookup();
-        if lane.try_raise(StopReason::Kill) == RaiseResult::Refused {
+        // Only the incarnation the Kill was raised on is armed: a later
+        // registration under the same name is not.
+        let raised = raise_kill_declared(
+            Some(self),
+            KillKey::Name(name),
+            &status_rx,
+            &lane,
+            None,
+            None,
+            || {},
+        );
+        if raised.result == RaiseResult::Refused {
             return Err(SendError::Closed);
-        }
-        #[cfg(test)]
-        self.run_after_kill_raise();
-        // The abort is read after the raise: an entry still in the window
-        // before its abort handle is stored is armed by `attach_abort`, which
-        // reads the lane after storing the handle, so one of the two sees
-        // the other's write. Only the incarnation the Kill was raised on is
-        // armed: a later registration under the same name is not.
-        let target = self
-            .by_name
-            .get(name)
-            .filter(|entry| entry.status_rx.same_channel(&status_rx))
-            .map(|entry| (entry.abort.clone(), entry.kill_grace, entry.runtime.clone()));
-        if let Some((Some(abort), grace, runtime)) = target {
-            self.arm_kill_backstop(abort, lane.abort_record(), grace, &runtime);
         }
         Ok(())
     }
 
     /// Lists all registered actor names in this system.
     pub fn registered(&self) -> Vec<String> {
-        self.by_name.iter().map(|e| e.key().clone()).collect()
+        self.by_name.iter().map(|e| e.key().to_string()).collect()
     }
 
     // - Visibility -----------------------------------------------------------
 
     /// Snapshot of every actor id currently registered in this system,
-    /// named or anonymous. Enumeration parity with `erlang:processes/0`
-    /// (erlang.org/docs/28): every actor is visible through its system,
-    /// regardless of how it was spawned.
+    /// named or anonymous, however it was spawned; an actor leaves the list
+    /// when its registration ends, after its children are stopped (or, when it
+    /// ends by `Kill`, without waiting for them: as its links drop, a worker
+    /// child is raised `Kill` and a supervisor child `ParentKilled`, which can
+    /// come after the id has left) and before it reads `Stopped`. To wait
+    /// until the actors below a killed actor have ended, take an observer with
+    /// [`observe_subtree`](Self::observe_subtree) before the kill. Erlang/OTP's
+    /// `processes/0` lists every process of the
+    /// node; here each system lists its own actors.
     pub fn actor_ids(&self) -> Vec<ActorId> {
         self.by_id.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Reads an actor's current status by id. Returns `None` if the id is
-    /// not registered in this system.
-    ///
-    /// An actor whose task was aborted never writes a final status itself;
-    /// its status sender closing is the terminal signal instead, and this
-    /// reports [`ActorStatus::Stopped`] for that case too.
+    /// not registered in this system, which includes an actor that has ended,
+    /// since an actor leaves the registry before its status reads
+    /// [`ActorStatus::Stopped`].
     pub fn actor_status(&self, id: &ActorId) -> Option<ActorStatus> {
         self.by_id.get(id).map(|e| read_status(&e.status_rx))
     }
 
-    /// Force-kills an actor by id, bypassing all lifecycle callbacks -
-    /// untrappable, matching `erlang:exit(Pid, kill)` (erlang.org/docs/28).
+    /// Returns an observer of the subtree of the actor registered under `id`,
+    /// or `None` when no actor is registered under it.
+    ///
+    /// Take it before the kill it is meant to outlast: an actor that ends by
+    /// `Kill` leaves the registry before the actors below it have ended, so a
+    /// lookup made afterwards cannot tell an id that was never registered from
+    /// a subtree that is still running. [`kill_by_id`](Self::kill_by_id)
+    /// reports the killed actor only; the observer's
+    /// [`wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended) waits
+    /// for the actors below it as well.
+    ///
+    /// The observer names the incarnation registered under `id` at this call.
+    /// A supervised child that restarts by itself between this call and a
+    /// separate kill is killed as a later incarnation, which the observer does
+    /// not wait for;
+    /// [`kill_by_id_with_observer`](Self::kill_by_id_with_observer) takes the
+    /// observer and the kill from one lookup.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult, ActorSystem, SubtreeEnd,
+    /// };
+    ///
+    /// struct Worker;
+    ///
+    /// impl Actor for Worker {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// struct Boss;
+    ///
+    /// impl Actor for Boss {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         ctx.spawn_child(|| Worker).await?;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let sys = ActorSystem::create("observe-subtree-example")?;
+    ///     let boss = Boss.spawn().on_system(&sys).supervisor().await?;
+    ///     let id = boss.id().clone();
+    ///
+    ///     // Take the observer before the kill, then kill by id.
+    ///     let below = sys.observe_subtree(&id).expect("the boss is registered");
+    ///     sys.kill_by_id(&id).await;
+    ///
+    ///     // The report named the boss only; the observer waits for the worker too.
+    ///     assert_eq!(below.wait_ended().await, SubtreeEnd::Ended);
+    ///     assert!(sys.actor_ids().is_empty());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn observe_subtree(&self, id: &ActorId) -> Option<SubtreeObserver> {
+        self.by_id
+            .get(id)
+            .map(|e| SubtreeObserver::new(e.status_rx.clone()))
+    }
+
+    /// Force-kills an actor by id with the same `Kill` as [`kill`](Self::kill):
+    /// no lifecycle callback begins once it is read, a callback still awaiting
+    /// after the kill grace is aborted (at once when the actor's runtime has no
+    /// time driver), and one that never yields survives the abort and is
+    /// reported [`StopOutcome::Unresponsive`]. Erlang/OTP's `exit(Pid, kill)`
+    /// sends an untrappable exit signal, and the process exits with reason
+    /// `killed` whatever it is running (erlang.org/docs/28).
     /// Returns `None` if the id is not registered, or if its actor's lane
     /// refuses the `Kill` (it stopped taking the request between this call's
     /// lookup and its raise, where [`kill`](Self::kill) answers
@@ -718,7 +1018,14 @@ impl ActorSystem {
     ///
     /// The report names the step of that ladder at which the actor ended and
     /// the reason it ended with ([`StopReport`]); an actor that never yields
-    /// to the runtime is reported [`StopOutcome::Unresponsive`].
+    /// to the runtime is reported [`StopOutcome::Unresponsive`]. The report
+    /// names the killed actor only: the actors below it end after it, as
+    /// [`actor_ids`](Self::actor_ids) says. To wait for them too, take an
+    /// observer with [`observe_subtree`](Self::observe_subtree) before the kill
+    /// and await
+    /// [`wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended) after
+    /// it, or take both from one lookup with
+    /// [`kill_by_id_with_observer`](Self::kill_by_id_with_observer).
     ///
     /// To force a restart of a supervised child, kill it: its supervisor
     /// restarts it per its restart type and charges the restart budget, as
@@ -731,7 +1038,59 @@ impl ActorSystem {
     /// [`StopReason::Kill`] on a handle it kept.
     /// [`stop_child`](crate::actor::context::ActorContext::stop_child) is
     /// the bounce that charges nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it is first polled with no Tokio runtime current, or with a
+    /// current runtime that has no time driver (build it with
+    /// `Builder::enable_time` or `enable_all`): the call waits out the kill
+    /// grace on the calling runtime, and for a registered id it panics before
+    /// it raises anything on the target. A current runtime without the driver is
+    /// the only one the check refuses: a runtime that is shutting down or has
+    /// ended passes it. An id nothing holds, and a target
+    /// that does not take a `Kill`, answer `None` on any runtime.
+    /// With `panic = "abort"` the entry cannot tell whether the runtime has the
+    /// driver, so a call on a runtime without it ends the process at the first
+    /// timer it uses.
     pub async fn kill_by_id(&self, id: &ActorId) -> Option<StopReport> {
+        self.kill_by_id_taking(id, |_| ())
+            .await
+            .map(|(report, ())| report)
+    }
+
+    /// [`kill_by_id`](Self::kill_by_id), also returning an observer of the
+    /// killed incarnation's subtree, taken from the same lookup that picked
+    /// the target.
+    ///
+    /// The observer names exactly the incarnation the report names. Two calls
+    /// ([`observe_subtree`](Self::observe_subtree), then `kill_by_id`) look
+    /// the id up twice, and a supervised child that restarts by itself between
+    /// them is killed as a later incarnation than the one observed. Await the
+    /// observer's
+    /// [`wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended) to
+    /// wait for the actors below the killed actor as well. The call answers
+    /// `None` where `kill_by_id` does, and panics where it does.
+    ///
+    /// # Panics
+    ///
+    /// As [`kill_by_id`](Self::kill_by_id).
+    pub async fn kill_by_id_with_observer(
+        &self,
+        id: &ActorId,
+    ) -> Option<(StopReport, SubtreeObserver)> {
+        self.kill_by_id_taking(id, |status_rx| SubtreeObserver::new(status_rx.clone()))
+            .await
+    }
+
+    /// The body of [`kill_by_id`](Self::kill_by_id) and of
+    /// [`kill_by_id_with_observer`](Self::kill_by_id_with_observer): one
+    /// lookup, one raise, one wait. `take` is called once, with the status
+    /// plane the lookup found, when the `Kill` is accepted and before the wait.
+    async fn kill_by_id_taking<T>(
+        &self,
+        id: &ActorId,
+        take: impl FnOnce(&StatusRx) -> T,
+    ) -> Option<(StopReport, T)> {
         // Guard-before-await discipline, as in `stop`/`kill`: clone the
         // pieces `force_stop` needs out of the `DashMap` guard before any
         // `.await`.
@@ -739,28 +1098,62 @@ impl ActorSystem {
             Some(e) => (e.status_rx.clone(), e.stop_lane.clone(), e.kill_grace),
             None => return None,
         };
-        #[cfg(test)]
-        self.run_after_kill_lookup();
-        // Raise first, then read the abort and arm (see `kill`); a lane that
-        // refuses the `Kill` belongs to a task past its last read of it, and
-        // the call answers as `kill` does. The wait is the incarnation's own
-        // grace, read with the lookup, so it holds after the entry is gone.
-        if lane.try_raise(StopReason::Kill) == RaiseResult::Refused {
+        // A target that does not take a `Kill` answers `None` without a
+        // timer; the timer check comes before the raise.
+        if lane.refuses(&StopReason::Kill) {
             return None;
         }
-        let abort = self.arm_after_raise(id, &status_rx, lane.abort_record());
+        crate::time_probe::require_caller_timers("ActorSystem::kill_by_id");
+        #[cfg(test)]
+        self.run_after_kill_lookup();
+        // A lane that refuses the `Kill` belongs to a task past its last read
+        // of it, and the call answers as `kill` does. The wait is the
+        // incarnation's own grace, read with the lookup, so it holds after
+        // the entry is gone.
+        let raised = raise_kill_declared(
+            Some(self),
+            KillKey::Id(id),
+            &status_rx,
+            &lane,
+            None,
+            None,
+            || {},
+        );
+        if raised.result == RaiseResult::Refused {
+            return None;
+        }
+        let abort = raised.abort;
         let record = lane.abort_record().clone();
-        Some(force_stop(status_rx, abort, record, grace, StopOutcome::Killed).await)
+        let taken = take(&status_rx);
+        let report = force_stop(status_rx, abort, record, grace, StopOutcome::Killed).await;
+        Some((report, taken))
     }
 
     // - Internal registration (used by spawn path) --------------------------
 
+    /// What registering `name` would answer right now for a system that is
+    /// not taking registrations or a name already taken, read without
+    /// claiming anything. The registration itself decides again.
+    pub(crate) fn precheck_spawn(&self, name: Option<&str>) -> Result<(), SpawnError> {
+        if SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) != SystemPhase::Active {
+            return Err(SpawnError::SystemShuttingDown(self.name.clone()));
+        }
+        if let Some(n) = name {
+            if self.by_name.contains_key(n) {
+                return Err(SpawnError::NameTaken {
+                    name: n.to_string(),
+                    system: self.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a spawned actor, returning its registration sequence
     /// number (the source of [`RegistryGuard`]'s seq-checked removal).
-    /// `is_root` distinguishes a top-level (`SpawnBuilder`) spawn, which
-    /// system shutdown signals directly, from a supervised child
-    /// (`spawn_child`), which is taken down by its own supervisor's shutdown
-    /// cascade instead.
+    /// `is_root` distinguishes a top-level (`SpawnBuilder`) spawn, which the
+    /// system shutdown walks, from a supervised child (`spawn_child`), which
+    /// its supervisor's cascade or the final sweep takes down.
     ///
     /// Returns [`SpawnError::SystemShuttingDown`] unless the system is
     /// currently `Active`: OTP's application controller rejects new
@@ -771,7 +1164,7 @@ impl ActorSystem {
     pub(crate) fn register_actor<A: Actor>(
         &self,
         id: &ActorId,
-        name: Option<&str>,
+        name: Option<&Arc<str>>,
         handle: &ActorHandle<A>,
         is_root: bool,
         turn_clock: TurnClock,
@@ -797,7 +1190,7 @@ impl ActorSystem {
 
         let seq = self.registration_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(n) = name {
-            let entry = self.by_name.entry(n.to_string());
+            let entry = self.by_name.entry(Arc::clone(n));
             match entry {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     return Err(SpawnError::NameTaken {
@@ -882,17 +1275,20 @@ impl ActorSystem {
         self.incarnation_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Moves a `Defunct` system (one whose last `shutdown`/`shutdown_with`
-    /// in flight has fully completed) back to `Active`, so its name can be
-    /// registered into again instead of staying poisoned forever.
+    /// Moves a `Defunct` system (one with no `shutdown`/`shutdown_with` in
+    /// flight, after a shutdown completed) back to `Active`, so its name can
+    /// be registered into again instead of staying poisoned forever.
     ///
     /// Returns `false` without effect if the system is not currently
     /// `Defunct` - either still `Active` (nothing to reactivate), or
     /// `ShuttingDown` - or if any shutdown is still in flight: reactivating
     /// out from under one would let a registration land after that
     /// shutdown's last snapshot, neither stopped nor refused. A system left
-    /// `ShuttingDown` by a dropped shutdown reaches `Defunct` by calling
-    /// [`shutdown`](Self::shutdown) again and letting it complete.
+    /// `ShuttingDown` by shutdowns that were all cut short reaches `Defunct`
+    /// by calling [`shutdown`](Self::shutdown) again and letting it complete;
+    /// once a shutdown has completed since the system was last `Active`, the
+    /// system is `Defunct` whenever no shutdown is in flight, however later
+    /// calls ended.
     pub fn reactivate(&self) -> bool {
         let in_flight = self
             .registration_gate
@@ -903,6 +1299,7 @@ impl ActorSystem {
         {
             return false;
         }
+        self.completed_since_active.store(false, Ordering::Relaxed);
         self.phase
             .store(SystemPhase::Active.as_u8(), Ordering::Release);
         true
@@ -918,7 +1315,10 @@ impl ActorSystem {
     /// caller raises and then reads the entry's abort, this stores the abort
     /// and then reads the lane, and both go through locks, so at least one
     /// of them sees the other's write. When the lane already holds a `Kill`,
-    /// this arms the backstop itself, with the entry's own kill grace.
+    /// this arms the backstop itself, after the earliest deadline a raiser
+    /// declared on the entry before its raise (see
+    /// [`raise_kill_declared`]), or after the entry's own kill
+    /// grace when none did; a deadline already passed arms it at zero.
     ///
     /// Only the entries of this spawn's own registration, `registration_seq`,
     /// take the handle, each checked under the same entry lock as the write:
@@ -952,9 +1352,80 @@ impl ActorSystem {
         }
         if let Some((lane, grace, runtime)) = armed_with {
             if matches!(lane.reason(), Some(StopReason::Kill)) {
-                self.arm_kill_backstop(abort, lane.abort_record(), grace, &runtime);
+                // The deadlines are read after the lane: every raiser
+                // declared its own before its raise, so the earliest of
+                // those whose `Kill` this read saw is among them.
+                let due = self.declared_kill_due(id, name, registration_seq);
+                let after = match due {
+                    0 => grace,
+                    due => Duration::from_nanos(due.saturating_sub(self.kill_clock())),
+                };
+                self.arm_kill_backstop(abort, lane.abort_record(), after, &runtime);
             }
         }
+    }
+
+    /// The earliest `Kill` deadline declared on the registration
+    /// `registration_seq` under `id` or `name`, `0` when none was.
+    fn declared_kill_due(&self, id: &ActorId, name: Option<&str>, registration_seq: u64) -> u64 {
+        let by_id = self
+            .by_id
+            .get(id)
+            .filter(|entry| entry.registration_seq == registration_seq)
+            .map_or(0, |entry| entry.kill_due);
+        let by_name = name
+            .and_then(|name| self.by_name.get(name))
+            .filter(|entry| entry.registration_seq == registration_seq)
+            .map_or(0, |entry| entry.kill_due);
+        match (by_id, by_name) {
+            (0, due) | (due, 0) => due,
+            (a, b) => a.min(b),
+        }
+    }
+
+    /// Nanoseconds from the system's epoch to now, at least `1` so that `0`
+    /// stays free for "no deadline".
+    fn kill_clock(&self) -> u64 {
+        u64::try_from(
+            Instant::now()
+                .saturating_duration_since(self.epoch)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1)
+    }
+
+    /// Records the deadline of a `Kill` about to be raised on the incarnation
+    /// of `id` whose status plane is `status_rx`: `window` from now, or the
+    /// incarnation's kill grace when no window is given. The entry keeps the
+    /// earliest deadline asked for, whether or not its abort handle is
+    /// attached. Only [`raise_kill_declared`] calls this, before it
+    /// raises: an attach that finds the `Kill` raised then reads every
+    /// deadline declared before that raise. The entry is matched by its
+    /// status plane, never by the id alone, and nothing else runs under the
+    /// shard's lock.
+    fn declare_kill(&self, id: &ActorId, status_rx: &StatusRx, window: Option<Duration>) {
+        let now = self.kill_clock();
+        if let Some(mut entry) = self.by_id.get_mut(id) {
+            if entry.status_rx.same_channel(status_rx) {
+                entry.declare_kill(now, window);
+            }
+        }
+        #[cfg(test)]
+        self.run_after_kill_declaration();
+    }
+
+    /// [`declare_kill`](Self::declare_kill) for a raiser that found its target
+    /// by name.
+    fn declare_kill_by_name(&self, name: &str, status_rx: &StatusRx, window: Option<Duration>) {
+        let now = self.kill_clock();
+        if let Some(mut entry) = self.by_name.get_mut(name) {
+            if entry.status_rx.same_channel(status_rx) {
+                entry.declare_kill(now, window);
+            }
+        }
+        #[cfg(test)]
+        self.run_after_kill_declaration();
     }
 
     /// Schedules the abort of a task whose actor was just sent `Kill`: the
@@ -988,26 +1459,57 @@ impl ActorSystem {
 
     /// After a `Kill` was raised on the incarnation whose status plane is
     /// `raised_on`: reads its abort handle, kill grace and runtime from the
-    /// registry and schedules the abort. The read comes after the raise,
-    /// never before: a handle stored by `attach_abort` before this read is
-    /// armed here, and one stored after it is armed by `attach_abort`, which
-    /// reads the lane after storing it. The read is exact to the incarnation
-    /// (`kill_target_for`): a later registration under the same id is never
-    /// armed. Returns the abort handle read: absent in the window before it
-    /// is stored, and for an incarnation already gone.
-    fn arm_after_raise(
+    /// registry entry `key` names and schedules the abort, after `window`
+    /// when given and otherwise after the entry's kill grace. The read comes
+    /// after the raise, never before: a handle stored by `attach_abort`
+    /// before this read is armed here, and one stored after it is armed by
+    /// `attach_abort`, which reads the lane after storing it. The read is
+    /// exact to the incarnation (a later registration under the same id or
+    /// name is never armed). Returns the abort handle read: absent in the
+    /// window before it is stored, and for an incarnation already gone.
+    fn arm_raised_kill(
         &self,
-        id: &ActorId,
-        raised_on: &watch::Receiver<StatusValue>,
+        key: KillKey<'_>,
+        raised_on: &StatusRx,
         record: &AbortRecord,
+        window: Option<Duration>,
     ) -> Option<AbortHandle> {
-        #[cfg(test)]
-        self.run_after_kill_raise();
-        let (abort, grace, runtime) = self.kill_target_for(id, raised_on)?;
+        let (abort, grace, runtime) = match key {
+            KillKey::Id(id) => self.kill_target_for(id, raised_on)?,
+            KillKey::Name(name) => {
+                let entry = self.by_name.get(name)?;
+                if !entry.status_rx.same_channel(raised_on) {
+                    return None;
+                }
+                (entry.abort.clone(), entry.kill_grace, entry.runtime.clone())
+            }
+        };
         if let Some(abort) = &abort {
-            self.arm_kill_backstop(abort.clone(), record, grace, &runtime);
+            self.arm_kill_backstop(abort.clone(), record, window.unwrap_or(grace), &runtime);
         }
         abort
+    }
+
+    /// Sets the hook that runs once after a registry `Kill` is raised and
+    /// before its abort is read and armed.
+    #[cfg(test)]
+    pub(crate) fn set_after_kill_raise_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.after_kill_raise.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Sets the hook that runs once right after a registry `Kill`'s deadline
+    /// is declared.
+    #[cfg(test)]
+    pub(crate) fn set_after_kill_declaration_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.after_kill_declaration.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_after_kill_declaration(&self) {
+        let hook = self.after_kill_declaration.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -1016,6 +1518,38 @@ impl ActorSystem {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ladder_hook(
+        &self,
+        hook: impl Fn(LadderPoint, &ActorId) + Send + Sync + 'static,
+    ) {
+        *self.ladder_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Replaces the reaper of runtime `rt` by a receiver that counts the
+    /// entries handed to it.
+    #[cfg(test)]
+    pub(crate) fn capture_reaper(&self, rt: &Handle) -> mpsc::UnboundedReceiver<ReaperEntry> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = rt.spawn(std::future::pending::<()>()).abort_handle();
+        self.reaper
+            .lock()
+            .unwrap()
+            .insert(rt.id(), ReaperSlot { tx, task });
+        rx
+    }
+
+    /// How many runtimes hold a reaper of this system.
+    #[cfg(test)]
+    pub(crate) fn reaper_slots(&self) -> usize {
+        self.reaper.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_ladder_hook(&self) {
+        *self.ladder_hook.lock().unwrap() = None;
     }
 
     #[cfg(test)]
@@ -1056,7 +1590,7 @@ impl ActorSystem {
     pub(crate) fn kill_target_for(
         &self,
         id: &ActorId,
-        status_rx: &watch::Receiver<StatusValue>,
+        status_rx: &StatusRx,
     ) -> Option<(Option<AbortHandle>, Duration, Handle)> {
         let entry = self.by_id.get(id)?;
         if !entry.status_rx.same_channel(status_rx) {
@@ -1094,17 +1628,23 @@ impl ActorSystem {
     /// [`actor_status`](Self::actor_status) still reports the status the
     /// actor holds ([`ActorStatus::Initializing`], [`ActorStatus::Running`] or
     /// [`ActorStatus::Stopping`]) for a wedged actor - `turn_elapsed` and
-    /// `stuck_actors`, not `actor_status`, are how to tell. OTP parity:
-    /// `erlang:system_monitor/2` with `{long_schedule, Time}`
-    /// (erlang.org/docs/28). Set the threshold well above normal turn
-    /// lengths to avoid false positives.
+    /// `stuck_actors`, not `actor_status`, are how to tell. The closest
+    /// Erlang/OTP mechanism is `erlang:system_monitor/2` with
+    /// `{long_schedule, Time}` (erlang.org/docs/28), which reports a process
+    /// that runs at least `Time` wall-clock milliseconds without being
+    /// scheduled out, as a message to its monitor process; this watchdog times
+    /// each callback, awaits included, and is read on demand through
+    /// `turn_elapsed` and `stuck_actors`. Set the threshold well above normal
+    /// turn lengths to avoid false positives.
     ///
     /// With the `tracing` feature, setting a threshold also (re)starts the
     /// background task that logs actors over it: it runs on whichever
-    /// runtime was current when it was started, exits when that runtime is
-    /// dropped out from under it, and is started again, when a threshold is
-    /// in effect, by the next call to this method or the next actor
-    /// registration made with a runtime current.
+    /// runtime was current when it was started, provided that runtime has the
+    /// Tokio time driver (a call made on one without it starts nothing; with
+    /// `panic = "abort"` the task's first timer ends the process instead),
+    /// exits when that runtime is dropped out from under it, and is started
+    /// again, when a threshold is in effect, by the next call to this method
+    /// or the next actor registration made with a runtime current.
     pub fn set_turn_warning_threshold(&self, threshold: Option<Duration>) {
         self.turn_warning_threshold_nanos
             .store(threshold_to_nanos(threshold), Ordering::Relaxed);
@@ -1194,8 +1734,42 @@ impl ActorSystem {
     /// sweep is currently running; once that sweep's task ends - see
     /// [`turn_watchdog_sweep`]'s drop guard - the next call here spawns a
     /// fresh one.
+    ///
+    /// The sweep sleeps on `rt`, so a runtime without the time driver is
+    /// never used for it: the call does nothing there, and the next call on a
+    /// runtime with the driver starts it. A runtime found without the driver
+    /// is remembered by this system, so a spawn there does not probe it again.
     #[cfg(feature = "tracing")]
     fn ensure_sweep_spawned_with(&self, rt: &Handle) {
+        // A sweep that is alive needs no probe. A runtime known to have the
+        // driver goes on; one this system already found without it returns;
+        // any other is probed, outside every lock, and a negative answer is
+        // remembered.
+        if self.sweep_spawned.load(Ordering::Acquire) {
+            return;
+        }
+        if !crate::time_probe::runtime_known_to_have_timers(rt) {
+            let id = rt.id();
+            if self
+                .timerless_runtimes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&id)
+            {
+                return;
+            }
+            if !crate::time_probe::probe_runtime_for_timers(rt) {
+                let mut memo = self
+                    .timerless_runtimes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if memo.len() >= TIMERLESS_MEMO_LIMIT {
+                    memo.clear();
+                }
+                memo.insert(id);
+                return;
+            }
+        }
         if self
             .sweep_spawned
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1211,10 +1785,40 @@ impl ActorSystem {
         // its runtime never gets around to it before shutting down.
         let guard = SweepLatchGuard(self.sweep_spawned.clone());
         let name = self.name.clone();
-        rt.spawn(async move {
-            let _guard = guard;
-            turn_watchdog_sweep(name).await
-        });
+        drop(self.helpers.spawn(rt, HelperKind::Sweep, None, |end| {
+            end.observe(async move {
+                let _guard = guard;
+                turn_watchdog_sweep(name).await
+            })
+        }));
+    }
+
+    /// Spawns a helper task of the crate on `rt` through this system's helper
+    /// slot, which records the task's end.
+    pub(crate) fn spawn_helper<F, Fut>(
+        &self,
+        rt: &Handle,
+        kind: HelperKind,
+        owner: Option<ActorId>,
+        make: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: FnOnce(crate::helper::EndGuard) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.helpers.spawn(rt, kind, owner, make)
+    }
+
+    /// The helper tasks of this system that have started and not ended.
+    #[cfg(test)]
+    pub(crate) fn live_helpers(&self) -> usize {
+        self.helpers.live()
+    }
+
+    /// The ends the helper slot of `rt` has recorded, in order.
+    #[cfg(test)]
+    pub(crate) fn helper_ends(&self, rt: &Handle) -> Vec<(HelperKind, crate::helper::HelperEnd)> {
+        self.helpers.ends(rt)
     }
 
     /// Returns the reaper feed of runtime `rt`, spawning its backing task on
@@ -1245,7 +1849,12 @@ impl ActorSystem {
         }
         slots.retain(|_, slot| !slot.task.is_finished());
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = rt.spawn(reaper_loop(rx)).abort_handle();
+        let task = self
+            .helpers
+            .spawn(rt, HelperKind::Reaper, None, |end| {
+                end.observe(reaper_loop(rx))
+            })
+            .abort_handle();
         let fresh = tx.clone();
         slots.insert(id, ReaperSlot { tx, task });
         fresh
@@ -1254,8 +1863,8 @@ impl ActorSystem {
     // - Shutdown -------------------------------------------------------------
 
     /// Shuts down all registered actors using the system's stored policy.
-    /// See [`shutdown_with`](Self::shutdown_with); it needs a Tokio runtime
-    /// with the time driver enabled.
+    /// See [`shutdown_with`](Self::shutdown_with); with a root to wait on it
+    /// needs a Tokio runtime with the time driver enabled.
     pub async fn shutdown(&self) -> ShutdownReport {
         self.shutdown_with(self.shutdown_policy.clone()).await
     }
@@ -1264,20 +1873,24 @@ impl ActorSystem {
     /// top-level `SpawnBuilder`, not a supervised child) in reverse
     /// registration order, sequentially, escalating from
     /// `StopReason::ParentRequest` up through `Kill` and finally a task abort
-    /// as needed. Each root's own supervision cascade takes its
-    /// subtree down in turn - the system never signals a child directly, so a
-    /// supervisor mid-restart when shutdown begins is never raced, and its
-    /// children are never restarted (the parent's own message loop, the only
-    /// thing that would evaluate a restart, has already exited by the time
-    /// its children are stopped).
+    /// as needed. Each root's own supervision cascade takes its subtree down
+    /// in turn: the walk takes the roots down their ladders, and every other
+    /// actor is stopped by its supervisor (when a supervisor ends by a `Kill`
+    /// or an abort, the link guards of its children stop them) or by the
+    /// walk's final sweep described below. A supervisor evaluates restarts
+    /// only in its own message loop, so once that loop has exited no restart
+    /// of its children is begun.
     ///
     /// New registrations are rejected with `SpawnError::SystemShuttingDown`
-    /// from the moment this is called (OTP application-controller parity).
-    /// The system reads `Defunct` once a shutdown completes with no other
-    /// shutdown in flight. A shutdown whose future is dropped before it
-    /// completes leaves the system `ShuttingDown`, refusing registrations
-    /// and with [`reactivate`](Self::reactivate) returning `false`, until
-    /// another shutdown completes.
+    /// from the first poll of this call.
+    /// The system reads `Defunct` once a shutdown has completed since it was
+    /// last `Active` and no shutdown is in flight any more. Shutdowns cut
+    /// short before one completes (see "The walk and its caller" below)
+    /// leave the system `ShuttingDown`, refusing registrations and with
+    /// [`reactivate`](Self::reactivate) returning `false`, until a shutdown
+    /// completes; after that the system keeps refusing registrations, and
+    /// `reactivate` works again whenever no shutdown is in flight, however
+    /// later calls ended.
     ///
     /// Bounded by `policy.timeout`: once the global deadline passes, every
     /// remaining root is force-stopped (`Kill` + `abort`) CONCURRENTLY instead
@@ -1293,67 +1906,169 @@ impl ActorSystem {
     /// and then killed. After the global deadline, a shutdown can run on for
     /// the longest kill grace among the roots it forces plus the abort settle
     /// time, then the longest kill grace among the leftovers it forces plus the
-    /// abort settle time, and that time once more plus the abort settle time
-    /// for a leftover whose abort, scheduled with the system, is issued late.
-    /// That deadline `Kill`, and
-    /// the abort one kill grace after it (counted from when the `Kill` fires),
-    /// are scheduled with the system when the sweep begins, so they happen even
-    /// if the future returned here is dropped before the deadline. Since a stop only ever strengthens,
+    /// abort settle time, and, for either of those two steps, that time once
+    /// more plus the abort settle time when the abort of an actor it forces,
+    /// scheduled with the system, is issued late. That deadline `Kill`, and the
+    /// abort one kill grace after it (counted from when the `Kill` fires), are
+    /// scheduled with the system when the sweep begins, on the runtime of each
+    /// leftover whose task is already spawned, so they happen even if the walk
+    /// is cut short before the deadline. Since a stop only ever strengthens,
     /// the system holds one sweep deadline: a sweep lowers it to its own when
     /// that is earlier, but never to before the moment it lowers it, and every
     /// sweep, one already waiting in another call included, waits on and
     /// reports its leftovers by it. It is cleared only when the last shutdown
-    /// in flight completes (a dropped last shutdown leaves it, as it leaves
-    /// `ShuttingDown`).
+    /// in flight ends after a shutdown has completed since the system was last
+    /// `Active` (shutdowns that are all cut short before one completes leave
+    /// it, as they leave `ShuttingDown`). A shutdown made after only cut-short
+    /// ones folds into the stored deadline, which may already have passed, and
+    /// then forces its leftovers at once.
     ///
-    /// A leftover reads by the instant its end became final (its stop lane's
-    /// seal) against the system's deadline: `Graceful` with the reason it
-    /// ended with when that instant is before the deadline and it published
-    /// `Stopped`, `Killed` when it is at or after it or when this shutdown's
-    /// force took a `Kill` on the leftover, `Aborted` when its task ended
-    /// without publishing `Stopped`, and `Unresponsive` when even the abort
-    /// did not end it within the settle time after it. The instant does not
+    /// A leftover whose task ended without publishing `Stopped` reads
+    /// `Aborted`. One that published `Stopped` reads by the instant its end
+    /// became final (its stop lane's seal) against the system's deadline:
+    /// `Killed` when that instant is at or after the deadline (or there is
+    /// none) or when this shutdown's force took a `Kill` on the leftover, and
+    /// `Graceful`, with the reason it ended with, when it is before the
+    /// deadline. A leftover reads `Unresponsive` when even the abort did not
+    /// end it within the settle time after it. The instant does not
     /// depend on which call looks or when, so concurrent calls report one end
     /// the same way.
     ///
     /// Needs a Tokio runtime with the time driver enabled (`enable_time` or
-    /// `enable_all`): without it, a root's wait panics, and a leftover whose
-    /// wait fails is forced at once and reported from its plane.
+    /// `enable_all`) that is driven, not only entered: the walk is a task of
+    /// the system on that runtime. Without the driver the call panics at its
+    /// first wait on a root, after the system has entered shutdown, and a
+    /// leftover whose wait fails is forced at once and reported from its
+    /// plane; a system with no root completes.
     ///
     /// Registry entries are removed as their actors die (the existing
     /// `RegistryGuard` drop machinery) - never cleared up front, so a lookup
     /// racing the early part of shutdown still finds a live actor.
     ///
-    /// # Dropping the future
-    /// Drive this future to completion, or spawn it. If it is dropped, the root
-    /// it was stopping keeps the stop request it was given but is not escalated
-    /// further, and the roots it had not yet reached are never asked to stop
-    /// and keep running. A `Kill` it already raised on a root still registered
-    /// then still ends in its abort, after that root's kill grace, and once its
-    /// final sweep has begun, every leftover still running at the global
-    /// deadline is killed then and aborted one kill grace later, since the
-    /// system holds that deadline. The system stays shutting down, as described
-    /// above, and refuses every supervised restart as well as every new
-    /// registration with [`SpawnError::SystemShuttingDown`], and a refused
-    /// restart is charged to the restart budget like any failed restart: a
-    /// supervisor whose child then dies and is due a restart exhausts a budget
-    /// whose window holds its `max_restarts` restarts, while a zero window
-    /// keeps retrying until a shutdown reaches the supervisor, unless the
-    /// restarts read the same instant (see
+    /// # The walk and its caller
+    /// The call enters the shutdown, so that registrations are refused, in
+    /// its first poll, and then runs the walk in a task of the system on the
+    /// runtime that is current at the call; the caller only waits for the
+    /// walk's report. The walk therefore survives its caller's future: a call
+    /// that is dropped, abandoned, stored and never polled again, or made from
+    /// inside an actor that the walk stops, does not stop the walk, which
+    /// takes each root down its ladder (a stop request, then a `Kill` once its
+    /// time has passed, then an abort; once the global deadline has passed,
+    /// the remaining roots are force-stopped with a `Kill` and an abort),
+    /// completes, and leaves the system `Defunct` once no other shutdown is in
+    /// flight; a root that does not yield even to the abort is reported
+    /// `Unresponsive` and may still be running. A call from inside a root is
+    /// stopped with that root like any other pending handler, and the walk goes
+    /// on to the roots after it. Several calls at once each run their own walk,
+    /// and their sweep deadlines fold into one as described above.
+    ///
+    /// OTP parity: `init:stop/0` is a request to a system process, `init`,
+    /// which owns the node's shutdown and returns to the caller at once; here
+    /// the walk is likewise a task of the system, and the caller waits for its
+    /// report. The first two steps of each root's escalation follow
+    /// `shutdown/1` in `supervisor.erl`, which runs in the supervisor process:
+    /// a stop request, then a `Kill` (the counterpart of `exit(Pid, kill)`)
+    /// once its time has passed. The abort that follows, as the backstop for a
+    /// callback that does not reach a turn boundary, has no OTP counterpart,
+    /// since `exit(Pid, kill)` needs no cooperation from the process. OTP waits
+    /// without limit for the `'DOWN'` after its kill; here the walk settles
+    /// after a short time and reports the root `Unresponsive`: a declared
+    /// departure.
+    ///
+    /// The walk does not survive its own runtime. When the runtime it runs on
+    /// ends before the walk does and nothing is still waiting on the call, the
+    /// walk stops there: it asks no further
+    /// root to stop, so the roots on other runtimes that it had not yet
+    /// reached keep running (roots on the ended runtime end with it), and the
+    /// system keeps refusing
+    /// every supervised restart as well as every new registration with
+    /// [`SpawnError::SystemShuttingDown`], and a refused restart is charged to
+    /// the restart budget like any failed restart: a supervisor whose child
+    /// then dies and is due a restart exhausts a budget whose window holds its
+    /// `max_restarts` restarts, while a zero window with a `max_restarts`
+    /// above zero keeps retrying until a shutdown reaches the supervisor,
+    /// unless the restarts read the same instant (see
     /// [`SupervisionConfig::restart_window`](crate::actor::supervision::SupervisionConfig::restart_window)).
-    /// A later call to [`shutdown`](Self::shutdown) finishes the job.
+    /// [`reactivate`](Self::reactivate) works again once a shutdown of the
+    /// system has completed (an earlier one counts) and none is in flight, and
+    /// a later call to [`shutdown`](Self::shutdown) can complete one. If the
+    /// task ends without a report while its caller still waits (the walk
+    /// panicked, or the runtime it ran on ended while the call was polled from
+    /// outside it), the caller walks the system itself in its own future and
+    /// returns that report if that walk completes; a walk that needs a timer on
+    /// an ended runtime panics at its first wait on a root that is still
+    /// running. A call made with no Tokio runtime current walks in the
+    /// caller's future, and dropping that future stops the walk. With no
+    /// runtime current the call completes only for a system with no root and no
+    /// leftover: once a root exists, it panics at its first wait on it, because
+    /// that wait uses a timer, which needs a driven runtime with the time
+    /// driver. The system keeps refusing registrations.
     pub async fn shutdown_with(&self, policy: ShutdownPolicy) -> ShutdownReport {
         #[cfg(test)]
         self.shutdown_at_the_gate.store(true, Ordering::SeqCst);
-        // Every registration in progress completes before the change, and
-        // every later one sees it (see `registration_gate`). The guard keeps
-        // this shutdown counted until it ends, completed or dropped.
-        let mut in_flight = ShutdownInFlight::enter(self);
         let deadline = saturating_deadline(Instant::now(), policy.timeout);
+        let Some((rt, owner)) = self.walk_host() else {
+            // No runtime is current, or the system is not the one the global
+            // map holds: the caller drives the walk.
+            let in_flight = ShutdownInFlight::enter(self);
+            let roots = self.first_snapshot();
+            return self.walk(policy, deadline, roots, in_flight).await;
+        };
+        // The phase change and the first snapshot happen here, in the
+        // caller's first poll: a registration attempted right after it is
+        // refused, and every root registered before it is in the snapshot.
+        let in_flight = ShutdownInFlight::enter(owner.clone());
+        let roots = owner.first_snapshot();
+        let (report_tx, report_rx) = oneshot::channel();
+        let report_tx = WalkReport(Some(report_tx));
+        let walk_policy = policy.clone();
+        let walker = owner.clone();
+        drop(
+            owner.spawn_helper(&rt, HelperKind::ShutdownWalk, None, move |end| {
+                end.observe(async move {
+                    let report = walker.walk(walk_policy, deadline, roots, in_flight).await;
+                    report_tx.send(report);
+                })
+            }),
+        );
+        match report_rx.await {
+            Ok(report) => report,
+            Err(_) => {
+                // The walk helper ended without a report (it panicked, or its
+                // runtime ended): the caller walks the system itself.
+                let in_flight = ShutdownInFlight::enter(self);
+                let roots = self.first_snapshot();
+                self.walk(policy, deadline, roots, in_flight).await
+            }
+        }
+    }
 
+    /// The runtime and the owning handle a shutdown walk runs on, or `None`
+    /// when no runtime is current or this system is not the one the global
+    /// map holds under its name.
+    fn walk_host(&self) -> Option<(Handle, Arc<ActorSystem>)> {
+        let rt = Handle::try_current().ok()?;
+        let held = systems().get(&self.name)?.value().clone();
+        std::ptr::eq(Arc::as_ptr(&held), self).then_some((rt, held))
+    }
+
+    /// The roots a shutdown that has just entered takes on first, in the
+    /// order it stops them: the most recently registered first.
+    fn first_snapshot(&self) -> Vec<RootSnapshot> {
         let mut roots = self.snapshot_roots();
-        // Reverse registration order: most-recently-registered stops first.
         roots.sort_by_key(|r| std::cmp::Reverse(r.registration_seq));
+        roots
+    }
+
+    /// The shutdown walk: stops `roots`, sweeps the leftovers and, when it
+    /// completes, releases `in_flight` as a completed shutdown.
+    async fn walk<S: std::ops::Deref<Target = ActorSystem>>(
+        &self,
+        policy: ShutdownPolicy,
+        deadline: Instant,
+        roots: Vec<RootSnapshot>,
+        mut in_flight: ShutdownInFlight<S>,
+    ) -> ShutdownReport {
         // Every root incarnation this shutdown has taken on, by its
         // registration sequence (unique to one registration, so to one
         // incarnation): a later incarnation registered under a reported id
@@ -1504,10 +2219,14 @@ impl ActorSystem {
             );
         }
 
-        // Shutdown has fully completed: the last one in flight moves the
-        // system to `Defunct` rather than leaving `ShuttingDown` set forever,
-        // so `reactivate` can return this system's name to service, and
-        // clears the system's sweep deadline in the same step.
+        // Shutdown has fully completed. Every walk snapshots after its own
+        // entry, and registrations are refused from the first entry after
+        // the system was last `Active`, so this walk has stopped every root
+        // registered before that. The last shutdown in flight to end, this
+        // one or a cut-short one that ends later, therefore moves the system
+        // to `Defunct` rather than leaving `ShuttingDown` set forever, so
+        // `reactivate` can return this system's name to service, and clears
+        // the system's sweep deadline in the same step.
         in_flight.completed = true;
         drop(in_flight);
 
@@ -1629,7 +2348,7 @@ impl ActorSystem {
         // Step 2: Kill (unvetoable, but still only observed cooperatively -
         // an actor stuck inside a callback never reaches the select! that
         // would see it). The system schedules the abort when it raises the
-        // Kill, so a shutdown future dropped from here on still ends in one.
+        // Kill, so a walk cut short from here on still ends in one.
         #[cfg(test)]
         self.run_ladder_hook(LadderPoint::Kill, id);
         let kill_raised = self.raise_kill(id, &status_rx);
@@ -1691,10 +2410,8 @@ impl ActorSystem {
         // Each task's target, its plane, the outcome its classifier asks for
         // and whether this shutdown raised `Kill` on it, fixed here before
         // the task is spawned.
-        let mut by_task: HashMap<
-            tokio::task::Id,
-            (ActorId, watch::Receiver<StatusValue>, StopOutcome, bool),
-        > = HashMap::new();
+        let mut by_task: HashMap<tokio::task::Id, (ActorId, StatusRx, StopOutcome, bool)> =
+            HashMap::new();
         for target in targets {
             let SweepTarget {
                 id,
@@ -1725,13 +2442,22 @@ impl ActorSystem {
             };
             #[cfg(test)]
             self.run_after_kill_lookup();
-            // Raise first, then read the abort and arm (see `kill`). A lane
-            // that refuses the `Kill` belongs to an incarnation already past
-            // its last read of it: nothing is armed, it ends with its own
-            // reason, and the verdict is `Killed` only if this shutdown raised
-            // `Kill` on it earlier. The wait is the incarnation's own grace,
-            // read with the lookup, so it holds after the entry is gone.
-            let took = lane.try_raise(StopReason::Kill) != RaiseResult::Refused;
+            // A lane that refuses the `Kill` belongs to an incarnation
+            // already past its last read of it: nothing is armed, it ends
+            // with its own reason, and the verdict is `Killed` only if this
+            // shutdown raised `Kill` on it earlier. The wait is the
+            // incarnation's own grace, read with the lookup, so it holds
+            // after the entry is gone.
+            let raised_kill = raise_kill_declared(
+                Some(self),
+                KillKey::Id(&id),
+                &status_rx,
+                &lane,
+                None,
+                None,
+                || {},
+            );
+            let took = raised_kill.result != RaiseResult::Refused;
             let raised = took || kill_raised;
             let requested = if raised {
                 StopOutcome::Killed
@@ -1740,7 +2466,7 @@ impl ActorSystem {
             };
             let record = lane.abort_record().clone();
             let abort = if took {
-                self.arm_after_raise(&id, &status_rx, &record)
+                raised_kill.abort
             } else {
                 self.kill_target_for(&id, &status_rx)
                     .and_then(|(abort, _, _)| abort)
@@ -1781,12 +2507,7 @@ impl ActorSystem {
     /// entry (the actor already died on its own), or one that is a later
     /// incarnation under the same id, is a silent no-op: the caller's
     /// subsequent status wait finds the incarnation already terminal.
-    fn send_stop(
-        &self,
-        id: &ActorId,
-        status_rx: &watch::Receiver<StatusValue>,
-        reason: StopReason,
-    ) {
+    fn send_stop(&self, id: &ActorId, status_rx: &StatusRx, reason: StopReason) {
         let lane = self
             .by_id
             .get(id)
@@ -1802,7 +2523,7 @@ impl ActorSystem {
     /// Returns whether the `Kill` was raised: it is not when the registry does
     /// not hold that incarnation under `id` (it left, or a later incarnation
     /// holds the id) or its lane refuses the request.
-    fn raise_kill(&self, id: &ActorId, status_rx: &watch::Receiver<StatusValue>) -> bool {
+    fn raise_kill(&self, id: &ActorId, status_rx: &StatusRx) -> bool {
         let Some(lane) = self
             .by_id
             .get(id)
@@ -1813,16 +2534,21 @@ impl ActorSystem {
         };
         #[cfg(test)]
         self.run_after_kill_lookup();
-        // Raise first, then read the abort and arm (see `kill`).
-        if lane.try_raise(StopReason::Kill) == RaiseResult::Refused {
-            return false;
-        }
-        self.arm_after_raise(id, status_rx, lane.abort_record());
-        true
+        raise_kill_declared(
+            Some(self),
+            KillKey::Id(id),
+            status_rx,
+            &lane,
+            None,
+            None,
+            || {},
+        )
+        .result
+            != RaiseResult::Refused
     }
 
     /// Aborts the task of the incarnation whose status plane is `status_rx`.
-    fn abort_by_id(&self, id: &ActorId, status_rx: &watch::Receiver<StatusValue>) {
+    fn abort_by_id(&self, id: &ActorId, status_rx: &StatusRx) {
         let target = self
             .by_id
             .get(id)
@@ -1873,6 +2599,15 @@ impl Drop for SweepLatchGuard {
     }
 }
 
+/// How long the turn-watchdog sweep sleeps between checks for a given turn
+/// warning threshold: a quarter of the threshold, never less than 50 ms and
+/// never more than 1 s. A zero threshold gives 50 ms and `Duration::MAX`
+/// gives 1 s; the division cannot overflow.
+#[cfg(feature = "tracing")]
+fn sweep_tick(threshold: Duration) -> Duration {
+    (threshold / 4).clamp(Duration::from_millis(50), Duration::from_secs(1))
+}
+
 /// Background task, spawned by [`ActorSystem::ensure_sweep_spawned_with`]
 /// whenever none is currently alive for this system, that periodically logs
 /// actors whose current turn has run longer than their system's turn
@@ -1900,7 +2635,7 @@ async fn turn_watchdog_sweep(name: String) {
             continue;
         }
         let threshold = Duration::from_nanos(threshold_nanos);
-        let tick = (threshold / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+        let tick = sweep_tick(threshold);
 
         // Collected with no `.await` in the loop body: never hold a
         // `DashMap` guard across one. `snapshot()` reads the token and the
@@ -1942,7 +2677,11 @@ async fn turn_watchdog_sweep(name: String) {
 
 /// The points at which a test hook runs: before each step of a root's
 /// sequential shutdown ladder, before the force sweep looks a target up, and
-/// before `ActorHandle::stop_within` raises its own `Kill`.
+/// at seven points of `ActorHandle::stop_within`: when its stop task starts,
+/// before the task raises its `Kill`, between the step cell's store and the
+/// raise, after it raised it, after it answered, inside the task's loss
+/// action once the loss has been handled, and in the caller when it finds
+/// the task's answer closed.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LadderPoint {
@@ -1950,32 +2689,76 @@ pub(crate) enum LadderPoint {
     Kill,
     Abort,
     SweepLookup,
+    StopBeforeRaise,
+    StopHelperStart,
     StopWithinKill,
+    StopKillStored,
+    StopAfterKill,
+    StopHelperLost,
+    StopAnswered,
+    StopClosedSeen,
+    StopRaised,
+    StopDecided,
 }
 
 #[cfg(test)]
 type LadderHook = Arc<dyn Fn(LadderPoint, &ActorId) + Send + Sync>;
 
+/// How many runtimes without the time driver a system remembers before it
+/// starts its memo over.
+#[cfg(feature = "tracing")]
+const TIMERLESS_MEMO_LIMIT: usize = 64;
+
+/// The channel a shutdown walk run by a helper task reports on. The report is
+/// sent once, contained; a walk that ends without one (it panicked, or its
+/// runtime ended) drops the sender, which wakes the shutdown's caller, whose
+/// waker belongs to the caller's task. That drop can run while the walk
+/// unwinds, so a panic of the waker is contained there too.
+struct WalkReport(Option<oneshot::Sender<ShutdownReport>>);
+
+impl WalkReport {
+    fn send(mut self, report: ShutdownReport) {
+        if let Some(tx) = self.0.take() {
+            let _ = send_contained(tx, report);
+        }
+    }
+}
+
+impl Drop for WalkReport {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            contain_waker_panic("shutdown report", None, move || drop(tx));
+        }
+    }
+}
+
 /// Counts one shutdown in flight (see `ActorSystem::registration_gate`):
 /// entered with the phase change out of `Active`, and left when the shutdown
-/// ends, completed or dropped. Only a completed shutdown that was the last in
-/// flight stores `Defunct`; an abandoned one leaves the system refusing
-/// registrations until a later shutdown completes.
-struct ShutdownInFlight<'a> {
-    system: &'a ActorSystem,
+/// ends, completed or cut short. A completed one records that the system has
+/// completed a shutdown since it was last `Active`; the shutdown that lowers
+/// the count to zero stores `Defunct` when that is recorded, whichever order
+/// the calls ended in. Registrations are refused from the first entry after
+/// the system was last `Active` and every walk snapshots after its own entry,
+/// so a completed walk has stopped every root registered before that. Only
+/// cut-short shutdowns leave the system refusing registrations until a
+/// shutdown of the system has completed (an earlier one counts).
+struct ShutdownInFlight<S: std::ops::Deref<Target = ActorSystem>> {
+    system: S,
     completed: bool,
 }
 
-impl<'a> ShutdownInFlight<'a> {
-    fn enter(system: &'a ActorSystem) -> Self {
-        let mut in_flight = system
-            .registration_gate
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *in_flight += 1;
-        system
-            .phase
-            .store(SystemPhase::ShuttingDown.as_u8(), Ordering::Release);
+impl<S: std::ops::Deref<Target = ActorSystem>> ShutdownInFlight<S> {
+    fn enter(system: S) -> Self {
+        {
+            let mut in_flight = system
+                .registration_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *in_flight += 1;
+            system
+                .phase
+                .store(SystemPhase::ShuttingDown.as_u8(), Ordering::Release);
+        }
         Self {
             system,
             completed: false,
@@ -1983,7 +2766,7 @@ impl<'a> ShutdownInFlight<'a> {
     }
 }
 
-impl Drop for ShutdownInFlight<'_> {
+impl<S: std::ops::Deref<Target = ActorSystem>> Drop for ShutdownInFlight<S> {
     fn drop(&mut self) {
         let mut in_flight = self
             .system
@@ -1991,7 +2774,12 @@ impl Drop for ShutdownInFlight<'_> {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *in_flight -= 1;
-        if self.completed && *in_flight == 0 {
+        if self.completed {
+            self.system
+                .completed_since_active
+                .store(true, Ordering::Relaxed);
+        }
+        if *in_flight == 0 && self.system.completed_since_active.load(Ordering::Relaxed) {
             // No sweep of this system is in flight any more: the deadline it
             // held for them goes with the move to `Defunct`, under the same
             // lock, so a shutdown after a reactivation folds only its own.
@@ -2021,7 +2809,7 @@ struct SweepTarget {
 struct RootSnapshot {
     id: ActorId,
     registration_seq: u64,
-    status_rx: watch::Receiver<StatusValue>,
+    status_rx: StatusRx,
     kill_grace: Duration,
     /// The incarnation's abort record: a leftover whose registry entry is
     /// already freed is judged by the abort the reaper issues against it.
@@ -2037,26 +2825,26 @@ fn time_left(deadline: Instant) -> Duration {
 /// sender as terminal: an aborted task never writes a final status itself,
 /// so the sender closing is itself the terminal signal, the same one
 /// [`wait_terminal`] already treats as terminal.
-pub(crate) fn read_status(rx: &watch::Receiver<StatusValue>) -> ActorStatus {
+pub(crate) fn read_status(rx: &StatusRx) -> ActorStatus {
     if rx.has_changed().is_err() {
         ActorStatus::Stopped
     } else {
-        rx.borrow().status
+        rx.status()
     }
 }
 
 /// The reason a terminal plane carries: the one written, or `Kill` for a
 /// plane that closed without one. Meaningful only once the plane is
 /// terminal.
-pub(crate) fn terminal_reason(rx: &watch::Receiver<StatusValue>) -> StopReason {
+pub(crate) fn terminal_reason(rx: &StatusRx) -> StopReason {
     rx.borrow().reason_or_kill()
 }
 
 /// Waits, without a bound, until the plane is terminal and returns its
 /// reason.
-pub(crate) async fn wait_reason(rx: &mut watch::Receiver<StatusValue>) -> StopReason {
+pub(crate) async fn wait_reason(rx: &mut StatusRx) -> StopReason {
     loop {
-        if rx.borrow().status == ActorStatus::Stopped {
+        if rx.status() == ActorStatus::Stopped {
             return rx.borrow().reason_or_kill();
         }
         if rx.changed().await.is_err() {
@@ -2065,16 +2853,36 @@ pub(crate) async fn wait_reason(rx: &mut watch::Receiver<StatusValue>) -> StopRe
     }
 }
 
+/// Waits, without a bound, until the plane is closed: every sender of it is
+/// gone. An actor's senders are held by its task, its registry guard and its
+/// timer and stream forwarders, so the plane closes once the actor's task has
+/// dropped everything it owned and let go of the plane. That comes after
+/// `Stopped` is published and after whatever runs between the publication and
+/// the task's return (the end log line, with the `tracing` feature), and on
+/// an abort with the task's drop. A version the plane carries does not end
+/// the wait.
+pub(crate) async fn wait_closed(rx: &mut StatusRx) {
+    loop {
+        if rx.has_changed().is_err() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Waits, without a bound, until the plane carries the actor's final reason
 /// (written at its lane seal; for a task that never reaches its seal, by its
 /// abort guard once its name is free, or by its context when it is dropped
 /// before its first poll) or closes, and returns that reason.
-pub(crate) async fn wait_final_reason(rx: &mut watch::Receiver<StatusValue>) -> StopReason {
+pub(crate) async fn wait_final_reason(rx: &mut StatusRx) -> StopReason {
     loop {
-        if let Some(reason) = rx.borrow().reason.clone() {
+        let reason = rx.borrow().reason.clone();
+        if let Some(reason) = reason {
             return reason;
         }
-        if rx.borrow().status == ActorStatus::Stopped {
+        if rx.status() == ActorStatus::Stopped {
             return rx.borrow().reason_or_kill();
         }
         if rx.changed().await.is_err() {
@@ -2089,7 +2897,7 @@ pub(crate) async fn wait_final_reason(rx: &mut watch::Receiver<StatusValue>) -> 
 /// takes while the wait runs, so a sweep that starts later with an earlier
 /// deadline shortens it. Returns whether the plane was found terminal.
 async fn wait_end_by_the_system_deadline(
-    rx: &mut watch::Receiver<StatusValue>,
+    rx: &mut StatusRx,
     system: &mut watch::Receiver<Option<Instant>>,
     deadline: Instant,
 ) -> bool {
@@ -2128,11 +2936,7 @@ async fn wait_end_by_the_system_deadline(
 /// `Graceful` when it became final before. The reason is the one the plane
 /// carries. Every terminal leftover goes through here, whichever path
 /// produced its report, so one end reads one way whichever call reports it.
-fn leftover_outcome(
-    rx: &watch::Receiver<StatusValue>,
-    raised: bool,
-    deadline: Instant,
-) -> StopOutcome {
+fn leftover_outcome(rx: &StatusRx, raised: bool, deadline: Instant) -> StopOutcome {
     let value = rx.borrow();
     if value.status != ActorStatus::Stopped {
         return StopOutcome::Aborted;
@@ -2146,11 +2950,7 @@ fn leftover_outcome(
 
 /// The [`StopReport`] of a final-sweep leftover whose plane is terminal:
 /// [`leftover_outcome`] and the reason the plane carries.
-fn leftover_report(
-    rx: &watch::Receiver<StatusValue>,
-    raised: bool,
-    deadline: Instant,
-) -> StopReport {
+fn leftover_report(rx: &StatusRx, raised: bool, deadline: Instant) -> StopReport {
     StopReport {
         outcome: leftover_outcome(rx, raised, deadline),
         reason: Some(terminal_reason(rx)),
@@ -2159,10 +2959,7 @@ fn leftover_report(
 
 /// The [`StopReport`] of a terminal wait: the outcome from
 /// [`terminal_outcome`] and the reason the plane carries.
-pub(crate) fn terminal_report(
-    rx: &watch::Receiver<StatusValue>,
-    requested: StopOutcome,
-) -> StopReport {
+pub(crate) fn terminal_report(rx: &StatusRx, requested: StopOutcome) -> StopReport {
     StopReport {
         outcome: terminal_outcome(rx, requested),
         reason: Some(terminal_reason(rx)),
@@ -2182,12 +2979,9 @@ fn unresponsive() -> StopReport {
 /// `ActorStatus::Stopped`, or the sender dropped without ever writing it (an
 /// aborted task - terminal too, matching `ActorHandle::wait_stopped`).
 /// Returns `true` if terminal was observed within `bound`.
-pub(crate) async fn wait_terminal(
-    status_rx: &mut watch::Receiver<StatusValue>,
-    bound: Duration,
-) -> bool {
+pub(crate) async fn wait_terminal(status_rx: &mut StatusRx, bound: Duration) -> bool {
     tokio::time::timeout(bounded_wait(bound), async {
-        while status_rx.borrow().status != ActorStatus::Stopped {
+        while status_rx.status() != ActorStatus::Stopped {
             if status_rx.changed().await.is_err() {
                 return;
             }
@@ -2205,14 +2999,290 @@ pub(crate) async fn wait_terminal(
 /// Every terminal wait of `stop_within`, the shutdown ladder and the force
 /// stops answers through here, so one condition gets one verdict on every
 /// path, whichever of the deadlines fired first.
-pub(crate) fn terminal_outcome(
-    status_rx: &watch::Receiver<StatusValue>,
-    requested: StopOutcome,
-) -> StopOutcome {
-    if status_rx.borrow().status == ActorStatus::Stopped {
+pub(crate) fn terminal_outcome(status_rx: &StatusRx, requested: StopOutcome) -> StopOutcome {
+    if status_rx.status() == ActorStatus::Stopped {
         requested
     } else {
         StopOutcome::Aborted
+    }
+}
+
+/// Waits until `deadline` for `status_rx` to reach a terminal state, as
+/// [`wait_terminal`] does for a duration. Returns `true` if terminal was
+/// observed first.
+pub(crate) async fn wait_terminal_until(status_rx: &mut StatusRx, deadline: Instant) -> bool {
+    tokio::time::timeout_at(deadline, async {
+        while status_rx.borrow().status != ActorStatus::Stopped {
+            if status_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// The step a bounded stop has reached, written by whoever takes its steps
+/// and read by whoever has to classify the call without them: what a
+/// `Stopped` the actor publishes reads as. A bounded stop starts at its
+/// plain request. While raisers of its `Kill` are in flight the cell counts
+/// them, and that count is the pending step: a reader that finds it waits.
+/// Once any raiser's `Kill` is accepted the cell settles at `Killed` and
+/// stays there. A raiser the lane refuses, or that unwinds before the raise,
+/// gives back only its own share of the count, so the step is back at the
+/// plain request only when no raiser of the call is left in flight.
+///
+/// The cell also holds the decision on the call's first request, for the
+/// stop task a call spawns before it raises that request: the task takes no
+/// step until the raise is decided. The caller decides right after the raise,
+/// with nothing awaited in between.
+#[derive(Debug, Default)]
+pub(crate) struct StopStep(AtomicU16, AtomicU8);
+
+/// What a stop task that is lost owes, as its decision reads at the loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LossOwes {
+    /// The first request was accepted: the steps go to the reaper.
+    Steps,
+    /// The first request was refused, or is not decided yet and the caller
+    /// takes over when it decides: nothing is handed over.
+    Nothing,
+}
+
+impl StopStep {
+    /// No raiser is in flight and no `Kill` was accepted. Any value between
+    /// this and `KILLED` is the number of raisers in flight.
+    const REQUESTED: u16 = 0;
+    /// A `Kill` of the call was accepted; never left again.
+    const KILLED: u16 = u16::MAX;
+
+    /// The raise is not decided yet.
+    const UNDECIDED: u8 = 0;
+    /// The lane took the call's first request.
+    const ACCEPTED: u8 = 1;
+    /// The lane refused it: the call answers `Err` and owes no step.
+    const REFUSED: u8 = 2;
+    /// The task was lost before the decision; the caller owes its steps.
+    const LOST_UNDECIDED: u8 = 3;
+
+    /// The cell of a task spawned after the first request was accepted.
+    pub(crate) fn accepted() -> Self {
+        Self(
+            AtomicU16::new(Self::REQUESTED),
+            AtomicU8::new(Self::ACCEPTED),
+        )
+    }
+
+    /// Decides the call's first request as refused: its task owes no step.
+    /// Does nothing once the request is decided.
+    pub(crate) fn decide_refused(&self) {
+        let _ = self.1.compare_exchange(
+            Self::UNDECIDED,
+            Self::REFUSED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Decides the call's first request as accepted. Returns whether the
+    /// stop task was lost before this decision: then it handed nothing over,
+    /// and the caller hands the steps over itself.
+    pub(crate) fn decide_accepted(&self) -> bool {
+        self.1
+            .compare_exchange(
+                Self::UNDECIDED,
+                Self::ACCEPTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .err()
+            == Some(Self::LOST_UNDECIDED)
+    }
+
+    /// Waits until the first request is decided, and returns whether it was
+    /// accepted. The decider never awaits, so the wait ends as soon as the
+    /// deciding thread runs, as the wait of [`requested`](Self::requested)
+    /// for a step in progress does.
+    pub(crate) async fn first_request_accepted(&self) -> bool {
+        loop {
+            match self.1.load(Ordering::SeqCst) {
+                Self::UNDECIDED => tokio::task::yield_now().await,
+                Self::REFUSED => return false,
+                _ => return true,
+            }
+        }
+    }
+
+    /// Records the loss of the stop task and says what it owes: the steps
+    /// when the request was accepted, nothing when it was refused, and
+    /// nothing, with the loss recorded for the caller, when it is not decided.
+    pub(crate) fn lose_before_the_last_wait(&self) -> LossOwes {
+        match self.1.compare_exchange(
+            Self::UNDECIDED,
+            Self::LOST_UNDECIDED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => LossOwes::Nothing,
+            Err(Self::ACCEPTED) => LossOwes::Steps,
+            Err(_) => LossOwes::Nothing,
+        }
+    }
+
+    /// Whether the call's first request was refused.
+    #[cfg(test)]
+    pub(crate) fn refused(&self) -> bool {
+        self.1.load(Ordering::SeqCst) == Self::REFUSED
+    }
+
+    /// Raises `Kill` on `lane` as the step of the ladder. The raiser takes a
+    /// share of the cell's count before the raise, so no one who sees the
+    /// `Kill` take effect reads an earlier step, and a reader that finds the
+    /// count waits for the step to settle. A raiser the lane accepts stores
+    /// `Killed` when it leaves. A raiser the lane refuses, or that unwinds
+    /// before the raise, gives back its share and nothing else, so it never
+    /// settles the step while another raiser of the call is still in flight.
+    /// A raiser that unwinds out of the raise itself stores `Killed`: the
+    /// lane writes the request before its wakes run, so the `Kill` may
+    /// already stand.
+    ///
+    /// A cell that reads `Killed` is never written again: an earlier raise of
+    /// the same call was accepted, and a later raiser, accepted or refused,
+    /// raises on the lane and leaves the cell alone, so no reader sees an
+    /// earlier step for a moment. Every change of the count is a
+    /// compare-exchange from the value just read, never an add or a
+    /// subtract, so a raiser that read a count cannot overwrite a `Killed`
+    /// that settles after its read. The answer is the lane's own. `between`
+    /// runs after the share is taken and before the raise (just before the
+    /// raise on a `Killed` cell). A share is held only inside this
+    /// synchronous function, which awaits nothing, so every share is matched
+    /// by the store or the give-back, a panic included.
+    fn raise_kill(&self, lane: &StopLane, between: impl FnOnce()) -> RaiseResult {
+        let mut seen = self.0.load(Ordering::SeqCst);
+        let took_a_share = loop {
+            if seen == Self::KILLED {
+                break false;
+            }
+            debug_assert!(seen + 1 < Self::KILLED, "more raisers than the cell counts");
+            match self
+                .0
+                .compare_exchange_weak(seen, seen + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(now) => seen = now,
+            }
+        };
+        let mut share = took_a_share.then_some(RaiserShare {
+            cell: &self.0,
+            phase: SharePhase::Taken,
+        });
+        between();
+        if let Some(share) = share.as_mut() {
+            share.phase = SharePhase::Raising;
+        }
+        let result = lane.try_raise(StopReason::Kill);
+        if let Some(share) = share.as_mut() {
+            share.phase = SharePhase::Settled {
+                accepted: result != RaiseResult::Refused,
+            };
+        }
+        #[cfg(test)]
+        run_after_raise();
+        result
+    }
+
+    /// The cell's raw value: the count of raisers in flight, or `Killed`.
+    #[cfg(test)]
+    pub(crate) fn cell(&self) -> u16 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Whether the `Kill` step was taken, or is being taken, by a raise of the
+    /// same call.
+    pub(crate) fn kill_started(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != Self::REQUESTED
+    }
+
+    /// What a `Stopped` the actor publishes reads as at the step reached,
+    /// once a step in progress has settled.
+    pub(crate) async fn requested(&self) -> StopOutcome {
+        loop {
+            match self.0.load(Ordering::SeqCst) {
+                Self::KILLED => return StopOutcome::Killed,
+                Self::REQUESTED => return StopOutcome::Graceful,
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    }
+}
+
+/// Where a raiser is in its raise.
+#[derive(Clone, Copy)]
+enum SharePhase {
+    /// The share is held and `between` runs: no `Kill` is written yet.
+    Taken,
+    /// `between` returned and the lane's raise is entered: the lane may have
+    /// written the `Kill` before an unwind out of it.
+    Raising,
+    /// The lane's answer is known.
+    Settled { accepted: bool },
+}
+
+/// One raiser's share of the step cell's count, settled when dropped, which
+/// settles it whether the step ended or unwound: a raiser whose `Kill` stands
+/// or may stand stores `Killed`, any other gives back its one count. A
+/// `Killed` cell is left alone by the give-back.
+struct RaiserShare<'a> {
+    cell: &'a AtomicU16,
+    phase: SharePhase,
+}
+
+impl Drop for RaiserShare<'_> {
+    fn drop(&mut self) {
+        match self.phase {
+            SharePhase::Raising | SharePhase::Settled { accepted: true } => {
+                self.cell.store(StopStep::KILLED, Ordering::SeqCst);
+            }
+            SharePhase::Taken | SharePhase::Settled { accepted: false } => {
+                let mut seen = self.cell.load(Ordering::SeqCst);
+                while seen != StopStep::KILLED {
+                    debug_assert!(seen > 0, "a share is given back that was not taken");
+                    if seen == StopStep::REQUESTED {
+                        break;
+                    }
+                    match self.cell.compare_exchange_weak(
+                        seen,
+                        seen - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(now) => seen = now,
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_RAISE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms `hook` to run once on this thread, right after the next
+/// [`StopStep::raise_kill`] raise and before its share is settled.
+#[cfg(test)]
+pub(crate) fn run_once_after_the_next_raise(hook: impl FnOnce() + 'static) {
+    AFTER_RAISE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_raise() {
+    let hook = AFTER_RAISE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -2221,7 +3291,7 @@ pub(crate) fn terminal_outcome(
 /// wait. `requested` is what a `Stopped` the actor publishes itself reads as
 /// (`Killed` once a `Kill` was raised on it).
 async fn force_stop(
-    mut status_rx: watch::Receiver<StatusValue>,
+    mut status_rx: StatusRx,
     abort: Option<AbortHandle>,
     record: AbortRecord,
     kill_grace: Duration,
@@ -2251,12 +3321,15 @@ async fn force_stop(
 /// first abort recorded against the incarnation plus the settle time, held
 /// while an abort is owed to it and not issued yet (up to `cap` past the
 /// budget's deadline, plus the settle time of an abort issued inside the
-/// cap). The record is read again at each of its changes and
-/// once more when the floor read before is reached, so an abort that became
-/// owed in the meantime still holds the verdict. With no record and nothing
-/// owed, the verdict comes at the budget's deadline exactly.
+/// cap). The wait wakes when the status reaches `Stopped`, when an abort is
+/// recorded, and when the floor it last read is reached, and reads the record
+/// again at each wake, so an abort that became owed in the meantime still
+/// holds the verdict. A mark released while the wait sleeps is seen at the
+/// next of those wakes, so the verdict can come later than the floor that
+/// release implies, never earlier. With no record and nothing owed, the verdict comes
+/// at the budget's deadline exactly.
 pub(crate) async fn wait_end_or_floor(
-    status_rx: &mut watch::Receiver<StatusValue>,
+    status_rx: &mut StatusRx,
     record: Option<&AbortRecord>,
     budget: Duration,
     cap: Duration,
@@ -2273,23 +3346,24 @@ pub(crate) async fn wait_end_or_floor(
             owed,
         ))
     };
-    let mut changes = record.map(AbortRecord::subscribe);
     loop {
+        // Created before the record is read below (a `Notified` is woken by
+        // every `notify_waiters` after its creation), so a record
+        // written after that read wakes this pass.
+        let mut recorded = std::pin::pin!(record.map(AbortRecord::recorded));
+        if let Some(notified) = recorded.as_mut().as_pin_mut() {
+            notified.enable();
+        }
         let at = floor();
         let floor_passed = tokio::select! {
             biased;
             _ = status_rx.wait_for(|v| v.status == ActorStatus::Stopped) => return true,
-            changed = async {
-                match changes.as_mut() {
-                    Some(rx) => rx.changed().await,
+            () = async {
+                match recorded.as_mut().as_pin_mut() {
+                    Some(notified) => notified.await,
                     None => std::future::pending().await,
                 }
-            } => {
-                if changed.is_err() {
-                    changes = None;
-                }
-                false
-            }
+            } => false,
             () = tokio::time::sleep_until(at) => Instant::now() >= floor(),
         };
         if floor_passed {
@@ -2310,8 +3384,9 @@ pub(crate) async fn wait_end_or_floor(
 /// ended (then it does nothing), so the feed holds at most the entries armed
 /// within the longest `Shutdown` window plus kill grace, `stop_within`
 /// window, or shutdown timeout plus kill grace in use. An entry is a
-/// deadline and an abort handle, and for a two-stage entry a lane: a few
-/// words.
+/// deadline and an abort handle, and for a two-stage entry a lane; its abort
+/// handle keeps the task's cell allocated (the size of a run-loop future)
+/// until the entry ends, even when the task ended long before.
 pub(crate) type ReaperFeed = mpsc::UnboundedSender<ReaperEntry>;
 
 /// The live reaper of one runtime: its feed and the `AbortHandle` used to tell
@@ -2328,8 +3403,9 @@ struct ReaperSlot {
 /// An entry has one stage or two. The abort stage is the entry's `deadline`.
 /// A first stage, `kill_at`, raises `Kill` on a lane at its instant and
 /// leaves the abort stage in place: it is the orderly stop of a supervisor
-/// whose own supervisor ended, or a final sweep's deadline, which the abort
-/// follows once the target's kill grace has passed after that `Kill`. The
+/// whose own supervisor ended, a final sweep's deadline, or the steps still
+/// owed by a bounded stop whose stop task was lost, which the abort follows
+/// once the target's kill grace has passed after that `Kill`. The
 /// grace is the span between the two stages as built, and it is counted
 /// again from the moment the `Kill` stage actually fires: an entry whose
 /// stages were both already past when it was queued still gives its target
@@ -2354,6 +3430,9 @@ pub(crate) struct ReaperEntry {
     /// (nothing is owed to a task that already finished), written when the
     /// entry aborts the task.
     record: AbortRecord,
+    /// The step cell of the bounded stop whose ladder this entry carries on:
+    /// the first stage writes it in the step that raises the `Kill`.
+    step: Option<Arc<StopStep>>,
     fired: bool,
 }
 
@@ -2365,6 +3444,7 @@ impl ReaperEntry {
             deadline,
             abort,
             record,
+            step: None,
             fired: false,
         }
     }
@@ -2384,8 +3464,16 @@ impl ReaperEntry {
             deadline,
             abort,
             record,
+            step: None,
             fired: false,
         }
+    }
+
+    /// Makes the first stage take the step of a bounded stop: the cell is
+    /// written with the raise.
+    pub(crate) fn with_step(mut self, step: Arc<StopStep>) -> Self {
+        self.step = Some(step);
+        self
     }
 
     /// The instant the reaper acts on this entry next: the pending first
@@ -2405,7 +3493,14 @@ impl ReaperEntry {
     fn fire(mut self) -> Option<Self> {
         if !self.abort.is_finished() {
             if let Some((_, lane, grace)) = self.kill_at.take() {
-                lane.raise(StopReason::Kill);
+                // The entry holds the abort handle itself, so no deadline is
+                // owed to an attach: a duplicate arm by one is harmless.
+                match &self.step {
+                    Some(step) => {
+                        step.raise_kill(&lane, || {});
+                    }
+                    None => lane.raise(StopReason::Kill),
+                }
                 self.deadline = self
                     .deadline
                     .max(saturating_deadline(Instant::now(), grace));
@@ -2523,8 +3618,27 @@ async fn reaper_run(mut state: ReaperState) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod duplicate_id_registration_tests;
+
+#[cfg(test)]
+mod kill_raiser_tests;
+
+#[cfg(test)]
+mod observer_pairing_tests;
+
+#[cfg(test)]
+mod refused_raiser_tests;
+
+#[cfg(test)]
+mod shutdown_walk_tests;
+
+#[cfg(all(test, feature = "tracing"))]
+mod sweep_tick_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::StatusValue;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc;
 
@@ -2555,21 +3669,118 @@ mod tests {
     }
 
     fn dummy_handle(id: &ActorId, system_name: &str) -> ActorHandle<Dummy> {
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, _stop_rx) = StopLane::new();
         ActorHandle::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             system_name.into(),
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         )
+    }
+
+    // Both registry maps are built with the same shard count, whatever CPUs
+    // the process may use: a table growth then rehashes a small slice of the
+    // entries instead of a quarter or a sixteenth of them. The literal bound
+    // keeps the count itself from being lowered without this test noticing.
+    #[tokio::test]
+    async fn registry_maps_keep_the_shard_count_on_any_cpu_set() {
+        let sys = ActorSystem::create(format!("shards-{}", uuid::Uuid::new_v4())).unwrap();
+        for (map, shards) in [
+            ("by_name", sys.by_name.shards().len()),
+            ("by_id", sys.by_id.shards().len()),
+        ] {
+            assert_eq!(shards, REGISTRY_SHARDS, "{map} shard count");
+            assert!(shards >= 256, "{map} has only {shards} shards");
+        }
+        assert_eq!(registry_map::<u8, u8>().shards().len(), REGISTRY_SHARDS);
+    }
+
+    // The longest single insert while a map takes `keys` one by one, each
+    // timed alone; the map is dropped before the caller builds the next one.
+    fn longest_insert<V>(
+        map: DashMap<String, V>,
+        keys: &[String],
+        value: impl Fn() -> V,
+    ) -> Duration {
+        let mut longest = Duration::ZERO;
+        for key in keys {
+            let key = key.clone();
+            let started = std::time::Instant::now();
+            map.insert(key, value());
+            longest = longest.max(started.elapsed());
+        }
+        longest
+    }
+
+    // A table growth moves at most the entries of one shard, and the shards
+    // are the registry's: the map has the registry's shard count, and with
+    // half a million entries no shard holds more than twice its even share.
+    // Those two bound the entries one growth step moves under one shard's
+    // write lock, with no clock in the test. A map of 4 or 16 shards fails the
+    // count, and a hash that piles keys into few shards fails the largest
+    // shard.
+    #[test]
+    fn a_table_growth_at_half_a_million_entries_moves_a_bounded_slice_of_the_map() {
+        const ENTRIES: usize = 500_000;
+        let map = registry_map::<String, u8>();
+        let shards = map.shards().len();
+        assert_eq!(shards, REGISTRY_SHARDS, "the registry map's shard count");
+        assert!(shards >= 256, "the registry map has only {shards} shards");
+        for i in 0..ENTRIES {
+            map.insert(format!("actor-{i}"), 0);
+        }
+        let largest = map.shards().iter().map(|s| s.read().len()).max().unwrap();
+        let even_share = ENTRIES.div_ceil(shards);
+        assert!(
+            largest <= 2 * even_share,
+            "the largest of {shards} shards holds {largest} of {ENTRIES} entries, \
+             more than twice the even share of {even_share}"
+        );
+    }
+
+    // The stall is in the map, not in the actors: a map of the registry's
+    // shard count takes half a million entries with no insert waiting on the
+    // rehash of a large table, while a map of 4 shards (the count a process
+    // limited to one CPU gets by default) rehashes a quarter of its entries
+    // under one shard's write lock. 500,000 entries pass the 458,752 at which
+    // each of 4 shards doubles its largest table (4 * 114,688), so the
+    // baseline includes that rehash. The value is the size of a registry
+    // entry, so a rehash moves the bytes a real entry moves. A rehash stall
+    // shows in every repeat, a scheduling hiccup in one, so the registry map
+    // is filled again, up to six times, until the smallest longest insert of
+    // its repeats meets both bounds.
+    #[test]
+    #[ignore = "wall-time bound for a quiet CPU; the structure test covers the default run"]
+    fn a_table_growth_at_half_a_million_entries_never_stalls_an_insert() {
+        type Entry = [u8; std::mem::size_of::<AnyActorHandle>()];
+        const ENTRIES: usize = 500_000;
+        let keys: Vec<String> = (0..ENTRIES).map(|i| format!("actor-{i}")).collect();
+        let entry = || -> Entry { [0; std::mem::size_of::<AnyActorHandle>()] };
+        let four_shards = (0..2)
+            .map(|_| longest_insert(DashMap::with_capacity_and_shard_amount(0, 4), &keys, entry))
+            .min()
+            .unwrap();
+        let holds = |worst: Duration| worst * 8 <= four_shards && worst <= Duration::from_millis(5);
+        let mut shipped = longest_insert(registry_map(), &keys, entry);
+        let mut repeats = 1;
+        while repeats < 6 && !holds(shipped) {
+            shipped = shipped.min(longest_insert(registry_map(), &keys, entry));
+            repeats += 1;
+        }
+        assert!(
+            shipped * 8 <= four_shards,
+            "the registry map's worst insert {shipped:?} is not far below a 4-shard map's {four_shards:?}"
+        );
+        assert!(
+            shipped <= Duration::from_millis(5),
+            "the registry map's worst insert took {shipped:?}"
+        );
     }
 
     // A guard whose registration was replaced (its entry removed by another
@@ -2647,7 +3858,7 @@ mod tests {
             let err = sys
                 .register_actor::<Dummy>(
                     &id,
-                    Some("second-name"),
+                    Some(&Arc::from("second-name")),
                     &second,
                     is_root,
                     TurnClock::default(),
@@ -2866,11 +4077,7 @@ mod tests {
     }
 
     /// A task that never ends on its own, with a lane to raise on.
-    fn parked_with_a_lane() -> (
-        tokio::task::JoinHandle<()>,
-        StopLane,
-        watch::Receiver<crate::types::LaneState>,
-    ) {
+    fn parked_with_a_lane() -> (tokio::task::JoinHandle<()>, StopLane, crate::types::LaneRx) {
         let (lane, lane_rx) = StopLane::new();
         (tokio::spawn(std::future::pending::<()>()), lane, lane_rx)
     }
@@ -2946,14 +4153,10 @@ mod tests {
         child.abort();
     }
 
-    /// A plane that holds `status`, `reason` and the instant `final_at` (a
-    /// watch keeps its last value once its sender is gone).
-    fn plane(
-        status: ActorStatus,
-        reason: StopReason,
-        final_at: Option<Instant>,
-    ) -> watch::Receiver<StatusValue> {
-        watch::channel(StatusValue {
+    /// A plane that holds `status`, `reason` and the instant `final_at` (the
+    /// cell keeps its last value once its sender is gone).
+    fn plane(status: ActorStatus, reason: StopReason, final_at: Option<Instant>) -> StatusRx {
+        StatusTx::channel(StatusValue {
             status,
             reason: Some(reason),
             final_at,
@@ -2967,7 +4170,7 @@ mod tests {
         let stopped = plane(ActorStatus::Stopped, StopReason::Kill, None);
         assert_eq!(terminal_outcome(&stopped, Graceful), Graceful);
         assert_eq!(terminal_outcome(&stopped, Killed), Killed);
-        let (tx, closed) = watch::channel(StatusValue::new(ActorStatus::Stopping));
+        let (tx, closed) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
         drop(tx);
         assert_eq!(terminal_outcome(&closed, Graceful), Aborted);
         assert_eq!(terminal_outcome(&closed, Killed), Aborted);
@@ -3002,7 +4205,7 @@ mod tests {
         // A plane that closed without `Stopped`, its reason final before the
         // deadline (an abort guard's write): aborted, never read by its
         // instant.
-        let (tx, closed) = watch::channel(StatusValue::new(ActorStatus::Stopping));
+        let (tx, closed) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
         StatusValue::write_reason(&tx, StopReason::Kill, false);
         drop(tx);
         assert!(closed.borrow().final_at.is_some_and(|at| at < deadline));
@@ -3013,7 +4216,7 @@ mod tests {
     /// is lowered: it gives up at the new deadline, not at its own.
     #[tokio::test(start_paused = true)]
     async fn a_parked_wait_follows_a_system_deadline_lowered_while_it_waits() {
-        let (status_tx, mut rx) = watch::channel(StatusValue::new(ActorStatus::Stopping));
+        let (status_tx, mut rx) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
         let (system_tx, mut system) =
             watch::channel(Some(Instant::now() + Duration::from_secs(10)));
         let own = Instant::now() + Duration::from_secs(5);
@@ -3352,6 +4555,178 @@ mod tests {
         sys.set_turn_warning_threshold(None);
     }
 
+    /// A runtime without the time driver is never used for the sweep: a
+    /// threshold set while one is current starts nothing, and the next call on
+    /// a runtime with the driver starts it.
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn the_sweep_is_not_started_on_a_runtime_without_the_time_driver() {
+        let sys = ActorSystem::create(format!("sweep-bare-{}", uuid::Uuid::new_v4())).unwrap();
+
+        let bare = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        {
+            let _enter = bare.enter();
+            sys.set_turn_warning_threshold(Some(Duration::from_millis(50)));
+        }
+        assert!(
+            !sys.sweep_spawned.load(Ordering::Acquire),
+            "no sweep task is spawned on a runtime without the time driver"
+        );
+        assert_eq!(sys.live_helpers(), 0);
+
+        let timed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _enter = timed.enter();
+            sys.set_turn_warning_threshold(Some(Duration::from_millis(50)));
+        }
+        assert!(
+            sys.sweep_spawned.load(Ordering::Acquire),
+            "the next call on a runtime with the driver starts the sweep"
+        );
+        assert_eq!(sys.live_helpers(), 1);
+
+        drop(timed);
+        assert_eq!(sys.live_helpers(), 0);
+        sys.set_turn_warning_threshold(None);
+    }
+
+    /// A system asks a runtime without the time driver once, and remembers a
+    /// bounded number of such runtimes.
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn a_system_probes_a_runtime_without_the_driver_once_and_remembers_a_bounded_number() {
+        let _serial = crate::time_probe::serial_table();
+        let sys = ActorSystem::create(format!("sweep-memo-{}", uuid::Uuid::new_v4())).unwrap();
+        let bare = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for _ in 0..5 {
+            sys.ensure_sweep_spawned_with(bare.handle());
+        }
+        assert_eq!(crate::time_probe::probes_run(bare.handle()), 1);
+        let other = ActorSystem::create(format!("sweep-memo-b-{}", uuid::Uuid::new_v4())).unwrap();
+        other.ensure_sweep_spawned_with(bare.handle());
+        assert_eq!(
+            crate::time_probe::probes_run(bare.handle()),
+            1,
+            "the answer is kept for the process, not for one system"
+        );
+        let many: Vec<_> = (0..TIMERLESS_MEMO_LIMIT + 6)
+            .map(|_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        for rt in &many {
+            sys.ensure_sweep_spawned_with(rt.handle());
+        }
+        assert!(sys.timerless_runtimes.lock().unwrap().len() <= TIMERLESS_MEMO_LIMIT);
+        assert!(!sys.sweep_spawned.load(Ordering::Acquire));
+    }
+
+    /// The decision on a call's first request: the caller decides once, a
+    /// task lost before the decision owes nothing and tells the caller, a
+    /// task lost after an acceptance owes its steps.
+    #[test]
+    fn the_decision_on_a_first_request_settles_once() {
+        let step = StopStep::default();
+        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Nothing);
+        assert!(
+            step.decide_accepted(),
+            "the task was lost before the decision"
+        );
+        step.decide_refused();
+        assert!(!step.refused(), "a decided request stays decided");
+
+        let step = StopStep::default();
+        assert!(!step.decide_accepted());
+        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Steps);
+        assert!(!step.decide_accepted(), "decided once");
+
+        let step = StopStep::default();
+        step.decide_refused();
+        assert!(step.refused());
+        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Nothing);
+        assert!(!step.decide_accepted(), "a refusal is not undone");
+        assert!(StopStep::accepted().lose_before_the_last_wait() == LossOwes::Steps);
+    }
+
+    /// The declared `Kill` deadline is one `u64` on a registry entry: a named
+    /// actor has two entries (by id and by name), so it costs 16 bytes, an
+    /// anonymous one 8. The entry is exactly the size its fields need, the
+    /// deadline included, rounded up to the 8-byte alignment; a second word,
+    /// a wider deadline or a stray word of padding fails here.
+    #[test]
+    fn a_registry_entry_costs_at_most_eight_bytes_for_its_kill_deadline() {
+        use std::mem::size_of;
+        let without_deadline = size_of::<TypeId>()
+            + size_of::<Box<dyn Any + Send + Sync>>()
+            + size_of::<StopLane>()
+            + size_of::<StatusRx>()
+            + size_of::<crate::types::TurnClock>()
+            + size_of::<Option<AbortHandle>>()
+            + size_of::<bool>()
+            + size_of::<u64>()
+            + size_of::<Duration>()
+            + size_of::<Handle>();
+        assert_eq!(std::mem::align_of::<AnyActorHandle>(), 8);
+        let exact = (without_deadline + size_of::<u64>()).div_ceil(8) * 8;
+        assert_eq!(
+            size_of::<AnyActorHandle>(),
+            exact,
+            "an entry is {} bytes; its fields and the one deadline word need {exact}",
+            size_of::<AnyActorHandle>()
+        );
+    }
+
+    /// The deadline of a `Kill` declared before its raise: the earliest wins,
+    /// whichever is declared first, and a declaration on another incarnation
+    /// of the id is ignored.
+    #[tokio::test]
+    async fn the_earliest_declared_kill_deadline_is_kept_on_the_entry_of_its_incarnation() {
+        let sys = ActorSystem::create(format!("declare-{}", uuid::Uuid::new_v4())).unwrap();
+        let id = ActorId::from("declare-id");
+        let handle = dummy_handle(&id, sys.name());
+        let seq = sys
+            .register_actor::<Dummy>(
+                &id,
+                None,
+                &handle,
+                true,
+                crate::types::TurnClock::default(),
+                Duration::from_secs(2),
+                Handle::current(),
+            )
+            .unwrap();
+        let due = |sys: &ActorSystem| sys.declared_kill_due(&id, None, seq);
+        assert_eq!(due(&sys), 0, "nothing declared");
+        sys.declare_kill(&id, &handle.status_rx(), Some(Duration::from_secs(10)));
+        let long = due(&sys);
+        assert_ne!(long, 0);
+        sys.declare_kill(&id, &handle.status_rx(), None);
+        let grace = due(&sys);
+        assert!(grace < long, "the grace is earlier than the window");
+        sys.declare_kill(&id, &handle.status_rx(), Some(Duration::from_secs(10)));
+        assert_eq!(
+            due(&sys),
+            grace,
+            "a later, longer declaration keeps the earliest"
+        );
+        let other = dummy_handle(&id, sys.name());
+        sys.declare_kill(&id, &other.status_rx(), Some(Duration::ZERO));
+        assert_eq!(
+            due(&sys),
+            grace,
+            "another incarnation's plane declares nothing"
+        );
+    }
+
     // - Reaper survives a runtime change --------------------------------------
 
     /// Mirrors the sweep-latch test's shape: two hand-built multi-thread
@@ -3618,25 +4993,23 @@ mod tests {
         let sys = ActorSystem::create(format!("pre-attach-hook-{}", uuid::Uuid::new_v4())).unwrap();
         let name = format!("hook-target-{}", uuid::Uuid::new_v4());
         let id = ActorId::from(name.clone());
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
         let handle = ActorHandle::<Dummy>::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             sys.name().into(),
             None,
-            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
         );
         let seq = sys
             .register_actor::<Dummy>(
                 &id,
-                Some(&name),
+                Some(&Arc::from(name.as_str())),
                 &handle,
                 true,
                 TurnClock::default(),
@@ -3672,20 +5045,18 @@ mod tests {
         grace: Duration,
     ) -> tokio::task::JoinHandle<()> {
         let id = ActorId::from(format!("sweep-{n}"));
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
         let handle = ActorHandle::<Dummy>::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             sys.name().into(),
             None,
-            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
         );
         let seq = sys
             .register_actor::<Dummy>(
@@ -3728,11 +5099,16 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // The observation counts only if the grace had not passed on the
+        // test's own clock by the time it was made, so the clock is read after
+        // it.
         let aborted_early = tasks.iter().filter(|task| task.is_finished()).count();
-        assert_eq!(
-            aborted_early, 0,
-            "{aborted_early} of 1200 targets were aborted before their {grace:?} grace"
-        );
+        if started.elapsed() < grace {
+            assert_eq!(
+                aborted_early, 0,
+                "{aborted_early} of 1200 targets were aborted before their {grace:?} grace"
+            );
+        }
         for task in tasks {
             let ended = tokio::time::timeout(grace + ABORT_SETTLE + Duration::from_secs(3), task)
                 .await
@@ -3841,25 +5217,24 @@ mod tests {
         name: Option<&str>,
         grace: Duration,
     ) -> (u64, tokio::task::JoinHandle<()>) {
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let shared: Option<Arc<str>> = name.map(Arc::from);
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
         let handle = ActorHandle::<Dummy>::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             sys.name().into(),
             None,
-            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
         );
         let seq = sys
             .register_actor::<Dummy>(
                 id,
-                name,
+                shared.as_ref(),
                 &handle,
                 true,
                 TurnClock::default(),
@@ -3867,7 +5242,7 @@ mod tests {
                 Handle::current(),
             )
             .unwrap();
-        let guard = RegistryGuard::new(sys.clone(), id.clone(), name.map(str::to_string), seq);
+        let guard = RegistryGuard::new(sys.clone(), id.clone(), shared, seq);
         let task = tokio::spawn(async move {
             let _owned = (status_tx, stop_rx, guard);
             std::future::pending::<()>().await;
@@ -3917,21 +5292,36 @@ mod tests {
             KillSite::ById => {
                 let _ = tokio::time::timeout(Duration::ZERO, sys.kill_by_id(&id)).await;
             }
-            KillSite::ShutdownKillStep => {
-                let policy = ShutdownPolicy {
-                    timeout: Duration::from_secs(30),
-                    per_actor_timeout: Duration::from_millis(10),
+            KillSite::ShutdownKillStep | KillSite::ForceSweep => {
+                let policy = match site {
+                    KillSite::ShutdownKillStep => ShutdownPolicy {
+                        timeout: Duration::from_secs(30),
+                        per_actor_timeout: Duration::from_millis(10),
+                    },
+                    _ => ShutdownPolicy {
+                        timeout: Duration::from_millis(10),
+                        per_actor_timeout: Duration::from_secs(5),
+                    },
                 };
-                let _ = tokio::time::timeout(Duration::from_millis(60), sys.shutdown_with(policy))
-                    .await;
-            }
-            KillSite::ForceSweep => {
-                let policy = ShutdownPolicy {
-                    timeout: Duration::from_millis(10),
-                    per_actor_timeout: Duration::from_secs(5),
+                // The shutdown is driven until the hook has put the successor
+                // in place, however long the host takes to get there. The
+                // arm decision follows the hook inside the same poll, so the
+                // next look at the slot sees a decided arm.
+                let mut shutdown = Box::pin(sys.shutdown_with(policy));
+                let replaced = async {
+                    while successor.lock().unwrap().is_none() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                 };
-                let _ = tokio::time::timeout(Duration::from_millis(60), sys.shutdown_with(policy))
-                    .await;
+                let driven = async {
+                    tokio::select! {
+                        _ = &mut shutdown => {}
+                        _ = replaced => {}
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(20), driven)
+                    .await
+                    .expect("the shutdown reached its Kill");
             }
         }
         let successor = successor
@@ -4005,7 +5395,7 @@ mod tests {
             let sys = sys.clone();
             tokio::spawn(async move {
                 sys.shutdown_with(ShutdownPolicy {
-                    timeout: Duration::from_millis(400),
+                    timeout: Duration::from_millis(2400),
                     per_actor_timeout: Duration::from_secs(5),
                 })
                 .await
@@ -4056,26 +5446,24 @@ mod tests {
     async fn attach_abort_arms_the_backstop_when_the_lane_already_holds_a_kill() {
         let sys = ActorSystem::create(format!("pre-attach-{}", uuid::Uuid::new_v4())).unwrap();
         let id = ActorId::from("pre-attach-id");
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, _stop_rx) = StopLane::new();
         let handle = ActorHandle::<Dummy>::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane.clone(),
             1,
             status_rx,
             sys.name().into(),
             None,
-            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
         );
         let grace = Duration::from_millis(100);
         let seq = sys
             .register_actor::<Dummy>(
                 &id,
-                Some("pre-attach-name"),
+                Some(&Arc::from("pre-attach-name")),
                 &handle,
                 true,
                 TurnClock::default(),
@@ -4103,25 +5491,23 @@ mod tests {
         let id = ActorId::from("stale-attach-id");
         let name = "stale-attach-name";
         let register = |sys: &Arc<ActorSystem>| {
-            let (tx, _rx) = mpsc::channel(1);
-            let (system_tx, _system_rx) = mpsc::channel(1);
-            let (_status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+            let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let (stop_lane, _stop_rx) = StopLane::new();
             let handle = ActorHandle::<Dummy>::new(
                 id.clone(),
                 tx,
-                system_tx,
                 stop_lane.clone(),
                 1,
                 status_rx,
                 sys.name().into(),
                 None,
-                Arc::new(AtomicBool::new(false)),
+                Some(Arc::new(AtomicBool::new(false))),
             );
             let seq = sys
                 .register_actor::<Dummy>(
                     &id,
-                    Some(name),
+                    Some(&Arc::from(name)),
                     &handle,
                     true,
                     TurnClock::default(),
@@ -4169,6 +5555,129 @@ mod tests {
             "the stale attach armed no backstop"
         );
         new_task.abort();
+        old_task.abort();
+    }
+
+    /// Every lookup that is exact to one incarnation ignores a later
+    /// incarnation registered under the same id: nothing is raised on it,
+    /// nothing of it is armed or aborted, and no target of it is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_exact_lookup_ignores_a_later_incarnation_of_the_same_id() {
+        let sys = scripted_system("exact-lookups");
+        let id = ActorId::from("exact-lookups");
+        let old = Scripted::register(&sys, &id, LONG_GRACE);
+        let old_rx = old.handle.status_rx();
+        let new = old.replace(&sys, LONG_GRACE);
+        let new_rx = new.handle.status_rx();
+        assert!(!old_rx.same_channel(&new_rx));
+
+        assert!(sys.kill_target_for(&id, &old_rx).is_none());
+        sys.send_stop(&id, &old_rx, StopReason::Graceful);
+        assert!(
+            new.lane.reason().is_none(),
+            "send_stop raised on the later one"
+        );
+        assert!(!sys.raise_kill(&id, &old_rx));
+        assert!(
+            new.lane.reason().is_none(),
+            "raise_kill raised on the later one"
+        );
+        sys.abort_by_id(&id, &old_rx);
+        tokio::task::yield_now().await;
+        assert!(!new.task_ended(), "abort_by_id aborted the later one");
+        assert_eq!(sys.backstop_arms.load(Ordering::SeqCst), 0);
+
+        // The same calls with the later incarnation's own plane reach it.
+        assert!(sys.kill_target_for(&id, &new_rx).is_some());
+        sys.send_stop(&id, &new_rx, StopReason::Graceful);
+        assert!(matches!(new.lane.reason(), Some(StopReason::Graceful)));
+        assert!(sys.raise_kill(&id, &new_rx));
+        assert!(matches!(new.lane.reason(), Some(StopReason::Kill)));
+        sys.abort_by_id(&id, &new_rx);
+        let task = new.task();
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the later incarnation's own abort ends its task");
+        assert!(ended.unwrap_err().is_cancelled());
+        old.publish_stopped();
+        new.publish_stopped();
+        old.task().abort();
+    }
+
+    /// A `kill` by name raises on the incarnation it looked up; when that
+    /// one is replaced under the same name before the raise lands, nothing is
+    /// armed on the later one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_by_name_arms_nothing_on_a_later_registration_of_the_name() {
+        let sys = scripted_system("kill-name");
+        let id = ActorId::from("kill-name-id");
+        let name = "kill-name-name";
+        let register = {
+            let id = id.clone();
+            move |sys: &Arc<ActorSystem>| {
+                let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+                let (_status_tx, status_rx) =
+                    StatusTx::channel(StatusValue::new(ActorStatus::Running));
+                let (stop_lane, stop_rx) = StopLane::new();
+                let handle = ActorHandle::<Dummy>::new(
+                    id.clone(),
+                    tx,
+                    stop_lane,
+                    1,
+                    status_rx,
+                    sys.name().into(),
+                    None,
+                    Some(Arc::new(AtomicBool::new(false))),
+                );
+                let seq = sys
+                    .register_actor::<Dummy>(
+                        &id,
+                        Some(&Arc::from(name)),
+                        &handle,
+                        true,
+                        TurnClock::default(),
+                        LONG_GRACE,
+                        Handle::current(),
+                    )
+                    .unwrap();
+                let task = tokio::spawn(async move {
+                    let _owned = stop_rx;
+                    std::future::pending::<()>().await;
+                });
+                sys.attach_abort(&id, Some(name), task.abort_handle(), seq);
+                (seq, task)
+            }
+        };
+        let (old_seq, old_task) = register(&sys);
+        let later = Arc::new(Mutex::new(None));
+        {
+            let (hook_sys, hook_id, later) = (sys.clone(), id.clone(), later.clone());
+            *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || {
+                hook_sys.unregister_by_id(&hook_id, old_seq);
+                hook_sys.unregister_by_name(name, old_seq);
+                *later.lock().unwrap() = Some(register(&hook_sys));
+            }));
+        }
+        sys.kill(name)
+            .await
+            .expect("the kill raised on the incarnation it found");
+        assert!(
+            sys.after_kill_lookup.lock().unwrap().is_none(),
+            "the kill reached its lookup"
+        );
+        assert_eq!(
+            sys.backstop_arms.load(Ordering::SeqCst),
+            0,
+            "nothing was armed through the later registration"
+        );
+        let (_, later_task) = later
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the later one registered");
+        tokio::task::yield_now().await;
+        assert!(!later_task.is_finished());
+        later_task.abort();
         old_task.abort();
     }
 
@@ -4318,8 +5827,9 @@ mod tests {
         rx
     }
 
+    /// Polls until `ready` holds. The bound only limits how long a real hang takes to report.
     async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-        for _ in 0..1000 {
+        for _ in 0..12_000 {
             if ready() {
                 return;
             }
@@ -4521,7 +6031,7 @@ mod tests {
         handle: ActorHandle<Dummy>,
         lane: StopLane,
         guard: Mutex<Option<RegistryGuard>>,
-        status_tx: Mutex<Option<watch::Sender<StatusValue>>>,
+        status_tx: Mutex<Option<StatusTx>>,
         task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
@@ -4541,20 +6051,18 @@ mod tests {
             grace: Duration,
             is_root: bool,
         ) -> Arc<Scripted> {
-            let (tx, _rx) = mpsc::channel(1);
-            let (system_tx, _system_rx) = mpsc::channel(1);
-            let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let (stop_lane, stop_rx) = StopLane::new();
             let handle = ActorHandle::<Dummy>::new(
                 id.clone(),
                 tx,
-                system_tx,
                 stop_lane.clone(),
                 1,
                 status_rx,
                 sys.name().into(),
                 None,
-                Arc::new(AtomicBool::new(false)),
+                Some(Arc::new(AtomicBool::new(false))),
             );
             let phase = sys
                 .phase
@@ -5103,10 +6611,11 @@ mod tests {
         root.task().abort();
     }
 
-    /// `stop_within(Graceful)` outlives its window; before it raises its own
-    /// `Kill`, the actor leaves the registry, seals its lane and publishes
-    /// `Stopped`. The lane refuses the `Kill`, nothing is armed, and the call
-    /// reports `Graceful`, the outcome the actor reached by itself.
+    /// `stop_within(Graceful)` outlives its window; before the system's stop
+    /// task raises its `Kill`, the actor leaves the registry, seals its lane
+    /// and publishes `Stopped`. The lane refuses the `Kill`, nothing is armed,
+    /// and the call reports `Graceful`, the outcome the actor reached by
+    /// itself.
     async fn stop_within_reports_its_kill_only_when_the_lane_took_it() {
         let sys = scripted_system("stop-within-refused");
         let root = Scripted::register(&sys, &ActorId::from("stop-within-refused"), LONG_GRACE);
@@ -5142,6 +6651,17 @@ mod tests {
             "nothing was armed"
         );
         assert_eq!(outcome, StopOutcome::Graceful);
+        let rt = tokio::runtime::Handle::current();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !sys
+                .helper_ends(&rt)
+                .contains(&(HelperKind::StopLadder, crate::helper::HelperEnd::Finished))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Kill step ran in a stop task of the system, which ended");
         root.task().abort();
     }
 
@@ -5288,6 +6808,30 @@ mod tests {
                 root.task().abort();
             }
         }
+    }
+
+    /// A registered root whose lane does not take a `Kill`: `kill_by_id`
+    /// answers `None` on a calling runtime without the time driver, with no
+    /// timer needed, and arms nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_by_id_answers_none_for_a_target_that_takes_no_kill_on_a_runtime_without_timers() {
+        let sys = scripted_system("refused-driverless");
+        let root = Scripted::register(&sys, &ActorId::from("refused-driverless"), LONG_GRACE);
+        let _ = root.lane.seal();
+        let (caller_system, id) = (sys.clone(), root.id.clone());
+        let answer = tokio::task::spawn_blocking(move || {
+            let bare = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            bare.block_on(async move { caller_system.kill_by_id(&id).await })
+        })
+        .await
+        .unwrap();
+        assert!(answer.is_none());
+        assert_eq!(sys.backstop_arms.load(Ordering::SeqCst), 0);
+        root.leave();
+        root.publish_stopped();
+        root.task().abort();
     }
 
     // - Late roots ------------------------------------------------------------
@@ -5526,20 +7070,18 @@ mod tests {
         id: &ActorId,
         rt: &Handle,
     ) -> Result<(), SpawnError> {
-        let (tx, _rx) = mpsc::channel(1);
-        let (system_tx, _system_rx) = mpsc::channel(1);
-        let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, mut stop_rx) = StopLane::new();
         let handle = ActorHandle::<Dummy>::new(
             id.clone(),
             tx,
-            system_tx,
             stop_lane,
             1,
             status_rx,
             sys.name().into(),
             None,
-            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
         );
         let seq = sys.register_actor::<Dummy>(
             id,
@@ -5812,7 +7354,7 @@ mod tests {
     async fn a_lowering_at_the_instant_of_an_end_lands_after_it() {
         let sys = scripted_system("lowering-tie");
         let first = sys.fold_sweep_deadline(Instant::now() + Duration::from_secs(10));
-        let (tx, rx) = watch::channel(StatusValue::new(ActorStatus::Stopping));
+        let (tx, rx) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
         assert!(StatusValue::write_reason(&tx, StopReason::Graceful, true));
         let before = leftover_outcome(&rx, false, sys.current_sweep_deadline(first));
         let lowered = sys.fold_sweep_deadline(Instant::now());
@@ -6021,6 +7563,89 @@ mod tests {
         a_sweep_target_that_refuses_the_kill_keeps_its_own_outcome =>
             a_sweep_target_that_refuses_the_kill_keeps_its_own_outcome_multi_thread,
             a_sweep_target_that_refuses_the_kill_keeps_its_own_outcome_current_thread;
+    }
+
+    // - The shutdown count and the phase it leaves behind --------------------
+
+    fn phase_of(sys: &ActorSystem) -> SystemPhase {
+        SystemPhase::from_u8(sys.phase.load(Ordering::Acquire))
+    }
+
+    fn ends(guard: ShutdownInFlight<Arc<ActorSystem>>, completed: bool) {
+        let mut guard = guard;
+        guard.completed = completed;
+        drop(guard);
+    }
+
+    /// A shutdown that completes while a cut-short one is still in flight
+    /// leaves the move to `Defunct` to whichever ends last.
+    #[test]
+    fn a_completed_shutdown_that_ends_first_leaves_defunct_when_the_cut_short_one_ends() {
+        let sys = scripted_system("episode-completed-first");
+        let completed = ShutdownInFlight::enter(sys.clone());
+        let cut_short = ShutdownInFlight::enter(sys.clone());
+        ends(completed, true);
+        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
+        assert!(!sys.reactivate(), "a shutdown is still in flight");
+        ends(cut_short, false);
+        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
+        assert!(sys.reactivate());
+    }
+
+    /// The same two shutdowns ending in the other order.
+    #[test]
+    fn a_cut_short_shutdown_that_ends_first_leaves_defunct_when_the_completed_one_ends() {
+        let sys = scripted_system("episode-cut-short-first");
+        let completed = ShutdownInFlight::enter(sys.clone());
+        let cut_short = ShutdownInFlight::enter(sys.clone());
+        ends(cut_short, false);
+        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
+        ends(completed, true);
+        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
+        assert!(sys.reactivate());
+    }
+
+    /// Shutdowns that are all cut short leave the system shutting down.
+    #[test]
+    fn shutdowns_that_are_all_cut_short_leave_the_system_shutting_down() {
+        let sys = scripted_system("episode-all-cut-short");
+        let first = ShutdownInFlight::enter(sys.clone());
+        let second = ShutdownInFlight::enter(sys.clone());
+        ends(first, false);
+        ends(second, false);
+        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
+        assert!(!sys.reactivate());
+    }
+
+    /// A reactivation starts the record over: a later shutdown that is cut
+    /// short leaves the system shutting down.
+    #[test]
+    fn a_completed_shutdown_does_not_carry_over_a_reactivation() {
+        let sys = scripted_system("episode-reactivated");
+        ends(ShutdownInFlight::enter(sys.clone()), true);
+        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
+        assert!(sys.reactivate());
+        ends(ShutdownInFlight::enter(sys.clone()), false);
+        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
+        assert!(!sys.reactivate());
+        // A shutdown that completes then still gets the system to `Defunct`.
+        ends(ShutdownInFlight::enter(sys.clone()), true);
+        assert!(sys.reactivate());
+    }
+
+    /// Without a reactivation in between, a second shutdown that is cut short
+    /// leaves the system `Defunct`: a shutdown has completed since it was
+    /// last `Active`, and registrations were refused throughout.
+    #[test]
+    fn a_cut_short_shutdown_after_a_completed_one_leaves_defunct() {
+        let sys = scripted_system("episode-redundant");
+        ends(ShutdownInFlight::enter(sys.clone()), true);
+        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
+        let redundant = ShutdownInFlight::enter(sys.clone());
+        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
+        ends(redundant, false);
+        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
+        assert!(sys.reactivate());
     }
 
     // - A kill never arms the incarnation a supervisor restarted under its id -
@@ -6232,14 +7857,14 @@ mod tests {
     ) -> (
         ActorHandle<Parked>,
         tokio::task::JoinHandle<crate::types::StopReason>,
-        watch::Sender<StatusValue>,
+        StatusTx,
     ) {
         let name = format!("parked-{}", uuid::Uuid::new_v4());
         let (handle, join, status_tx, _subtree) = crate::actor::runtime::spawn_actor_parts(
             ActorId::from(name.clone()),
             Parked,
             crate::actor::runtime::ActorConfig::default(),
-            Some(name),
+            Some(Arc::from(name)),
             Some(sys.clone()),
             None,
             true,
@@ -6327,7 +7952,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn force_stop_reads_the_plane_after_its_abort() {
         for published in [true, false] {
-            let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let target = tokio::spawn(std::future::pending::<crate::types::StopReason>());
             let abort = target.abort_handle();
             let call = tokio::spawn(force_stop(
@@ -6374,7 +7999,7 @@ mod tests {
         /// ends its task. With `stuck`, its plane stays open past its task.
         async fn force_leftover(late: Duration, stuck: bool) -> (StopReport, Instant, Instant) {
             let (lane, _lane_rx) = StopLane::new();
-            let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let plane = stuck.then(|| status_tx.clone());
             let task = tokio::spawn(async move {
                 let _status = status_tx;
@@ -6426,7 +8051,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_forces_own_abort_is_recorded() {
             let (lane, _lane_rx) = StopLane::new();
-            let (status_tx, status_rx) = watch::channel(StatusValue::new(ActorStatus::Running));
+            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
             let task = tokio::spawn(async move {
                 let _status = status_tx.clone();
                 std::future::pending::<()>().await;
@@ -6458,11 +8083,13 @@ mod tests {
     }
 
     /// A mark never outlives its task. A hold of the actor can: a forwarder
-    /// still ending holds it past the task's end. Every path that finds the
-    /// task already finished releases the mark instead of skipping it, and
-    /// the release counts as the subtree's latest abort, so a wait on the
-    /// subtree gives its verdict after the settle time, never at the cap. An
-    /// entry built over a task that already finished takes no mark at all.
+    /// still ending holds it past the task's end. Each of these releases the
+    /// mark instead of skipping it when it sees the task finished: an abort
+    /// that finds it so, the join arm of a ladder, an observer of a lost
+    /// runner, the reaper's entry, and the drop of the hold. The release
+    /// counts as the subtree's latest abort, so a wait on the subtree gives
+    /// its verdict after the settle time, never at the cap. An entry built over a task that already
+    /// finished takes no mark at all.
     mod finished_task {
         use super::*;
         use crate::actor::subtree::SubtreeLink;
@@ -6651,12 +8278,11 @@ mod tests {
         }
 
         /// `stop_within(Kill, within)` on an actor that never reaches a turn
-        /// boundary aborts it once `within` has passed: the record holds
-        /// that instant.
+        /// boundary has it aborted, by the backstop the system armed at the
+        /// raise, once `within` has passed: the record holds that instant.
         #[tokio::test(start_paused = true)]
         async fn a_stop_withins_abort_is_recorded_on_the_actors_lane() {
             let sys = scripted_system("abort-stop-within");
-            let _entries = counting_reaper(&sys);
             let root = Scripted::register(&sys, &ActorId::from("parked"), GRACE);
             let within = Duration::from_millis(300);
             let started = Instant::now();
@@ -6702,8 +8328,9 @@ mod tests {
             }
         }
 
-        /// A root spawn's start timeout aborts the initialization: the
-        /// record holds the instant the timeout ran out.
+        /// A root spawn's start timeout cuts the initialization: the lane
+        /// holds a `Kill`, and the record holds the instant the timeout ran
+        /// out.
         #[tokio::test(start_paused = true)]
         async fn a_root_start_timeouts_abort_is_recorded_on_the_actors_lane() {
             let sys = scripted_system("abort-start-timeout");
@@ -6723,7 +8350,83 @@ mod tests {
                 Ok(_) => panic!("expected StartTimeout, the spawn succeeded"),
             }
             let lane = lane_rx.await.expect("pre_start ran");
+            assert_eq!(lane.reason(), Some(StopReason::Kill));
             assert_eq!(lane.abort_record().view(), (Some(started + timeout), false));
+        }
+    }
+
+    /// The helper task that walks a shutdown.
+    mod walk_helper {
+        use super::*;
+        use crate::actor::ActorExt;
+
+        fn walk_ends(sys: &ActorSystem) -> Vec<crate::helper::HelperEnd> {
+            sys.helper_ends(&Handle::current())
+                .into_iter()
+                .filter(|(kind, _)| *kind == HelperKind::ShutdownWalk)
+                .map(|(_, end)| end)
+                .collect()
+        }
+
+        /// Waits until `count` walk ends are recorded. The bound only limits how long a real hang takes to report.
+        async fn until_walk_ends(sys: &ActorSystem, count: usize) {
+            let waited = tokio::time::timeout(Duration::from_secs(60), async {
+                while walk_ends(sys).len() < count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(waited.is_ok(), "the walk helper's end is recorded");
+        }
+
+        /// A walk that runs to its end is recorded once, as finished, and
+        /// leaves the system defunct.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_finished_walk_is_recorded_once() {
+            let sys = scripted_system("walk-finishes");
+            let root = Dummy
+                .spawn()
+                .named("walk-finishes-root")
+                .on_system(&sys)
+                .await
+                .unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(10), sys.shutdown())
+                .await
+                .expect("the shutdown returns");
+            assert_eq!(outcome_of(&report, root.id()), StopOutcome::Graceful);
+            until_walk_ends(&sys, 1).await;
+            assert_eq!(walk_ends(&sys), vec![crate::helper::HelperEnd::Finished]);
+            assert!(sys.reactivate());
+        }
+
+        /// A walk whose poll panics ends without a report: the helper is
+        /// contained and recorded as a panic, and the caller walks the system
+        /// itself and returns that report.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_walk_that_panics_is_walked_again_by_the_caller() {
+            let sys = scripted_system("walk-panics");
+            let root = Dummy
+                .spawn()
+                .named("walk-panics-root")
+                .on_system(&sys)
+                .await
+                .unwrap();
+            let armed = Arc::new(AtomicBool::new(true));
+            let hook_armed = armed.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::Stop && hook_armed.swap(false, Ordering::SeqCst) {
+                    panic!("walk panics once");
+                }
+            });
+            let report = shut_down(&sys, Duration::from_secs(5), Duration::from_secs(1)).await;
+            assert!(
+                !armed.load(Ordering::SeqCst),
+                "the first walk reached the panic"
+            );
+            assert_eq!(outcome_of(&report, root.id()), StopOutcome::Graceful);
+            until_walk_ends(&sys, 1).await;
+            assert_eq!(walk_ends(&sys), vec![crate::helper::HelperEnd::Panicked]);
+            assert!(sys.reactivate());
         }
     }
 }

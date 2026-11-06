@@ -1,0 +1,1268 @@
+//! Which children leave a spec behind when they stop, and what a same-name
+//! `spawn_child` and `delete_child` answer while a spec is held.
+//!
+//! A supervisor refuses a `spawn_child` under a name whose spec it holds,
+//! whatever the child is doing: it runs, it died and its death is not handled
+//! yet, it is being stopped, it is being restarted, or it is down with its
+//! spec kept until `delete_child` removes it. A `Temporary` child, and any
+//! child of a `SimpleOneForOne` supervisor, leaves no spec once its end is
+//! classified, so its name is free at once and `delete_child` has nothing to
+//! remove.
+//!
+//! Every scenario runs its calls inside one handler of the supervisor, the
+//! only place where they meet the states between two turns of its message
+//! loop: while the handler runs, the loop handles no death and adopts no
+//! restart.
+
+mod common;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::time::{sleep, timeout, Instant};
+use tokio_actors::{
+    actor::{context::ActorContext, Actor, ActorExt},
+    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType,
+    Shutdown, SpawnError, StopReason, SupervisionAction, SupervisionConfig, SupervisionError,
+};
+
+// ---------------------------------------------------------------------------
+// Timing and names
+// ---------------------------------------------------------------------------
+
+/// The longest a wait for an outcome may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const BOUND: Duration = Duration::from_secs(20);
+
+/// The longest a turn or an init held on a gate holds its thread when the
+/// test never opens the gate.
+const GATE_CAP: Duration = Duration::from_secs(30);
+
+/// The kill grace of a leaf whose turn the tests hold: far past the turn, so
+/// only the leaf's own end frees its name.
+const LEAF_GRACE: Duration = Duration::from_millis(1500);
+
+/// The turn a leaf holds in the case of a killed supervisor child: long
+/// enough that a `terminate_child` that returns before the leaf ended is seen
+/// on a host that stalls its threads.
+const LEAF_TURN: Duration = Duration::from_millis(400);
+
+static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+fn uname(base: &str) -> String {
+    format!("kept-spec-{base}-{}", UNIQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Awaits `fut` for at most [`BOUND`].
+async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    match timeout(BOUND, fut).await {
+        Ok(value) => value,
+        Err(_) => panic!("timed out after {BOUND:?} waiting for: {what}"),
+    }
+}
+
+/// Polls `pred` every 5 ms until it holds, for at most [`BOUND`].
+async fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
+    let deadline = Instant::now() + BOUND;
+    loop {
+        if pred() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {BOUND:?} waiting for: {what}"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The child under test
+// ---------------------------------------------------------------------------
+
+/// What a test tells a child to do and what it observes of it, across the
+/// child's restarts.
+#[derive(Default)]
+struct Knobs {
+    /// Calls of the child's factory.
+    builds: AtomicUsize,
+    /// Incarnations that began `on_started`.
+    starts: AtomicUsize,
+    /// While set, `on_started` waits.
+    hold_start: AtomicBool,
+    /// While set, `pre_stop` refuses a stop.
+    veto_stop: AtomicBool,
+    /// Set: the next `on_stopped` fails, once.
+    fail_stop: AtomicBool,
+    /// Set when the held turn began.
+    stuck_entered: AtomicBool,
+    /// Set by the test to end the held turn.
+    stuck_open: AtomicBool,
+    /// Set when the held turn ended.
+    stuck_returned: AtomicBool,
+    /// While set, the supervisor's held turn waits.
+    hold_turn: AtomicBool,
+    /// Set when the supervisor's held turn began.
+    turn_entered: AtomicBool,
+}
+
+/// Ends the holds a test put on a child or on the supervisor when it goes out
+/// of scope, so a failed assertion cannot leave a turn or an init waiting.
+struct Release(Arc<Knobs>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.hold_start.store(false, Ordering::SeqCst);
+        self.0.veto_stop.store(false, Ordering::SeqCst);
+        self.0.stuck_open.store(true, Ordering::SeqCst);
+        self.0.hold_turn.store(false, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+enum ChildMsg {
+    /// Fails the child with a panic.
+    Crash,
+    /// Stops the child cleanly, at its own request.
+    Finish,
+    /// Holds the child's thread until the test opens the gate.
+    Stick,
+}
+
+struct Child(Arc<Knobs>);
+
+impl Actor for Child {
+    type Message = ChildMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ChildMsg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            ChildMsg::Crash => panic!("the child crashes on command"),
+            ChildMsg::Finish => {
+                let _ = ctx.self_handle().stop(StopReason::Graceful).await;
+                Ok(())
+            }
+            ChildMsg::Stick => {
+                self.0.stuck_entered.store(true, Ordering::SeqCst);
+                let cap = std::time::Instant::now() + GATE_CAP;
+                while !self.0.stuck_open.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.0.stuck_returned.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.0.starts.fetch_add(1, Ordering::SeqCst);
+        let cap = Instant::now() + GATE_CAP;
+        while self.0.hold_start.load(Ordering::SeqCst) && Instant::now() < cap {
+            sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        !self.0.veto_stop.load(Ordering::SeqCst)
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        if self.0.fail_stop.swap(false, Ordering::SeqCst) {
+            return Err(ActorError::User("the cleanup fails".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// How a script spawns a child.
+#[derive(Clone)]
+struct Spec {
+    name: String,
+    restart: RestartType,
+    shutdown: Option<Shutdown>,
+    kill_grace: Option<Duration>,
+    start_timeout: Option<Duration>,
+    knobs: Arc<Knobs>,
+}
+
+impl Spec {
+    fn new(name: &str, restart: RestartType, knobs: &Arc<Knobs>) -> Self {
+        Self {
+            name: name.to_string(),
+            restart,
+            shutdown: None,
+            kill_grace: None,
+            start_timeout: None,
+            knobs: knobs.clone(),
+        }
+    }
+
+    fn shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    fn kill_grace(mut self, grace: Duration) -> Self {
+        self.kill_grace = Some(grace);
+        self
+    }
+
+    fn start_timeout(mut self, bound: Duration) -> Self {
+        self.start_timeout = Some(bound);
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The supervisor and its scripts
+// ---------------------------------------------------------------------------
+
+/// One call of a script. A script runs inside one handler of the supervisor
+/// and answers one line per call.
+#[derive(Clone)]
+enum Op {
+    /// `spawn_child` under the spec's name: `spawned`, `duplicate` or the
+    /// error text.
+    Spawn(Spec),
+    /// `terminate_child`: `terminated`, `unresponsive` or the error text.
+    Terminate(String),
+    /// `terminate_child` with the wait dropped at once: the stop is committed
+    /// and goes on without the caller.
+    TerminateAbandoned(String),
+    /// `stop_child`, the outcome printed.
+    StopChild(String),
+    /// `delete_child`: `deleted`, `not found`, `running`, `restarting` or the
+    /// error text.
+    Delete(String),
+    /// What `children()` says of the child: `alive=<bool> pending=<bool>`, or
+    /// `no such child`.
+    Read(String),
+    /// Sends the child a message that fails it.
+    Crash(String),
+    /// Polls `children()` every 5 ms until the child is no longer alive: for
+    /// a child whose task ended, until the supervisor reads its end.
+    UntilNotAlive(String),
+    /// Remembers the clock.
+    Mark,
+    /// Prints the time since the last `Mark`.
+    Elapsed,
+    /// Holds the supervisor's turn until the test releases it: the loop
+    /// handles nothing meanwhile.
+    HoldTurn(Arc<Knobs>),
+}
+
+type Events = Arc<Mutex<Vec<ChildEvent>>>;
+
+/// The supervisor under test: it records what `on_child_stopped` is told, and
+/// answers a death delivered while it stops by trying the spawn in `late`.
+struct Sup {
+    events: Events,
+    late: Arc<Mutex<Option<Spec>>>,
+    late_answers: Arc<Mutex<Vec<String>>>,
+}
+
+async fn spawn_line(ctx: &mut ActorContext<Sup>, spec: &Spec) -> String {
+    let knobs = spec.knobs.clone();
+    let mut builder = ctx
+        .spawn_child(move || {
+            knobs.builds.fetch_add(1, Ordering::SeqCst);
+            Child(knobs.clone())
+        })
+        .named(spec.name.clone())
+        .restart_type(spec.restart);
+    if let Some(shutdown) = spec.shutdown {
+        builder = builder.shutdown(shutdown);
+    }
+    if let Some(grace) = spec.kill_grace {
+        builder = builder.kill_grace(grace);
+    }
+    if let Some(bound) = spec.start_timeout {
+        builder = builder.start_timeout(bound);
+    }
+    match builder.await {
+        Ok(_) => "spawned".to_string(),
+        Err(SpawnError::DuplicateChild(_)) => "duplicate".to_string(),
+        Err(SpawnError::SupervisorStopping) => "stopping".to_string(),
+        Err(other) => format!("spawn: {other}"),
+    }
+}
+
+impl Actor for Sup {
+    type Message = Vec<Op>;
+    type Response = Vec<String>;
+
+    async fn handle(
+        &mut self,
+        ops: Vec<Op>,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<Vec<String>> {
+        let mut lines = Vec::with_capacity(ops.len());
+        let mut mark = Instant::now();
+        for op in ops {
+            let line = match op {
+                Op::Spawn(spec) => spawn_line(ctx, &spec).await,
+                Op::Terminate(name) => match ctx.terminate_child(name).await {
+                    Ok(()) => "terminated".to_string(),
+                    Err(SupervisionError::ChildUnresponsive(_)) => "unresponsive".to_string(),
+                    Err(other) => format!("terminate: {other}"),
+                },
+                Op::TerminateAbandoned(name) => {
+                    let _ = timeout(Duration::ZERO, ctx.terminate_child(name)).await;
+                    "abandoned".to_string()
+                }
+                Op::StopChild(name) => match ctx.stop_child(name).await {
+                    Ok(outcome) => format!("stop: {outcome:?}"),
+                    Err(other) => format!("stop: {other}"),
+                },
+                Op::Delete(name) => match ctx.delete_child(name) {
+                    Ok(()) => "deleted".to_string(),
+                    Err(SupervisionError::ChildNotFound(_)) => "not found".to_string(),
+                    Err(SupervisionError::ChildRunning(_)) => "running".to_string(),
+                    Err(SupervisionError::ChildRestarting(_)) => "restarting".to_string(),
+                    Err(other) => format!("delete: {other}"),
+                },
+                Op::Read(name) => match ctx
+                    .children()
+                    .into_iter()
+                    .find(|info| info.id.as_str() == name)
+                {
+                    Some(info) => {
+                        format!("alive={} pending={}", info.is_alive, info.restart_pending)
+                    }
+                    None => "no such child".to_string(),
+                },
+                Op::Crash(name) => {
+                    let child = ActorSystem::default()
+                        .get::<Child>(&name)
+                        .expect("the child is registered");
+                    child
+                        .notify(ChildMsg::Crash)
+                        .await
+                        .expect("the child takes the message");
+                    "crash sent".to_string()
+                }
+                Op::UntilNotAlive(name) => {
+                    let deadline = Instant::now() + BOUND;
+                    loop {
+                        let alive = ctx
+                            .children()
+                            .iter()
+                            .any(|info| info.id.as_str() == name && info.is_alive);
+                        if !alive {
+                            break "not alive".to_string();
+                        }
+                        if Instant::now() >= deadline {
+                            break "still alive at the deadline".to_string();
+                        }
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                }
+                Op::Mark => {
+                    mark = Instant::now();
+                    "marked".to_string()
+                }
+                Op::Elapsed => format!("elapsed={:?}", mark.elapsed()),
+                Op::HoldTurn(knobs) => {
+                    knobs.turn_entered.store(true, Ordering::SeqCst);
+                    let cap = Instant::now() + GATE_CAP;
+                    while knobs.hold_turn.load(Ordering::SeqCst) && Instant::now() < cap {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                    "released".to_string()
+                }
+            };
+            lines.push(line);
+        }
+        Ok(lines)
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        if event.action == SupervisionAction::SupervisorStopping {
+            let late = self.late.lock().unwrap().clone();
+            if let Some(spec) = late {
+                let answer = spawn_line(ctx, &spec).await;
+                self.late_answers.lock().unwrap().push(answer);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A running supervisor and what its `on_child_stopped` saw.
+struct Rig {
+    sup: ActorHandle<Sup>,
+    events: Events,
+    late: Arc<Mutex<Option<Spec>>>,
+    late_answers: Arc<Mutex<Vec<String>>>,
+}
+
+impl Rig {
+    async fn new(config: SupervisionConfig) -> Self {
+        let events = Events::default();
+        let late = Arc::new(Mutex::new(None));
+        let late_answers = Arc::new(Mutex::new(Vec::new()));
+        let sup = within("the supervisor to start", async {
+            Sup {
+                events: events.clone(),
+                late: late.clone(),
+                late_answers: late_answers.clone(),
+            }
+            .spawn()
+            .named(uname("sup"))
+            .with_supervision(config)
+            .await
+        })
+        .await
+        .expect("the supervisor starts");
+        Self {
+            sup,
+            events,
+            late,
+            late_answers,
+        }
+    }
+
+    /// Runs the calls in one handler of the supervisor.
+    async fn script(&self, ops: Vec<Op>) -> Vec<String> {
+        within("the supervisor to answer", self.sup.send(ops))
+            .await
+            .expect("the supervisor answers")
+    }
+
+    /// Reads the child once per handler turn until it reads `expected`, so
+    /// the supervisor's loop runs between two reads.
+    async fn until_read(&self, name: &str, expected: &str) {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            let line = self
+                .script(vec![Op::Read(name.to_string())])
+                .await
+                .remove(0);
+            if line == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {BOUND:?} waiting for `{name}` to read `{expected}`, last read `{line}`"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The actions `on_child_stopped` was told of the child, in order.
+    fn reported(&self, name: &str) -> Vec<SupervisionAction> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.child_name.as_deref() == Some(name))
+            .map(|event| event.action)
+            .collect()
+    }
+
+    async fn stop(self) {
+        within("the supervisor to stop", async {
+            self.sup
+                .stop(StopReason::Graceful)
+                .await
+                .expect("the stop is accepted");
+            self.sup.wait_stopped().await;
+        })
+        .await;
+    }
+}
+
+/// Sends the named child a message through the default system.
+async fn tell(name: &str, msg: ChildMsg) {
+    let child = ActorSystem::default()
+        .get::<Child>(name)
+        .expect("the child is registered");
+    within("the child to take the message", child.notify(msg))
+        .await
+        .expect("the child takes the message");
+}
+
+/// Kills the named actor through the default system.
+async fn kill(name: &str) {
+    within("the kill to be accepted", ActorSystem::default().kill(name))
+        .await
+        .expect("the kill is accepted");
+}
+
+// ---------------------------------------------------------------------------
+// A stopped child keeps its spec
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_kept_spec_refuses_a_same_name_spawn_until_it_is_deleted() {
+    // The cycle runs in one handler, straight after the call that stopped the
+    // child: the spec is there, the name is free of any actor, and a spawn
+    // under it is refused until `delete_child` removes the spec.
+    common::run(4, async {
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        for restart in [RestartType::Permanent, RestartType::Transient] {
+            for round in 0..100 {
+                let name = uname("kept");
+                let knobs = Arc::new(Knobs::default());
+                let spec = Spec::new(&name, restart, &knobs);
+                let lines = rig
+                    .script(vec![
+                        Op::Spawn(spec.clone()),
+                        Op::Terminate(name.clone()),
+                        Op::Read(name.clone()),
+                        Op::Spawn(spec.clone()),
+                        Op::Delete(name.clone()),
+                        Op::Spawn(spec),
+                    ])
+                    .await;
+                assert_eq!(
+                    lines,
+                    [
+                        "spawned",
+                        "terminated",
+                        "alive=false pending=false",
+                        "duplicate",
+                        "deleted",
+                        "spawned"
+                    ],
+                    "{restart:?}, round {round}"
+                );
+                assert_eq!(
+                    knobs.builds.load(Ordering::SeqCst),
+                    2,
+                    "the refused spawn built nothing: {restart:?}, round {round}"
+                );
+            }
+        }
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_kept_spec_whose_stop_was_reported_still_refuses_a_same_name_spawn() {
+    // Once the supervisor has handled the stop and told `on_child_stopped`,
+    // the spec is still held: only `delete_child` removes it.
+    common::run(4, async {
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        for restart in [RestartType::Permanent, RestartType::Transient] {
+            for round in 0..20 {
+                let name = uname("reported");
+                let knobs = Arc::new(Knobs::default());
+                let spec = Spec::new(&name, restart, &knobs);
+                let lines = rig
+                    .script(vec![Op::Spawn(spec.clone()), Op::Terminate(name.clone())])
+                    .await;
+                assert_eq!(
+                    lines,
+                    ["spawned", "terminated"],
+                    "{restart:?}, round {round}"
+                );
+                wait_until("the stop to be reported", || {
+                    rig.reported(&name) == [SupervisionAction::Removed]
+                })
+                .await;
+                let lines = rig
+                    .script(vec![
+                        Op::Read(name.clone()),
+                        Op::Spawn(spec.clone()),
+                        Op::Delete(name.clone()),
+                        Op::Spawn(spec),
+                    ])
+                    .await;
+                assert_eq!(
+                    lines,
+                    [
+                        "alive=false pending=false",
+                        "duplicate",
+                        "deleted",
+                        "spawned"
+                    ],
+                    "{restart:?}, round {round}"
+                );
+            }
+        }
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_transient_child_that_ends_cleanly_keeps_its_spec() {
+    // A `Transient` child that ends on its own, without a failure, is not
+    // restarted and keeps its spec, which only `delete_child` removes.
+    common::run(4, async {
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        for round in 0..20 {
+            let name = uname("finished");
+            let knobs = Arc::new(Knobs::default());
+            let spec = Spec::new(&name, RestartType::Transient, &knobs);
+            let lines = rig.script(vec![Op::Spawn(spec.clone())]).await;
+            assert_eq!(lines, ["spawned"], "round {round}");
+            tell(&name, ChildMsg::Finish).await;
+            wait_until("the clean end to be reported", || {
+                rig.reported(&name) == [SupervisionAction::Removed]
+            })
+            .await;
+            let lines = rig
+                .script(vec![
+                    Op::Read(name.clone()),
+                    Op::Spawn(spec.clone()),
+                    Op::Delete(name.clone()),
+                    Op::Spawn(spec),
+                ])
+                .await;
+            assert_eq!(
+                lines,
+                [
+                    "alive=false pending=false",
+                    "duplicate",
+                    "deleted",
+                    "spawned"
+                ],
+                "round {round}"
+            );
+            assert_eq!(knobs.builds.load(Ordering::SeqCst), 2, "round {round}");
+        }
+        rig.stop().await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A removed spec leaves the name free
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_temporary_or_pool_child_leaves_no_spec_to_delete() {
+    // `terminate_child` of a `Temporary` child, and of any child of a
+    // `SimpleOneForOne` supervisor, removes the spec: there is nothing to
+    // delete, and the name takes a new child at once.
+    common::run(4, async {
+        let cases = [
+            (
+                "a Temporary child",
+                RestartType::Temporary,
+                SupervisionConfig::one_for_one(),
+            ),
+            (
+                "a child of a pool",
+                RestartType::Permanent,
+                SupervisionConfig::simple_one_for_one(),
+            ),
+        ];
+        for (what, restart, config) in cases {
+            let rig = Rig::new(config).await;
+            for round in 0..100 {
+                let name = uname("removed");
+                let knobs = Arc::new(Knobs::default());
+                let spec = Spec::new(&name, restart, &knobs);
+                let lines = rig
+                    .script(vec![
+                        Op::Spawn(spec.clone()),
+                        Op::Terminate(name.clone()),
+                        Op::Read(name.clone()),
+                        Op::Delete(name.clone()),
+                        Op::Spawn(spec),
+                    ])
+                    .await;
+                assert_eq!(
+                    lines,
+                    [
+                        "spawned",
+                        "terminated",
+                        "no such child",
+                        "not found",
+                        "spawned"
+                    ],
+                    "{what}, round {round}"
+                );
+            }
+            rig.stop().await;
+        }
+    });
+}
+
+#[test]
+fn a_same_name_spawn_after_a_removed_spec_waits_for_nothing() {
+    // The clock is paused, so any wait that a timer ends moves it: the call
+    // that stops the child and the spawn after it take no time at all.
+    common::run_paused(async {
+        let cases = [
+            (RestartType::Temporary, SupervisionConfig::one_for_one()),
+            (
+                RestartType::Permanent,
+                SupervisionConfig::simple_one_for_one(),
+            ),
+        ];
+        for (restart, config) in cases {
+            let rig = Rig::new(config).await;
+            let name = uname("at-once");
+            let knobs = Arc::new(Knobs::default());
+            let spec = Spec::new(&name, restart, &knobs);
+            let lines = rig
+                .script(vec![
+                    Op::Spawn(spec.clone()),
+                    Op::Mark,
+                    Op::Terminate(name.clone()),
+                    Op::Spawn(spec),
+                    Op::Elapsed,
+                ])
+                .await;
+            assert_eq!(
+                lines,
+                ["spawned", "marked", "terminated", "spawned", "elapsed=0ns"],
+                "{restart:?}"
+            );
+            rig.stop().await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A terminated supervisor child frees the names of its descendants
+// ---------------------------------------------------------------------------
+
+/// The names and counters of one tree: a `Top` supervisor, a `Mid`
+/// supervisor child and the `Leaf` it spawns under a name of its own.
+struct Tree {
+    leaf: String,
+    /// Whether `Mid` is stopped with `Kill` and its first leaf holds a turn.
+    killed: bool,
+    /// Incarnations of `Mid` that began `on_started`.
+    starts: AtomicUsize,
+    /// Spawns of the leaf that were refused.
+    refused: AtomicUsize,
+    /// Set when the first leaf began its held turn.
+    entered: AtomicBool,
+}
+
+struct Leaf(Arc<Tree>);
+
+impl Actor for Leaf {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.0.entered.store(true, Ordering::SeqCst);
+        sleep(LEAF_TURN).await;
+        Ok(())
+    }
+}
+
+struct Mid(Arc<Tree>);
+
+impl Actor for Mid {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let incarnation = self.0.starts.fetch_add(1, Ordering::SeqCst) + 1;
+        let tree = self.0.clone();
+        let spawned = ctx
+            .spawn_child(move || Leaf(tree.clone()))
+            .named(self.0.leaf.clone())
+            .kill_grace(LEAF_GRACE)
+            .await;
+        match spawned {
+            Ok(leaf) => {
+                if self.0.killed && incarnation == 1 {
+                    leaf.notify(()).await.expect("the leaf takes the message");
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.0.refused.fetch_add(1, Ordering::SeqCst);
+                Err(err.into())
+            }
+        }
+    }
+}
+
+async fn spawn_mid(ctx: &mut ActorContext<Top>, tree: &Arc<Tree>, name: &str) -> String {
+    let world = tree.clone();
+    let mut builder = ctx
+        .spawn_child(move || Mid(world.clone()))
+        .named(name.to_string())
+        .with_config(ActorConfig::default().with_supervision(SupervisionConfig::one_for_one()));
+    if tree.killed {
+        builder = builder
+            .shutdown(Shutdown::Kill)
+            .kill_grace(Duration::from_millis(20));
+    }
+    match builder.await {
+        Ok(_) => "spawned".to_string(),
+        Err(err) => format!("spawn: {err}"),
+    }
+}
+
+struct Top;
+
+impl Actor for Top {
+    type Message = Arc<Tree>;
+    type Response = Vec<String>;
+
+    /// Spawns `Mid`, waits until its leaf is up, terminates `Mid`, reads
+    /// whether the leaf's name is free, deletes `Mid` and spawns it again,
+    /// all in this one handler.
+    async fn handle(
+        &mut self,
+        tree: Arc<Tree>,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<Vec<String>> {
+        let system = ActorSystem::default();
+        let mid = format!("{}-mid", tree.leaf);
+        let mut lines = vec![spawn_mid(ctx, &tree, &mid).await];
+        let deadline = Instant::now() + BOUND;
+        let up = loop {
+            let up = system.get::<Leaf>(&tree.leaf).is_some()
+                && (!tree.killed || tree.entered.load(Ordering::SeqCst));
+            if up || Instant::now() >= deadline {
+                break up;
+            }
+            sleep(Duration::from_millis(5)).await;
+        };
+        lines.push(format!("leaf up={up}"));
+        lines.push(match ctx.terminate_child(mid.clone()).await {
+            Ok(()) => "terminated".to_string(),
+            Err(err) => format!("terminate: {err}"),
+        });
+        lines.push(format!(
+            "leaf name free={}",
+            system.get::<Leaf>(&tree.leaf).is_none()
+        ));
+        lines.push(match ctx.delete_child(mid.clone()) {
+            Ok(()) => "deleted".to_string(),
+            Err(err) => format!("delete: {err}"),
+        });
+        lines.push(spawn_mid(ctx, &tree, &mid).await);
+        Ok(lines)
+    }
+}
+
+async fn descendants_names_round(killed: bool, round: usize) {
+    let top = within("the top supervisor to start", async {
+        Top.spawn().named(uname("top")).supervisor().await
+    })
+    .await
+    .expect("the top supervisor starts");
+    let tree = Arc::new(Tree {
+        leaf: uname("leaf"),
+        killed,
+        starts: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+        entered: AtomicBool::new(false),
+    });
+    let lines = within("the top supervisor's cycle", top.send(tree.clone()))
+        .await
+        .expect("the top supervisor answers");
+    assert_eq!(
+        lines,
+        [
+            "spawned",
+            "leaf up=true",
+            "terminated",
+            "leaf name free=true",
+            "deleted",
+            "spawned"
+        ],
+        "killed={killed}, round {round}"
+    );
+    // The respawned `Mid` spawns its leaf under the same name. A refused
+    // spawn fails its init and its supervisor restarts it, after which the
+    // name comes up all the same, so only the counter shows a refusal.
+    wait_until("the second Mid to start", || {
+        tree.starts.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    wait_until("the second leaf's name", || {
+        ActorSystem::default().get::<Leaf>(&tree.leaf).is_some()
+    })
+    .await;
+    assert_eq!(
+        tree.refused.load(Ordering::SeqCst),
+        0,
+        "no leaf spawn was refused: killed={killed}, round {round}"
+    );
+    within("the top supervisor to stop", async {
+        top.stop(StopReason::Graceful)
+            .await
+            .expect("the stop is accepted");
+        top.wait_stopped().await;
+    })
+    .await;
+}
+
+#[test]
+fn a_terminated_supervisor_child_frees_its_descendants_names_before_the_call_returns() {
+    // A supervisor child that stops in order has ended its leaf when it ends
+    // itself. One stopped with `Kill` ends at once and leaves its leaf, in a
+    // held turn, to end later: `terminate_child` waits for that leaf, so the
+    // delete and the respawn of the same handler find the leaf's name free.
+    common::run(4, async {
+        for round in 0..50 {
+            descendants_names_round(false, round).await;
+        }
+        for round in 0..10 {
+            descendants_names_round(true, round).await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A name stays held in every state of a child that is not stopped and kept
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_same_name_spawn_over_a_crashed_permanent_child_is_refused_in_every_state_of_its_restart() {
+    common::run(4, async {
+        let knobs = Arc::new(Knobs::default());
+        // Opens the gate on every exit path, a failed assertion included.
+        let _release = Release(knobs.clone());
+        let rig =
+            Rig::new(SupervisionConfig::one_for_one().max_restarts(10, Duration::from_secs(60)))
+                .await;
+        let name = uname("crashed");
+        // The held init of the second incarnation is bounded far past the
+        // test, so a default bound on a restarted child's init cannot end it.
+        let spec =
+            Spec::new(&name, RestartType::Permanent, &knobs).start_timeout(Duration::from_secs(60));
+
+        // Running: the child is up and its task runs.
+        let lines = rig.script(vec![Op::Spawn(spec.clone())]).await;
+        assert_eq!(lines, ["spawned"]);
+        rig.until_read(&name, "alive=true pending=false").await;
+        wait_until("the first start", || {
+            knobs.starts.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        // The death is not handled yet: the child crashes, its task ends and
+        // its end is recorded, while the supervisor is still inside this
+        // handler and has not handled it. The ledger still holds the child as
+        // running, its restart decision is owed, and the name is held.
+        knobs.hold_start.store(true, Ordering::SeqCst);
+        let lines = rig
+            .script(vec![
+                Op::Crash(name.clone()),
+                Op::UntilNotAlive(name.clone()),
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "crash sent",
+                "not alive",
+                "duplicate",
+                "restarting",
+                "alive=false pending=true"
+            ],
+            "the death is not handled yet"
+        );
+
+        // A restart attempt: the supervisor handles the death and starts the
+        // second incarnation, which waits in its init on the gate.
+        wait_until("the second start", || {
+            knobs.starts.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            ["duplicate", "restarting", "alive=false pending=true"],
+            "the restart attempt is in flight"
+        );
+
+        // Running again: the init completes and the supervisor adopts it.
+        knobs.hold_start.store(false, Ordering::SeqCst);
+        rig.until_read(&name, "alive=true pending=false").await;
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            ["duplicate", "running", "alive=true pending=false"],
+            "the child runs again"
+        );
+        assert_eq!(
+            knobs.builds.load(Ordering::SeqCst),
+            2,
+            "the initial build and the restart's: a refused spawn built nothing"
+        );
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_crashed_temporary_child_keeps_its_name_until_its_death_is_handled() {
+    // The spec of a `Temporary` child is removed when the supervisor handles
+    // its end, not when its task ends: the name is held until then.
+    common::run(4, async {
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        let name = uname("temporary");
+        let knobs = Arc::new(Knobs::default());
+        let spec = Spec::new(&name, RestartType::Temporary, &knobs);
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::Crash(name.clone()),
+                Op::UntilNotAlive(name.clone()),
+                Op::Spawn(spec.clone()),
+            ])
+            .await;
+        assert_eq!(lines, ["spawned", "crash sent", "not alive", "duplicate"]);
+        rig.until_read(&name, "no such child").await;
+        let lines = rig.script(vec![Op::Spawn(spec)]).await;
+        assert_eq!(lines, ["spawned"]);
+        assert_eq!(rig.reported(&name), [SupervisionAction::Removed]);
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_child_being_stopped_keeps_its_name() {
+    common::run(4, async {
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+
+        // The stop is in progress and the child's task still runs: the child
+        // refuses the stop and its window is far away.
+        let name = uname("stopping-live");
+        let knobs = Arc::new(Knobs::default());
+        let _release = Release(knobs.clone());
+        knobs.veto_stop.store(true, Ordering::SeqCst);
+        let spec = Spec::new(&name, RestartType::Permanent, &knobs)
+            .shutdown(Shutdown::Timeout(Duration::from_secs(60)));
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::TerminateAbandoned(name.clone()),
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "spawned",
+                "abandoned",
+                "duplicate",
+                "restarting",
+                "alive=true pending=false"
+            ],
+            "the stop is in progress and the task runs"
+        );
+        kill(&name).await;
+        wait_until("the end to be reported", || {
+            rig.reported(&name) == [SupervisionAction::Removed]
+        })
+        .await;
+
+        // The stop is in progress and the child's task ended: the window ran
+        // out inside the handler, which has not handled the end.
+        let name = uname("stopping-ended");
+        let knobs = Arc::new(Knobs::default());
+        let _release_ended = Release(knobs.clone());
+        knobs.veto_stop.store(true, Ordering::SeqCst);
+        let spec = Spec::new(&name, RestartType::Permanent, &knobs)
+            .shutdown(Shutdown::Timeout(Duration::from_millis(100)));
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::TerminateAbandoned(name.clone()),
+                Op::UntilNotAlive(name.clone()),
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "spawned",
+                "abandoned",
+                "not alive",
+                "duplicate",
+                "restarting",
+                "alive=false pending=false"
+            ],
+            "the stop is in progress and the task ended"
+        );
+        wait_until("the end to be reported", || {
+            rig.reported(&name) == [SupervisionAction::Removed]
+        })
+        .await;
+        let lines = rig
+            .script(vec![Op::Delete(name.clone()), Op::Spawn(spec)])
+            .await;
+        assert_eq!(lines, ["deleted", "spawned"], "the end was handled");
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_bounce_that_met_a_crash_keeps_the_childs_name_until_the_death_is_decided() {
+    // The child's cleanup fails during the bounce, so the end is a failure
+    // and its restart decision is owed: the supervisor makes it once the
+    // handler returns, and until then the name is held.
+    common::run(4, async {
+        let rig =
+            Rig::new(SupervisionConfig::one_for_one().max_restarts(10, Duration::from_secs(60)))
+                .await;
+        let name = uname("bounced");
+        let knobs = Arc::new(Knobs::default());
+        knobs.fail_stop.store(true, Ordering::SeqCst);
+        let spec = Spec::new(&name, RestartType::Permanent, &knobs);
+        let lines = rig
+            .script(vec![
+                Op::Spawn(spec.clone()),
+                Op::StopChild(name.clone()),
+                Op::Read(name.clone()),
+                Op::Spawn(spec),
+                Op::Delete(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "spawned",
+                "stop: Stopped",
+                "alive=false pending=true",
+                "duplicate",
+                "restarting"
+            ]
+        );
+        // The decision is made once the handler returned: the Permanent
+        // child is restarted.
+        rig.until_read(&name, "alive=true pending=false").await;
+        assert_eq!(knobs.builds.load(Ordering::SeqCst), 2);
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn an_unresponsive_temporary_child_keeps_its_spec_until_its_death_is_handled() {
+    // A `terminate_child` that answers `ChildUnresponsive` leaves the child
+    // being stopped: its spec is not classified yet, so the name is held and
+    // the spec cannot be deleted. Once the child ends and the supervisor
+    // handles its end, the spec of a `Temporary` child is gone.
+    common::run_multi_thread_only(4, async {
+        let knobs = Arc::new(Knobs::default());
+        let _release = Release(knobs.clone());
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        let name = uname("unresponsive");
+        let spec = Spec::new(&name, RestartType::Temporary, &knobs)
+            .shutdown(Shutdown::Timeout(Duration::from_millis(50)))
+            .kill_grace(Duration::from_millis(20));
+        let lines = rig.script(vec![Op::Spawn(spec.clone())]).await;
+        assert_eq!(lines, ["spawned"]);
+        // The child's turn holds its thread until the test opens the gate, so
+        // no stop reaches it.
+        tell(&name, ChildMsg::Stick).await;
+        wait_until("the held turn to begin", || {
+            knobs.stuck_entered.load(Ordering::SeqCst)
+        })
+        .await;
+        let lines = rig
+            .script(vec![
+                Op::Terminate(name.clone()),
+                Op::Spawn(spec.clone()),
+                Op::Delete(name.clone()),
+                Op::Read(name.clone()),
+            ])
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "unresponsive",
+                "duplicate",
+                "restarting",
+                "alive=true pending=false"
+            ]
+        );
+        assert!(
+            !knobs.stuck_returned.load(Ordering::SeqCst),
+            "the verdict came while the turn held its thread"
+        );
+        knobs.stuck_open.store(true, Ordering::SeqCst);
+        rig.until_read(&name, "no such child").await;
+        let lines = rig.script(vec![Op::Spawn(spec)]).await;
+        assert_eq!(lines, ["spawned"]);
+        rig.stop().await;
+    });
+}
+
+#[test]
+fn a_spawn_over_a_held_spec_from_a_final_delivery_answers_supervisor_stopping() {
+    // The supervisor's turn is held while its child is killed and its own
+    // stop is queued, so the child's death is delivered to `on_child_stopped`
+    // as the supervisor stops. A spawn made there under the dead child's name
+    // meets two refusals, the stopping supervisor and the held spec, and the
+    // first one answers.
+    common::run(4, async {
+        let knobs = Arc::new(Knobs::default());
+        let _release = Release(knobs.clone());
+        let rig = Rig::new(SupervisionConfig::one_for_one()).await;
+        let name = uname("late");
+        let spec = Spec::new(&name, RestartType::Permanent, &knobs);
+        *rig.late.lock().unwrap() = Some(spec.clone());
+        let lines = rig.script(vec![Op::Spawn(spec)]).await;
+        assert_eq!(lines, ["spawned"]);
+
+        knobs.hold_turn.store(true, Ordering::SeqCst);
+        let held = {
+            let sup = rig.sup.clone();
+            let knobs = knobs.clone();
+            tokio::spawn(async move { sup.send(vec![Op::HoldTurn(knobs)]).await })
+        };
+        wait_until("the supervisor to hold its turn", || {
+            knobs.turn_entered.load(Ordering::SeqCst)
+        })
+        .await;
+        kill(&name).await;
+        wait_until("the child to end", || {
+            ActorSystem::default().get::<Child>(&name).is_none()
+        })
+        .await;
+        within(
+            "the stop to be accepted",
+            rig.sup.stop(StopReason::Graceful),
+        )
+        .await
+        .expect("the stop is accepted");
+        knobs.hold_turn.store(false, Ordering::SeqCst);
+        within("the supervisor to stop", rig.sup.wait_stopped()).await;
+        let _ = within("the held turn to end", held).await;
+        assert_eq!(*rig.late_answers.lock().unwrap(), ["stopping"]);
+        assert_eq!(
+            knobs.builds.load(Ordering::SeqCst),
+            1,
+            "the refused spawn built nothing"
+        );
+    });
+}

@@ -1,30 +1,47 @@
 //! An actor task whose own poll unwinds outside every catch. Every call of
 //! user code and every log line is caught, so the unwind is forced from the
 //! crate's own code through a test hook: the registry guard's release of the
-//! name, at the end of the task, panics, or a supervisor's teardown walk
-//! panics while the supervisor still holds a live child. The actor's status
+//! name, at the end of the task, panics, a supervisor's teardown walk panics
+//! while the supervisor still holds a live child, or a turn panics after its
+//! handler returned, while the request's sender is held. The actor's status
 //! plane, its supervisor's report of its end, the restart attempt that joins
 //! it and an awaited spawn whose initialization the unwind cut all read one
 //! reason, `Failure(Panic(..))`, the reason of an uncaught panic. With the
 //! `tracing` feature, the task that joins the unwound one logs the unwind's
 //! payload once. A live child of an unwound supervisor is killed, as the
 //! worker of a killed parent is.
+//!
+//! Every test that has a supervisor runs through [`bounded_run`]: a supervisor
+//! that keeps handling one report forever never yields its worker, so a
+//! timeout inside the test could not fire and the test would hang instead of
+//! failing.
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use futures_core::Stream;
 
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use super::bounded_run::{self, Flavor};
 use crate::actor::context::ActorContext;
 use crate::actor::runtime::{end_hooks, ActorConfig, UNCAUGHT_PANIC};
 use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult, SpawnError};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, ChildEvent, RestartType, StopReason};
+use crate::types::{ActorId, ChildEvent, RestartType, Shutdown, StopReason, StreamEvent};
 
-const BOUND: Duration = Duration::from_secs(10);
+/// The longest a wait may take. It only limits how long a real hang takes to
+/// report.
+const BOUND: Duration = Duration::from_secs(60);
+
+/// How many reports a rig keeps for its test. A supervisor that handled one
+/// report over and over would otherwise fill the memory of the host.
+const REPORTS_KEPT: usize = 1024;
 
 /// The text of the panic the hook raises in the task's own poll.
 const HOOK_PANIC: &str = "the crate's own code panics in the task's poll";
@@ -38,8 +55,16 @@ fn unique(base: &str) -> String {
 }
 
 /// Makes the release of `name` panic at the end of its task.
-fn panic_at_the_end_of(name: &str) {
+pub(crate) fn panic_at_the_end_of(name: &str) {
     end_hooks::attach(end_hooks::NAME, ActorId::from(name), || {
+        panic!("{HOOK_PANIC}")
+    });
+}
+
+/// Makes the turn of `name` that handled a request panic once the handler has
+/// returned, while the request's sender is still held.
+pub(crate) fn panic_in_the_turn_of(name: &str) {
+    end_hooks::attach(end_hooks::TURN, ActorId::from(name), || {
         panic!("{HOOK_PANIC}")
     });
 }
@@ -114,7 +139,7 @@ struct Top {
     /// Whether [`Mid`] is itself a supervisor.
     mid_supervises: bool,
     fail_init: Arc<AtomicUsize>,
-    events: mpsc::UnboundedSender<ChildEvent>,
+    events: mpsc::Sender<ChildEvent>,
 }
 
 impl Actor for Top {
@@ -144,7 +169,7 @@ impl Actor for Top {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        let _ = self.events.send(event.clone());
+        let _ = self.events.try_send(event.clone());
         Ok(())
     }
 }
@@ -154,7 +179,7 @@ struct Rig {
     system: Arc<ActorSystem>,
     mid: String,
     fail_init: Arc<AtomicUsize>,
-    events: mpsc::UnboundedReceiver<ChildEvent>,
+    events: mpsc::Receiver<ChildEvent>,
 }
 
 async fn rig(restart: RestartType) -> Rig {
@@ -166,7 +191,7 @@ async fn rig_of(restart: RestartType, mid_supervises: bool) -> Rig {
     let system = ActorSystem::create(unique("system")).unwrap();
     let mid = unique("mid");
     let fail_init = Arc::new(AtomicUsize::new(0));
-    let (tx, events) = mpsc::unbounded_channel();
+    let (tx, events) = mpsc::channel(REPORTS_KEPT);
     let top = Top {
         mid: mid.clone(),
         restart,
@@ -207,14 +232,18 @@ async fn a_child_unwinding_from_its_own_poll_reads_one_panic() -> String {
     rig.mid
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_child_unwinding_from_its_own_poll_reads_one_panic_current_thread() {
-    a_child_unwinding_from_its_own_poll_reads_one_panic().await;
+#[test]
+fn a_child_unwinding_from_its_own_poll_reads_one_panic_current_thread() {
+    bounded_run::run(Flavor::CurrentThread, || async {
+        a_child_unwinding_from_its_own_poll_reads_one_panic().await;
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_child_unwinding_from_its_own_poll_reads_one_panic_multi_thread() {
-    a_child_unwinding_from_its_own_poll_reads_one_panic().await;
+#[test]
+fn a_child_unwinding_from_its_own_poll_reads_one_panic_multi_thread() {
+    bounded_run::run(Flavor::MultiThread, || async {
+        a_child_unwinding_from_its_own_poll_reads_one_panic().await;
+    });
 }
 
 /// An actor whose initialization failed unwinds at the end of its task,
@@ -290,15 +319,18 @@ async fn a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_rea
     rig.mid
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason_current_thread()
-{
-    a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
+#[test]
+fn a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason_current_thread() {
+    bounded_run::run(Flavor::CurrentThread, || async {
+        a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason_multi_thread() {
-    a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
+#[test]
+fn a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason_multi_thread() {
+    bounded_run::run(Flavor::MultiThread, || async {
+        a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
+    });
 }
 
 /// A supervisor's own poll unwinds in its teardown walk, while it still
@@ -341,14 +373,215 @@ async fn a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child_current_thread() {
-    a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child().await;
+#[test]
+fn a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child_current_thread() {
+    bounded_run::run(Flavor::CurrentThread, || async {
+        a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child().await;
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child_multi_thread() {
-    a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child().await;
+#[test]
+fn a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child_multi_thread() {
+    bounded_run::run(Flavor::MultiThread, || async {
+        a_supervisor_unwinding_in_its_teardown_walk_kills_its_live_child().await;
+    });
+}
+
+/// A gate that blocks the thread waiting on it until a test opens it.
+pub(crate) struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    pub(crate) fn new() -> Arc<Gate> {
+        Arc::new(Gate {
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    /// Blocks the calling thread until the gate opens. It gives up after
+    /// [`BOUND`], so a failing test never keeps a worker for good.
+    fn wait(&self) {
+        let open = self.open.lock().unwrap();
+        let _ = self
+            .opened
+            .wait_timeout_while(open, BOUND, |open| !*open)
+            .unwrap();
+    }
+}
+
+/// Opens its gate when dropped, so the thread a failing test left in the
+/// gate is released.
+pub(crate) struct OpensOnDrop(pub(crate) Arc<Gate>);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// A stream that never yields and whose drop blocks on a gate, as user code
+/// that releases a resource slowly does.
+pub(crate) struct SlowDrop {
+    pub(crate) gate: Arc<Gate>,
+}
+
+impl Stream for SlowDrop {
+    type Item = ();
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+        Poll::Pending
+    }
+}
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        self.gate.wait();
+    }
+}
+
+/// The kill grace of the held supervisor's child. The subtree's budget
+/// carries it, so a wait on the subtree is bounded by about this long.
+const LEAF_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the held supervisor is given to stop in order before its `Kill`.
+const WINDOW: Duration = Duration::from_millis(300);
+
+/// The longest the supervisor may take, from the order that stops the held
+/// child, to give its verdict: the stop window, the wait's bound (the leaf's
+/// kill grace plus two settle times) and a margin, and well short of a whole
+/// wait more.
+const VERDICT_LIMIT: Duration = Duration::from_millis(3_600);
+
+/// What a [`HeldTop`] is asked.
+enum HeldTopMsg {
+    /// Starts the [`Held`] child.
+    Start,
+    /// Stops the [`Held`] child, which its supervisor restarts.
+    Bounce,
+}
+
+/// What a [`Held`] is asked.
+enum HeldMsg {
+    Event,
+}
+
+impl From<StreamEvent<()>> for HeldMsg {
+    fn from(_event: StreamEvent<()>) -> Self {
+        HeldMsg::Event
+    }
+}
+
+/// A supervisor of one [`Leaf`] with a long kill grace and a stream whose
+/// drop is held by a gate. It vetoes every stop that is not a `Kill`.
+struct Held {
+    leaf: String,
+    gate: Arc<Gate>,
+}
+
+impl Actor for Held {
+    type Message = HeldMsg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.add_stream(SlowDrop {
+            gate: self.gate.clone(),
+        });
+        ctx.spawn_child(|| Leaf)
+            .named(self.leaf.clone())
+            .kill_grace(LEAF_GRACE)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: HeldMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
+/// Supervises one [`Held`] under a short stop window.
+struct HeldTop {
+    held: String,
+    leaf: String,
+    gate: Arc<Gate>,
+}
+
+impl Actor for HeldTop {
+    type Message = HeldTopMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: HeldTopMsg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            HeldTopMsg::Start => {
+                let (leaf, gate) = (self.leaf.clone(), self.gate.clone());
+                ctx.spawn_child(move || Held {
+                    leaf: leaf.clone(),
+                    gate: gate.clone(),
+                })
+                .named(self.held.clone())
+                .shutdown(Shutdown::Timeout(WINDOW))
+                .with_config(ActorConfig::default().supervisor())
+                .await?;
+            }
+            HeldTopMsg::Bounce => {
+                ctx.stop_child(self.held.as_str()).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A supervised child whose ladder owes a `Kill` unwinds from its own poll
+/// at the end of its task while a stream forwarder of its still runs the
+/// slow drop of a user stream, so the child's subtree token outlives the
+/// task. The restart waits on that subtree, whose budget is long: the
+/// supervisor gives its verdict, `ChildUnresponsive`, the settle time after
+/// the end, and not a whole wait later, and before the forwarder's drop
+/// ends. A multi-thread test: the drop blocks the worker it runs on.
+#[test]
+fn a_forwarder_still_dropping_after_an_unwind_gives_the_verdict_at_the_settle_time() {
+    bounded_run::run(Flavor::MultiThread, || async {
+        let system = ActorSystem::create(unique("system")).unwrap();
+        let gate = Gate::new();
+        let _opens = OpensOnDrop(gate.clone());
+        let held = unique("held");
+        let top = HeldTop {
+            held: held.clone(),
+            leaf: unique("leaf"),
+            gate: gate.clone(),
+        }
+        .spawn()
+        .named(unique("top"))
+        .on_system(&system)
+        .supervisor()
+        .await
+        .expect("top starts");
+        top.send(HeldTopMsg::Start).await.expect("held starts");
+        panic_at_the_end_of(&held);
+        top.notify(HeldTopMsg::Bounce).await.expect("accepted");
+        // The stop window, then the wait on the subtree: the verdict comes
+        // about `WINDOW` plus the wait's bound after the order, and a whole
+        // wait later when the end leaves its mark. The limit sits between.
+        let reason = timeout(VERDICT_LIMIT, top.wait_stopped())
+            .await
+            .expect("the verdict comes the settle time after the end");
+        assert!(
+            format!("{reason:?}").contains("ChildUnresponsive"),
+            "{reason:?}"
+        );
+        gate.open();
+    });
 }
 
 /// The warnings that name `child` and carry the hook's panic as an unwind's
@@ -369,29 +602,34 @@ fn unwind_lines_of(lines: &std::sync::Mutex<Vec<String>>, child: &str) -> Vec<St
 /// A child's own unwind is logged once, with its payload, by the runner that
 /// joins its task.
 #[cfg(feature = "tracing")]
-#[tokio::test(flavor = "current_thread")]
-async fn the_joiner_logs_a_child_s_own_unwind_once() {
-    let lines = crate::actor::supervision::lost_runner::capture::install();
-    let child = a_child_unwinding_from_its_own_poll_reads_one_panic().await;
-    let logged = unwind_lines_of(&lines, &child);
-    assert_eq!(logged.len(), 1, "one line carries the payload: {logged:?}");
-    assert!(
-        logged[0].contains("panicked outside every catch"),
-        "{logged:?}"
-    );
+#[test]
+fn the_joiner_logs_a_child_s_own_unwind_once() {
+    bounded_run::run(Flavor::CurrentThread, || async {
+        let lines = crate::actor::supervision::lost_runner::capture::install();
+        let child = a_child_unwinding_from_its_own_poll_reads_one_panic().await;
+        let logged = unwind_lines_of(&lines, &child);
+        assert_eq!(logged.len(), 1, "one line carries the payload: {logged:?}");
+        assert!(
+            logged[0].contains("panicked outside every catch"),
+            "{logged:?}"
+        );
+    });
 }
 
 /// A restarted incarnation's own unwind is logged once, with its payload,
 /// by the restart attempt that joins its task.
 #[cfg(feature = "tracing")]
-#[tokio::test(flavor = "current_thread")]
-async fn the_restart_attempt_logs_an_incarnation_s_own_unwind_once() {
-    let lines = crate::actor::supervision::lost_runner::capture::install();
-    let child = a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
-    let logged = unwind_lines_of(&lines, &child);
-    assert_eq!(logged.len(), 1, "one line carries the payload: {logged:?}");
-    assert!(
-        logged[0].contains("panicked outside every catch"),
-        "{logged:?}"
-    );
+#[test]
+fn the_restart_attempt_logs_an_incarnation_s_own_unwind_once() {
+    bounded_run::run(Flavor::CurrentThread, || async {
+        let lines = crate::actor::supervision::lost_runner::capture::install();
+        let child =
+            a_restarted_incarnation_unwinding_before_its_ack_reports_the_planes_reason().await;
+        let logged = unwind_lines_of(&lines, &child);
+        assert_eq!(logged.len(), 1, "one line carries the payload: {logged:?}");
+        assert!(
+            logged[0].contains("panicked outside every catch"),
+            "{logged:?}"
+        );
+    });
 }

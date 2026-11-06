@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::actor::context::ActorContext;
@@ -28,13 +28,13 @@ use crate::actor::subtree::SubtreeWatch;
 use crate::actor::Actor;
 use crate::error::{ActorError, ActorResult};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, ActorStatus, StatusValue, StopReason, StreamEvent};
+use crate::types::{ActorId, ActorStatus, StatusRx, StopReason, StreamEvent};
 
 type InitAck = oneshot::Receiver<Result<(), ActorError>>;
 
 /// What the test can read about the actor while one of its items drops.
 struct Probe {
-    status: watch::Receiver<StatusValue>,
+    status: StatusRx,
     subtree: SubtreeWatch,
     system: Arc<ActorSystem>,
     name: String,
@@ -61,6 +61,7 @@ struct Seen {
     plane_ended: bool,
     name_registered: bool,
     subtree_gone: bool,
+    hold_released: bool,
     ack: AckRead,
 }
 
@@ -137,6 +138,7 @@ impl Drop for Owned {
                     || probe.status.borrow().status == ActorStatus::Stopped,
                 name_registered: probe.system.get::<Subject>(&probe.name).is_some(),
                 subtree_gone: probe.subtree.is_gone(),
+                hold_released: probe.subtree.is_released(),
                 ack,
             });
         }
@@ -302,7 +304,7 @@ struct Panics {
 struct Rig {
     handle: ActorHandle<Subject>,
     join: JoinHandle<StopReason>,
-    status: watch::Receiver<StatusValue>,
+    status: StatusRx,
     subtree: SubtreeWatch,
     system: Arc<ActorSystem>,
     name: String,
@@ -347,6 +349,7 @@ impl Rig {
     }
 
     /// Waits until the status plane reads as ended and the subtree is gone.
+    /// The bound only limits how long a real hang takes to report.
     async fn wait_ended(&self) {
         let ended = async {
             let mut status = self.status.clone();
@@ -354,13 +357,19 @@ impl Rig {
                 if status.changed().await.is_err() {
                     break;
                 }
+                // A change that is already pending resolves at once; yielding
+                // lets the timeout around this wait fire if the status never
+                // reaches Stopped.
+                tokio::task::yield_now().await;
             }
             let mut wait = crate::actor::subtree::SubtreeWait::new(&self.subtree);
             while !self.subtree.is_gone() {
-                wait.changed().await;
+                tokio::time::timeout(Duration::from_secs(60), wait.changed())
+                    .await
+                    .expect("the subtree wait resolves");
             }
         };
-        tokio::time::timeout(Duration::from_secs(10), ended)
+        tokio::time::timeout(Duration::from_secs(60), ended)
             .await
             .expect("the actor ends");
     }
@@ -440,6 +449,11 @@ impl Rig {
                 "the subtree read as ended before {} was dropped: {seen:?}",
                 s.who
             );
+            assert!(
+                !s.hold_released,
+                "the hold read as released before {} was dropped: {seen:?}",
+                s.who
+            );
             // A supervisor drops its child factories with its children's
             // teardown, whatever its stop reason, before its name is freed.
             if name_free_first && s.who == "factory" {
@@ -512,11 +526,14 @@ fn rig_held(start: Start, panics: Panics, with_ack: bool, value_hold: Option<Hol
         ActorId::from(name.clone()),
         subject,
         config,
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system.clone()),
         ack_tx,
         true,
-        Duration::from_millis(120),
+        // Far longer than any test waits: a `Kill` is read at a turn
+        // boundary, and the tests that abort the task do so themselves, so
+        // no host delay turns an orderly end into an abort.
+        Duration::from_secs(60),
         None,
     )
     .expect("the actor spawns");
@@ -543,6 +560,7 @@ fn rig_held(start: Start, panics: Panics, with_ack: bool, value_hold: Option<Hol
                     || status.borrow().status == ActorStatus::Stopped,
                 name_registered: system.get::<Subject>(&name).is_some(),
                 subtree_gone: subtree.is_gone(),
+                hold_released: subtree.is_released(),
                 ack: AckRead::None,
             });
         });
@@ -811,6 +829,77 @@ async fn an_actor_aborted_before_its_first_poll_drops_everything_first() {
         "the plane is closed: every sender is gone"
     );
     assert!(r.subtree.is_gone());
+}
+
+/// A wait on the status plane of a task that is aborted before its first
+/// poll ends when the plane closes. The waiter is parked again after the
+/// reason was written and the name was freed, so only the close of the plane
+/// can wake it from there; it reads `Kill`. Current-thread only, as the test
+/// above.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parked_wait_stopped_returns_when_a_never_polled_task_is_aborted() {
+    use crate::types::status_cell::probe::CountWake;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut r = rig(Start::Run, Panics::default(), false);
+    let rx: &'static mut StatusRx = Box::leak(Box::new(r.handle.status_rx()));
+    let wait: Pin<Box<dyn Future<Output = StopReason> + Send>> =
+        Box::pin(crate::system::wait_reason(rx));
+    let wait = Arc::new(Mutex::new(wait));
+    let woken = Arc::new(CountWake::default());
+    let waker = std::task::Waker::from(woken.clone());
+    assert!(
+        wait.lock()
+            .unwrap()
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending(),
+        "the actor has not ended"
+    );
+    let wakes_at_the_hook = Arc::new(AtomicUsize::new(usize::MAX));
+    {
+        let (wait, woken, waker) = (wait.clone(), woken.clone(), waker.clone());
+        let wakes_at_the_hook = wakes_at_the_hook.clone();
+        crate::actor::runtime::end_hooks::attach(
+            crate::actor::runtime::end_hooks::NAME_FREED,
+            ActorId::from(r.name.clone()),
+            move || {
+                // The reason is written and the plane is still open.
+                assert!(
+                    wait.lock()
+                        .unwrap()
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending(),
+                    "the plane is still open at this point of the end"
+                );
+                wakes_at_the_hook.store(woken.count(), Ordering::SeqCst);
+            },
+        );
+    }
+    r.join.abort();
+    let joined = (&mut r.join).await;
+    assert!(joined.unwrap_err().is_cancelled());
+    assert_ne!(
+        wakes_at_the_hook.load(Ordering::SeqCst),
+        usize::MAX,
+        "the end reached the point where the name is freed"
+    );
+    assert!(
+        woken.count() > wakes_at_the_hook.load(Ordering::SeqCst),
+        "the close of the plane woke the parked waiter"
+    );
+    let polled = wait
+        .lock()
+        .unwrap()
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker));
+    match polled {
+        Poll::Ready(reason) => assert_eq!(reason, StopReason::Kill),
+        Poll::Pending => panic!("the waiter is still parked after the plane closed"),
+    }
 }
 
 /// A panic in a drop of the end is caught and `Stopped` is still
@@ -1195,7 +1284,7 @@ async fn a_forwarder_poll_panic_during_the_end_wait_belongs_to_the_run() {
             }),
         },
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system.clone()),
         None,
         true,
@@ -1260,7 +1349,7 @@ async fn an_in_flight_message_that_panics_on_abort_ends_as_an_abort() {
         ActorId::from(name.clone()),
         Parker,
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -1366,7 +1455,7 @@ async fn a_forwarder_panic_during_the_run_never_changes_the_end(reaped_by_the_lo
             attached: Some(attached_tx),
         },
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -1473,7 +1562,7 @@ async fn an_in_flight_message_whose_panic_payload_panics_when_dropped_ends_as_an
         ActorId::from(name.clone()),
         PayloadParker,
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -1565,7 +1654,7 @@ async fn a_forwarder_panic_still_finishing_when_the_end_begins_never_changes_the
             attached: Some(attached_tx),
         },
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -1640,7 +1729,7 @@ async fn an_in_flight_message_drops_before_the_name_is_freed_on_an_abort() {
         ActorId::from(name.clone()),
         ProbeParker,
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -1816,7 +1905,7 @@ async fn a_cancelled_forwarder_s_drop_panic_never_changes_the_end(
             dropped: dropped.clone(),
         },
         ActorConfig::default(),
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system.clone()),
         None,
         true,
@@ -1966,7 +2055,7 @@ async fn a_stream_parked_on_the_full_mailbox_ends(with_child: bool) -> StopReaso
             with_child,
         },
         config,
-        Some(name.clone()),
+        Some(Arc::from(name.clone())),
         Some(system),
         None,
         true,
@@ -2121,7 +2210,7 @@ async fn a_producer_child_stops_at_its_parent_s_request(shutdown: crate::types::
             shutdown,
         },
         config,
-        Some(name),
+        Some(Arc::from(name)),
         Some(system),
         None,
         true,
@@ -2300,7 +2389,7 @@ async fn a_child_waiting_on_a_forwarder_s_release(
             shutdown,
         },
         config,
-        Some(name),
+        Some(Arc::from(name)),
         Some(system),
         None,
         true,
@@ -2418,7 +2507,7 @@ async fn a_cancelled_parked_stream_ends() -> StopReason {
             handled: 0,
         },
         config,
-        Some(name),
+        Some(Arc::from(name)),
         Some(system),
         None,
         true,
@@ -2448,4 +2537,99 @@ async fn a_stream_cancelled_in_on_stopped_while_parked_is_the_run_s_multi_thread
         let r = a_cancelled_parked_stream_ends().await;
         assert!(matches!(r, StopReason::Graceful), "{r:?}");
     }
+}
+
+/// A stream whose one poll holds its worker thread until the test releases it
+/// (or drops the release sender), and which then ends.
+struct StraddlingPoll {
+    _bomb: FloodBomb,
+    entered: Option<oneshot::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Stream for StraddlingPoll {
+    type Item = ();
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        // The bound only limits how long a real hang holds the worker.
+        let _ = self.release.recv_timeout(Duration::from_secs(60));
+        Poll::Ready(None)
+    }
+}
+
+/// Cancels its stream in `on_stopped`.
+struct CancelsInOnStopped {
+    stream: Option<StraddlingPoll>,
+}
+
+impl Actor for CancelsInOnStopped {
+    type Message = FloodMsg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.add_stream(self.stream.take().expect("the stream"));
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: FloodMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _r: &StopReason,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        ctx.cancel_all_streams();
+        Ok(())
+    }
+}
+
+/// A stream cancelled in `on_stopped` while one of its polls is running, and
+/// whose poll returns only after the mailbox closed, belongs to the run: the
+/// forwarder drops it at the close, and the end reads that drop by the
+/// registration, so its panic never changes the actor's reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_cancelled_in_on_stopped_whose_poll_ends_after_the_close_is_the_run_s() {
+    let system = ActorSystem::create(format!("end-order-{}", uuid::Uuid::new_v4())).unwrap();
+    let name = format!("end-order-{}", uuid::Uuid::new_v4());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, entered) = oneshot::channel();
+    let (release_tx, release) = std::sync::mpsc::channel();
+    let (handle, join, _subtree) = spawn_actor(
+        ActorId::from(name.clone()),
+        CancelsInOnStopped {
+            stream: Some(StraddlingPoll {
+                _bomb: FloodBomb(seen.clone()),
+                entered: Some(entered_tx),
+                release,
+            }),
+        },
+        ActorConfig::default(),
+        Some(Arc::from(name)),
+        Some(system),
+        None,
+        true,
+        Duration::from_millis(200),
+        None,
+    )
+    .expect("the actor spawns");
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("the stream is polled")
+        .unwrap();
+    handle.stop(StopReason::Graceful).await.expect("accepted");
+    tokio::time::timeout(Duration::from_secs(10), handle.mailbox_close())
+        .await
+        .expect("the mailbox closes");
+    release_tx.send(()).expect("the poll is still waiting");
+    let reason = tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("the actor ends")
+        .expect("the task returns its reason");
+    assert_eq!(*seen.lock().unwrap(), vec!["dropped"]);
+    assert!(matches!(reason, StopReason::Graceful), "{reason:?}");
 }

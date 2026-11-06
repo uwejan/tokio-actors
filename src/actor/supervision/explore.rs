@@ -242,6 +242,32 @@ enum LaneMode {
     Sealed,
 }
 
+/// A caller's request to an incarnation (`send` and its timed and priority
+/// forms): a slot reserved in the mailbox, the push through it, the handler's
+/// reply, the handler's failure answered once the incarnation has ended, or
+/// the answer read from the final reason when the request found the mailbox
+/// closed or was dropped unhandled.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+enum Req {
+    #[default]
+    None,
+    /// The slot is held; the mailbox may close before the push.
+    Reserved,
+    /// Pushed while the mailbox was open, waiting for the loop.
+    Queued,
+    /// Taken by the loop: a turn runs its handler.
+    InHandler,
+    /// The handler failed: the answer is held to the incarnation's end.
+    Held,
+    /// Dropped unhandled or pushed after the close: waits for the final
+    /// reason.
+    WaitFinal,
+    /// The handler's reply, a plain value.
+    Replied,
+    /// Answered with the incarnation's final reason.
+    Answered(Reason),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Answer {
     Ok,
@@ -482,6 +508,13 @@ struct Inc {
     end: Option<Reason>,
     acked: bool,
     aborted: bool,
+    req: Req,
+    /// Whether the mailbox is closed: at the run loop's closing point, or
+    /// when the task ends without reaching it.
+    mailbox_closed: bool,
+    /// The task ended but a worker still holds the incarnation's hold: the
+    /// subtree is not gone until `HoldDrops`.
+    kept: bool,
 }
 
 /// Facts the checks compare against, written by the harness part of a step or
@@ -629,6 +662,11 @@ struct Budgets {
     new_spawn: u8,
     init_fail: u8,
     foreign: u8,
+    /// Requests to a child of the supervisor under test, each at most once.
+    request: u8,
+    /// The ends of an incarnation's task that leave its hold with a worker
+    /// still running (a forwarder dropping user code), each at most once.
+    keep_hold: u8,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -1144,9 +1182,10 @@ impl State {
     fn expirable(&self, cfg: &Cfg, t: Tok) -> bool {
         let live = self.subtree_live(t);
         self.release_bound(cfg, t) != INF
-            && live
+            && (live
                 .iter()
                 .any(|u| matches!(self.inc(*u).stage, Stage::Stuck(_)))
+                || kept_in(&self.incs, t))
             && !live.iter().any(|u| self.abort_owed(*u))
     }
 
@@ -1703,6 +1742,7 @@ impl<'a> Ap<'a> {
             (i.key, i.aborted, i.lane, i.acked)
         };
         let x = self.s.cell(t).sup;
+        self.close_mailbox(t);
         if !aborted && lane == Some(Reason::Kill) && r != Reason::Kill {
             r = Reason::Kill;
         }
@@ -1719,6 +1759,10 @@ impl<'a> Ap<'a> {
             i.lane_mode = LaneMode::Sealed;
             i.stage = Stage::Done;
             i.end = Some(r);
+        }
+        if self.s.left.keep_hold > 0 {
+            self.s.left.keep_hold -= 1;
+            self.s.incs.get_mut(&t).expect("model invariant: inc").kept = true;
         }
         self.s
             .cells
@@ -1804,6 +1848,23 @@ impl<'a> Ap<'a> {
         }
     }
 
+    /// Closes the mailbox: a request queued before the close is dropped
+    /// unhandled and waits for the final reason. A request whose slot is
+    /// still reserved is not touched; its push meets the closed mailbox.
+    /// A task that ends without reaching its closing point closes the
+    /// mailbox the same way.
+    fn close_mailbox(&mut self, t: Tok) {
+        let i = self.s.incs.get_mut(&t).expect("model invariant: inc");
+        if i.mailbox_closed {
+            return;
+        }
+        i.mailbox_closed = true;
+        if matches!(i.req, Req::Queued | Req::InHandler) {
+            i.req = Req::WaitFinal;
+            self.hit(Wit::RequestDrainedAtClose);
+        }
+    }
+
     /// The closing point of an incarnation's run loop.
     fn close(&mut self, t: Tok) {
         {
@@ -1813,6 +1874,7 @@ impl<'a> Ap<'a> {
             }
             i.lane_mode = LaneMode::KillOnly;
         }
+        self.close_mailbox(t);
         let r = self
             .s
             .inc(t)
@@ -4549,6 +4611,9 @@ fn new_inc(sup: SupId, key: Key, parent: Option<Tok>, id: IdKey) -> Inc {
         end: None,
         acked: false,
         aborted: false,
+        req: Req::None,
+        mailbox_closed: false,
+        kept: false,
     }
 }
 
@@ -4579,6 +4644,7 @@ enum Step {
     InitAck(Tok),
     StartTimeout(Tok),
     // Ladders, the reaper and runner failures.
+    HoldDrops(Tok),
     WindowEnds(Tok),
     GraceEnds(Tok),
     AbortGraceEnds(Tok),
@@ -4635,6 +4701,11 @@ enum Step {
     ThirdPartyRaise(Tok, Reason),
     BareKill(Tok),
     ForeignRegister(Key),
+    // A caller's request to a child of the supervisor under test.
+    RequestReserves(Tok),
+    RequestPushes(Tok),
+    RequestGivesBack(Tok),
+    RequestAnswers(Tok),
 }
 
 impl Step {
@@ -4662,6 +4733,7 @@ impl Step {
                 | Step::ThirdPartyRaise(..)
                 | Step::BareKill(_)
                 | Step::ForeignRegister(_)
+                | Step::RequestReserves(_)
         )
     }
 }
@@ -4707,13 +4779,41 @@ impl State {
     /// Every step enabled in this state.
     fn enabled(&self, cfg: &Cfg) -> Vec<Step> {
         let mut v = Vec::new();
+        for (&t, inc) in &self.incs {
+            if inc.kept {
+                v.push(Step::HoldDrops(t));
+            }
+        }
         self.enabled_children(cfg, &mut v);
         self.enabled_attempts_and_ladders(cfg, &mut v);
         self.enabled_supervisor(cfg, &mut v);
         self.enabled_shutdown(&mut v);
         self.enabled_sweep_entries(&mut v);
         self.enabled_external(cfg, &mut v);
+        self.enabled_requests(&mut v);
         v
+    }
+
+    /// The steps of a caller's request to a child of the supervisor under
+    /// test: the slot is reserved while the mailbox is open; the push, the
+    /// give-back and the answer are the caller's own continuation.
+    fn enabled_requests(&self, v: &mut Vec<Step>) {
+        for (&t, inc) in &self.incs {
+            if inc.sup != SupId::S {
+                continue;
+            }
+            match inc.req {
+                Req::None if self.left.request > 0 && !inc.mailbox_closed => {
+                    v.push(Step::RequestReserves(t));
+                }
+                Req::Reserved => {
+                    v.push(Step::RequestPushes(t));
+                    v.push(Step::RequestGivesBack(t));
+                }
+                Req::WaitFinal | Req::Held if inc.end.is_some() => v.push(Step::RequestAnswers(t)),
+                _ => {}
+            }
+        }
     }
 
     fn enabled_children(&self, cfg: &Cfg, v: &mut Vec<Step>) {
@@ -4736,7 +4836,7 @@ impl State {
                     if inc.unseen {
                         v.push(Step::Observe(t));
                     } else {
-                        if kid.turns {
+                        if kid.turns || inc.req == Req::Queued {
                             v.push(Step::BeginTurn(t));
                         }
                         if crash_left > 0 {
@@ -5293,12 +5393,34 @@ impl Ap<'_> {
             Step::Observe(t) => self.observe(t),
             Step::GateReturns(t) => self.gate_returns(t),
             Step::BeginTurn(t) => {
-                self.s.incs.get_mut(&t).expect("model invariant: inc").stage = Stage::Turn
+                let i = self.s.incs.get_mut(&t).expect("model invariant: inc");
+                i.stage = Stage::Turn;
+                if i.req == Req::Queued {
+                    i.req = Req::InHandler;
+                }
             }
             Step::EndTurn(t) => {
-                self.s.incs.get_mut(&t).expect("model invariant: inc").stage = Stage::Idle
+                let i = self.s.incs.get_mut(&t).expect("model invariant: inc");
+                i.stage = Stage::Idle;
+                if i.req == Req::InHandler {
+                    i.req = Req::Replied;
+                }
             }
             Step::Crash(t) => {
+                // A handler that fails holds its answer to the incarnation's
+                // end. The harness records the failure as a fact of its own,
+                // for the check that compares the request after the step.
+                let failed = {
+                    let i = self.s.incs.get_mut(&t).expect("model invariant: inc");
+                    let failed = i.req == Req::InHandler;
+                    if failed {
+                        i.req = Req::Held;
+                    }
+                    failed
+                };
+                if failed {
+                    self.obs.push(Obs::HandlerFailed(t));
+                }
                 if self.s.sys == SysPhase::ShuttingDown
                     && self.s.shutdown.is_some_and(|sh| sh.abandoned)
                 {
@@ -5488,6 +5610,9 @@ impl Ap<'_> {
                 self.s.reaper.insert(t, Reap::AbortDue);
             }
             Step::RunnerFails(t) => self.runner_fails(t),
+            Step::HoldDrops(t) => {
+                self.s.incs.get_mut(&t).expect("model invariant: inc").kept = false;
+            }
             Step::LostRunnerVerdict(t) => {
                 self.hit(Wit::StuckMemberRunnerFailedVerdict);
                 if self.s.cell(t).sup != SupId::S
@@ -5641,6 +5766,45 @@ impl Ap<'_> {
                 if self.s.inc(t).lane == Some(Reason::Kill) {
                     self.s.reaper.insert(t, Reap::AbortDue);
                 }
+            }
+            Step::RequestReserves(t) => {
+                self.s.left.request -= 1;
+                self.s.incs.get_mut(&t).expect("model invariant: inc").req = Req::Reserved;
+            }
+            Step::RequestPushes(t) => {
+                let closed = self.s.inc(t).mailbox_closed;
+                if closed {
+                    self.hit(Wit::RequestPushedAfterClose);
+                }
+                // The caller reads the closed flag after its push: a closed
+                // mailbox sends it to the final reason.
+                self.s.incs.get_mut(&t).expect("model invariant: inc").req =
+                    if closed { Req::WaitFinal } else { Req::Queued };
+            }
+            Step::RequestGivesBack(t) => {
+                self.s.incs.get_mut(&t).expect("model invariant: inc").req = Req::None;
+            }
+            Step::RequestAnswers(t) => {
+                let end = self
+                    .s
+                    .inc(t)
+                    .end
+                    .expect("model invariant: an answer waits for the end");
+                // The held answer of a failed handler is sent at the end,
+                // unless a `Kill` ended the incarnation: its caller then reads
+                // the final reason, as every request that meets the end does.
+                let req = if self.s.inc(t).req == Req::Held {
+                    if end == Reason::Kill {
+                        self.hit(Wit::CrashAnswerReplacedByKill);
+                        Req::Answered(end)
+                    } else {
+                        self.hit(Wit::CrashAnswerHeldToTheEnd);
+                        Req::Replied
+                    }
+                } else {
+                    Req::Answered(end)
+                };
+                self.s.incs.get_mut(&t).expect("model invariant: inc").req = req;
             }
             Step::ForeignRegister(c) => {
                 self.s.left.foreign -= 1;
@@ -5858,6 +6022,15 @@ impl Ap<'_> {
             }
             Behavior::ParentOnly => r == Reason::ParentRequest,
         };
+        if !accepted
+            && self
+                .s
+                .inc(t)
+                .lane
+                .is_some_and(|f| strength(f) == Strength::Forced)
+        {
+            self.hit(Wit::ForcedRequestWinsAVeto);
+        }
         if accepted
             && self.cfg_of(t).policy == Policy::Infinity
             && self.s.inc(t).reasked
@@ -5877,7 +6050,12 @@ impl Ap<'_> {
         }
         match lane {
             Some(f) if strength(f) == Strength::Forced => self.leave_loop(t, f),
-            _ if accepted => self.leave_loop(t, r),
+            _ if accepted => {
+                if lane.is_some_and(|l| l != r) {
+                    self.hit(Wit::AcceptingGateTakesTheStrongerRequest);
+                }
+                self.leave_loop(t, lane.unwrap_or(r));
+            }
             _ => {
                 self.s.incs.get_mut(&t).expect("model invariant: inc").stage = Stage::Idle;
             }
@@ -6215,6 +6393,13 @@ const NO_LEFTOVER_OUTLIVES_THE_DEADLINE_ONCE_THE_SWEEP_STARTED: &str =
     "no_leftover_outlives_the_deadline_once_the_sweep_started";
 const AT_MOST_ONE_HOLDER_PER_NAME: &str = "at_most_one_holder_per_name";
 const THE_SERIAL_OUTCOME_HOLDS: &str = "the_serial_outcome_holds";
+const A_REQUEST_ACROSS_THE_END_READS_THE_FINAL_REASON: &str =
+    "a_request_across_the_end_reads_the_final_reason";
+const NO_REQUEST_OUTLIVES_THE_END_UNANSWERED: &str = "no_request_outlives_the_end_unanswered";
+const A_FAILED_REQUEST_IS_ANSWERED_AFTER_THE_END: &str =
+    "a_failed_request_is_answered_after_the_end";
+const A_FAILED_REQUEST_ENDED_BY_KILL_READS_THE_FINAL_REASON: &str =
+    "a_failed_request_ended_by_kill_reads_the_final_reason";
 
 /// What a step witnessed, counted per exploration so that no check passes
 /// vacuously.
@@ -6255,6 +6440,8 @@ enum Wit {
     TeardownPassedRunnerFailedEnd,
     OverrideOneMoreAsk,
     AcceptsAfterTheOneMoreAsk,
+    AcceptingGateTakesTheStrongerRequest,
+    ForcedRequestWinsAVeto,
     FailedFinalDeliveryRestStillDelivered,
     UnspawnedAttemptOrderedAtEvaluation,
     WaitingAttemptOrderedAtEvaluation,
@@ -6307,6 +6494,11 @@ enum Wit {
     GuardKeepsLadderKillAbortUnderBoundedPolicy,
     GuardKeepsLadderKillAbortUnderInfinity,
     DeadlineEntryFiresAfterAbandon,
+    RequestPushedAfterClose,
+    RequestDrainedAtClose,
+    CrashAnswerHeldToTheEnd,
+    CrashAnswerReplacedByKill,
+    HoldKeptPastTheEnd,
 }
 
 impl Wit {
@@ -6349,6 +6541,11 @@ impl Wit {
             Wit::DeadlineEntryFiresAfterAbandon => {
                 "a deadline entry of the final sweep firing after its shutdown was abandoned"
             }
+            Wit::HoldKeptPastTheEnd => "a successor waiting on a subtree whose ended incarnation keeps its hold",
+            Wit::RequestPushedAfterClose => "a request pushed through a slot reserved before the mailbox closed",
+            Wit::RequestDrainedAtClose => "a request queued before the close, dropped unhandled at the close",
+            Wit::CrashAnswerHeldToTheEnd => "the answer to a failed handler held to the incarnation's end and then sent",
+            Wit::CrashAnswerReplacedByKill => "the answer to a failed handler held to the end, which a Kill made the final reason",
             Wit::TerminateOfDownChildWaitsOnSubtree => "a terminate of a child already down waiting on its old subtree",
             Wit::AttemptOrderedInit => "an in-flight attempt ordered during its init",
             Wit::AttemptOrderedInTransit => "an order written while an ack is in transit",
@@ -6392,6 +6589,12 @@ impl Wit {
             Wit::TeardownPassedRunnerFailedEnd => "a teardown that waited for the end of an incarnation whose runner failed",
             Wit::OverrideOneMoreAsk => "a terminate override giving the one more ask under Infinity",
             Wit::AcceptsAfterTheOneMoreAsk => "a member under Infinity accepting after the one more ask",
+            Wit::AcceptingGateTakesTheStrongerRequest => {
+                "a pre_stop that accepts while a stronger request has landed"
+            }
+            Wit::ForcedRequestWinsAVeto => {
+                "a pre_stop that vetoes while a forced request has landed"
+            }
             Wit::FailedFinalDeliveryRestStillDelivered => "a failed final delivery, the remaining reports still delivered",
             Wit::UnspawnedAttemptOrderedAtEvaluation => "an unspawned attempt ordered at a first group evaluation",
             Wit::WaitingAttemptOrderedAtEvaluation => "an attempt waiting for its predecessor's subtree ordered at a first group evaluation",
@@ -6916,6 +7119,7 @@ impl State {
             | Step::GateReturns(t)
             | Step::EndTurn(t)
             | Step::HookDone(t)
+            | Step::HoldDrops(t)
             | Step::WindowEnds(t)
             | Step::GraceEnds(t)
             | Step::AbortGraceEnds(t)
@@ -7464,6 +7668,14 @@ impl State {
                 }
             }
         }
+        // No request is left across an end: the caller of a request that
+        // meets the end of its incarnation is answered.
+        for inc in self.incs.values() {
+            if inc.end.is_some() && !matches!(inc.req, Req::None | Req::Replied | Req::Answered(_))
+            {
+                out.push(NO_REQUEST_OUTLIVES_THE_END_UNANSWERED);
+            }
+        }
         // The serial outcome.
         match self.s_phase {
             SPhase::Loop => {
@@ -7700,6 +7912,52 @@ fn step_checks(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<&
     }
     check_manual(cfg, pre, step, ap, out);
     check_tree_steps(cfg, pre, step, post, out);
+    check_requests(pre, ap, out);
+}
+
+/// A request that waited for the final reason is answered once the
+/// incarnation has ended, with the reason it ended with: not the reason it
+/// stopped for, which a `Kill` or an abort may have replaced. A request whose
+/// handler failed is answered with the handler's error once the incarnation
+/// has ended, unless a `Kill` ended it: its caller then reads the final
+/// reason, `Kill`.
+fn check_requests(pre: &State, ap: &Applied, out: &mut Vec<&'static str>) {
+    let post = &ap.post;
+    for (&t, inc) in &pre.incs {
+        let Some(after) = post.incs.get(&t) else {
+            continue;
+        };
+        if let (Req::WaitFinal, Req::Answered(r)) = (inc.req, after.req) {
+            if inc.end.is_none() || after.end != Some(r) {
+                out.push(A_REQUEST_ACROSS_THE_END_READS_THE_FINAL_REASON);
+            }
+        }
+        match (inc.req, after.req) {
+            (Req::Held, Req::Replied) => {
+                if inc.end.is_none() || after.end == Some(Reason::Kill) {
+                    out.push(A_FAILED_REQUEST_IS_ANSWERED_AFTER_THE_END);
+                }
+            }
+            (Req::Held, Req::Answered(r)) => {
+                if inc.end.is_none() {
+                    out.push(A_FAILED_REQUEST_IS_ANSWERED_AFTER_THE_END);
+                }
+                if r != Reason::Kill || after.end != Some(Reason::Kill) {
+                    out.push(A_FAILED_REQUEST_ENDED_BY_KILL_READS_THE_FINAL_REASON);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A step in which a handler failed leaves its request unanswered: the
+    // answer is the incarnation's end to send, never the handler's turn.
+    for obs in &ap.obs {
+        if let Obs::HandlerFailed(t) = obs {
+            if post.incs.get(t).is_some_and(|i| i.req == Req::Replied) {
+                out.push(A_FAILED_REQUEST_IS_ANSWERED_AFTER_THE_END);
+            }
+        }
+    }
 }
 
 /// The incarnations whose guard fired in a step: live before and after, taken
@@ -7834,6 +8092,15 @@ fn check_tree_steps(cfg: &Cfg, pre: &State, step: Step, post: &State, out: &mut 
             && after.stop_reason != Some(Reason::ParentKilled)
         {
             out.push(KILLED_SUPERVISOR_CHILDREN_SETTLE_IN_ORDER_WITHIN_THEIR_WINDOWS);
+        }
+        // A gate that accepts ends the actor with the lane's strongest
+        // reason, never the weaker one it was asked with.
+        if matches!(step, Step::GateReturns(u) if u == t)
+            && matches!(after.stage, Stage::Final | Stage::Hook)
+            && inc.lane.is_some_and(|l| l != Reason::Kill)
+            && after.stop_reason != inc.lane
+        {
+            out.push(STOP_REQUESTS_NEVER_WEAKEN);
         }
         // The reason `on_stopped` received is never rewritten, but by the
         // final read of a Kill and by a failed final delivery.
@@ -9038,6 +9305,8 @@ enum MEvent {
         raised: bool,
     },
     Deadline,
+    /// The incarnation's task ended.
+    Ended,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -9046,11 +9315,15 @@ enum MAction {
     Raise(Reason),
     Abort,
     Verdict,
+    /// The abort owed to the incarnation is released.
+    Release,
 }
 
 /// The model's ladder: an order arms it (raising the first signal unless it was
 /// raised already, the clock starting at the raise), the graceful window ends
-/// in a `Kill`, the kill grace in an abort, the abort wait in the verdict.
+/// in a `Kill`, the kill grace in an abort, the abort wait in the verdict. The
+/// task's end, at any position, releases the abort the ladder owes and leaves
+/// the position as it is.
 fn m_ladder(step: MStep, event: MEvent, now: u64, grace: u64) -> (MStep, MAction) {
     match (step, event) {
         (
@@ -9086,6 +9359,7 @@ fn m_ladder(step: MStep, event: MEvent, now: u64, grace: u64) -> (MStep, MAction
             MAction::Abort,
         ),
         (MStep::AbortGrace(_), MEvent::Deadline) => (MStep::Spent, MAction::Verdict),
+        (step, MEvent::Ended) => (step, MAction::Release),
         (step, _) => (step, MAction::Nothing),
     }
 }
@@ -9166,6 +9440,7 @@ impl Clock {
                 initial_raised: raised,
             },
             MEvent::Deadline => LadderEvent::DeadlineReached,
+            MEvent::Ended => LadderEvent::TaskEnded,
         }
     }
 
@@ -9176,6 +9451,7 @@ impl Clock {
             LadderAction::Raise(Signal::ParentRequest) => MAction::Raise(Reason::ParentRequest),
             LadderAction::Abort => MAction::Abort,
             LadderAction::WriteVerdict => MAction::Verdict,
+            LadderAction::ReleaseMark => MAction::Release,
         }
     }
 
@@ -9244,6 +9520,27 @@ fn site_ladder(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<&
         };
         let got = clock.production(MStep::Idle, event, now, kid.kg());
         if got != m_ladder(MStep::Idle, event, now, kid.kg()) || got.1 != MAction::Nothing {
+            bad = true;
+        }
+    }
+    // The end of an incarnation whose ladder the runner or the attempt runs:
+    // the ladder releases the abort it owes and keeps its position.
+    for (&t, cell) in &pre.cells {
+        let ladder_runs = matches!(cell.exec, Exec::Runner | Exec::Attempt(AttemptStage::Init));
+        if !ladder_runs || !pre.live(t) || post.live(t) || !post.incs.contains_key(&t) {
+            continue;
+        }
+        let kid = cfg.kid_of(cell.sup, cell.key);
+        let held = match cell.ladder {
+            Ladder::Off => MStep::Idle,
+            Ladder::Window => MStep::Graceful(Some(m_after(now, kid.window_ns))),
+            Ladder::WindowInf => MStep::Graceful(None),
+            Ladder::KillGrace => MStep::KillGrace(m_after(now, kid.kg())),
+            Ladder::AbortGrace => MStep::AbortGrace(m_after(now, ABORT_SETTLE)),
+            Ladder::Spent => MStep::Spent,
+        };
+        let got = clock.production(held, MEvent::Ended, now, kid.kg());
+        if got != (held, MAction::Release) || got != m_ladder(held, MEvent::Ended, now, kid.kg()) {
             bad = true;
         }
     }
@@ -9329,7 +9626,7 @@ fn domain_ladder() -> bool {
         MStep::Spent,
     ];
     steps.dedup();
-    let mut events = vec![MEvent::Deadline];
+    let mut events = vec![MEvent::Deadline, MEvent::Ended];
     for policy in policies {
         for raised in [false, true] {
             events.push(MEvent::Order {
@@ -10281,6 +10578,10 @@ enum Obs {
         lane: Option<Reason>,
         kill_now: bool,
     },
+    /// The handler of the request an incarnation had in its turn failed: a
+    /// fact of the harness, which the request check compares the request
+    /// with after the step.
+    HandlerFailed(Tok),
     /// The budget a child's creation added to the subtree it hangs from: the
     /// child's shape, policy and kill grace, and the model's two values.
     Budget {
@@ -10743,6 +11044,9 @@ fn site_observed(ap: &Applied, out: &mut Vec<&'static str>) {
                     out.push(OWN_BUDGET_CONFORMANCE);
                 }
             }
+            // A harness fact, compared by the request check, not a decision
+            // production takes with a `rules` function.
+            Obs::HandlerFailed(_) => {}
             Obs::InitRead { lane, kill_now } => {
                 INIT_SITES.with(|c| c.set(c.get() + 1));
                 let image = lane.map(img_reason);
@@ -11645,8 +11949,8 @@ fn site_answer(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<&
 /// planes its cell publishes, so the cell reads open.
 struct KeptSlot {
     _io: super::SlotIo,
-    _lane_rx: tokio::sync::watch::Receiver<LaneState>,
-    _status_tx: Option<tokio::sync::watch::Sender<crate::types::StatusValue>>,
+    _lane_rx: crate::types::LaneRx,
+    _status_tx: Option<crate::types::StatusTx>,
 }
 
 fn img_status(status: Status) -> crate::types::ActorStatus {
@@ -11698,8 +12002,9 @@ fn img_supervision(cfg: &Cfg, pre: &State, kept: &mut Vec<KeptSlot>) -> Supervis
             if let Some(reason) = inc.lane {
                 lane.raise(img_reason(reason));
             }
-            let (status_tx, status_rx) =
-                tokio::sync::watch::channel(crate::types::StatusValue::new(img_status(inc.status)));
+            let (status_tx, status_rx) = crate::types::StatusTx::channel(
+                crate::types::StatusValue::new(img_status(inc.status)),
+            );
             io.publish(
                 lane,
                 status_rx,
@@ -12722,6 +13027,17 @@ impl State {
         v.extend(self.reaper.keys());
         v.extend(self.oracle.decided.keys().map(|k| &k.1));
         v.extend(self.oracle.pending_call.map(|p| p.t).iter());
+        // An ended incarnation whose caller has not been answered stays: the
+        // check that no request outlives the end reads it.
+        v.extend(
+            self.incs
+                .iter()
+                .filter(|(_, i)| !matches!(i.req, Req::None | Req::Replied | Req::Answered(_)))
+                .map(|(t, _)| t),
+        );
+        // An ended incarnation whose hold is kept stays: the subtree it
+        // belongs to is not gone.
+        v.extend(self.incs.iter().filter(|(_, i)| i.kept).map(|(t, _)| t));
         // A live incarnation names the supervisor incarnation that spawned
         // it, and an attempt waits on its predecessor.
         loop {
@@ -13035,12 +13351,20 @@ impl State {
 
 /// Whether `t` and everything below it ended, read from the incarnations.
 fn gone_in(incs: &BTreeMap<Tok, Inc>, t: Tok) -> bool {
-    if incs.get(&t).is_some_and(|i| i.end.is_none()) {
+    if incs.get(&t).is_some_and(|i| i.end.is_none() || i.kept) {
         return false;
     }
     !incs
         .iter()
         .any(|(&u, i)| i.parent == Some(t) && !gone_in(incs, u))
+}
+
+/// Whether `t` or an incarnation below it ended with its hold still kept.
+fn kept_in(incs: &BTreeMap<Tok, Inc>, t: Tok) -> bool {
+    incs.get(&t).is_some_and(|i| i.kept)
+        || incs
+            .iter()
+            .any(|(&u, i)| i.parent == Some(t) && kept_in(incs, u))
 }
 
 /// A set of tokens: tokens are bytes.
@@ -13315,6 +13639,9 @@ fn scan_witnesses(cfg: &Cfg, pre: &State, step: Step, post: &State, wit: &mut Ve
     // Attempts waiting on a subtree.
     for cell in post.cells.values() {
         if let (Exec::Attempt(AttemptStage::Wait), Some(w)) = (cell.exec, cell.waits_on) {
+            if kept_in(&post.incs, w) {
+                wit.push(Wit::HoldKeptPastTheEnd);
+            }
             if !post.gone(w) {
                 wit.push(Wit::SuccessorWaitingOnLiveSubtree);
                 if post.cells.get(&w).is_some_and(|c| c.exec == Exec::Returned) {
@@ -13911,7 +14238,28 @@ fn small_lane_cfgs() -> Vec<Cfg> {
         Reason::ParentKilled,
         Reason::Cancelled,
     ];
-    vec![a, b, c]
+    // A cooperative child asked with a `Graceful` whose gate runs while a
+    // `ParentRequest` lands: the accept ends it with the stronger request.
+    let mut d = base("small_lane", Strategy::OneForOne, vec![PLAIN.turns()], 1);
+    d.budgets = Budgets {
+        third: 2,
+        ..Budgets::default()
+    };
+    d.third_reasons = vec![Reason::Graceful, Reason::ParentRequest];
+    // A child that vetoes a `Graceful` whose gate runs while a forced request
+    // lands: the veto does not hold it, the gate leaves with the forced request.
+    let mut e = base("small_lane", Strategy::OneForOne, vec![VETO], 1);
+    e.budgets = Budgets {
+        third: 2,
+        ..Budgets::default()
+    };
+    e.third_reasons = vec![
+        Reason::Graceful,
+        Reason::Failure(Cause::Crash),
+        Reason::ParentKilled,
+        Reason::Cancelled,
+    ];
+    vec![a, b, c, d, e]
 }
 
 /// A `Transient` child stopped from above by a party other than its
@@ -14248,6 +14596,35 @@ fn small_tree_stored_kill_cfgs() -> Vec<Cfg> {
     ]
 }
 
+/// A request to a child that crashes and is killed bare: the request's slot
+/// is reserved before the close and pushed after it, or pushed before the
+/// close and dropped unhandled at it, and in both orders its caller is
+/// answered with the reason the incarnation ended with, which an abort or a
+/// `Kill` may have made different from the reason it stopped for.
+fn small_late_request_cfgs() -> Vec<Cfg> {
+    let c = base(
+        "small_late_request",
+        Strategy::OneForOne,
+        vec![PLAIN.turns()],
+        1,
+    );
+    // A supervisor child closes its mailbox before its teardown ends, so a
+    // request meets a closed mailbox and an incarnation that has not ended.
+    let tree = tree_base(
+        "small_late_request",
+        Strategy::OneForOne,
+        PLAIN,
+        PLAIN.turns(),
+        false,
+    );
+    let set = |b: &mut Budgets| {
+        b.crash_s = 1;
+        b.bare_kill = 1;
+        b.request = 1;
+    };
+    vec![with(&c, set), with(&tree, set)]
+}
+
 /// A supervisor child with a start timeout crashes; the start timeout of its
 /// restart attempt raises `Kill` on the new incarnation, which arms no reaper
 /// entry (the attempt runs its own grace and abort), and then its supervisor
@@ -14355,6 +14732,37 @@ fn small_tree_stuck_grandchild_cfgs() -> Vec<Cfg> {
             b.bare_kill = 1;
             b.stuck = 1;
             b.parent_stop = 1;
+        }),
+    ]
+}
+
+fn small_tree_kept_hold_cfgs() -> Vec<Cfg> {
+    let w0 = PLAIN.turns();
+    let c = tree_base(
+        "small_tree_kept_hold",
+        Strategy::OneForOne,
+        PLAIN.policy(Policy::Kill),
+        w0,
+        false,
+    );
+    // The first task to end leaves its hold with a worker still running, so
+    // a successor waits on a subtree whose ended incarnation is not gone.
+    let beside_a_sibling = tree_base(
+        "small_tree_kept_hold",
+        Strategy::OneForOne,
+        PLAIN.policy(Policy::Kill),
+        w0,
+        true,
+    );
+    vec![
+        with(&c, |b| {
+            b.bare_kill = 1;
+            b.keep_hold = 1;
+        }),
+        with(&beside_a_sibling, |b| {
+            b.bare_kill = 1;
+            b.keep_hold = 1;
+            b.crash_s = 1;
         }),
     ]
 }
@@ -14937,6 +15345,19 @@ fn small_tree_stored_kill() {
 }
 
 #[test]
+fn small_late_request() {
+    run_configuration(
+        &small_late_request_cfgs(),
+        &[
+            Wit::RequestPushedAfterClose,
+            Wit::RequestDrainedAtClose,
+            Wit::CrashAnswerHeldToTheEnd,
+            Wit::CrashAnswerReplacedByKill,
+        ],
+    );
+}
+
+#[test]
 fn small_shutdown_abandoned_sweep() {
     run_configuration(
         &small_shutdown_abandoned_sweep_cfgs(),
@@ -15001,6 +15422,11 @@ fn small_tree_stuck_grandchild() {
             &[Wit::OrderBesideAnExpirableWait],
         ],
     );
+}
+
+#[test]
+fn small_tree_kept_hold() {
+    run_configuration(&small_tree_kept_hold_cfgs(), &[Wit::HoldKeptPastTheEnd]);
 }
 
 #[test]
@@ -15158,7 +15584,14 @@ fn small_retry() {
 
 #[test]
 fn small_lane() {
-    run_configuration(&small_lane_cfgs(), &[Wit::ThirdGracefulOverParentRequest]);
+    run_configuration(
+        &small_lane_cfgs(),
+        &[
+            Wit::ThirdGracefulOverParentRequest,
+            Wit::AcceptingGateTakesTheStrongerRequest,
+            Wit::ForcedRequestWinsAVeto,
+        ],
+    );
 }
 
 #[test]

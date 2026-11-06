@@ -51,30 +51,6 @@ async fn config_defaults_when_not_specified() {
 }
 
 #[tokio::test]
-async fn config_can_be_passed_via_builder() {
-    let config = ActorConfig::default();
-    let actor = DummyActor
-        .spawn()
-        .named("cfg-via-builder")
-        .with_config(config)
-        .await
-        .unwrap();
-    assert!(actor.is_alive());
-}
-
-#[tokio::test]
-async fn config_with_custom_mailbox_via_builder() {
-    let config = ActorConfig::default().with_mailbox_capacity(128);
-    let actor = DummyActor
-        .spawn()
-        .named("cfg-custom-mailbox")
-        .with_config(config)
-        .await
-        .unwrap();
-    assert_eq!(actor.mailbox_capacity(), 128);
-}
-
-#[tokio::test]
 async fn zero_mailbox_capacity_returns_spawn_error_instead_of_panicking() {
     let config = ActorConfig::default().with_mailbox_capacity(0);
     let result = DummyActor

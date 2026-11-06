@@ -37,13 +37,15 @@ async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     }
 }
 
+/// Polls `cond` until it holds. The bound only limits how long a real hang takes to report.
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    within(what, async {
+    let waited = timeout(Duration::from_secs(60), async {
         while !cond() {
             sleep(Duration::from_millis(2)).await;
         }
     })
     .await;
+    assert!(waited.is_ok(), "timed out waiting for: {what}");
 }
 
 fn panic_reason(text: &str) -> StopReason {

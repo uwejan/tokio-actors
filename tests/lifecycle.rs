@@ -14,9 +14,13 @@ use tokio_actors::{
 /// The bound on every outcome a test awaits.
 const BOUND: Duration = Duration::from_secs(10);
 
-/// Polls `pred` until it holds; fails the test after `BOUND`.
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// Polls `pred` until it holds; fails the test after `HANG_BOUND`. The bound only limits how long a real hang takes to report.
 async fn eventually(what: &str, mut pred: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + BOUND;
+    let deadline = tokio::time::Instant::now() + HANG_BOUND;
     while !pred() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -450,12 +454,14 @@ async fn stopped_implies_not_alive() {
 // cascade
 // ---------------------------------------------------------------------------
 
-/// Vetoes every stoppable stop forever - only the `Kill` its own supervisor's
-/// `Shutdown::Timeout` escalates to can ever end it.
-#[derive(Default)]
-struct VetoingChild;
+/// Holds every stop in `pre_stop` until the test releases it, then accepts. It
+/// signals `entered` on entering `pre_stop`.
+struct HeldChild {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
 
-impl Actor for VetoingChild {
+impl Actor for HeldChild {
     type Message = ();
     type Response = ();
 
@@ -464,24 +470,34 @@ impl Actor for VetoingChild {
     }
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        false
+        self.entered.notify_one();
+        self.release.notified().await;
+        true
     }
 }
 
-/// A supervisor with one child on a long `Shutdown::Timeout`, so its own
-/// stop spends a well-defined window inside the child cascade (after
-/// `on_stopped` has already run).
-#[derive(Default)]
-struct SlowCascadeSupervisor;
+/// A supervisor with one child on `Shutdown::Infinity` whose stop the test
+/// holds, so its own stop spends as long as the test wants inside the child
+/// cascade (after `on_stopped` has already run).
+struct SlowCascadeSupervisor {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
 
 impl Actor for SlowCascadeSupervisor {
     type Message = ();
     type Response = ();
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        ctx.spawn_child(VetoingChild::default)
-            .shutdown(Shutdown::Timeout(Duration::from_millis(600)))
-            .await?;
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        ctx.spawn_child(move || HeldChild {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .named("slow-cascade-child")
+        .shutdown(Shutdown::Infinity)
+        .await?;
         Ok(())
     }
 
@@ -490,24 +506,46 @@ impl Actor for SlowCascadeSupervisor {
     }
 }
 
-/// Ports the report's probe scenario: a supervisor whose one child vetoes
-/// with a long `Shutdown::Timeout`, probed 100ms after `stop(Graceful)` -
-/// still well inside the child's 600ms window. Every "already stopped"
-/// probe must agree from the instant the stop was accepted, not only once
-/// the supervisor's task has fully exited.
+/// Ports the report's probe scenario: a supervisor whose one child holds its
+/// stop, probed once `stop(Graceful)` was accepted and while the child still
+/// holds the cascade open. Every "already stopped" probe must agree from the
+/// moment the supervisor has narrowed its stop lane and closed its mailbox,
+/// not only once its task has fully exited. The supervisor publishes `Stopping`
+/// earlier, before its final deliveries and `on_stopped`, and a non-`Kill`
+/// request accepted in that window has no effect. The probes therefore order on
+/// the child's `pre_stop` being entered, which happens only after the lane is
+/// narrowed and the cascade has begun. The test releases the child only after
+/// the last probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_are_refused_from_stop_acceptance_through_a_slow_child_cascade() {
-    let handle = SlowCascadeSupervisor.spawn().supervisor().await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = SlowCascadeSupervisor {
+        entered: entered.clone(),
+        release: release.clone(),
+    }
+    .spawn()
+    .supervisor()
+    .await
+    .unwrap();
 
     // Let the child actually finish spawning before stopping the supervisor.
-    sleep(Duration::from_millis(30)).await;
+    let child = ActorSystem::default()
+        .get::<HeldChild>("slow-cascade-child")
+        .expect("the child is registered once the supervisor started");
+    eventually("the child to run", || {
+        child.status() == ActorStatus::Running
+    })
+    .await;
 
     handle.stop(StopReason::Graceful).await.unwrap();
 
-    // Still well inside the child's 600ms Shutdown::Timeout window.
-    sleep(Duration::from_millis(100)).await;
-
-    assert_eq!(handle.status(), ActorStatus::Stopping);
+    // The child holds the cascade open. Its `pre_stop` is entered only after
+    // the supervisor narrowed its stop lane and closed its mailbox, and the
+    // supervisor reads `Stopping` until released.
+    timeout(HANG_BOUND, entered.notified())
+        .await
+        .expect("the child to enter pre_stop");
 
     let stop_err = handle.stop(StopReason::Graceful).await.unwrap_err();
     assert!(matches!(stop_err, SendError::Closed));
@@ -527,4 +565,15 @@ async fn sends_are_refused_from_stop_acceptance_through_a_slow_child_cascade() {
 
     let try_notify_err = handle.try_notify(()).unwrap_err();
     assert!(matches!(try_notify_err, TrySendError::Closed));
+
+    assert_eq!(
+        handle.status(),
+        ActorStatus::Stopping,
+        "the cascade was still open for every probe"
+    );
+    release.notify_one();
+    eventually("the supervisor to stop", || {
+        handle.status() == ActorStatus::Stopped
+    })
+    .await;
 }

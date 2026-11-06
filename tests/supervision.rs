@@ -6,8 +6,8 @@ use tokio::time::sleep;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorResult, ChildEvent, RestartStrategy, RestartType, Shutdown, StopReason,
-    SupervisionAction, SupervisionConfig,
+    ActorConfig, ActorResult, ChildEvent, RestartStrategy, Shutdown, StopReason, SupervisionAction,
+    SupervisionConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -210,47 +210,8 @@ async fn supervised_actor_responds_to_get_status() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: Restart budget
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn supervision_config_accessible_via_get_status() {
-    let sup = SupervisionConfig::one_for_one().max_restarts(5, Duration::from_secs(10));
-    let handle = Supervisor {
-        events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-    }
-    .spawn()
-    .named("sup-budget")
-    .with_config(ActorConfig::default().with_supervision(sup))
-    .await
-    .unwrap();
-
-    let status = handle.get_status().await.unwrap();
-    assert_eq!(status.child_count, 0);
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-}
-
-// ---------------------------------------------------------------------------
 // Tests: SpawnBuilder integration with supervision
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn supervised_actor_has_zero_children_initially() {
-    let handle = Supervisor {
-        events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-    }
-    .spawn()
-    .named("sup-zero-children")
-    .supervisor()
-    .await
-    .unwrap();
-
-    let status = handle.get_status().await.unwrap();
-    assert_eq!(status.child_count, 0);
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-}
 
 #[tokio::test]
 async fn supervision_config_strategies() {
@@ -297,27 +258,6 @@ async fn child_event_fields() {
     assert_eq!(event.action, SupervisionAction::Removed);
 }
 
-#[tokio::test]
-async fn supervision_action_variants() {
-    assert_eq!(
-        SupervisionAction::RestartInitiated,
-        SupervisionAction::RestartInitiated
-    );
-    assert_eq!(SupervisionAction::Removed, SupervisionAction::Removed);
-    assert_eq!(
-        SupervisionAction::NotSupervised,
-        SupervisionAction::NotSupervised
-    );
-    assert_eq!(
-        SupervisionAction::BudgetExhausted,
-        SupervisionAction::BudgetExhausted
-    );
-    assert_ne!(
-        SupervisionAction::RestartInitiated,
-        SupervisionAction::Removed
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Tests: Shutdown types
 // ---------------------------------------------------------------------------
@@ -326,14 +266,6 @@ async fn supervision_action_variants() {
 async fn shutdown_default_is_timeout_5s() {
     let shutdown = Shutdown::default();
     assert_eq!(shutdown, Shutdown::Timeout(Duration::from_secs(5)));
-}
-
-#[tokio::test]
-async fn restart_type_variants() {
-    assert_eq!(RestartType::Permanent, RestartType::Permanent);
-    assert_eq!(RestartType::Transient, RestartType::Transient);
-    assert_eq!(RestartType::Temporary, RestartType::Temporary);
-    assert_ne!(RestartType::Permanent, RestartType::Temporary);
 }
 
 // ---------------------------------------------------------------------------

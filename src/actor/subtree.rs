@@ -1,4 +1,5 @@
-//! Subtree tokens: how a restart learns that every actor its previous
+//! Subtree tokens: how a restart, a `terminate_child`, a `spawn_child` under
+//! the id of a removed child and a subtree observer learn that every actor an
 //! incarnation spawned has ended.
 //!
 //! Every spawned actor holds a token. A token is held by the actor's run
@@ -7,6 +8,11 @@
 //! a token is dropped only when the actor, everything it owned and everything
 //! below it have ended. Its drop glue signals `gone`, and drop glue runs when
 //! a task is aborted too, so the signal fires on every way an actor can end.
+//! The hold also signals `released` as the last step of its own drop, after it
+//! let go of its reference to the token: the actor let go of everything it
+//! held, and the actors below it may still run. A wait that needs no timer for
+//! the actor's own end waits for `released`, and one that finds `released`
+//! without `gone` knows that something else still holds the token.
 //!
 //! A token also carries the budget of its subtree: the time that subtree can
 //! outlive a killed root. Creating a child raises its parent's budget to at
@@ -27,35 +33,84 @@
 //! nor before the latest abort plus the settle time: an abort that is late
 //! holds the wait for at most the bound once more plus one more settle time,
 //! and one recorded past that bound holds it no further. The end of an actor
-//! that was owed an abort counts as that abort.
+//! that was owed an abort counts as that abort. The actor's own end releases
+//! its mark, and so does each of these when it sees the task end: the join
+//! arm of the supervisor's stop ladder and of its restart attempt, the two
+//! observers of a lost runner, the reaper's entry, and the drop of the hold,
+//! because a hold a forwarder keeps can outlive the task.
+//!
+//! Two lists of waiters sit on one token, and a change wakes them one after
+//! the other, each under a catch of its own. The first is the library's own: a
+//! restart attempt's wait for the previous incarnation's subtree, and the
+//! waits of `terminate_child` and `spawn_child`; every task that parks there is
+//! one the library polls, with tokio's own waker. The second is the subtree
+//! observers' (see `SubtreeObserver`), whose tasks are users' and whose wakers
+//! can panic. Tokio owns each list's batch and ends its wake at a waker that
+//! panics, leaving the waiters behind it in that list unwoken; the library's
+//! list holds no user's waker, so a panicking observer's waker can strand no
+//! wait of the library, and strands only the observers behind it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::{sleep_until, Instant};
 
+use crate::actor::panic::contain_waker_panic;
 use crate::actor::runtime::{bounded_wait, saturating_deadline};
 use crate::actor::supervision::rules;
 
 /// The state a token and every watch of it share.
 #[derive(Debug)]
 pub(crate) struct SubtreeShared {
-    /// Set when the token is dropped: the actor and everything below it ended.
-    gone: watch::Sender<bool>,
     /// The budget of the subtree below this token, in nanoseconds. A value of
     /// `u64::MAX` is unbounded.
     below_nanos: AtomicU64,
-    /// The number of live supervisor children below this token whose orderly
-    /// stop has no bound.
-    inf_live: watch::Sender<u32>,
-    /// Signalled whenever `below_nanos` is raised, and whenever `aborts`
-    /// changes.
-    below_changed: watch::Sender<()>,
-    /// The aborts owed to and issued against the live actors of the subtree.
-    aborts: Mutex<SubtreeAborts>,
+    /// Whether the actor's own hold has been released: written once, by the
+    /// last step of the hold's drop (see [`ReleaseSignal`]), after the hold's
+    /// reference to the token dropped. A reader that finds it set and `gone`
+    /// not set knows that something else still holds the token: an actor
+    /// below the observed one, or a restart of one that is not dropped yet.
+    released: AtomicBool,
+    /// The token's signal (`gone`, the live unbounded-supervisor count and
+    /// the generations a wait compares) and the aborts owed to and issued
+    /// against the live actors of the subtree, under one lock.
+    state: Mutex<SubtreeState>,
+    /// The library's own waits (a restart attempt's, `terminate_child`'s and
+    /// `spawn_child`'s), woken after every change of `state`. A wait creates
+    /// its `Notified` before it reads `state`, and `notify_waiters` reaches
+    /// every `Notified` created before the call, so a change after the read
+    /// wakes it. No user's waker parks here.
+    changed: tokio::sync::Notify,
+    /// The subtree observers' waits, woken after every change of `state`,
+    /// after `changed`, and read the same way. A user's waker parks here, and
+    /// a panic of one ends tokio's wake of this list only.
+    observers: tokio::sync::Notify,
+    /// Set, never cleared, when the first observer's wait is created (before
+    /// it registers and reads `state`). A change wakes the observers' list
+    /// only once it is set, so a subtree nobody observes pays nothing for the
+    /// list. An observer sets it before it reads `state`, and a change reads
+    /// it after it wrote `state`: either the observer's read sees the change,
+    /// or the change sees the flag and wakes the list the observer is on.
+    observed: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct SubtreeState {
+    signal: SubtreeSignal,
+    aborts: SubtreeAborts,
+}
+
+/// The fields of a token's one signal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubtreeSignal {
+    gone: bool,
+    inf_live: u32,
+    /// Bumped on every change of `inf_live`, so a net-zero change between
+    /// two reads still re-arms a wait.
+    inf_gen: u64,
+    below_gen: u64,
 }
 
 /// What a subtree's aborts say about a verdict on it.
@@ -68,27 +123,75 @@ struct SubtreeAborts {
     latest: Option<Instant>,
 }
 
+/// The site the log names when a subtree observer's waker panics.
+const OBSERVERS: &str = "subtree observers";
+
 impl SubtreeShared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            gone: watch::channel(false).0,
             below_nanos: AtomicU64::new(0),
-            inf_live: watch::channel(0).0,
-            below_changed: watch::channel(()).0,
-            aborts: Mutex::new(SubtreeAborts::default()),
+            released: AtomicBool::new(false),
+            state: Mutex::new(SubtreeState::default()),
+            changed: tokio::sync::Notify::new(),
+            observers: tokio::sync::Notify::new(),
+            observed: AtomicBool::new(false),
         })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SubtreeState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Wakes every wait whose `Notified` was created before this call: the
+    /// library's own waits, then the observers', each list under a catch of
+    /// its own. The observers' wakers belong to the observers' tasks, and a
+    /// panic of one is kept out of the change that woke it. Tokio ends the wake
+    /// of a list at the waker that panics, so the observers behind it stay
+    /// asleep; the library's waits are on the other list and are never among
+    /// them.
+    fn wake_waits(&self, site: &'static str) {
+        contain_waker_panic(site, None, || self.changed.notify_waiters());
+        if self.observed.load(Ordering::SeqCst) {
+            contain_waker_panic(OBSERVERS, None, || self.observers.notify_waiters());
+        }
+    }
+
+    /// The `Notified` of a wait on this signal: the observers' list for a
+    /// subtree observer's wait, the library's for any other.
+    fn notified(&self, observer: bool) -> tokio::sync::futures::Notified<'_> {
+        if observer {
+            self.observed.store(true, Ordering::SeqCst);
+            self.observers.notified()
+        } else {
+            self.changed.notified()
+        }
+    }
+
+    /// Applies `change` to the signal, then wakes every wait whose `Notified`
+    /// was created before this call.
+    fn modify(&self, change: impl FnOnce(&mut SubtreeSignal)) {
+        change(&mut self.lock().signal);
+        self.wake_waits("subtree change");
+    }
+
+    fn signal(&self) -> SubtreeSignal {
+        let read = self.lock().signal;
+        #[cfg(test)]
+        test_hook::run();
+        read
     }
 
     fn update_aborts(&self, change: impl FnOnce(&mut SubtreeAborts)) {
         {
-            let mut aborts = self.aborts.lock().unwrap_or_else(|p| p.into_inner());
-            change(&mut aborts);
+            let mut state = self.lock();
+            change(&mut state.aborts);
+            state.signal.below_gen = state.signal.below_gen.wrapping_add(1);
         }
-        self.below_changed.send_modify(|_| {});
+        self.wake_waits("subtree change");
     }
 
     fn aborts(&self) -> SubtreeAborts {
-        *self.aborts.lock().unwrap_or_else(|p| p.into_inner())
+        self.lock().aborts
     }
 }
 
@@ -99,9 +202,14 @@ impl SubtreeShared {
 /// Written once: the first abort wins, and a later abort or a re-raised
 /// `Kill` never moves it. From the moment an abort is owed (a reaper entry
 /// exists for the task, or a ladder raised its `Kill`) until the abort is
-/// issued or the actor ends, the record holds an owed mark, counted on the
-/// incarnation's subtree token and on every ancestor's. The record holds
-/// its token weakly, so it never keeps a subtree alive; the mark holds the
+/// issued or the task ends, the record holds an owed mark, counted on the
+/// incarnation's subtree token and on every ancestor's. The task's end
+/// releases the mark when the actor ends, and when the join arm of a ladder,
+/// an observer of a lost runner, the reaper's entry or the drop of the hold
+/// sees the task end, whichever comes first. The record holds
+/// its token weakly, so it never keeps a subtree alive, and the token's
+/// shared state strongly (counters and a notification, which pin nothing), so
+/// a reader can tell after the subtree ended that it did; the mark holds the
 /// shared state of each token it counted on, so its release reaches them
 /// whatever ended in between.
 #[derive(Clone, Debug, Default)]
@@ -111,23 +219,312 @@ pub(crate) struct AbortRecord {
 
 #[derive(Debug)]
 struct AbortShared {
-    at: watch::Sender<Option<Instant>>,
-    token: OnceLock<Weak<SubtreeToken>>,
+    linked: OnceLock<Linked>,
     owed: Mutex<Owed>,
+    /// The incarnation's status plane (see `StatusCell`).
+    status: crate::types::status_cell::StatusCell,
+    /// Woken when the first abort is recorded.
+    recorded: tokio::sync::Notify,
+    /// The run loop's waker slot (see `WakeSlot`): woken by a raise of the
+    /// stop lane.
+    reader: crate::types::WakeSlot,
+    /// The stop lane's cell: its state, version and receiver-gone flag.
+    lane: crate::types::LaneCell,
+    /// Woken, after the cell's lock is released, by every new version of the
+    /// status plane and of the stop lane, and by the close of the plane's
+    /// last sender. A waiter creates its notification before it reads, and
+    /// re-checks what it waits for on every wake, so a wake meant for the
+    /// other signal of the block is harmless.
+    signals: tokio::sync::Notify,
+    /// The incarnation's system plane. It stores no waker: a requester wakes
+    /// the run loop through `reader` after it queued its request.
+    system: Mutex<SystemSlot>,
+    /// What the plane holds, as `SYSTEM_HELD` and `SYSTEM_OPEN`, written
+    /// under `system`'s lock and read without it.
+    system_state: std::sync::atomic::AtomicU8,
 }
 
 impl Default for AbortShared {
     fn default() -> Self {
         Self {
-            at: watch::channel(None).0,
-            token: OnceLock::new(),
+            linked: OnceLock::new(),
             owed: Mutex::new(Owed::default()),
+            status: crate::types::status_cell::StatusCell::new(),
+            signals: tokio::sync::Notify::new(),
+            recorded: tokio::sync::Notify::new(),
+            reader: crate::types::WakeSlot::default(),
+            lane: crate::types::LaneCell::default(),
+            system: Mutex::new(SystemSlot::default()),
+            system_state: std::sync::atomic::AtomicU8::new(0),
         }
     }
 }
 
+/// What a record holds of its incarnation's subtree once the actor's hold
+/// exists: the token weakly, so the record never keeps a subtree alive, and
+/// the token's shared state strongly. The shared state is counters and a
+/// notification and pins no actor, name, id or token, so a reader that comes
+/// after the subtree ended still finds the signal that says so, and reads it
+/// under the lock every writer of that signal takes.
+#[derive(Debug)]
+struct Linked {
+    token: Weak<SubtreeToken>,
+    shared: Arc<SubtreeShared>,
+}
+
+/// The plane holds a request outside its channel.
+const SYSTEM_HELD: u8 = 1;
+/// The plane's channel exists.
+const SYSTEM_OPEN: u8 = 2;
+/// The capacity of a plane's channel: in steady state a plane queues this
+/// many requests, as many as the system channel of an actor without a held
+/// slot does. The request held before the channel opened is taken by the run
+/// loop with the channel's receiver, so a plane whose run loop has not yet
+/// polled it holds that one request beside a full channel.
+const SYSTEM_CAPACITY: usize = 64;
+
+type StatusReply = tokio::sync::oneshot::Sender<crate::types::ActorStatusInfo>;
+
+/// The incarnation's system plane. A query to an actor that has none queued
+/// is held in the slot itself, so the first `get_status` allocates nothing
+/// for the plane; a request that finds one held creates the channel, which
+/// takes every later request. The held request is the oldest, and is
+/// answered first.
+#[derive(Debug, Default)]
+enum SystemSlot {
+    #[default]
+    Idle,
+    /// One request, held without a channel.
+    One(crate::types::StatusRequest),
+    /// The channel exists. `first` is the request held before it was created,
+    /// until the run loop takes it.
+    Open {
+        first: Option<crate::types::StatusRequest>,
+        tx: tokio::sync::mpsc::Sender<crate::types::SystemMessage>,
+        rx: Option<tokio::sync::mpsc::Receiver<crate::types::SystemMessage>>,
+    },
+    Closed,
+}
+
+/// The run loop's end of the incarnation's system plane. The held request is
+/// taken from the slot and the channel's receiver is taken here on the next
+/// poll; dropping this closes the plane, so a request queued and not
+/// answered fails, and a later `get_status` is refused.
+///
+/// The plane is read by its state bits and by emptiness and never registers
+/// a waker of its own: a requester wakes the run loop through the
+/// incarnation's waker slot after it queued its request
+/// (`AbortRecord::submit_status`), and the run loop's stop branch arms that
+/// slot earlier in the same select poll, so a request queued after this read
+/// finds the slot armed, and one queued before it is seen by it.
+///
+/// The channel behind a full plane is tokio's bounded channel. A requester
+/// that waits for room (past `SYSTEM_CAPACITY` queued requests) is woken by
+/// tokio in two places. The close of the channel, at the plane's drop, is made
+/// inside a catch (see [`contain_waker_panic`]): tokio ends its wake of the
+/// parked requesters at a waker that panics, and the requesters behind it may
+/// stay unwoken, so their futures finish at their next poll, which finds the
+/// plane closed. The run loop's own receive is the other: it frees the slot a parked
+/// requester takes, and it returns the request it took, which a catch around
+/// it would drop, so a panic of that requester's waker there is outside the
+/// catches the crate puts on the wakes it makes itself (see
+/// [`AbortRecord::notify_signals`]). A request held outside the channel is
+/// dropped inside a catch as well, and so is one queued in the channel when
+/// the plane ends.
+///
+/// The priority lane is tokio's bounded channel too, and a `send_priority`
+/// caller that waits for room on a full lane is woken by tokio in the same two
+/// places: the close of the lane at the end of the message loop is made inside
+/// a catch, with the same limit (the senders behind a waker that panics may
+/// stay unwoken, and find the lane closed at their next poll), and the run loop's
+/// receive from the lane frees the slot a parked sender takes, outside a
+/// catch, for the same reason.
+#[derive(Debug)]
+pub(crate) struct SystemPlane {
+    record: AbortRecord,
+    rx: Option<tokio::sync::mpsc::Receiver<crate::types::SystemMessage>>,
+    /// The actor the plane belongs to, named by the logs of its end.
+    owner: crate::types::ActorId,
+    /// The system whose helper slot takes a receiver that ends with a slot
+    /// still out.
+    system: std::sync::Arc<crate::system::ActorSystem>,
+}
+
+impl SystemPlane {
+    pub(crate) fn new(
+        record: AbortRecord,
+        owner: crate::types::ActorId,
+        system: std::sync::Arc<crate::system::ActorSystem>,
+    ) -> Self {
+        Self {
+            record,
+            rx: None,
+            owner,
+            system,
+        }
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<crate::types::SystemMessage>> {
+        let shared = &self.record.shared;
+        if shared.system_state.load(Ordering::Acquire) & SYSTEM_HELD != 0 {
+            let mut slot = shared.system.lock().unwrap_or_else(|p| p.into_inner());
+            let held = match &mut *slot {
+                SystemSlot::One(_) => match std::mem::take(&mut *slot) {
+                    SystemSlot::One(held) => Some(held),
+                    _ => None,
+                },
+                SystemSlot::Open { first, .. } => first.take(),
+                _ => None,
+            };
+            if held.is_some() {
+                shared
+                    .system_state
+                    .fetch_and(!SYSTEM_HELD, Ordering::Release);
+            }
+            drop(slot);
+            if let Some(request) = held {
+                return std::task::Poll::Ready(Some(crate::types::SystemMessage::GetStatus(
+                    request,
+                )));
+            }
+        }
+        #[cfg(test)]
+        between_loads();
+        if self.rx.is_none() {
+            if shared.system_state.load(Ordering::Acquire) & SYSTEM_OPEN == 0 {
+                return std::task::Poll::Pending;
+            }
+            let mut slot = shared.system.lock().unwrap_or_else(|p| p.into_inner());
+            if let SystemSlot::Open { first, rx, .. } = &mut *slot {
+                self.rx = rx.take();
+                // A request held before the channel opened is older than
+                // every request in it, and may have been queued after this
+                // poll's read of the held bit: it is handed out first.
+                if let Some(request) = first.take() {
+                    shared
+                        .system_state
+                        .fetch_and(!SYSTEM_HELD, Ordering::Release);
+                    drop(slot);
+                    return std::task::Poll::Ready(Some(crate::types::SystemMessage::GetStatus(
+                        request,
+                    )));
+                }
+            }
+        }
+        match self.rx.as_mut() {
+            // Empty and open: pend without registering on the channel.
+            Some(rx) if rx.is_empty() && !rx.is_closed() => std::task::Poll::Pending,
+            Some(rx) => rx.poll_recv(cx),
+            // Open, and the receiver is not in the slot: only this
+            // owner takes it, so this is not reached.
+            None => std::task::Poll::Pending,
+        }
+    }
+
+    /// Whether the run loop's poll of the plane would pend now: no request
+    /// held, and no channel opened, or its receiver taken here, empty and
+    /// open. A channel opened and not yet taken reads busy, so the poll takes
+    /// its receiver.
+    pub(crate) fn is_idle(&self) -> bool {
+        let state = self.record.shared.system_state.load(Ordering::Acquire);
+        if state & SYSTEM_HELD != 0 {
+            return false;
+        }
+        match &self.rx {
+            Some(rx) => rx.is_empty() && !rx.is_closed(),
+            None => state & SYSTEM_OPEN == 0,
+        }
+    }
+
+    /// The next request on the plane; pends while no request is queued.
+    pub(crate) async fn recv(&mut self) -> Option<crate::types::SystemMessage> {
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    /// Drops a request held outside the channel, inside a catch (see
+    /// [`contain_waker_panic`]).
+    fn drop_held(&self, request: Option<crate::types::StatusRequest>) {
+        contain_waker_panic("status request", Some(&self.owner), move || drop(request));
+    }
+}
+
+impl Drop for SystemPlane {
+    fn drop(&mut self) {
+        // The plane's contents are moved out under the lock and dropped after
+        // it is released: the channel's close, the wakes of parked requesters
+        // and the drops of queued requests (which wake their requesters) run
+        // outside the lock.
+        let open = {
+            let mut slot = self
+                .record
+                .shared
+                .system
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            std::mem::replace(&mut *slot, SystemSlot::Closed)
+        };
+        // A request held outside the channel is dropped, and so is the
+        // slot's sender: the plane does not rely on a requester's sender
+        // having gone out of scope. The drop of a request wakes its
+        // requester, whose waker belongs to the requester's task, so it runs
+        // inside a catch: a panic of that waker must not turn the actor's
+        // reason into a failure, and the plane is dropped before the reason is
+        // final. Each receiver, the one taken here and the one still in the
+        // slot, is ended like any queue: closed and drained, and handed to a
+        // task that drops what a sender pushes through a slot it reserved
+        // before the close.
+        let slot_rx = match open {
+            SystemSlot::Open { first, tx, rx } => {
+                self.drop_held(first);
+                drop(tx);
+                rx
+            }
+            SystemSlot::One(request) => {
+                self.drop_held(Some(request));
+                None
+            }
+            SystemSlot::Idle | SystemSlot::Closed => None,
+        };
+        for rx in self.rx.take().into_iter().chain(slot_rx) {
+            if let Some(panic) =
+                crate::actor::runtime::end_queue_late(rx, &self.system, &self.owner)
+            {
+                crate::actor::panic::log_waker_panic("status queue", &panic, Some(&self.owner));
+            }
+        }
+    }
+}
+
+// Runs once, between the two reads of the plane's state in a poll, when a
+// test installs it: it lets a test queue requests inside that window.
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_LOADS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_loads() {
+    if let Some(hook) = BETWEEN_LOADS.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+#[path = "subtree_system_tests.rs"]
+mod system_tests;
+
+#[cfg(test)]
+#[path = "subtree_waker_tests.rs"]
+mod waker_tests;
+
 #[derive(Debug, Default)]
 struct Owed {
+    /// The instant of the first abort issued, written once.
+    at: Option<Instant>,
     mark: Option<OwedMark>,
     /// The actor ended: nothing is owed to it any more.
     ended: bool,
@@ -153,10 +550,130 @@ impl AbortRecord {
         Self::default()
     }
 
+    /// The incarnation's status plane storage.
+    pub(crate) fn status_cell(&self) -> &crate::types::status_cell::StatusCell {
+        &self.shared.status
+    }
+
+    /// A future woken by the next [`notify_signals`](Self::notify_signals).
+    /// Create it before reading what it waits for, so a change after the read
+    /// wakes it.
+    pub(crate) fn signalled(&self) -> tokio::sync::futures::Notified<'_> {
+        self.shared.signals.notified()
+    }
+
+    /// Wakes every task waiting on the block's signals, after the lock that
+    /// guarded the change is released: a stop lane's new version, a status
+    /// plane's new version and the close of the plane. The waiters are other
+    /// tasks' (`wait_stopped`, the waits on the status plane, a bounded
+    /// stop's wait for the end), and a waker belongs to the task that polls
+    /// with it. A panic of one waker's wake is contained here (see
+    /// [`contain_waker_panic`]): the raise that is waking, the actor that is
+    /// publishing its status and the drop that closes the plane go on, and a
+    /// request or a status that was written stays written. Every raise and
+    /// every plane write wakes through this call, and nothing else calls
+    /// `notify_waiters` on the notification.
+    pub(crate) fn notify_signals(&self) {
+        contain_waker_panic("signals", None, || self.shared.signals.notify_waiters());
+    }
+
+    /// Whether both records are the same incarnation's block.
+    pub(crate) fn same_block(&self, other: &AbortRecord) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// A sender of the plane's channel, when it exists.
+    #[cfg(test)]
+    pub(crate) fn system_tx_for_test(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::types::SystemMessage>> {
+        match &*self.shared.system.lock().unwrap_or_else(|p| p.into_inner()) {
+            SystemSlot::Open { tx, .. } => Some(tx.clone()),
+            _ => None,
+        }
+    }
+
+    /// The run loop's waker slot.
+    pub(crate) fn reader(&self) -> &crate::types::WakeSlot {
+        &self.shared.reader
+    }
+
+    /// The stop lane's cell.
+    pub(crate) fn lane(&self) -> &crate::types::LaneCell {
+        &self.shared.lane
+    }
+
+    /// Queues a status request on the incarnation's system plane, waiting for
+    /// room when the plane is full, then wakes the run loop with no await
+    /// between the queueing and the wake. `Err` once the run loop closed the
+    /// plane.
+    ///
+    /// No clone of the plane's sender lives across the requester's await on
+    /// the reply: the one cloned here goes out of scope when this call
+    /// returns, so once the run loop closes the plane and the last sender is
+    /// gone, a request still queued is freed and its requester gets an
+    /// answer instead of waiting on a value nobody will take. The plane's end
+    /// does not depend on this: it also drains the queue and hands a
+    /// receiver with slots still reserved to a task that drops late values.
+    pub(crate) async fn submit_status(&self, reply: StatusReply) -> Result<(), ()> {
+        // Each request carries its own requester kind, so the reply to it
+        // reads that request's kind whatever else is queued.
+        let request = crate::types::StatusRequest {
+            reply,
+            task: tokio::task::try_id().is_some(),
+        };
+        let tx = {
+            let mut slot = self.shared.system.lock().unwrap_or_else(|p| p.into_inner());
+            match std::mem::take(&mut *slot) {
+                SystemSlot::Closed => {
+                    *slot = SystemSlot::Closed;
+                    return Err(());
+                }
+                SystemSlot::Idle => {
+                    *slot = SystemSlot::One(request);
+                    self.shared
+                        .system_state
+                        .fetch_or(SYSTEM_HELD, Ordering::Release);
+                    drop(slot);
+                    self.shared.reader.wake();
+                    return Ok(());
+                }
+                SystemSlot::One(first) => {
+                    let (tx, rx) = tokio::sync::mpsc::channel(SYSTEM_CAPACITY);
+                    *slot = SystemSlot::Open {
+                        first: Some(first),
+                        tx: tx.clone(),
+                        rx: Some(rx),
+                    };
+                    self.shared
+                        .system_state
+                        .fetch_or(SYSTEM_OPEN, Ordering::Release);
+                    tx
+                }
+                SystemSlot::Open { first, tx, rx } => {
+                    let sender = tx.clone();
+                    *slot = SystemSlot::Open { first, tx, rx };
+                    sender
+                }
+            }
+        };
+        tx.send(crate::types::SystemMessage::GetStatus(request))
+            .await
+            .map_err(|_| ())?;
+        self.shared.reader.wake();
+        Ok(())
+    }
+
     /// The shared state of the linked token and of every ancestor's.
     fn chain(&self) -> Vec<Arc<SubtreeShared>> {
         let mut chain = Vec::new();
-        let token = self.shared.token.get().and_then(Weak::upgrade);
+        let token = self
+            .shared
+            .linked
+            .get()
+            .and_then(|linked| linked.token.upgrade());
+        #[cfg(test)]
+        test_hook::run_in_chain();
         let mut at = token.as_deref();
         while let Some(current) = at {
             chain.push(current.shared.clone());
@@ -168,11 +685,8 @@ impl AbortRecord {
     /// An abort is now owed to the task: marks it unless an abort was
     /// already issued, a mark is already held, or the actor ended.
     pub(crate) fn owe(&self) {
-        if self.shared.at.borrow().is_some() {
-            return;
-        }
         let mut owed = self.shared.owed.lock().unwrap_or_else(|p| p.into_inner());
-        if owed.ended || owed.mark.is_some() || self.shared.at.borrow().is_some() {
+        if owed.ended || owed.mark.is_some() || owed.at.is_some() {
             return;
         }
         let chain = self.chain();
@@ -195,6 +709,14 @@ impl AbortRecord {
         }
     }
 
+    /// A party that watches the incarnation's task saw it end (a ladder's
+    /// join, an observer of the status plane's end): releases the owed mark
+    /// and takes none again, exactly as the actor's own end releases it, so
+    /// a hold that outlives the task keeps no mark alive. Idempotent.
+    pub(crate) fn task_ended(&self) {
+        self.release();
+    }
+
     /// Aborts `task`, recording the instant unless an abort was recorded
     /// already. Every abort the crate issues against an incarnation's task
     /// goes through here. A task that already finished gets no abort and no
@@ -211,28 +733,31 @@ impl AbortRecord {
     }
 
     /// Records `now` as the first abort. A record already written stands.
+    ///
+    /// The chain of a record with no owed mark is read inside the critical
+    /// section, and not at all once the actor has ended: the release of the
+    /// actor's hold takes this lock before it lets go of the token, so no
+    /// reader of the chain holds the token when the hold's release is
+    /// written (see [`ReleaseSignal`]). An abort recorded after the actor
+    /// ended reaches no ancestor: nothing is left of it to wait for.
     fn record(&self, now: Instant) {
-        let first = self.shared.at.send_if_modified(|at| {
-            if at.is_some() {
-                return false;
+        let (mark, chain) = {
+            let mut owed = self.shared.owed.lock().unwrap_or_else(|p| p.into_inner());
+            if owed.at.is_some() {
+                return;
             }
-            *at = Some(now);
-            true
-        });
-        if !first {
-            return;
-        }
-        let mark = self
-            .shared
-            .owed
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .mark
-            .take();
-        let chain = match &mark {
-            Some(mark) => mark.chain.clone(),
-            None => self.chain(),
+            owed.at = Some(now);
+            let mark = owed.mark.take();
+            let chain = match &mark {
+                Some(mark) => mark.chain.clone(),
+                None if owed.ended => Vec::new(),
+                None => self.chain(),
+            };
+            (mark, chain)
         };
+        #[cfg(test)]
+        test_hook::run_after_write();
+        self.shared.recorded.notify_waiters();
         for shared in &chain {
             shared.update_aborts(|a| a.latest = Some(a.latest.map_or(now, |l| l.max(now))));
         }
@@ -266,29 +791,46 @@ impl AbortRecord {
     }
 
     /// The first abort's instant, and whether an abort is owed and not yet
-    /// issued. A recorded abort answers the owed one, also in the moment
-    /// between its write and the release of the mark.
+    /// issued. The instant is written and the mark taken in one critical
+    /// section, so an abort is never reported both recorded and owed.
     pub(crate) fn view(&self) -> (Option<Instant>, bool) {
-        let at = *self.shared.at.borrow();
-        let owed = at.is_none()
-            && self
-                .shared
-                .owed
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .mark
-                .is_some();
-        (at, owed)
+        let read = {
+            let owed = self.shared.owed.lock().unwrap_or_else(|p| p.into_inner());
+            (owed.at, owed.mark.is_some())
+        };
+        #[cfg(test)]
+        test_hook::run();
+        read
     }
 
-    /// A receiver woken when the first abort is recorded.
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<Instant>> {
-        self.shared.at.subscribe()
+    /// A future woken when the first abort is recorded; create it before
+    /// reading the record so no record is missed.
+    pub(crate) fn recorded(&self) -> tokio::sync::futures::Notified<'_> {
+        self.shared.recorded.notified()
     }
 
     /// Links the record to the incarnation's subtree token.
     fn link(&self, token: &Arc<SubtreeToken>) {
-        let _ = self.shared.token.set(Arc::downgrade(token));
+        let _ = self.shared.linked.set(Linked {
+            token: Arc::downgrade(token),
+            shared: token.shared.clone(),
+        });
+    }
+
+    /// An observer of the incarnation's subtree, or `None` while the record
+    /// is not linked, which is before the actor's hold is built (a spawn
+    /// registers the actor first) and for a record that never got one.
+    ///
+    /// The link is set before the actor's task is spawned and a task cannot
+    /// end before it is spawned, so a reader that has seen the actor end
+    /// finds the link unless the actor never ran. The answer to "has the
+    /// subtree ended" is read from the signal under its lock, never inferred
+    /// from a failed upgrade of the token.
+    pub(crate) fn subtree_watch(&self) -> Option<SubtreeWatch> {
+        self.shared.linked.get().map(|linked| SubtreeWatch {
+            shared: linked.shared.clone(),
+            observer: false,
+        })
     }
 }
 
@@ -311,7 +853,8 @@ impl SubtreeToken {
             .below_nanos
             .fetch_max(candidate, Ordering::SeqCst);
         if candidate > previous {
-            self.shared.below_changed.send_modify(|_| {});
+            self.shared
+                .modify(|s| s.below_gen = s.below_gen.wrapping_add(1));
             if let Some(parent) = &self.parent {
                 parent.raise_below(self.own_nanos.saturating_add(candidate));
             }
@@ -323,12 +866,13 @@ impl SubtreeToken {
     fn shift_infinity(token: &Arc<SubtreeToken>, raise: bool) {
         let mut at = Some(token);
         while let Some(current) = at {
-            current.shared.inf_live.send_modify(|count| {
-                *count = if raise {
-                    count.saturating_add(1)
+            current.shared.modify(|s| {
+                s.inf_live = if raise {
+                    s.inf_live.saturating_add(1)
                 } else {
-                    count.saturating_sub(1)
+                    s.inf_live.saturating_sub(1)
                 };
+                s.inf_gen = s.inf_gen.wrapping_add(1);
             });
             at = current.parent.as_ref();
         }
@@ -337,7 +881,7 @@ impl SubtreeToken {
 
 impl Drop for SubtreeToken {
     fn drop(&mut self) {
-        self.shared.gone.send_replace(true);
+        self.shared.modify(|s| s.gone = true);
     }
 }
 
@@ -374,11 +918,39 @@ pub(crate) struct SubtreeHold {
     /// The abort record of the actor's incarnation, released when the hold
     /// drops: the actor ended, so no abort is owed to it any more.
     record: AbortRecord,
+    /// Declared last, so the hold's drop ends with it: it says the hold has
+    /// been released once the hold's reference to the token is gone.
+    _released: ReleaseSignal,
+}
+
+/// The last thing the drop of a [`SubtreeHold`] does: marks the hold released
+/// and wakes the waits on the subtree. Fields drop in declaration order after
+/// the hold's own `drop`, so this runs after the hold's reference to the
+/// token dropped. A hold with nothing below it therefore reads released and
+/// the subtree gone together, and a reader of the subtree that finds the hold
+/// released and the subtree not gone knows that something else still holds
+/// the token: an actor below, or a restart of one that is not dropped yet. No
+/// reader of the abort chain is such a holder: the chain is read under the
+/// lock the hold's release takes before it lets go of the token.
+#[derive(Debug)]
+struct ReleaseSignal(Arc<SubtreeShared>);
+
+impl Drop for ReleaseSignal {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        test_hook::run_before_release();
+        self.0.released.store(true, Ordering::SeqCst);
+        // An observer's waker belongs to the observer's task: a panic from it
+        // must not unwind into the drop that releases the hold.
+        self.0.wake_waits("subtree release");
+    }
 }
 
 impl Drop for SubtreeHold {
     fn drop(&mut self) {
         self.record.release();
+        #[cfg(test)]
+        test_hook::run_after_release();
     }
 }
 
@@ -393,6 +965,7 @@ impl SubtreeHold {
     }
 
     /// The hold of a new actor: a root, or the child described by `link`.
+    #[cfg(test)]
     pub(crate) fn new(link: Option<SubtreeLink>) -> Arc<Self> {
         Self::build(link, AbortRecord::new())
     }
@@ -424,10 +997,12 @@ impl SubtreeHold {
                 (token, mark)
             }
         };
+        let released = ReleaseSignal(token.shared.clone());
         Arc::new(Self {
             token,
             _mark: mark,
             record,
+            _released: released,
         })
     }
 
@@ -440,26 +1015,71 @@ impl SubtreeHold {
     pub(crate) fn watch(&self) -> SubtreeWatch {
         SubtreeWatch {
             shared: self.token.shared.clone(),
+            observer: false,
         }
     }
 }
 
 /// An observer of one actor's subtree. Cloning it is cheap, and holding it
 /// never keeps the subtree alive.
+///
+/// Its waits park on the library's list of the token, or, once
+/// [`for_observer`](Self::for_observer) made it a subtree observer's, on the
+/// observers' list (see the module note).
 #[derive(Clone, Debug)]
 pub(crate) struct SubtreeWatch {
     shared: Arc<SubtreeShared>,
+    /// Whether the watch's waits are a subtree observer's, whose task is a
+    /// user's.
+    observer: bool,
 }
 
 impl SubtreeWatch {
+    /// This watch for a subtree observer's waits: they park on the observers'
+    /// list, where a panic of a user's waker can strand only other observers.
+    pub(crate) fn for_observer(mut self) -> Self {
+        self.observer = true;
+        self
+    }
+
     /// Whether the actor and everything below it ended.
     pub(crate) fn is_gone(&self) -> bool {
-        *self.shared.gone.borrow()
+        self.shared.signal().gone
+    }
+
+    /// Whether the actor's own hold has been released: the actor let go of
+    /// what it held, and the actors below it may still run.
+    #[cfg(test)]
+    pub(crate) fn is_released(&self) -> bool {
+        self.shared.released.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the actor's own hold has been released, at once when it
+    /// was, whatever runs below the actor. It reads no clock and needs no
+    /// timer, so a caller on any runtime, or none, can wait through it. When
+    /// it resolves and the subtree is not gone, something else holds the
+    /// token: an actor below the observed one, or a restart of one that is
+    /// not dropped yet.
+    pub(crate) async fn released(&self) {
+        loop {
+            // Created before the read: a release after the read wakes this
+            // wait.
+            let notified = self.shared.notified(self.observer);
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let released = self.shared.released.load(Ordering::SeqCst);
+            #[cfg(test)]
+            test_hook::run();
+            if released {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// The live-supervisor count below the actor.
     fn infinity_live(&self) -> u32 {
-        *self.shared.inf_live.borrow()
+        self.shared.signal().inf_live
     }
 
     /// The bound of a wait on the actor's subtree that starts now: `None`
@@ -487,14 +1107,25 @@ impl SubtreeWatch {
     /// Resolves once the actor and everything below it ended, at once when
     /// they did.
     pub(crate) async fn gone(&self) {
-        flag_set(&mut self.shared.gone.subscribe()).await;
+        self.wait_until(|s| s.gone).await;
     }
 
     /// Resolves once no supervisor child with an unbounded orderly stop is
     /// alive below the actor, at once when none is.
     pub(crate) async fn infinity_cleared(&self) {
-        let mut live = self.shared.inf_live.subscribe();
-        let _ = live.wait_for(|live| *live == 0).await;
+        self.wait_until(|s| s.inf_live == 0).await;
+    }
+
+    async fn wait_until(&self, done: impl Fn(&SubtreeSignal) -> bool) {
+        loop {
+            let notified = self.shared.notified(self.observer);
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if done(&self.shared.signal()) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -508,9 +1139,8 @@ impl SubtreeWatch {
 /// moment plus the new bound.
 pub(crate) struct SubtreeWait {
     watch: SubtreeWatch,
-    gone: watch::Receiver<bool>,
-    infinity: watch::Receiver<u32>,
-    below: watch::Receiver<()>,
+    /// The signal as this wait last read it.
+    seen: SubtreeSignal,
     deadline: Option<Instant>,
     /// The bound the deadline was last armed with: the cap of a wait for an
     /// owed abort counts it once more from the deadline.
@@ -523,8 +1153,6 @@ pub(crate) struct SubtreeWait {
 
 /// What woke a [`SubtreeWait`].
 enum WaitWake {
-    Gone,
-    Infinity,
     Below,
     Deadline,
 }
@@ -532,11 +1160,10 @@ enum WaitWake {
 impl SubtreeWait {
     /// Starts a wait on `watch`, arming its deadline when it has a bound.
     pub(crate) fn new(watch: &SubtreeWatch) -> Self {
+        let seen = watch.shared.signal();
         let mut wait = Self {
             watch: watch.clone(),
-            gone: watch.shared.gone.subscribe(),
-            infinity: watch.shared.inf_live.subscribe(),
-            below: watch.shared.below_changed.subscribe(),
+            seen,
             deadline: None,
             bound: Duration::ZERO,
             below_seen: 0,
@@ -602,27 +1229,39 @@ impl SubtreeWait {
     /// changing (after which the deadline is re-read), a change of the
     /// subtree's aborts, or the instant the verdict may be given.
     pub(crate) async fn changed(&mut self) {
-        let wake = {
+        let shared = self.watch.shared.clone();
+        // Created before the read: a change after the read wakes this wait.
+        let notified = shared.notified(self.watch.observer);
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current = shared.signal();
+        if current.gone {
+            return;
+        }
+        // A change since this wait last read the signal is handled at once.
+        let wake = if current != self.seen {
+            WaitWake::Below
+        } else {
             let deadline = self.verdict_at();
             tokio::select! {
                 biased;
-                _ = flag_set(&mut self.gone) => WaitWake::Gone,
-                _ = self.infinity.changed() => WaitWake::Infinity,
-                _ = self.below.changed() => WaitWake::Below,
+                () = &mut notified => WaitWake::Below,
                 _ = sleep_until_opt(deadline) => WaitWake::Deadline,
             }
         };
-        match wake {
-            WaitWake::Infinity => self.rearm(),
-            WaitWake::Below => self.rearm_if_raised(),
-            WaitWake::Gone | WaitWake::Deadline => {}
+        if let WaitWake::Below = wake {
+            let now = shared.signal();
+            let was = std::mem::replace(&mut self.seen, now);
+            if now.gone {
+                return;
+            }
+            if now.inf_gen != was.inf_gen {
+                self.rearm();
+            } else if now.below_gen != was.below_gen {
+                self.rearm_if_raised();
+            }
         }
     }
-}
-
-/// Resolves once the flag reads set.
-async fn flag_set(flag: &mut watch::Receiver<bool>) {
-    let _ = flag.wait_for(|set| *set).await;
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -695,6 +1334,151 @@ mod abort_record_tests {
         assert_eq!(record.view(), (None, false));
     }
 
+    /// An abort recorded after the actor's hold was released reaches no
+    /// ancestor, though an actor below it keeps the token alive: the chain is
+    /// read under the lock the release takes first, and not at all once the
+    /// actor has ended, so no reader of it holds the token when the release
+    /// is written.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_recorded_after_the_hold_was_released_reaches_no_ancestor() {
+        let root = SubtreeHold::new(None);
+        let (middle, record) = child_of(&root);
+        let below = SubtreeHold::new(Some(SubtreeLink {
+            parent: middle.token(),
+            own: ms(50),
+            infinity: false,
+        }));
+        let task = tokio::spawn(std::future::pending::<()>());
+        drop(middle);
+        assert!(!record.subtree_watch().expect("linked").is_gone());
+        record.abort(&task.abort_handle());
+        assert_eq!(
+            root.watch().abort_view(),
+            (None, false),
+            "the actor ended: the abort reaches no ancestor"
+        );
+        assert!(record.view().0.is_some(), "the instant is recorded");
+        drop(below);
+    }
+
+    /// R3 proof: the chain is read under the lock the hold's release takes.
+    /// The record's chain read holds a temporary strong reference to the
+    /// token; a hold dropped on another thread meanwhile must not write its
+    /// release while that reference lives.
+    #[test]
+    fn r3_the_chain_is_read_under_the_lock_the_release_takes() {
+        use std::sync::mpsc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = rt.spawn(std::future::pending::<()>());
+        let record = AbortRecord::new();
+        let hold = SubtreeHold::with_record(None, record.clone());
+        let watch = hold.watch();
+        let seen = Arc::new(Mutex::new(None));
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let joined = Arc::new(Mutex::new(None));
+        test_hook::arm_in_chain({
+            let (seen, joined) = (seen.clone(), joined.clone());
+            move || {
+                let dropper = std::thread::spawn(move || {
+                    test_hook::arm_before_release({
+                        let seen = seen.clone();
+                        move || {
+                            *seen.lock().unwrap() = Some((watch.is_released(), watch.is_gone()));
+                            let _ = done_tx.send(());
+                        }
+                    });
+                    drop(hold);
+                });
+                *joined.lock().unwrap() = Some(dropper);
+                // Where the release is not held back by the record's lock it
+                // is written within this wait.
+                let _ = done_rx.recv_timeout(Duration::from_millis(500));
+            }
+        });
+        record.abort(&task.abort_handle());
+        joined
+            .lock()
+            .unwrap()
+            .take()
+            .expect("dropper")
+            .join()
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((false, true)),
+            "the release was written while the record's chain read held the token"
+        );
+    }
+
+    /// R3 proof: an abort recorded between the hold's release of the record
+    /// and the drop of the hold's token reads no chain.
+    #[test]
+    fn r3_an_abort_between_the_record_release_and_the_token_drop_reads_no_chain() {
+        use std::sync::mpsc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = rt.spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let record = AbortRecord::new();
+        let hold = SubtreeHold::with_record(None, record.clone());
+        let watch = hold.watch();
+        let seen = Arc::new(Mutex::new(None));
+        let (state_tx, state_rx) = mpsc::channel::<&'static str>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let joined = Arc::new(Mutex::new(None));
+        let dropper = std::thread::spawn({
+            let (seen, joined) = (seen.clone(), joined.clone());
+            move || {
+                test_hook::arm_after_release({
+                    let (seen, joined) = (seen.clone(), joined.clone());
+                    move || {
+                        let racer = std::thread::spawn({
+                            let state_tx = state_tx.clone();
+                            move || {
+                                test_hook::arm_in_chain({
+                                    let state_tx = state_tx.clone();
+                                    move || {
+                                        let _ = state_tx.send("in_chain");
+                                        let _ = go_rx.recv_timeout(Duration::from_secs(5));
+                                    }
+                                });
+                                record.abort(&abort);
+                                let _ = state_tx.send("done");
+                            }
+                        });
+                        *joined.lock().unwrap() = Some(racer);
+                        let _ = state_rx.recv_timeout(Duration::from_secs(5));
+                        test_hook::arm_before_release({
+                            let seen = seen.clone();
+                            move || {
+                                *seen.lock().unwrap() =
+                                    Some((watch.is_released(), watch.is_gone()));
+                                let _ = go_tx.send(());
+                            }
+                        });
+                    }
+                });
+                drop(hold);
+            }
+        });
+        dropper.join().unwrap();
+        joined
+            .lock()
+            .unwrap()
+            .take()
+            .expect("racer")
+            .join()
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((false, true)),
+            "an abort recorded after the record was released held the token while the hold dropped it"
+        );
+    }
+
     /// The end of an actor that was owed nothing raises nothing: a subtree
     /// with nothing owed and nothing recorded keeps its deadline exactly.
     #[tokio::test(start_paused = true)]
@@ -762,6 +1546,46 @@ mod abort_record_tests {
         assert_eq!(root.watch().abort_view(), (Some(first), false));
     }
 
+    /// A party that watches the task end releases the owed mark once: a
+    /// second release moves nothing, an owe after the end takes nothing, a
+    /// later abort of a live task still writes its instant, and a release
+    /// never moves a written instant.
+    #[tokio::test(start_paused = true)]
+    async fn task_ended_is_idempotent_and_never_moves_a_written_record() {
+        let root = SubtreeHold::new(None);
+        let (kept, record) = child_of(&root);
+        let live = tokio::spawn(std::future::pending::<()>());
+        record.owe();
+        assert_eq!(root.watch().abort_view(), (None, true));
+        record.task_ended();
+        let first = root.watch().abort_view();
+        assert!(first.0.is_some() && !first.1, "{first:?}");
+        tokio::time::advance(ms(50)).await;
+        record.task_ended();
+        assert_eq!(
+            root.watch().abort_view(),
+            first,
+            "a second release moves nothing"
+        );
+        record.owe();
+        assert_eq!(
+            record.view(),
+            (None, false),
+            "an ended task is owed nothing"
+        );
+        record.abort(&live.abort_handle());
+        let (at, owed) = record.view();
+        assert!(at.is_some() && !owed, "{at:?} {owed}");
+        record.task_ended();
+        assert_eq!(
+            record.view(),
+            (at, false),
+            "a release never moves a written record"
+        );
+        live.abort();
+        drop((kept, root));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_finished_task_records_nothing() {
         let record = AbortRecord::new();
@@ -805,6 +1629,76 @@ mod tests {
         assert!(!watch.is_gone(), "the grandchild still holds it");
         drop(grandkid);
         assert!(watch.is_gone());
+    }
+
+    #[test]
+    fn a_hold_reads_released_with_the_subtree_gone_when_nothing_is_below_it() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let other = root.clone();
+        assert!(!watch.is_released());
+        drop(root);
+        assert!(!watch.is_released(), "a clone of the hold still lives");
+        assert!(!watch.is_gone());
+        drop(other);
+        assert!(watch.is_released());
+        assert!(watch.is_gone());
+    }
+
+    #[test]
+    fn a_hold_with_an_actor_below_it_reads_released_while_the_subtree_is_not_gone() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kid = child(&root, ms(10), false);
+        drop(root);
+        assert!(watch.is_released(), "the actor let go of its hold");
+        assert!(!watch.is_gone(), "the actor below it still holds the token");
+        drop(kid);
+        assert!(watch.is_gone());
+    }
+
+    /// The release is written after the hold's reference to the token
+    /// dropped, so a reader that sees the release and finds the subtree not
+    /// gone knows something else holds the token.
+    #[test]
+    fn the_release_is_written_after_the_hold_let_go_of_the_token() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let seen = Arc::new(Mutex::new(None));
+        test_hook::arm_before_release({
+            let (watch, seen) = (watch.clone(), seen.clone());
+            move || *seen.lock().unwrap() = Some((watch.is_released(), watch.is_gone()))
+        });
+        drop(root);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((false, true)),
+            "when the release is about to be written the token is gone"
+        );
+        assert!(watch.is_released());
+    }
+
+    #[tokio::test]
+    async fn released_resolves_at_once_for_a_released_hold_and_wakes_a_waiter_otherwise() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kid = child(&root, ms(10), false);
+        let waiter = tokio::spawn({
+            let watch = watch.clone();
+            async move { watch.released().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the hold is not released");
+        drop(root);
+        tokio::time::timeout(ms(1000), waiter)
+            .await
+            .expect("the release wakes the waiter")
+            .expect("the waiter ends");
+        assert!(!watch.is_gone(), "the actor below it still lives");
+        tokio::time::timeout(ms(1000), watch.released())
+            .await
+            .expect("a released hold resolves at once");
+        drop(kid);
     }
 
     #[test]
@@ -935,11 +1829,15 @@ mod tests {
         tokio::time::advance(ms(10_000)).await;
         assert!(!wait.expired());
         drop(first);
-        wait.changed().await;
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
         assert_eq!(wait.deadline(), None, "one still lives");
         let ended_at = Instant::now();
         drop(second);
-        wait.changed().await;
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
         assert_eq!(
             wait.deadline(),
             Some(ended_at + ms(200) + ABORT_SETTLE),
@@ -961,12 +1859,16 @@ mod tests {
             "armed at once: nothing unbounded lives"
         );
         let kid = child(&root, ms(50), true);
-        wait.changed().await;
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
         assert_eq!(wait.deadline(), None, "disarmed again");
         tokio::time::advance(ms(10_000)).await;
         assert!(!wait.expired());
         drop(kid);
-        wait.changed().await;
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
         assert!(wait.deadline().is_some(), "armed again once it ended");
     }
 
@@ -978,7 +1880,9 @@ mod tests {
         let armed = wait.deadline().expect("armed");
         tokio::time::advance(ms(40)).await;
         let _kid = child(&root, ms(500), false);
-        wait.changed().await;
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
         let extended = wait.deadline().expect("armed");
         assert!(extended > armed);
         assert_eq!(extended, Instant::now() + ms(500) + ABORT_SETTLE);
@@ -1143,7 +2047,7 @@ mod tests {
             crate::types::ActorId::from(name.clone()),
             Named,
             crate::actor::runtime::ActorConfig::default(),
-            Some(name.clone()),
+            Some(Arc::from(name.clone())),
             Some(system.clone()),
             None,
             true,
@@ -1536,5 +2440,449 @@ mod ceiling_tests {
             "verdict {:?} before the cap",
             deadline + bound - at
         );
+    }
+}
+
+/// A one-shot hook run by the calling thread right after the next read of a
+/// subtree signal or an abort record, so a test can land a change exactly
+/// between a read and the wait that follows it.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::RefCell;
+
+    type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        static HOOK: Hook = const { RefCell::new(None) };
+        static AFTER_WRITE: Hook = const { RefCell::new(None) };
+        static BEFORE_RELEASE: Hook = const { RefCell::new(None) };
+        static IN_CHAIN: Hook = const { RefCell::new(None) };
+        static AFTER_RELEASE: Hook = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm_in_chain(hook: impl FnOnce() + 'static) {
+        IN_CHAIN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_in_chain() {
+        if let Some(hook) = IN_CHAIN.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(crate) fn arm_after_release(hook: impl FnOnce() + 'static) {
+        AFTER_RELEASE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_after_release() {
+        if let Some(hook) = AFTER_RELEASE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(crate) fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Armed like [`arm`], but run by the next first-abort record right after
+    /// it wrote the abort's instant and before it wakes the waits.
+    pub(crate) fn arm_after_write(hook: impl FnOnce() + 'static) {
+        AFTER_WRITE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_after_write() {
+        if let Some(hook) = AFTER_WRITE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Armed like [`arm`], but run by the next hold's release right before it
+    /// writes that the hold is released.
+    pub(crate) fn arm_before_release(hook: impl FnOnce() + 'static) {
+        BEFORE_RELEASE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn run_before_release() {
+        if let Some(hook) = BEFORE_RELEASE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+mod lost_wake_tests {
+    use super::*;
+    use crate::actor::supervision::ABORT_SETTLE;
+    use crate::system::wait_end_or_floor;
+    use crate::types::{ActorStatus, StatusTx, StatusValue};
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn child(parent: &Arc<SubtreeHold>, own: Duration, infinity: bool) -> Arc<SubtreeHold> {
+        SubtreeHold::new(Some(SubtreeLink {
+            parent: parent.token(),
+            own,
+            infinity,
+        }))
+    }
+
+    /// A release that lands right after the wait read that the hold was not
+    /// released wakes the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_right_after_the_read_wakes_the_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        test_hook::arm(move || drop(root));
+        tokio::time::timeout(ms(1000), watch.released())
+            .await
+            .expect("the release after the read wakes the wait");
+        assert!(watch.is_released());
+    }
+
+    /// A wait with no deadline (an unbounded supervisor child lives below)
+    /// is woken by a change that lands right after the wait read the signal.
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_an_unbounded_child_right_after_the_read_wakes_the_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kid = child(&root, ms(50), true);
+        let mut wait = SubtreeWait::new(&watch);
+        assert_eq!(wait.deadline(), None);
+        test_hook::arm(move || drop(kid));
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the change after the read wakes the wait");
+        assert!(wait.deadline().is_some(), "armed again once it ended");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_raise_right_after_the_read_wakes_the_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let _inf = child(&root, ms(50), true);
+        let mut wait = SubtreeWait::new(&watch);
+        assert_eq!(wait.deadline(), None);
+        let kept = Rc::new(RefCell::new(None));
+        let kept2 = kept.clone();
+        let root2 = root.clone();
+        test_hook::arm(move || *kept2.borrow_mut() = Some(child(&root2, ms(500), false)));
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the raise after the read wakes the wait");
+        assert!(kept.borrow().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_abort_right_after_the_read_wakes_the_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let _inf = child(&root, ms(50), true);
+        let record = AbortRecord::new();
+        let link = SubtreeLink {
+            parent: root.token(),
+            own: ms(200),
+            infinity: false,
+        };
+        let _kid = SubtreeHold::with_record(Some(link), record.clone());
+        let mut wait = SubtreeWait::new(&watch);
+        test_hook::arm(move || record.owe());
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the owed abort after the read wakes the wait");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_subtree_right_after_the_read_wakes_the_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kid = child(&root, ms(50), true);
+        let mut wait = SubtreeWait::new(&watch);
+        assert_eq!(wait.deadline(), None);
+        test_hook::arm(move || {
+            drop(kid);
+            drop(root);
+        });
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the end after the read wakes the wait");
+        assert!(wait.gone());
+    }
+
+    /// An unbounded child that comes and goes between two polls of a wait
+    /// (no raise of the budget, only the count moves 0 -> 1 -> 0) still
+    /// counts the bound again from its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_net_zero_unbounded_child_between_two_polls_rearms_the_deadline() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let mut wait = SubtreeWait::new(&watch);
+        let armed = wait.deadline().expect("armed at once");
+        tokio::time::advance(ms(40)).await;
+        drop(child(&root, Duration::ZERO, true));
+        assert_eq!(watch.release_bound(), Some(ABORT_SETTLE));
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
+        assert_eq!(wait.deadline(), Some(armed + ms(40)));
+    }
+
+    /// The same change while the wait is parked.
+    #[tokio::test(start_paused = true)]
+    async fn a_net_zero_unbounded_child_while_parked_rearms_the_deadline() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let mut wait = SubtreeWait::new(&watch);
+        let armed = wait.deadline().expect("armed at once");
+        let root2 = root.clone();
+        let mover = tokio::spawn(async move {
+            tokio::time::sleep(ms(40)).await;
+            drop(child(&root2, Duration::ZERO, true));
+        });
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
+        mover.await.unwrap();
+        assert_eq!(wait.deadline(), Some(armed + ms(40)));
+    }
+
+    /// An unbounded child that appears while the wait is being built is
+    /// seen by its first arming or by its first poll, never by neither.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_child_appearing_while_the_wait_is_built_disarms_it() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kept = Rc::new(RefCell::new(None));
+        let kept2 = kept.clone();
+        let root2 = root.clone();
+        test_hook::arm(move || *kept2.borrow_mut() = Some(child(&root2, ms(50), true)));
+        let wait = SubtreeWait::new(&watch);
+        assert!(
+            kept.borrow().is_some(),
+            "the child appeared during the build"
+        );
+        assert_eq!(wait.deadline(), None, "an unbounded child lives below");
+    }
+
+    /// The end of the subtree wakes a parked wait whose deadline is far off.
+    #[tokio::test(start_paused = true)]
+    async fn the_end_of_the_subtree_wakes_a_parked_wait_long_before_its_deadline() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let kid = child(&root, ms(60_000), false);
+        let mut wait = SubtreeWait::new(&watch);
+        assert!(wait.deadline().is_some());
+        let start = Instant::now();
+        let ender = tokio::spawn(async move {
+            tokio::time::sleep(ms(10)).await;
+            drop(kid);
+            drop(root);
+        });
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
+        ender.await.unwrap();
+        assert!(wait.gone());
+        assert_eq!(
+            Instant::now() - start,
+            ms(10),
+            "woken by the end, not by the deadline"
+        );
+    }
+
+    /// A raise of the budget reaches a parked wait before its old deadline
+    /// fires, and extends that deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_raise_wakes_a_parked_wait_and_extends_its_deadline() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let mut wait = SubtreeWait::new(&watch);
+        let armed = wait.deadline().expect("armed at once");
+        let start = Instant::now();
+        let root2 = root.clone();
+        let raiser = tokio::spawn(async move {
+            tokio::time::sleep(ms(40)).await;
+            child(&root2, ms(500), false)
+        });
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
+        let _kid = raiser.await.unwrap();
+        assert_eq!(
+            Instant::now() - start,
+            ms(40),
+            "woken by the raise, not by the deadline"
+        );
+        let extended = wait.deadline().expect("armed");
+        assert!(extended > armed);
+        assert_eq!(extended, start + ms(40) + ms(500) + ABORT_SETTLE);
+        assert!(!wait.expired());
+    }
+
+    /// An abort recorded against a live actor of the subtree reaches a
+    /// parked wait at once, and the verdict floor follows it.
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_abort_wakes_a_parked_wait() {
+        let root = SubtreeHold::new(None);
+        let watch = root.watch();
+        let record = AbortRecord::new();
+        let link = SubtreeLink {
+            parent: root.token(),
+            own: ms(200),
+            infinity: false,
+        };
+        let _kid = SubtreeHold::with_record(Some(link), record.clone());
+        let mut wait = SubtreeWait::new(&watch);
+        let start = Instant::now();
+        let rec = record.clone();
+        let mover = tokio::spawn(async move {
+            tokio::time::sleep(ms(30)).await;
+            rec.owe();
+        });
+        tokio::time::timeout(ms(1000), wait.changed())
+            .await
+            .expect("the wait resolves");
+        mover.await.unwrap();
+        assert_eq!(Instant::now() - start, ms(30), "woken by the owed abort");
+        assert!(!wait.expired());
+    }
+
+    /// The first abort lands right after the wait read the record while an
+    /// abort was owed: the owed floor (budget plus cap) is replaced by the
+    /// recorded one (the later of the budget and the abort plus the settle
+    /// time), and the wait must read the record again at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_recorded_right_after_the_read_moves_the_floor_at_once() {
+        let (_status_tx, mut status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+        let record = AbortRecord::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        record.owe();
+        let start = Instant::now();
+        let rec = record.clone();
+        let handle = task.abort_handle();
+        test_hook::arm(move || rec.abort(&handle));
+        let budget = ms(1000);
+        let cap = ms(3000);
+        let ended = wait_end_or_floor(&mut status_rx, Some(&record), budget, cap).await;
+        assert!(!ended);
+        assert_eq!(
+            Instant::now() - start,
+            budget.max(ABORT_SETTLE),
+            "the verdict follows the recorded floor, not the owed one"
+        );
+    }
+
+    /// The same, with the abort recorded while the wait sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_recorded_during_the_sleep_moves_the_floor_at_once() {
+        let (_status_tx, mut status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+        let record = AbortRecord::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        record.owe();
+        let start = Instant::now();
+        let budget = ms(1000);
+        let cap = ms(3000);
+        let rec = record.clone();
+        let waiter = tokio::spawn(async move {
+            let ended = wait_end_or_floor(&mut status_rx, Some(&rec), budget, cap).await;
+            (ended, Instant::now() - start)
+        });
+        tokio::time::sleep(ms(10)).await;
+        record.abort(&task.abort_handle());
+        let (ended, took) = waiter.await.unwrap();
+        assert!(!ended);
+        assert_eq!(took, budget.max(ms(10) + ABORT_SETTLE));
+    }
+
+    /// Two waits on one record, as a targeted kill racing a sweep: the first
+    /// abort lands after the second wait read the record, and both waits
+    /// move to the recorded floor, not only the one that parked first.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_recorded_after_a_second_wait_read_moves_both_floors() {
+        let (status_tx, mut first_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+        let mut second_rx = status_tx.subscribe();
+        let record = AbortRecord::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        record.owe();
+        let start = Instant::now();
+        let budget = ms(1000);
+        let cap = ms(3000);
+        let first = wait_end_or_floor(&mut first_rx, Some(&record), budget, cap);
+        let second = wait_end_or_floor(&mut second_rx, Some(&record), budget, cap);
+        tokio::pin!(first, second);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the first wait parks on the owed floor"
+        );
+        let rec = record.clone();
+        let handle = task.abort_handle();
+        test_hook::arm(move || rec.abort(&handle));
+        // The second wait's first poll reads the record, and the abort lands
+        // right after that read.
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the second wait parks on the recorded floor"
+        );
+        let (a, b) = tokio::time::timeout(ms(10_000), async {
+            tokio::join!(
+                async { (first.as_mut().await, Instant::now() - start) },
+                async { (second.as_mut().await, Instant::now() - start) },
+            )
+        })
+        .await
+        .expect("both waits answer");
+        assert_eq!(a, (false, budget.max(ABORT_SETTLE)));
+        assert_eq!(b, (false, budget.max(ABORT_SETTLE)));
+    }
+
+    /// A woken wait must find the abort's instant already written: the wake
+    /// is sent only after the record holds the first abort.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_abort_is_written_before_the_waits_are_woken() {
+        struct Flag(AtomicBool);
+        impl Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let record = AbortRecord::new();
+        let task = tokio::spawn(std::future::pending::<()>());
+        record.owe();
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        let recorded = record.recorded();
+        tokio::pin!(recorded);
+        recorded.as_mut().enable();
+        assert!(recorded.as_mut().poll(&mut cx).is_pending());
+        let seen = Rc::new(RefCell::new(None));
+        let (seen2, rec, flag2) = (seen.clone(), record.clone(), flag.clone());
+        test_hook::arm_after_write(move || {
+            *seen2.borrow_mut() = Some((rec.view().0.is_some(), flag2.0.load(Ordering::SeqCst)));
+        });
+        record.abort(&task.abort_handle());
+        assert_eq!(
+            *seen.borrow(),
+            Some((true, false)),
+            "written and not yet woken between the write and the wake"
+        );
+        assert!(flag.0.load(Ordering::SeqCst), "woken once it is written");
+        assert!(recorded.as_mut().poll(&mut cx).is_ready());
     }
 }

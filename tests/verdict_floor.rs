@@ -35,12 +35,14 @@ use tokio_actors::{
 
 mod common;
 
-/// The parked supervisor's `Shutdown` window, in the first scenario.
-const WINDOW: Duration = Duration::from_millis(600);
+/// The parked supervisor's `Shutdown` window, in the first scenario: the
+/// stall starts well inside it on any host that runs the test at all.
+const WINDOW: Duration = Duration::from_millis(2600);
 /// The parked supervisor's kill grace, in the first scenario.
 const GRACE: Duration = Duration::from_millis(200);
-/// The stopping supervisor's `Shutdown` window, in the second scenario.
-const INNER_WINDOW: Duration = Duration::from_millis(300);
+/// The stopping supervisor's `Shutdown` window, in the second scenario: the
+/// stall starts well inside it on any host that runs the test at all.
+const INNER_WINDOW: Duration = Duration::from_millis(2300);
 /// The stopping supervisor's kill grace, in the second scenario.
 const INNER_GRACE: Duration = Duration::from_millis(200);
 /// The parked worker's kill grace, in the second scenario.
@@ -48,10 +50,15 @@ const WORKER_GRACE: Duration = Duration::from_millis(100);
 /// The parked worker's `Shutdown` window: longer than the test, so its
 /// supervisor is still stopping it in order when the late `Kill` arrives.
 const WORKER_WINDOW: Duration = Duration::from_secs(10);
-/// How long after the terminated child ended the thread stalls.
+/// How long after the terminated child ended (and, in the second scenario,
+/// after its supervisor child began stopping its worker) the thread stalls.
 const STALL_AFTER: Duration = Duration::from_millis(100);
 /// Bounds every wait of the test; only a hang reaches it.
 const BOUND: Duration = Duration::from_secs(10);
+
+/// The longest a wait for a condition may take. It only limits how long a real
+/// hang takes to report; a slow host must not read as one.
+const HANG_BOUND: Duration = Duration::from_secs(60);
 
 /// What the test reads of the parked actor.
 #[derive(Default)]
@@ -251,8 +258,9 @@ impl Actor for Top {
     }
 }
 
+/// Polls `ready` until it holds. The bound only limits how long a real hang takes to report.
 async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + BOUND;
+    let deadline = Instant::now() + HANG_BOUND;
     while !ready() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         sleep(Duration::from_millis(1)).await;
@@ -286,7 +294,7 @@ async fn terminate_across_a_stall(below: Below) -> Terminated {
     let top = Top {
         below,
         mid: mid.clone(),
-        inner,
+        inner: inner.clone(),
         leaf: leaf.clone(),
         probe: probe.clone(),
     }
@@ -311,6 +319,10 @@ async fn terminate_across_a_stall(below: Below) -> Terminated {
         .await
         .unwrap();
     wait_until("the turn to park", || probe.parked.load(Ordering::SeqCst)).await;
+    let inner_handle = match below {
+        Below::ParkedSupervisor => None,
+        Below::StoppingSupervisor => Some(sys.get::<Inner>(&inner).expect("the inner runs")),
+    };
 
     // Stalls the thread once the terminated child has ended and the call
     // waits for its subtree.
@@ -323,6 +335,14 @@ async fn terminate_across_a_stall(below: Below) -> Terminated {
                 mid_handle.status() == ActorStatus::Stopped
             })
             .await;
+            if let Some(inner_handle) = inner_handle {
+                // Its supervisor child has begun stopping its worker in
+                // order: the stall comes after that and before its `Kill`.
+                wait_until("the inner supervisor to begin stopping", || {
+                    inner_handle.status() == ActorStatus::Stopping
+                })
+                .await;
+            }
             sleep(STALL_AFTER).await;
             let from = Instant::now();
             std::thread::sleep(stall);

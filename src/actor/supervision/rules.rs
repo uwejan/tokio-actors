@@ -18,7 +18,7 @@ use crate::types::{
 pub(crate) enum Signal {
     /// The vetoable request of a graceful stop.
     ParentRequest,
-    /// The untrappable request that bypasses every callback.
+    /// The request that cannot be vetoed: no callback begins once it is read.
     Kill,
 }
 
@@ -97,6 +97,8 @@ pub(crate) enum LadderEvent {
     },
     /// The step's deadline passed.
     DeadlineReached,
+    /// The incarnation's task ended (its join resolved).
+    TaskEnded,
 }
 
 /// What the ladder's owner does next.
@@ -109,6 +111,9 @@ pub(crate) enum LadderAction {
     Abort,
     /// Record that the incarnation outlived its whole ladder.
     WriteVerdict,
+    /// Release the abort the ladder owed to the incarnation: the task ended,
+    /// so no abort is left to issue.
+    ReleaseMark,
 }
 
 /// `base + after`, capped so the result stays a safe timer deadline.
@@ -133,7 +138,8 @@ pub(crate) fn kill_grace_from(now: Instant, grace: Duration) -> LadderStep {
 /// `Kill` policy goes straight to the kill grace, a `Timeout` runs its
 /// window first, `Infinity` waits without a deadline. A deadline reached in
 /// the graceful window raises `Kill`; in the kill grace it aborts the task;
-/// in the abort wait it writes the verdict.
+/// in the abort wait it writes the verdict. The task's end, at any step,
+/// releases the abort the ladder may still owe and leaves the step as it is.
 pub(crate) fn ladder_step(
     step: LadderStep,
     event: LadderEvent,
@@ -141,6 +147,7 @@ pub(crate) fn ladder_step(
     grace: Duration,
 ) -> (LadderStep, LadderAction) {
     match (step, event) {
+        (step, LadderEvent::TaskEnded) => (step, LadderAction::ReleaseMark),
         (
             LadderStep::Idle,
             LadderEvent::Order {
@@ -2262,6 +2269,27 @@ mod tests {
             ladder_step(LadderStep::Idle, LadderEvent::DeadlineReached, now, grace),
             (LadderStep::Idle, LadderAction::None)
         );
+        // The task's end, at every step, releases the abort the ladder may
+        // owe and leaves the step as it is.
+        for step in [
+            LadderStep::Idle,
+            LadderStep::Graceful {
+                deadline: Some(at(t0, 5)),
+            },
+            LadderStep::Graceful { deadline: None },
+            LadderStep::KillGrace {
+                deadline: at(t0, 5),
+            },
+            LadderStep::AbortGrace {
+                deadline: at(t0, 5),
+            },
+            LadderStep::Spent,
+        ] {
+            assert_eq!(
+                ladder_step(step, LadderEvent::TaskEnded, now, grace),
+                (step, LadderAction::ReleaseMark)
+            );
+        }
         // The grace given is the grace waited, whatever its size; an
         // unbounded one is capped to a deadline a timer accepts.
         for grace in [Duration::ZERO, MS(120), MS(1500), Duration::MAX] {

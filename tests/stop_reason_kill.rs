@@ -181,8 +181,9 @@ impl Gate {
         }
     }
 
+    /// Waits until the callback reached its gate. The bound only limits how long a real hang takes to report.
     async fn entered(&self) {
-        let deadline = Instant::now() + BOUND;
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !self.0 .0.load(Ordering::SeqCst) {
             assert!(
                 Instant::now() < deadline,
@@ -311,10 +312,9 @@ async fn cancelled_raised_during_pre_stop_wins_over_graceful() {
     );
 }
 
-/// Control: a vetoing `pre_stop` already sends the run loop back through
-/// `stop_rx.changed()`, so a `Kill` raised after the veto returns is picked
-/// up correctly independent of the re-read fix above - `on_stopped` must
-/// never run.
+/// Control: a vetoing `pre_stop` already sends the run loop back to its
+/// select, so a `Kill` raised after the veto returns is picked up by the run
+/// loop - `on_stopped` must never run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_after_a_vetoing_pre_stop_bypasses_on_stopped() {
     let on_stopped_reason = Arc::new(Mutex::new(None));
@@ -333,8 +333,9 @@ async fn kill_after_a_vetoing_pre_stop_bypasses_on_stopped() {
         .unwrap();
 
     handle.stop(StopReason::Graceful).await.unwrap();
-    // The veto has answered before Kill lands.
-    let deadline = Instant::now() + BOUND;
+    // The veto has answered before Kill lands. The bound only limits how long a
+    // real hang takes to report.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while answered.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "pre_stop never answered");
         sleep(Duration::from_millis(1)).await;
@@ -349,6 +350,59 @@ async fn kill_after_a_vetoing_pre_stop_bypasses_on_stopped() {
         reason.is_none(),
         "on_stopped must never run once Kill is raised after a veto, got {reason:?}"
     );
+}
+
+/// A forced reason raised while a vetoing `pre_stop` is in flight is the
+/// reason the actor stops with, whichever forced reason it is: the gate is
+/// not asked again, and `on_stopped` runs once with that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forced_reason_raised_during_a_vetoing_pre_stop_is_the_final_reason() {
+    for forced in [
+        StopReason::ParentKilled,
+        StopReason::Cancelled,
+        StopReason::Failure(ActorError::user("raised while pre_stop ran")),
+    ] {
+        let on_stopped_reason = Arc::new(Mutex::new(None));
+        let gate = Gate::default();
+        let _opens = OpensOnDrop(gate.clone());
+        let actor = GatedStopActor {
+            pre_stop_gate: Some(gate.clone()),
+            pre_stop_accepts: false,
+            on_stopped_reason: Arc::clone(&on_stopped_reason),
+            ..Default::default()
+        };
+        let answered = Arc::clone(&actor.answered);
+
+        let handle = actor
+            .spawn()
+            .named("forced-during-vetoing-pre-stop")
+            .with_config(ActorConfig::default())
+            .await
+            .unwrap();
+
+        handle.stop(StopReason::Graceful).await.unwrap();
+        // The gate is in flight, held: the forced reason lands inside it and
+        // the gate then vetoes.
+        gate.entered().await;
+        handle.stop(forced.clone()).await.unwrap();
+        gate.open();
+        timeout(BOUND, handle.wait_stopped())
+            .await
+            .expect("the actor stops");
+
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            1,
+            "{forced:?}: pre_stop is not asked again"
+        );
+        let received = on_stopped_reason.lock().unwrap().clone();
+        assert!(
+            received
+                .as_ref()
+                .is_some_and(|got| std::mem::discriminant(got) == std::mem::discriminant(&forced)),
+            "{forced:?}: on_stopped received {received:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
