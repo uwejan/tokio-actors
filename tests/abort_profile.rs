@@ -11,6 +11,15 @@
 //!
 //! Under the default profile the target only prints a note and exits 0.
 //!
+//! A panic in a closure given to `Sys::inspect`, `Sys::replace_state` or
+//! `Sys::install`, or in an actor's `format_status`, ends the process under
+//! this profile too: the catch that turns it into `SysError::Callback` or a
+//! placeholder needs unwinding.
+//!
+//! A telemetry handler attached with `attach_telemetry` is called without a
+//! catch under this profile: a panic of the handler ends the process, as a
+//! panic of any hook does.
+//!
 //! A case that says the process ends runs as a child process: the binary runs
 //! itself again with an environment variable that names the case, and the
 //! parent checks how the child ended (killed by SIGABRT on Unix, or the exit
@@ -145,6 +154,42 @@ mod checks {
                     did_not_write: NO_REPORT,
                 }),
                 run: a_handler_panic_ends_the_process,
+            },
+            Case {
+                name: "an_inspect_closure_panic_ends_the_process_and_reports_to_no_actor",
+                kind: Kind::InChild(Child {
+                    ends: Ends::Aborted,
+                    wrote: &["MARK trigger", "inspect panic"],
+                    did_not_write: NO_REPORT,
+                }),
+                run: an_inspect_closure_panic_ends_the_process,
+            },
+            Case {
+                name: "a_replace_state_closure_panic_ends_the_process_and_reports_to_no_actor",
+                kind: Kind::InChild(Child {
+                    ends: Ends::Aborted,
+                    wrote: &["MARK trigger", "replace_state panic"],
+                    did_not_write: NO_REPORT,
+                }),
+                run: a_replace_state_closure_panic_ends_the_process,
+            },
+            Case {
+                name: "an_installed_function_panic_ends_the_process_and_reports_to_no_actor",
+                kind: Kind::InChild(Child {
+                    ends: Ends::Aborted,
+                    wrote: &["install panic"],
+                    did_not_write: NO_REPORT,
+                }),
+                run: an_installed_function_panic_ends_the_process,
+            },
+            Case {
+                name: "a_format_status_panic_ends_the_process_and_reports_to_no_actor",
+                kind: Kind::InChild(Child {
+                    ends: Ends::Aborted,
+                    wrote: &["MARK closure", "format_status panic"],
+                    did_not_write: NO_REPORT,
+                }),
+                run: a_format_status_panic_ends_the_process,
             },
             Case {
                 name: "a_stack_overflow_ends_the_process_and_reports_to_no_actor",
@@ -524,7 +569,23 @@ mod checks {
         AllocationFailure,
         Abort,
         Exit,
+        /// Ends the turn at once, so an installed debug function sees it.
+        Nothing,
     }
+
+    /// What the parent does to a supervised `Victim` to make it run a closure
+    /// that panics.
+    #[derive(Clone, Copy)]
+    enum Action {
+        Send(Trigger),
+        Inspect,
+        ReplaceState,
+        Install,
+        FormatStatus,
+    }
+
+    /// Set to make the victim's `format_status` panic.
+    static FORMAT_STATUS_PANICS: AtomicBool = AtomicBool::new(false);
 
     /// A supervised child whose handler ends the process in the way a message
     /// names, and that would write a line if its `on_stopped` ran.
@@ -564,7 +625,16 @@ mod checks {
                 }
                 Trigger::Abort => std::process::abort(),
                 Trigger::Exit => std::process::exit(7),
+                Trigger::Nothing => Ok(()),
             }
+        }
+
+        fn format_status(&self) -> Option<String> {
+            if FORMAT_STATUS_PANICS.load(Ordering::SeqCst) {
+                mark("closure");
+                panic!("format_status panic");
+            }
+            None
         }
 
         async fn on_stopped(
@@ -589,6 +659,7 @@ mod checks {
                 .named("victim")
                 .restart_type(RestartType::Permanent)
                 .shutdown(Shutdown::Timeout(Duration::from_secs(5)))
+                .allow_state_access()
                 .await?;
             Ok(())
         }
@@ -607,10 +678,10 @@ mod checks {
         }
     }
 
-    /// Sends `trigger` to a supervised `Victim` and waits for the victim to
-    /// end. Returns only when the process was not ended, with `Ok` when the
-    /// victim ended by itself.
-    fn end_the_process_from_a_handler(trigger: Trigger) -> CaseResult {
+    /// Does `action` to a supervised `Victim` and waits for the victim to end.
+    /// Returns only when the process was not ended, with `Ok` when the victim
+    /// ended by itself.
+    fn end_the_process_from(action: Action) -> CaseResult {
         let runtime = with_timers();
         runtime.block_on(async {
             let system = ActorSystem::create(unique("victim")).map_err(|err| err.to_string())?;
@@ -626,10 +697,44 @@ mod checks {
             let victim = system
                 .get::<Victim>("victim")
                 .ok_or("the victim is not registered")?;
-            victim
-                .notify(trigger)
-                .await
-                .map_err(|err| format!("the trigger was not accepted: {err}"))?;
+            let refused = |err: tokio_actors::sys::SysError| format!("the call was refused: {err}");
+            match action {
+                Action::Send(trigger) => victim
+                    .notify(trigger)
+                    .await
+                    .map_err(|err| format!("the trigger was not accepted: {err}"))?,
+                Action::Inspect => {
+                    mark("trigger");
+                    victim
+                        .sys()
+                        .inspect(|_| -> () { panic!("inspect panic") })
+                        .await
+                        .map_err(refused)?;
+                }
+                Action::ReplaceState => {
+                    mark("trigger");
+                    victim
+                        .sys()
+                        .replace_state(|_| panic!("replace_state panic"))
+                        .await
+                        .map_err(refused)?;
+                }
+                Action::Install => {
+                    victim
+                        .sys()
+                        .install("boom", |_| panic!("install panic"))
+                        .await
+                        .map_err(refused)?;
+                    victim
+                        .notify(Trigger::Nothing)
+                        .await
+                        .map_err(|err| format!("the trigger was not accepted: {err}"))?;
+                }
+                Action::FormatStatus => {
+                    FORMAT_STATUS_PANICS.store(true, Ordering::SeqCst);
+                    victim.get_status().await.map_err(|err| err.to_string())?;
+                }
+            }
             timeout(EVENT_BOUND, victim.wait_stopped())
                 .await
                 .map_err(|_| "the victim neither ended the process nor stopped".to_string())?;
@@ -638,23 +743,39 @@ mod checks {
     }
 
     fn a_handler_panic_ends_the_process() -> CaseResult {
-        end_the_process_from_a_handler(Trigger::Panic)
+        end_the_process_from(Action::Send(Trigger::Panic))
     }
 
     fn a_stack_overflow_ends_the_process() -> CaseResult {
-        end_the_process_from_a_handler(Trigger::StackOverflow)
+        end_the_process_from(Action::Send(Trigger::StackOverflow))
     }
 
     fn an_allocation_failure_ends_the_process() -> CaseResult {
-        end_the_process_from_a_handler(Trigger::AllocationFailure)
+        end_the_process_from(Action::Send(Trigger::AllocationFailure))
     }
 
     fn process_abort_ends_the_process() -> CaseResult {
-        end_the_process_from_a_handler(Trigger::Abort)
+        end_the_process_from(Action::Send(Trigger::Abort))
     }
 
     fn process_exit_ends_the_process() -> CaseResult {
-        end_the_process_from_a_handler(Trigger::Exit)
+        end_the_process_from(Action::Send(Trigger::Exit))
+    }
+
+    fn an_inspect_closure_panic_ends_the_process() -> CaseResult {
+        end_the_process_from(Action::Inspect)
+    }
+
+    fn a_replace_state_closure_panic_ends_the_process() -> CaseResult {
+        end_the_process_from(Action::ReplaceState)
+    }
+
+    fn an_installed_function_panic_ends_the_process() -> CaseResult {
+        end_the_process_from(Action::Install)
+    }
+
+    fn a_format_status_panic_ends_the_process() -> CaseResult {
+        end_the_process_from(Action::FormatStatus)
     }
 
     // Cases that run in this process

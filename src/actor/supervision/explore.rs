@@ -55,6 +55,7 @@ enum Cause {
 enum Reason {
     Graceful,
     ParentRequest,
+    Shutdown,
     Failure(Cause),
     ParentKilled,
     Cancelled,
@@ -70,7 +71,7 @@ enum Strength {
 
 fn strength(r: Reason) -> Strength {
     match r {
-        Reason::Graceful | Reason::ParentRequest => Strength::Requested,
+        Reason::Graceful | Reason::ParentRequest | Reason::Shutdown => Strength::Requested,
         Reason::Failure(_) | Reason::ParentKilled | Reason::Cancelled => Strength::Forced,
         Reason::Kill => Strength::Kill,
     }
@@ -80,13 +81,16 @@ fn strength(r: Reason) -> Strength {
 fn rank(r: Reason) -> u8 {
     match r {
         Reason::Graceful | Reason::Cancelled | Reason::Kill => 0,
-        Reason::ParentRequest | Reason::ParentKilled => 1,
-        Reason::Failure(_) => 2,
+        Reason::Shutdown | Reason::ParentKilled => 1,
+        Reason::ParentRequest | Reason::Failure(_) => 2,
     }
 }
 
 fn vetoable(r: Option<Reason>) -> bool {
-    matches!(r, Some(Reason::Graceful | Reason::ParentRequest))
+    matches!(
+        r,
+        Some(Reason::Graceful | Reason::ParentRequest | Reason::Shutdown)
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -468,6 +472,9 @@ struct Cell {
     ladder: Ladder,
     fate: Option<Reason>,
     verdict: bool,
+    /// A caller that decides on the verdict was told: an answer of
+    /// `ChildUnresponsive` went to it.
+    reported: bool,
     cancelled: bool,
     closed: bool,
     st_fired: bool,
@@ -822,6 +829,26 @@ impl ChildCfg {
             sat(self.kg(), ABORT_SETTLE)
         }
     }
+    /// What a worker adds to the budget once its actor traps exit signals: its
+    /// own window under a `Timeout` policy, nothing for a supervisor child
+    /// (its window is in `own_budget` already) and nothing under `Kill` or
+    /// `Infinity`.
+    fn trap_extra(&self) -> u64 {
+        if !self.is_supervisor && self.policy == Policy::Timeout {
+            self.window_ns
+        } else {
+            0
+        }
+    }
+    /// Whether a worker that traps exit signals counts among the live
+    /// unbounded stops above it: a worker under `Infinity`. A supervisor child
+    /// under `Infinity` is counted from its start (`inf_live`), not by this
+    /// rule, so it is false for it. The explorer's workers do not trap; the
+    /// rule is compared with production over every child shape, and the
+    /// count itself is pinned by the subtree tests.
+    fn trap_infinity(&self) -> bool {
+        !self.is_supervisor && self.policy == Policy::Infinity
+    }
     /// As `own_budget`, with a finite stand-in for an unbounded supervisor
     /// child.
     fn own_fin(&self) -> u64 {
@@ -957,7 +984,7 @@ fn restart_eligible(restart: Restart, r: Reason) -> bool {
         Restart::Permanent => true,
         Restart::Transient => !matches!(
             r,
-            Reason::Graceful | Reason::ParentRequest | Reason::ParentKilled
+            Reason::Graceful | Reason::ParentRequest | Reason::Shutdown | Reason::ParentKilled
         ),
         Restart::Temporary => false,
     }
@@ -1131,6 +1158,53 @@ impl State {
 
     fn cell(&self, t: Tok) -> &Cell {
         self.cells.get(&t).expect("model invariant: cell exists")
+    }
+
+    fn cell_mut(&mut self, t: Tok) -> &mut Cell {
+        self.cells
+            .get_mut(&t)
+            .expect("model invariant: cell exists")
+    }
+
+    /// The facts the supervisor's check for a verdict nobody will report reads
+    /// of each ledger entry, newest first. The model's loop is free when the
+    /// check runs, so no caller waits: a caller that was told is `reported`.
+    fn stop_verdict_facts(&self) -> Vec<(Key, rules::StopVerdictFact)> {
+        self.sup
+            .order
+            .iter()
+            .rev()
+            .filter_map(|k| {
+                let life = self.life(*k)?;
+                let fact = match life {
+                    Life::Stopping { n, .. } => {
+                        let cell = self.cells.get(&n)?;
+                        rules::StopVerdictFact {
+                            stopping: true,
+                            verdict: cell.verdict,
+                            ended: self.ended(n),
+                            audience: cell.reported,
+                        }
+                    }
+                    _ => rules::StopVerdictFact {
+                        stopping: false,
+                        verdict: false,
+                        ended: false,
+                        audience: false,
+                    },
+                };
+                Some((*k, fact))
+            })
+            .collect()
+    }
+
+    /// The stop in progress whose verdict no caller reports: the exit the
+    /// supervisor's loop takes with that verdict.
+    fn orphan_verdict_exit(&self) -> Option<Key> {
+        self.stop_verdict_facts()
+            .into_iter()
+            .find(|(_, fact)| fact.stopping && fact.verdict && !fact.ended && !fact.audience)
+            .map(|(k, _)| k)
     }
 
     fn live(&self, t: Tok) -> bool {
@@ -4125,6 +4199,7 @@ impl Ap<'_> {
             self.answer = Some(Answer::Ok);
         } else if self.s.cell(n).verdict {
             self.hit(Wit::ManualJoinAnsweredUnresponsive);
+            self.s.cell_mut(n).reported = true;
             self.answer = Some(Answer::ChildUnresponsive);
         } else {
             self.s.caller = Some(Caller {
@@ -4190,6 +4265,7 @@ impl Ap<'_> {
             self.answer = Some(Answer::Ok);
         } else if self.s.cell(n).verdict {
             self.hit(Wit::OverrideAnsweredUnresponsive);
+            self.s.cell_mut(n).reported = true;
             self.answer = Some(Answer::ChildUnresponsive);
         } else {
             self.s.caller = Some(Caller {
@@ -4580,6 +4656,7 @@ fn new_cell(sup: SupId, key: Key, origin: Origin, exec: Exec) -> Cell {
         ladder: Ladder::Off,
         fate: None,
         verdict: false,
+        reported: false,
         cancelled: false,
         closed: false,
         st_fired: false,
@@ -4963,7 +5040,9 @@ impl State {
                 v.push(Step::DrainDeath(c, t, r));
             }
         }
-        if self.loop_free() && self.verdict_exit().is_some() {
+        if self.loop_free()
+            && (self.verdict_exit().is_some() || self.orphan_verdict_exit().is_some())
+        {
             v.push(Step::SVerdict);
         }
         match self.s_phase {
@@ -6170,11 +6249,27 @@ impl Ap<'_> {
         }
     }
 
+    /// The loop's check for a verdict nobody reports: a stop in progress whose
+    /// occupant carries the verdict, with no caller waiting or told, ends the
+    /// supervisor with the verdict.
+    fn s_orphan_verdict(&mut self) {
+        let Some(exit) = self.s.orphan_verdict_exit() else {
+            return;
+        };
+        self.hit(Wit::UnreportedVerdictEndsTheSupervisor);
+        let entries = self.s.stop_verdict_facts();
+        self.obs.push(Obs::OrphanVerdict {
+            entries,
+            exit: Some(exit),
+        });
+        self.s.oracle.s_cause = Some(SCause::Unresponsive);
+        self.final_drain(SupId::S, Reason::Failure(Cause::Unresponsive(exit)));
+    }
+
     fn s_verdict(&mut self) {
-        let exit = self
-            .s
-            .verdict_exit()
-            .expect("model invariant: verdict exit enabled");
+        let Some(exit) = self.s.verdict_exit() else {
+            return self.s_orphan_verdict();
+        };
         let chain = matches!(
             self.s.sup.group.as_ref().map(|g| &g.phase),
             Some(Phase::Chain { .. })
@@ -6216,7 +6311,7 @@ impl Ap<'_> {
                 }
             }
             if !blocked {
-                return;
+                return self.s_orphan_verdict();
             }
         } else if let Some(Phase::Chain { queue, .. }) = self.s.sup.group.as_ref().map(|g| &g.phase)
         {
@@ -6308,6 +6403,7 @@ impl Ap<'_> {
             }
             self.answer = Some(Answer::Ok);
         } else {
+            self.s.cell_mut(t).reported = true;
             self.answer = Some(Answer::ChildUnresponsive);
         }
         self.s.caller = None;
@@ -6456,6 +6552,7 @@ enum Wit {
     ManualJoinOneMoreAsk,
     ManualJoinAnsweredUnresponsive,
     OverrideAnsweredUnresponsive,
+    UnreportedVerdictEndsTheSupervisor,
     StopChildAbsorbedInRetry,
     StopChildKeptDownSpawnedSince,
     SpawnedSinceOverrideLeftOutOfTheRetry,
@@ -6609,6 +6706,7 @@ impl Wit {
             Wit::ManualJoinOneMoreAsk => "a manual join giving the one more ask under Infinity",
             Wit::ManualJoinAnsweredUnresponsive => "a manual join answered Unresponsive at once",
             Wit::OverrideAnsweredUnresponsive => "an override terminate answered Unresponsive at once",
+            Wit::UnreportedVerdictEndsTheSupervisor => "a stop whose caller left given the verdict, ending the supervisor with it",
             Wit::StopChildAbsorbedInRetry => "a stop_child absorbed in a retry's stop phase",
             Wit::StopChildKeptDownSpawnedSince => {
                 "a stop_child of a Transient or Temporary child started during a pending group, kept down like its terminate"
@@ -7045,7 +7143,10 @@ impl State {
         matches!(inc.stage, Stage::Stuck(_))
             || (inc.stage == Stage::Idle
                 && !inc.unseen
-                && matches!(inc.lane, Some(Reason::Graceful | Reason::ParentRequest)))
+                && matches!(
+                    inc.lane,
+                    Some(Reason::Graceful | Reason::ParentRequest | Reason::Shutdown)
+                ))
     }
 
     /// The exemption of a wait: it waits on an incarnation under `Infinity`
@@ -8886,6 +8987,19 @@ fn same_life(after: Option<Life>, want: Option<LifeAfter>, n: Tok) -> bool {
     }
 }
 
+/// The cells without the mark that a caller was told the verdict: telling the
+/// caller is the answer of a call, not an effect on the supervision state.
+fn without_reports(cells: &BTreeMap<Tok, Cell>) -> BTreeMap<Tok, Cell> {
+    cells
+        .iter()
+        .map(|(t, cell)| {
+            let mut cell = cell.clone();
+            cell.reported = false;
+            (*t, cell)
+        })
+        .collect()
+}
+
 fn check_manual(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<&'static str>) {
     let post = &ap.post;
     let (exp, c, op) = match step {
@@ -9170,7 +9284,7 @@ fn check_manual(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<
             Step::CallerSees | Step::SubtreeGone | Step::SubtreeWaitExpires
         )
         && (pre.sup != post.sup
-            || pre.cells != post.cells
+            || without_reports(&pre.cells) != without_reports(&post.cells)
             || pre.incs != post.incs
             || pre.caller != post.caller
             || pre.reaper != post.reaper
@@ -9208,15 +9322,19 @@ use super::rules::{
     ReportPlace, Signal, TaskState, TeardownAction, WalkChild,
 };
 use super::{
-    ChildLifecycle, ChildSpec, ChildState, DownPending, GroupPhase, GroupRestart, GroupScope,
-    ManualStop, Origin as ProdOrigin, SupervisionConfig, SupervisionState,
+    AutoShutdown, ChildLifecycle, ChildSpec, ChildState, DownPending, GroupPhase, GroupRestart,
+    GroupScope, ManualStop, Origin as ProdOrigin, SupervisionConfig, SupervisionState,
 };
 use crate::types::{
-    ActorId, ChildEvent, LaneState, RaiseResult, RestartStrategy, RestartType, Shutdown,
+    ActorId, ChildEvent, LaneState, RaiseResult, RestartStrategy, RestartType, Shutdown, StopLane,
     StopReason, SupervisionAction,
 };
 use std::collections::{HashMap, VecDeque as ProdQueue};
 
+const AUTO_SHUTDOWN_CONFORMANCE: &str =
+    "auto_shutdown_only_on_an_unordered_end (conformance of auto_shutdown_due and auto_active)";
+const STRICT_STEP_CONFORMANCE: &str =
+    "a_failed_child_fails_the_strict_start (conformance of strict_step)";
 const LADDER_STEP_CONFORMANCE: &str = "every_wait_is_bounded (conformance of ladder_step)";
 const MANUAL_COMMIT_CONFORMANCE: &str =
     "manual_results_match_the_table (conformance of manual_commit)";
@@ -9249,16 +9367,24 @@ const ABSORBABLE_CONFORMANCE: &str = "budget_matches_the_serial_count (conforman
 /// `m_teardown`) against the decisions the model took.
 const MODEL_TABLE_CONFORMANCE: &str =
     "model_tables_restate_the_model (self-check of m_attempt_step, m_commit and m_teardown)";
+const ORPHAN_VERDICT_CONFORMANCE: &str =
+    "one_verdict_and_no_silent_wedge (conformance of unreported_verdict)";
 const BARRIER_VERDICT_CONFORMANCE: &str =
     "one_verdict_and_no_silent_wedge (conformance of barrier_blocked_only_by_verdicts)";
 const LANE_ACCEPT_CONFORMANCE: &str = "stop_requests_never_weaken (conformance of lane_accept)";
 const INIT_KILL_CHECK_CONFORMANCE: &str = "kill_is_final (conformance of init_kill_check)";
+const LANE_CAUSE_CONFORMANCE: &str =
+    "kill_is_final (conformance of the lane's cause and final_reason)";
+const GUARD_STOP_CONFORMANCE: &str =
+    "killed_supervisor_children_settle_in_order_within_their_windows (conformance of guard_stop)";
 const INHERITED_STOP_CONFORMANCE: &str =
     "killed_supervisor_children_settle_in_order_within_their_windows (conformance of inherited_stop)";
 const OWN_BUDGET_CONFORMANCE: &str =
     "no_successor_starts_beside_its_predecessor_subtree (conformance of own_budget)";
 const OWN_FIN_CONFORMANCE: &str =
     "no_successor_starts_beside_its_predecessor_subtree (conformance of own_fin)";
+const TRAP_BUDGET_CONFORMANCE: &str =
+    "no_successor_starts_beside_its_predecessor_subtree (conformance of trap_extra and trap_infinity)";
 const SUCCESSOR_BOUND_CONFORMANCE: &str =
     "no_successor_starts_beside_its_predecessor_subtree (conformance of successor_bound)";
 const SUCCESSOR_WAIT_STEP_CONFORMANCE: &str =
@@ -10562,6 +10688,13 @@ enum Obs {
         entries: Vec<(Key, bool)>,
         exit: Option<Key>,
     },
+    /// The stops in progress the supervisor checked for a verdict nobody
+    /// reports, newest first with each entry's facts, and the key the model's
+    /// exit names.
+    OrphanVerdict {
+        entries: Vec<(Key, rules::StopVerdictFact)>,
+        exit: Option<Key>,
+    },
     /// A request raised on a lane: the lane before it, how the model's lane
     /// answered, and the lane after.
     Lane {
@@ -10739,6 +10872,7 @@ fn img_reason(reason: Reason) -> StopReason {
     match reason {
         Reason::Graceful => StopReason::Graceful,
         Reason::ParentRequest => StopReason::ParentRequest,
+        Reason::Shutdown => StopReason::Shutdown("model".into()),
         Reason::Failure(_) => StopReason::Failure(crate::error::ActorError::user("model failure")),
         Reason::ParentKilled => StopReason::ParentKilled,
         Reason::Cancelled => StopReason::Cancelled,
@@ -10998,6 +11132,16 @@ fn site_observed(ap: &Applied, out: &mut Vec<&'static str>) {
                 let got = rules::barrier_blocked_only_by_verdicts(&image);
                 if got != exit.map(|k| ActorId::from(format!("child-{k}"))) {
                     out.push(BARRIER_VERDICT_CONFORMANCE);
+                }
+            }
+            Obs::OrphanVerdict { entries, exit } => {
+                let image: Vec<(ActorId, rules::StopVerdictFact)> = entries
+                    .iter()
+                    .map(|(k, fact)| (ActorId::from(format!("child-{k}")), *fact))
+                    .collect();
+                let got = rules::unreported_verdict(image.iter().map(|(id, fact)| (id, *fact)));
+                if got != exit.map(|k| ActorId::from(format!("child-{k}"))) {
+                    out.push(ORPHAN_VERDICT_CONFORMANCE);
                 }
             }
             Obs::Lane {
@@ -11519,6 +11663,11 @@ fn compare_budgets(kid: &ChildCfg, out: &mut Vec<&'static str>) {
     if budget.map_or(INF, rules::saturating_nanos) != kid.own_budget() {
         out.push(OWN_BUDGET_CONFORMANCE);
     }
+    if rules::saturating_nanos(rules::trap_extra(kid.is_supervisor, shutdown)) != kid.trap_extra()
+        || rules::trap_infinity(kid.is_supervisor, shutdown) != kid.trap_infinity()
+    {
+        out.push(TRAP_BUDGET_CONFORMANCE);
+    }
 }
 
 /// Domain conformance of `own_budget` and `own_fin`: a worker or a supervisor
@@ -11558,6 +11707,7 @@ fn prod_lane(
         generation: 0,
         kill_only: mode != LaneMode::Open,
         sealed: mode == LaneMode::Sealed,
+        kill_cause: None,
     };
     rules::lane_accept(&state, &img_reason(new), receiver_gone)
 }
@@ -11595,6 +11745,7 @@ fn domain_lane_accept() -> bool {
     let reasons = [
         Reason::Graceful,
         Reason::ParentRequest,
+        Reason::Shutdown,
         Reason::Failure(Cause::Crash),
         Reason::ParentKilled,
         Reason::Cancelled,
@@ -11620,6 +11771,154 @@ fn domain_lane_accept() -> bool {
     ok
 }
 
+/// The model's cause after a raise: only a raise of `Kill` touches it. A
+/// plain `Kill` clears it; a caused `Kill` stores its cause when the lane
+/// held no `Kill` before and the cause is not `Kill` itself; a raise the lane
+/// refused changes nothing. The cause is the reason the actor ends with in
+/// place of `Kill` (`m_final_reason`).
+fn m_lane_cause(
+    stored: Option<Reason>,
+    stored_cause: Option<Reason>,
+    new: Reason,
+    new_cause: Option<Reason>,
+    mode: LaneMode,
+    receiver_gone: bool,
+) -> Option<Reason> {
+    let (answer, _, _) = m_lane_accept(stored, new, mode, receiver_gone);
+    if answer == RaiseResult::Refused || new != Reason::Kill {
+        return stored_cause;
+    }
+    match new_cause {
+        None => None,
+        Some(cause) if stored != Some(Reason::Kill) && cause != Reason::Kill => Some(cause),
+        Some(_) => stored_cause,
+    }
+}
+
+/// The model's final reason: the cause a `Kill` carries, else the reason the
+/// run loop decided.
+fn m_final_reason(decided: Reason, cause: Option<Reason>) -> Reason {
+    match (decided, cause) {
+        (Reason::Kill, Some(cause)) => cause,
+        (decided, _) => decided,
+    }
+}
+
+/// Domain conformance of the lane's cause rule and of `final_reason`: every
+/// stored reason with every cause it can carry, against every raise (plain,
+/// or caused by each reason), in every lane mode, with and without a receiver,
+/// and every decided reason against every cause.
+fn domain_lane_cause() -> bool {
+    let reasons = [
+        Reason::Graceful,
+        Reason::ParentRequest,
+        Reason::Shutdown,
+        Reason::Failure(Cause::Crash),
+        Reason::ParentKilled,
+        Reason::Cancelled,
+        Reason::Kill,
+    ];
+    let mut stored_rows: Vec<(Option<Reason>, Option<Reason>)> = vec![(None, None)];
+    for stored in reasons {
+        stored_rows.push((Some(stored), None));
+    }
+    for cause in [Reason::Shutdown, Reason::Failure(Cause::Crash)] {
+        stored_rows.push((Some(Reason::Kill), Some(cause)));
+    }
+    let mut ok = true;
+    for (stored, stored_cause) in &stored_rows {
+        let raises: Vec<(Reason, Option<Reason>)> = reasons
+            .iter()
+            .map(|r| (*r, None))
+            .chain(reasons.iter().map(|c| (Reason::Kill, Some(*c))))
+            .collect();
+        for (new, new_cause) in raises {
+            for receiver_gone in [false, true] {
+                for mode in [LaneMode::Open, LaneMode::KillOnly, LaneMode::Sealed] {
+                    let (lane, rx) = StopLane::with_state(LaneState {
+                        reason: stored.map(img_reason),
+                        generation: 0,
+                        kill_only: mode != LaneMode::Open,
+                        sealed: mode == LaneMode::Sealed,
+                        kill_cause: stored_cause.map(|cause| Box::new(img_reason(cause))),
+                    });
+                    if receiver_gone {
+                        drop(rx);
+                    }
+                    match new_cause {
+                        Some(cause) => {
+                            lane.try_raise_kill_caused(img_reason(cause));
+                        }
+                        None => {
+                            lane.try_raise(img_reason(new));
+                        }
+                    }
+                    let want =
+                        m_lane_cause(*stored, *stored_cause, new, new_cause, mode, receiver_gone);
+                    if lane.abort_record().kill_cause() != want.map(img_reason) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+    for decided in reasons {
+        for cause in std::iter::once(None).chain(reasons.iter().copied().map(Some)) {
+            let got =
+                crate::actor::runtime::final_reason(img_reason(decided), cause.map(img_reason));
+            if got != img_reason(m_final_reason(decided, cause)) {
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// Domain conformance of `guard_stop`: a worker or a supervisor child under
+/// every policy, grace and window, trapping or not, with and without a `Kill`
+/// on the lane, against the model's inherited stop: a child that traps exit
+/// signals gets the stop of a supervisor child.
+fn domain_guard_stop() -> bool {
+    let mut ok = true;
+    for is_supervisor in [false, true] {
+        for policy in [Policy::Kill, Policy::Timeout, Policy::Infinity] {
+            for window_ns in [0, 3_000_000_000, INF] {
+                for grace_ns in [0, 120_000_000, 1_500_000_000, INF] {
+                    for trapping in [false, true] {
+                        for kill_stored in [false, true] {
+                            let shutdown = Clock::shutdown(m_policy_of(policy, window_ns));
+                            let grace = Clock::duration(grace_ns);
+                            let got = rules::fired_stop(
+                                rules::guard_stop(
+                                    rules::inherited_stop(is_supervisor, shutdown, grace),
+                                    rules::inherited_stop_if_trapping(
+                                        is_supervisor,
+                                        shutdown,
+                                        grace,
+                                    ),
+                                    trapping,
+                                ),
+                                kill_stored,
+                            );
+                            let want = m_inherited_stop(
+                                is_supervisor || trapping,
+                                policy,
+                                window_ns,
+                                grace_ns,
+                                kill_stored,
+                            );
+                            if got != want {
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ok
+}
+
 /// Domain conformance of `init_kill_check`: a lane holding nothing, a
 /// requested reason, a forced reason and `Kill`.
 fn domain_init_kill_check() -> bool {
@@ -11627,6 +11926,7 @@ fn domain_init_kill_check() -> bool {
         None,
         Some(Reason::Graceful),
         Some(Reason::ParentRequest),
+        Some(Reason::Shutdown),
         Some(Reason::Failure(Cause::Crash)),
         Some(Reason::ParentKilled),
         Some(Reason::Cancelled),
@@ -12039,6 +12339,8 @@ fn img_supervision(cfg: &Cfg, pre: &State, kept: &mut Vec<KeptSlot>) -> Supervis
                 start_timeout: None,
                 kill_grace: crate::actor::supervision::DEFAULT_KILL_GRACE,
                 is_supervisor: false,
+                significant: false,
+                sys: crate::actor::sys::SysOptions::default(),
             },
             ctl,
             lifecycle: img_life(*life),
@@ -12197,6 +12499,99 @@ fn m_legal(from: Life, to: Life) -> bool {
         (Life::Down { n, .. }, Life::Down { n: m, .. }) => n == m,
         _ => false,
     }
+}
+
+/// The model's statement of when the end of a child the supervisor did not
+/// order and does not restart shuts the supervisor down: written as a table
+/// over the three modes, not as the production expression.
+fn m_auto_shutdown(mode: AutoShutdown, significant: bool, others_active: bool) -> bool {
+    match (mode, significant, others_active) {
+        (_, false, _) => false,
+        (AutoShutdown::Never, true, _) => false,
+        (AutoShutdown::AnySignificant, true, _) => true,
+        (AutoShutdown::AllSignificant, true, true) => false,
+        (AutoShutdown::AllSignificant, true, false) => true,
+    }
+}
+
+/// The model's view of which ledger entries count as active for
+/// `AllSignificant`: an occupant, a restart pending, an owed decision, and a
+/// stop in progress only when a start follows its end (a bounce of a non-pool
+/// `Permanent` child, or a member of the pending group's restart set). A child
+/// that is down does not count unless its decision is owed or the pending
+/// group restarts it.
+fn m_auto_active(life: Life, restart: Restart, pool: bool, in_set: bool) -> bool {
+    match life {
+        Life::Running(_) | Life::Restarting { .. } => true,
+        Life::Stopping { kind, .. } => {
+            in_set || (kind == Kind::Bounce && restart == Restart::Permanent && !pool)
+        }
+        Life::Down { pend, .. } => pend == Pend::Evaluate || in_set,
+    }
+}
+
+/// Domain conformance of `auto_shutdown_due` over every mode, both flags,
+/// and of `auto_active` over every ledger entry, restart type, pool flag and
+/// restart-set flag.
+fn domain_auto_shutdown() -> bool {
+    let modes = [
+        AutoShutdown::Never,
+        AutoShutdown::AnySignificant,
+        AutoShutdown::AllSignificant,
+    ];
+    let due = modes.iter().all(|&mode| {
+        [false, true].iter().all(|&sig| {
+            [false, true].iter().all(|&others| {
+                rules::auto_shutdown_due(mode, sig, others) == m_auto_shutdown(mode, sig, others)
+            })
+        })
+    });
+    let active = domain_lives().into_iter().all(|life| {
+        [Restart::Permanent, Restart::Transient, Restart::Temporary]
+            .iter()
+            .all(|&restart| {
+                [false, true].iter().all(|&pool| {
+                    [false, true].iter().all(|&in_set| {
+                        rules::auto_active(img_life(life), img_restart(restart), pool, in_set)
+                            == m_auto_active(life, restart, pool, in_set)
+                    })
+                })
+            })
+    });
+    due && active
+}
+
+/// Domain conformance of `strict_step` and `strict_closed_ordered`: a good
+/// acknowledgment goes on, an error fails the start, and a child that ended
+/// before it acknowledged fails it unless the supervisor itself ended it: the
+/// entry is gone, another incarnation holds the place, or a stop order was
+/// written to its slot before its cell read the end.
+fn domain_strict_step() -> bool {
+    use rules::{StrictAckKind, StrictStep};
+    let rows = [
+        (StrictAckKind::Ok, StrictStep::Next),
+        (StrictAckKind::Err, StrictStep::Fail),
+        (StrictAckKind::Closed { ordered: false }, StrictStep::Fail),
+        (StrictAckKind::Closed { ordered: true }, StrictStep::Next),
+    ];
+    let step = rows
+        .iter()
+        .all(|&(ack, want)| rules::strict_step(ack) == want);
+    // The incarnation closed its acknowledgment: it failed to start unless
+    // the entry is gone, another incarnation holds the place, or a stop order
+    // reached its slot before its cell read the end.
+    let ordered = [None, Some(None), Some(Some(1)), Some(Some(2))]
+        .iter()
+        .all(|&held| {
+            [false, true].iter().all(|&ordered_before_end| {
+                let want = match held {
+                    None => true,
+                    Some(occupant) => ordered_before_end || occupant == Some(2),
+                };
+                rules::strict_closed_ordered(held, 1, ordered_before_end) == want
+            })
+        });
+    step && ordered
 }
 
 fn domain_is_legal() -> bool {
@@ -12948,6 +13343,12 @@ fn domain_conformance(out: &mut Vec<&'static str>) {
     if !domain_manual_answer() {
         out.push(MANUAL_ANSWER_CONFORMANCE);
     }
+    if !domain_auto_shutdown() {
+        out.push(AUTO_SHUTDOWN_CONFORMANCE);
+    }
+    if !domain_strict_step() {
+        out.push(STRICT_STEP_CONFORMANCE);
+    }
     if !domain_is_legal() {
         out.push(IS_LEGAL_CONFORMANCE);
     }
@@ -12995,6 +13396,12 @@ fn domain_conformance(out: &mut Vec<&'static str>) {
     }
     if !domain_init_kill_check() {
         out.push(INIT_KILL_CHECK_CONFORMANCE);
+    }
+    if !domain_lane_cause() {
+        out.push(LANE_CAUSE_CONFORMANCE);
+    }
+    if !domain_guard_stop() {
+        out.push(GUARD_STOP_CONFORMANCE);
     }
     if !domain_successor_bound() {
         out.push(SUCCESSOR_BOUND_CONFORMANCE);
@@ -14245,7 +14652,7 @@ fn small_lane_cfgs() -> Vec<Cfg> {
         third: 2,
         ..Budgets::default()
     };
-    d.third_reasons = vec![Reason::Graceful, Reason::ParentRequest];
+    d.third_reasons = vec![Reason::Graceful, Reason::ParentRequest, Reason::Shutdown];
     // A child that vetoes a `Graceful` whose gate runs while a forced request
     // lands: the veto does not hold it, the gate leaves with the forced request.
     let mut e = base("small_lane", Strategy::OneForOne, vec![VETO], 1);
@@ -14278,6 +14685,7 @@ fn small_inherited_transient_cfgs() -> Vec<Cfg> {
     };
     c.third_reasons = vec![
         Reason::Graceful,
+        Reason::Shutdown,
         Reason::Failure(Cause::Crash),
         Reason::ParentKilled,
         Reason::Cancelled,
@@ -15612,6 +16020,7 @@ fn small_unresponsive() {
             Wit::ReportCollectedByEscalationDrain,
             Wit::ManualJoinAnsweredUnresponsive,
             Wit::OverrideAnsweredUnresponsive,
+            Wit::UnreportedVerdictEndsTheSupervisor,
         ],
         &[
             &[],

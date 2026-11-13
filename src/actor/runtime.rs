@@ -1,12 +1,15 @@
 //! Actor task spawning and the message-dispatch run loop.
 //!
 //! The run loop's `select!` is `biased`, highest priority first: the stop lane,
-//! then the system channel (`GetStatus`), then the supervision restart plane
+//! then the system channel (status reads, the drain of the signal inbox for
+//! links and exits, `SupervisorRef` requests and `sys` calls), then the
+//! supervision restart plane
 //! (restart attempts completing), then the death plane (child runner
 //! completions), then the verdict signal (an incarnation given the Unresponsive
 //! verdict), then the forwarder plane (timer and stream completions), then the
 //! priority lane (present only on an actor spawned with one), then the user
-//! mailbox. This ordering is deliberate, not incidental: a stop or kill
+//! mailbox, and last the idle spell's threshold, for an actor that set one.
+//! This ordering is deliberate, not incidental: a stop or kill
 //! request is observed, a child's death is observed, and (on an actor spawned
 //! with a priority lane) a priority message is received even while the mailbox
 //! is full, and `get_status` answers without waiting behind user traffic.
@@ -30,7 +33,9 @@
 //! supervision events, which sit above the lane, delays the lane and the
 //! mailbox alike. Reception order, highest first: stop lane, system channel,
 //! restart plane, death plane, verdict signal, forwarder plane, priority lane,
-//! mailbox; a stop request never travels on the priority lane.
+//! mailbox; an actor that set a receive timeout or an idle length reads that
+//! threshold after them all; a stop request never travels on the priority
+//! lane.
 //!
 //! A restart attempt runs in the parent's restart plane (a
 //! `JoinSet<RestartOutcome>`), initiated by the run loop or by a handler (a
@@ -38,23 +43,25 @@
 //! waits, still in the restart plane, until the previous incarnation's whole
 //! subtree has ended (every actor it spawned, and every actor those spawned),
 //! bounded by the longest chain of stop budgets in the subtree (a worker's kill
-//! grace, a supervisor child's `Shutdown` window plus its kill grace), each
+//! grace, a supervisor child's `Shutdown` window plus its kill grace, and for a
+//! worker that has called `trap_exit` its own `Shutdown` window as well), each
 //! followed by a short settle time, plus one more settle time, and unbounded
-//! only while a supervisor child under `Shutdown::Infinity` runs in it or a
-//! budget is too large to represent. Past that bound it gives no verdict on an
-//! actor before the abort the system owes it has had the settle time to end
-//! it, waiting for an abort that is late for at most the bound once more plus
-//! one more settle time. It honors a stop order during that wait.
-//! The attempt then owns its incarnation from the factory to the init ack,
-//! honoring a stop order at every stage, and hands the incarnation over with
-//! its outcome; the loop then spawns the incarnation's runner in the death
-//! plane, which owns it to its fate. An attempt's outcome - adopted, cancelled
-//! before its factory ran, stopped under an order, reported as an ordinary
-//! failure, or reported unresponsive because its wait for the previous subtree
-//! outlived its bound - is the `JoinSet`'s own returned value; nothing about a
-//! restart travels over any channel of any capacity. An attempt whose wait
-//! expired is not evaluated: it is recorded as down, and the supervisor stops
-//! with an unresponsive-child failure, so its own supervisor decides.
+//! only while a supervisor child under `Shutdown::Infinity` runs in it, or a
+//! worker under `Infinity` that traps exit signals, or a budget is too large to
+//! represent. Past that bound it gives no verdict on an actor before the abort
+//! the system owes it has had the settle time to end it, waiting for an abort
+//! that is late for at most the bound once more plus one more settle time. It
+//! honors a stop order during that wait. The attempt then owns its incarnation
+//! from the factory to the init ack, honoring a stop order at every stage, and
+//! hands the incarnation over with its outcome; the loop then spawns the
+//! incarnation's runner in the death plane, which owns it to its fate. An
+//! attempt's outcome - adopted, cancelled before its factory ran, stopped under
+//! an order, reported as an ordinary failure, or reported unresponsive because
+//! its wait for the previous subtree outlived its bound - is the `JoinSet`'s
+//! own returned value; nothing about a restart travels over any channel of any
+//! capacity. An attempt whose wait expired is not evaluated: it is recorded as
+//! down, and the supervisor stops with an unresponsive-child failure, so its
+//! own supervisor decides.
 //!
 //! The stop lane itself is a cell in state that the actor's task and its
 //! handles share, not a channel. Raising it is synchronous and never waits for
@@ -82,12 +89,13 @@
 //! task the system owns. A
 //! task dying with `StopReason::Kill` never awaits its own children: it drops
 //! its supervision state, and each live child's link guard acts for itself. A
-//! worker has Kill raised on its lane and is aborted by the system's reaper
-//! once its kill grace has passed. A child that is itself a supervisor is given
+//! worker that does not trap exit signals has Kill raised on its lane and is
+//! aborted by the system's reaper once its kill grace has passed. A child that
+//! is itself a supervisor, or a worker that traps exit signals, is given
 //! `StopReason::ParentKilled`; it runs `on_stopped` and stops its own children
 //! in order within its own `Shutdown` window, the reaper raises Kill at the end
 //! of that window and aborts the task once the child's kill grace has passed,
-//! and a supervisor child under `Shutdown::Infinity` has no window and is not
+//! and such a child under `Shutdown::Infinity` has no window and is not
 //! aborted. A child whose lane already holds a Kill when its guard fires keeps
 //! that Kill, whatever its `Shutdown`, and is aborted once its kill grace has
 //! passed.
@@ -115,6 +123,7 @@
 //! context, and each forwarder holds the actor's status plane and subtree
 //! open until its own future is dropped.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -130,30 +139,48 @@ use tokio::time::{Duration, Instant};
 
 use crate::actor::mailbox::{MailRx, QueueRx};
 use crate::actor::panic::{
-    catch_callback, catch_hook, catch_sync, contain_waker_panic, discard, payload_into_string,
+    catch_callback, catch_hook_t, catch_sync, contain_waker_panic, discard, payload_into_string,
     send_contained, AnswerHold,
 };
-use crate::actor::subtree::{SubtreeHold, SubtreeLink, SubtreeWatch, SystemPlane};
-use crate::actor::supervision::rules::{init_kill_check, InitStep, TeardownAction};
-use crate::actor::supervision::{
-    advance_restart_chain, await_cell, evaluate_strategy, rules, run_ladder, CellOutcome,
-    CellWatch, ChainStep, ChildLifecycle, ChildLinkGuard, ChildState, DeathOutcome, DownPending,
-    GroupMembership, GroupPhase, GroupRestart, GroupScope, Origin, ReportClass, RestartFn,
-    RestartOutcome, Route, SlotIo, StrategyOutcome, SupervisionConfig, SupervisionState, TaskPlane,
-    TaskState, DEFAULT_KILL_GRACE,
+use crate::actor::subtree::{AbortRecord, SubtreeHold, SubtreeLink, SubtreeWatch, SystemPlane};
+use crate::actor::supervision::rules::{
+    init_kill_check, strict_closed_ordered, strict_step, InitStep, StrictAckKind, StrictStep,
+    TeardownAction,
 };
+use crate::actor::supervision::{
+    advance_restart_chain, await_cell, evaluate_strategy_charged, rules, run_ladder, BudgetCharge,
+    CellOutcome, CellWatch, ChainStep, ChildLifecycle, ChildLinkGuard, ChildState, DeathOutcome,
+    DownPending, GroupMembership, GroupPhase, GroupRestart, GroupScope, Origin, ReportClass,
+    RestartFn, RestartOutcome, Route, SlotIo, StrategyOutcome, SupervisionConfig, SupervisionState,
+    TaskPlane, TaskState, DEFAULT_KILL_GRACE,
+};
+use crate::actor::sys::{DebugEntry, SysOptions};
+use crate::actor::sys_loop::is_suspended;
+use crate::actor::task_key::PollScope;
+use crate::actor::turn::IdleKind;
 use crate::actor::{
     context::{ActorContext, ForwarderEnd},
-    handle::ActorHandle,
+    handle::{ActorHandle, LaneFlags},
+    link::InboxItem,
     Actor, ActorEnvelope,
 };
+use crate::actor::{sys_serve, sys_state};
 use crate::error::{ActorError, SpawnError, SupervisionError};
-use crate::helper::{EndGuard, HelperKind};
+use crate::helper::{EndGuard, HelperKind, HelperOwner};
 use crate::system::{ActorSystem, RegistryGuard};
+use crate::telemetry::reports;
+use crate::telemetry::{
+    armed_for, push_about, ActorRef, ActorSpan, AttemptOutcome, Birth, EventKind, HookKind,
+    HotCache, Identity, SpawnTraced, TelemetryEvent, TurnOutcome,
+};
+use crate::types::turn_clock::{
+    now_nanos, outcome_of, outcome_plain, push_run, push_turn, TurnGuard, TurnMode,
+};
 use crate::types::{
-    ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildFate, ChildStoppedInternal, Envelope,
-    LaneRx, RestartStrategy, RestartType, Shutdown, StatusTx, StatusValue, StopLane, StopReason,
-    StopSeverity, SupervisionAction, SystemMessage, TurnClock,
+    ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildFate, ChildStoppedInternal, DownReason,
+    Envelope, Incarnation, LaneRx, LinkExit, MonitorId, RestartStrategy, RestartType, Shutdown,
+    StatusTx, StatusValue, StopLane, StopReason, StopSeverity, SupervisionAction, SystemMessage,
+    TurnClock,
 };
 
 /// Configuration for the actor's mailbox.
@@ -172,6 +199,14 @@ pub struct MailboxConfig {
     /// There is no default capacity for an enabled lane: see
     /// [`with_priority_lane`](Self::with_priority_lane).
     pub priority_capacity: Option<usize>,
+    /// Leaves the priority lane to priority aliases: the four `*_priority`
+    /// methods of a handle then use the ordinary mailbox, exactly as on an
+    /// actor with no lane, and a sender reaches the lane only through an alias
+    /// made with [`AliasOptions::priority`](crate::AliasOptions::priority).
+    /// The actor's own `monitor_priority` and `link_priority` notices and
+    /// `exit_priority` still take the lane. The default is `false`: any holder
+    /// of the handle can send on the lane. See [`with_priority_by_alias`](Self::with_priority_by_alias).
+    pub priority_by_alias: bool,
 }
 
 impl Default for MailboxConfig {
@@ -179,6 +214,7 @@ impl Default for MailboxConfig {
         Self {
             capacity: 64,
             priority_capacity: None,
+            priority_by_alias: false,
         }
     }
 }
@@ -226,17 +262,18 @@ impl MailboxConfig {
     /// normal-lane sibling.
     ///
     /// # Divergences from Erlang
-    /// A plain Erlang process has one message queue, whose length is not
-    /// otherwise observable and which never applies backpressure. This lane
-    /// diverges on both counts: its length and capacity are observable here
+    /// A plain Erlang process has one message queue, whose length is not otherwise observable and which never applies
+    /// backpressure. This lane diverges on both counts: its length and capacity
+    /// are observable here
     /// ([`ActorHandle::priority_len`](crate::actor::handle::ActorHandle::priority_len),
     /// [`ActorHandle::priority_capacity`](crate::actor::handle::ActorHandle::priority_capacity)),
-    /// and, being bounded, a full lane applies backpressure (`Full`, a
-    /// timeout) instead of growing without limit.
-    /// It also differs in who may use it: any holder of this actor's handle can
-    /// send on the lane, where Erlang/OTP lets a sender use priority only
-    /// through an alias the receiver created for it, so the receiver chooses
-    /// who may.
+    /// and, being bounded, a full lane applies backpressure (`Full`, a timeout)
+    /// instead of growing without limit. It also differs in who may use it: any
+    /// holder of this actor's handle can send on the lane unless the actor
+    /// leaves it to its priority aliases
+    /// ([`with_priority_by_alias`](Self::with_priority_by_alias)), where
+    /// Erlang/OTP lets a sender use priority only through an alias the receiver
+    /// created for it, so the receiver chooses who may.
     ///
     /// There is no default capacity, and a capacity of `0` is rejected at
     /// spawn time with
@@ -246,6 +283,37 @@ impl MailboxConfig {
     /// spawn time instead.
     pub fn with_priority_lane(mut self, capacity: usize) -> Self {
         self.priority_capacity = Some(capacity);
+        self
+    }
+
+    /// Leaves the priority lane to priority aliases, so the receiver chooses
+    /// who may use it.
+    ///
+    /// With this set, the four `*_priority` methods of
+    /// [`ActorHandle`] send on the ordinary mailbox, exactly as they do on an
+    /// actor with no lane, and an alias made with
+    /// [`AliasOptions::priority`](crate::AliasOptions::priority) is the way for
+    /// a sender to reach the lane. An alias's priority sends and
+    /// [`exit_priority`](crate::actor::context::ActorContext::exit_priority)
+    /// ride the lane whether this is set or not, and so do the actor's own
+    /// `monitor_priority` and `link_priority` notices. Without a priority lane
+    /// ([`with_priority_lane`](Self::with_priority_lane)) this changes
+    /// nothing.
+    ///
+    /// Erlang/OTP: a sender uses priority only through an alias the receiver
+    /// created for it (`alias/1` with the `priority` option).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use tokio_actors::MailboxConfig;
+    ///
+    /// let config = MailboxConfig::default()
+    ///     .with_priority_lane(8)
+    ///     .with_priority_by_alias();
+    /// assert!(config.priority_by_alias);
+    /// ```
+    pub fn with_priority_by_alias(mut self) -> Self {
+        self.priority_by_alias = true;
         self
     }
 }
@@ -280,6 +348,26 @@ impl ActorConfig {
     /// Sets the complete mailbox configuration.
     pub fn with_mailbox(mut self, mailbox: MailboxConfig) -> Self {
         self.mailbox = mailbox;
+        self
+    }
+
+    /// Leaves the priority lane to priority aliases (shorthand for
+    /// [`MailboxConfig::with_priority_by_alias`] through
+    /// [`with_mailbox`](Self::with_mailbox)): the four `*_priority` methods
+    /// of a handle then use the ordinary mailbox, and a sender reaches the lane
+    /// only through a priority alias.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use tokio_actors::ActorConfig;
+    ///
+    /// let config = ActorConfig::default()
+    ///     .with_priority_lane(8)
+    ///     .with_priority_by_alias();
+    /// assert!(config.mailbox.priority_by_alias);
+    /// ```
+    pub fn with_priority_by_alias(mut self) -> Self {
+        self.mailbox.priority_by_alias = true;
         self
     }
 
@@ -319,17 +407,18 @@ impl ActorConfig {
     /// normal-lane sibling.
     ///
     /// # Divergences from Erlang
-    /// A plain Erlang process has one message queue, whose length is not
-    /// otherwise observable and which never applies backpressure. This lane
-    /// diverges on both counts: its length and capacity are observable here
+    /// A plain Erlang process has one message queue, whose length is not otherwise observable and which never applies
+    /// backpressure. This lane diverges on both counts: its length and capacity
+    /// are observable here
     /// ([`ActorHandle::priority_len`](crate::actor::handle::ActorHandle::priority_len),
     /// [`ActorHandle::priority_capacity`](crate::actor::handle::ActorHandle::priority_capacity)),
-    /// and, being bounded, a full lane applies backpressure (`Full`, a
-    /// timeout) instead of growing without limit.
-    /// It also differs in who may use it: any holder of this actor's handle can
-    /// send on the lane, where Erlang/OTP lets a sender use priority only
-    /// through an alias the receiver created for it, so the receiver chooses
-    /// who may.
+    /// and, being bounded, a full lane applies backpressure (`Full`, a timeout)
+    /// instead of growing without limit. It also differs in who may use it: any
+    /// holder of this actor's handle can send on the lane unless the actor
+    /// leaves it to its priority aliases
+    /// ([`with_priority_by_alias`](Self::with_priority_by_alias)), where
+    /// Erlang/OTP lets a sender use priority only through an alias the receiver
+    /// created for it, so the receiver chooses who may.
     ///
     /// There is no default capacity, and a capacity of `0` is rejected at
     /// spawn time with
@@ -373,9 +462,10 @@ pub(crate) fn into_actor<A: Actor>(
     name: Option<Arc<str>>,
     system: Option<Arc<ActorSystem>>,
     kill_grace: Duration,
+    sys: SysOptions,
 ) -> Result<ActorHandle<A>, SpawnError> {
     // Only reachable from the top-level `.detached()` spawn path: always a root.
-    let (handle, _join, _subtree) = spawn_actor(
+    let (handle, _join, _subtree) = spawn_actor_in(
         id.into(),
         actor,
         config.into(),
@@ -385,6 +475,9 @@ pub(crate) fn into_actor<A: Actor>(
         true,
         kill_grace,
         None,
+        None,
+        Birth::root(),
+        sys,
     )?;
     Ok(handle)
 }
@@ -434,12 +527,112 @@ type SpawnParts<A> = (
     SubtreeWatch,
 );
 
+/// Queues the event of a refused spawn and returns the refusal. The system is
+/// the one the spawn names, or the default system when it exists; a spawn
+/// that names none and finds no default system has no sink to tell. Called
+/// with no registry guard held, once per refused spawn.
+pub(crate) fn refused(
+    system: Option<&Arc<ActorSystem>>,
+    name: Option<&str>,
+    error: SpawnError,
+) -> SpawnError {
+    let default;
+    let system = match system {
+        Some(system) => Some(system),
+        None => {
+            default = ActorSystem::get_named("default");
+            default.as_ref()
+        }
+    };
+    if let Some(system) = system {
+        system
+            .telemetry_mode()
+            .push(EventKind::SpawnRefused, || TelemetryEvent::SpawnRefused {
+                name: name.map(|name| std::borrow::Cow::Owned(name.to_string())),
+                error: error.clone(),
+            });
+    }
+    error
+}
+
+/// Queues the event of a spawn the registry accepted, before the actor's task
+/// exists, so no event the task raises reaches a sink ahead of it.
+#[inline]
+fn emit_actor_spawned(
+    system: &ActorSystem,
+    record: &AbortRecord,
+    id: &ActorId,
+    name: Option<&str>,
+    mailbox_capacity: usize,
+    priority_capacity: Option<usize>,
+) {
+    if !system.telemetry_mode().armed(EventKind::ActorSpawned) {
+        return;
+    }
+    emit_actor_spawned_armed(
+        system,
+        record,
+        id,
+        name,
+        mailbox_capacity,
+        priority_capacity,
+    );
+}
+
+/// The spawn event of a system whose sinks take it: kept out of line, so a
+/// spawn that nobody listens to tests one word and goes on.
+#[inline(never)]
+fn emit_actor_spawned_armed(
+    system: &ActorSystem,
+    record: &AbortRecord,
+    id: &ActorId,
+    name: Option<&str>,
+    mailbox_capacity: usize,
+    priority_capacity: Option<usize>,
+) {
+    crate::telemetry::with_mode(record, Some(system), |mode| {
+        if !mode.armed(EventKind::ActorSpawned) {
+            return;
+        }
+        let Some(identity) = crate::telemetry::identity_for(mode, record, Some(system), Some(id))
+        else {
+            mode.pump.count_dropped();
+            return;
+        };
+        mode.push_owned(&identity, EventKind::ActorSpawned, || {
+            TelemetryEvent::ActorSpawned {
+                actor: identity.actor().clone(),
+                name: name.map(|name| std::borrow::Cow::Owned(name.to_string())),
+                mailbox_capacity,
+                priority_capacity,
+            }
+        });
+    });
+}
+
 /// The refusal a mailbox configuration earns before anything is created.
 fn mailbox_config_error(config: &ActorConfig) -> Result<(), SpawnError> {
     if config.mailbox.capacity == 0 || config.mailbox.priority_capacity == Some(0) {
         return Err(SpawnError::ZeroMailboxCapacity);
     }
     Ok(())
+}
+
+/// The refusal a supervision setup earns before anything is created: a
+/// supervisor that sets `auto_shutdown` and uses `SimpleOneForOne`, which
+/// Erlang/OTP refuses too.
+pub(crate) fn supervision_setup_error(config: &ActorConfig) -> Result<(), SpawnError> {
+    match &config.supervision {
+        Some(sup)
+            if sup.auto_shutdown != crate::actor::supervision::AutoShutdown::Never
+                && sup.strategy == RestartStrategy::SimpleOneForOne =>
+        {
+            Err(SpawnError::InvalidSupervision(
+                "auto_shutdown with simple_one_for_one",
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What a spawn answers before it creates or claims anything, in the order
@@ -453,7 +646,8 @@ pub(crate) fn spawn_precheck(
     system: Option<&Arc<ActorSystem>>,
     name: Option<&str>,
 ) -> Result<(), SpawnError> {
-    mailbox_config_error(config)?;
+    mailbox_config_error(config).map_err(|err| refused(system, name, err))?;
+    supervision_setup_error(config).map_err(|err| refused(system, name, err))?;
     if Handle::try_current().is_err() {
         return Ok(());
     }
@@ -463,11 +657,14 @@ pub(crate) fn spawn_precheck(
         None => ActorSystem::get_named("default"),
     };
     match target {
-        Some(target) => target.precheck_spawn(name),
+        Some(target) => target
+            .precheck_spawn(name)
+            .map_err(|err| refused(Some(&target), name, err)),
         None => Ok(()),
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_actor<A: Actor>(
     id: ActorId,
@@ -481,7 +678,18 @@ pub(crate) fn spawn_actor<A: Actor>(
     subtree: Option<SubtreeLink>,
 ) -> Result<SpawnOutcome<A>, SpawnError> {
     spawn_actor_in(
-        id, actor, config, name, system, ack, is_root, kill_grace, subtree, None,
+        id,
+        actor,
+        config,
+        name,
+        system,
+        ack,
+        is_root,
+        kill_grace,
+        subtree,
+        None,
+        Birth::root(),
+        SysOptions::default(),
     )
 }
 
@@ -499,9 +707,12 @@ pub(crate) fn spawn_actor_in<A: Actor>(
     kill_grace: Duration,
     subtree: Option<SubtreeLink>,
     placement: Option<&Handle>,
+    birth: Birth<'_>,
+    sys: SysOptions,
 ) -> Result<SpawnOutcome<A>, SpawnError> {
     let (handle, join, _, subtree) = spawn_actor_parts_in(
         id, actor, config, name, system, ack, is_root, kill_grace, subtree, placement, false,
+        birth, sys,
     )?;
     Ok((handle, join, subtree))
 }
@@ -530,7 +741,19 @@ pub(crate) fn spawn_actor_parts<A: Actor>(
     SpawnError,
 > {
     let (handle, join, status, subtree) = spawn_actor_parts_in(
-        id, actor, config, name, system, ack, is_root, kill_grace, subtree, None, true,
+        id,
+        actor,
+        config,
+        name,
+        system,
+        ack,
+        is_root,
+        kill_grace,
+        subtree,
+        None,
+        true,
+        Birth::root(),
+        SysOptions::default(),
     )?;
     let status = status.expect("a spawn asked to keep a sender returns one");
     Ok((handle, join, status, subtree))
@@ -552,8 +775,13 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
     subtree: Option<SubtreeLink>,
     placement: Option<&Handle>,
     keep_status: bool,
+    birth: Birth<'_>,
+    sys: SysOptions,
 ) -> Result<SpawnParts<A>, SpawnError> {
-    mailbox_config_error(&config)?;
+    mailbox_config_error(&config).map_err(|err| refused(system.as_ref(), name.as_deref(), err))?;
+    supervision_setup_error(&config)
+        .map_err(|err| refused(system.as_ref(), name.as_deref(), err))?;
+    let priority_by_alias = config.mailbox.priority_by_alias;
     let mailbox_capacity = config.mailbox.capacity;
     // Clamped, not rejected: a capacity above what the channel
     // implementation can represent is over-provisioning, not a
@@ -566,7 +794,8 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
         .map(|cap| cap.min(tokio::sync::Semaphore::MAX_PERMITS));
     let handle = match placement {
         Some(placed) => placed.clone(),
-        None => Handle::try_current().map_err(|_| SpawnError::MissingRuntime)?,
+        None => Handle::try_current()
+            .map_err(|_| refused(system.as_ref(), name.as_deref(), SpawnError::MissingRuntime))?,
     };
     // What the mailbox and the run loop need to know about the runtime, read
     // once here from the handle the task is spawned on, which is the placement
@@ -585,11 +814,46 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
     // `ActorId`.
     let target_system = system.clone().unwrap_or_else(ActorSystem::default);
 
+    // The turn clock needs only the mode, so it is built ahead of the
+    // mailbox. It is owned by the run loop (the writer) and the registry entry
+    // (the reader) only, never by `ActorHandle`, so cloning a handle never
+    // touches it.
+    //
+    // Every incarnation has a number: a supervisor draws a child's, and a
+    // root draws its own here. It is the registration's sequence, so the
+    // registry entry knows it for an event raised later, and it names the
+    // incarnation in the wait graph through the clock's id.
+    let incarnation = birth
+        .incarnation
+        .unwrap_or_else(|| target_system.next_incarnation());
+    let turn_clock = TurnClock::with_id(target_system.telemetry_mode().clone(), incarnation);
+    // The record names the system before the incarnation is registered: every
+    // handle reaches its system through it, by identity. It is made ahead of
+    // the mailbox, which keeps it to reach the actor's system and identity.
+    let (stop_lane, stop_rx) = StopLane::new_in(
+        target_system.telemetry_mode().clone(),
+        crate::types::Incarnation::from_token(incarnation),
+    );
+    let (status_tx, status_rx) = stop_lane.abort_record().status_channel();
+    let abort_record = stop_lane.abort_record().clone();
+
     let (tx, rx) = crate::actor::mailbox::channel(
         mailbox_capacity,
         crate::actor::mailbox::lanes_for(workers),
-        Some(id.clone()),
+        Some(id.who()),
+        Some(abort_record.clone()),
     );
+    // State access rides the system channel and is decided by the block's
+    // bits, which are written only when one is set: an actor that uses
+    // nothing of the `sys` bundle has no channel, no field and no bit for it.
+    let sensitive = sys.effective_sensitive::<A>();
+    #[cfg(test)]
+    crate::actor::sys_loop::starts::record(&id, sys);
+    let sys_bits = (u8::from(sys.allow_state_access) * crate::actor::subtree::SYS_ALLOW_STATE)
+        | (u8::from(sensitive) * crate::actor::subtree::SYS_SENSITIVE);
+    if sys_bits != 0 {
+        abort_record.set_sys_bits(sys_bits);
+    }
     // A priority lane is a second, independent bounded channel, built only
     // when the config asks for one; `priority_rx` travels into the run loop
     // below, `priority_tx` into the handle callers use to reach it.
@@ -600,25 +864,57 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
         }
         None => (None, None),
     };
-    let (stop_lane, stop_rx) = StopLane::new();
-    let (status_tx, status_rx) = stop_lane.abort_record().status_channel();
-    let abort_record = stop_lane.abort_record().clone();
+    // The span is the task's own: it is built here, moved into the task's
+    // wrapper below and closed with the task. Its incarnation number and
+    // system name are drawn only when a subscriber wants the span.
+    let mode = target_system.telemetry_mode();
+    let span = ActorSpan::for_spawn(
+        &id,
+        name.as_deref(),
+        || incarnation,
+        || target_system.name(),
+    );
+    // The identity is recorded before the registry entry exists, so no lookup
+    // of the new actor finds a record without one, and only when a sink takes
+    // events or a subscriber wants the span or the identity fields of the
+    // actor's log statements: an actor spawned with none of them carries
+    // nothing.
+    // A sensitive actor always has one, so its log lines can tell it apart.
+    // Turn tracking and wait detection count as taking events here: their
+    // sites look identities up without an id.
+    let bound = mode.word() & crate::telemetry::RESOLVING != 0
+        || span.is_some()
+        || ActorSpan::log_interest()
+        || sensitive;
+    if bound {
+        let parent = birth.parent.map(|(parent, seq)| {
+            target_system
+                .resolve_identity_of(parent, seq)
+                .unwrap_or_else(|| Arc::new(Identity::unknown(parent.clone())))
+        });
+        let born = mode
+            .armed(EventKind::ActorEnded)
+            .then(tokio::time::Instant::now);
+        mode.bind(
+            abort_record.key(),
+            Arc::new(
+                Identity::new(id.clone(), incarnation, parent, name.clone(), born)
+                    .with_type(std::any::type_name::<A>())
+                    .with_sensitive(sensitive),
+            ),
+        );
+    }
+    let abort_incarnation = abort_record.incarnation();
     let system_plane = SystemPlane::new(abort_record.clone(), id.clone(), target_system.clone());
-    let actor_handle = ActorHandle::new(
+    let actor_handle = ActorHandle::with_lane_flags(
         id.clone(),
         tx,
         stop_lane,
         mailbox_capacity,
         status_rx,
-        target_system.shared_name(),
         priority_tx,
-        priority_capacity.map(|_| Arc::new(AtomicBool::new(false))),
+        priority_capacity.map(|_| Arc::new(LaneFlags::new(priority_by_alias))),
     );
-
-    // Owned by the run loop (the writer) and the registry entry (the
-    // reader) only - never by `ActorHandle`, so cloning a handle never
-    // touches this clock's shared threshold cell.
-    let turn_clock = TurnClock::new(target_system.turn_threshold_cell());
 
     // The registration comes first, before the context and the subtree hold
     // exist, so a spawn the registry refuses creates no hold and leaves the
@@ -632,15 +928,28 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
     // argument (possibly `None`), so a bare-spawned actor's `ctx.system`
     // stays `None`; this is harmless because every downstream spawn path
     // re-applies the same default-system fallback.
-    let registration_seq = target_system.register_actor::<A>(
-        &id,
-        name.as_ref(),
-        &actor_handle,
-        is_root,
-        turn_clock.clone(),
-        kill_grace,
-        handle.clone(),
-    )?;
+    // A refused spawn leaves no identity behind: the record that names it is
+    // dropped with the spawn.
+    let registration_seq = target_system
+        .register_actor_as::<A>(
+            &id,
+            name.as_ref(),
+            &actor_handle,
+            registry_parent(is_root, birth.parent),
+            turn_clock.clone(),
+            kill_grace,
+            handle.clone(),
+            incarnation,
+        )
+        .map_err(|err| refused(Some(&target_system), name.as_deref(), err))?;
+    // A system that took up resolving identities between the read above and
+    // the insert may have run its pass before the entry existed. The read
+    // here follows the insert under the shard's lock, and the pass reads the
+    // shard under the same lock after the engagement: either the pass saw
+    // the entry, or this read sees the engagement and records the identity.
+    if !bound && mode.word() & crate::telemetry::RESOLVING != 0 {
+        let _ = target_system.resolve_identity(&abort_record, &id);
+    }
     let guard = RegistryGuard::new(
         target_system.clone(),
         id.clone(),
@@ -652,7 +961,7 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
     let supervision = config.supervision.map(SupervisionState::new);
     let subtree = SubtreeHold::with_record(subtree, abort_record);
     let subtree_watch = subtree.watch();
-    let context = ActorContext::new(
+    let mut context = ActorContext::new(
         id.clone(),
         actor_handle.clone(),
         handle.clone(),
@@ -663,13 +972,21 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
         turn_clock.clone(),
         subtree.clone(),
     );
+    // The debug options of the spawn start the incarnation's debug state; an
+    // actor spawned with none holds nothing.
+    if let Some(debug) = crate::actor::sys_debug::DebugState::from_options(sys.debug) {
+        context.set_debug(debug);
+    }
     if let Some(sup) = context.supervision_ref() {
         sup.verdicts.set_supervisor(id.clone());
+        // A supervisor traps exits from its creation.
+        actor_handle.stop_lane_ref().abort_record().set_trap(true);
     }
 
     let guard = Some(guard.with_subtree(subtree.clone()));
 
     let marker = context.task_marker();
+    let owner = Owner::new(id.clone(), sensitive);
     #[cfg(test)]
     let abort_reason = AbortReason::new(status_tx.clone(), marker.clone(), id.clone());
     #[cfg(not(test))]
@@ -677,25 +994,50 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
     // Taken before the original moves into the run loop's parameters: a caller
     // that asked to keep a sender of the plane holds the one extra.
     let kept_status = keep_status.then(|| status_tx.clone());
-    let join = handle.spawn(MarkedRun::new(
+    let run = MarkedRun::new(
         marker,
+        abort_incarnation,
         run_actor(Box::new(RunParts {
             _subtree: subtree.clone(),
             status: status_tx,
-            actor_slot: CaughtDrop::new(actor, |actor, _| end_value(actor), id.clone()),
-            ctx_slot: CaughtDrop::new(context, end_context, id.clone()),
-            mailbox_slot: QueueSlot::new(Some(rx), &target_system, id.clone()),
-            priority_slot: QueueSlot::new(priority_rx, &target_system, id.clone()),
+            actor_slot: CaughtDrop::new(actor, |actor, _| end_value(actor), owner.clone()),
+            ctx_slot: CaughtDrop::new(context, end_context, owner.clone()),
+            mailbox_slot: QueueSlot::new(Some(rx), &target_system, owner.clone()),
+            priority_slot: QueueSlot::new(priority_rx, &target_system, owner),
             _abort_reason: abort_reason,
             system_rx: system_plane,
             stop_rx,
-            turn_clock,
+            turn_clock: TurnGuard::new(turn_clock),
             registry_guard: guard,
             ack: AnswerHold::new(ack),
             workers,
             same_thread,
         })),
-    ));
+    );
+    emit_actor_spawned(
+        &target_system,
+        actor_handle.stop_lane_ref().abort_record(),
+        &id,
+        name.as_deref(),
+        mailbox_capacity,
+        priority_capacity,
+    );
+    // A supervised restart's slot is told of the incarnation before its task
+    // can run: a reader of the slot that finds nothing published then knows
+    // that no incarnation of the attempt can have ended, and one that finds
+    // the plane reads the end of an incarnation that ran.
+    if let Some(publish) = birth.publish {
+        publish.io.publish(
+            actor_handle.stop_lane(),
+            actor_handle.status_rx(),
+            *publish.own,
+            Some(subtree_watch.clone()),
+        );
+    }
+    // Every poll of the task, and its drop, runs inside the incarnation's
+    // span when a subscriber is interested in it, the subscriber's calls
+    // inside a catch.
+    let join = span.spawn(&handle, run);
 
     // Attach the abort handle to the just-created registry entries. Any
     // shutdown sweep that lands in the brief window before this call treats
@@ -729,24 +1071,30 @@ pub(crate) fn spawn_actor_parts_in<A: Actor>(
 /// on the supervisor's death plane; no shared channel of any capacity sits
 /// between a child's death and its supervisor observing it, so however many
 /// children die at once, none of their fates are lost waiting for room.
+/// `ended` is the end of the task when the caller already took it from the
+/// join handle (a restart attempt that handed over an incarnation which had
+/// ended): the runner uses it instead of polling the spent handle again.
 /// `grace` is the incarnation's kill grace: the time between its `Kill` and
-/// its abort. The returned handle identifies the task in the plane.
+/// its abort. The returned handle identifies the task in the plane. The
+/// caller has made the runner's claim ([`claim_death`]) before this call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_runner(
     death_set: &mut JoinSet<DeathOutcome>,
     child_id: ActorId,
     incarnation: u64,
     join: JoinHandle<StopReason>,
+    ended: Option<StopReason>,
     lane: StopLane,
     io: SlotIo,
     guard: ChildLinkGuard,
     grace: Duration,
+    owner: Option<AbortRecord>,
 ) -> AbortHandle {
     death_set.spawn(async move {
         let mut guard = guard;
         let mut join = join;
         let mut io = io;
-        let reason = run_ladder(&mut join, &lane, &mut io, grace).await;
+        let reason = run_ladder(&mut join, ended, &lane, &mut io, grace).await;
         io.record_fate(ChildFate {
             reason: reason.clone(),
             incarnation,
@@ -755,8 +1103,33 @@ pub(crate) fn spawn_runner(
         // nothing left to force, so its drop below must not raise Kill,
         // rewrite the terminal status, or occupy the reaper.
         guard.disarm();
+        if let Some(owner) = &owner {
+            crate::telemetry::death_landed(owner, incarnation);
+        }
         (child_id, reason, incarnation)
     })
+}
+
+/// Records, for the supervisor whose record is `owner`, that a runner
+/// follows the child incarnation `incarnation`, whose record is `child`: the
+/// supervisor owes a decision on that incarnation's death from the child's
+/// end, which is recorded before the runner's join resolves, and a child
+/// that has already ended is owed at once. Made before the attempt that
+/// started the incarnation settles, so no reader finds the attempt settled
+/// and its ended incarnation not yet owed.
+pub(crate) fn claim_death(
+    owner: Option<&AbortRecord>,
+    child_id: &ActorId,
+    incarnation: u64,
+    child: &AbortRecord,
+) {
+    if let Some(owner) = owner {
+        #[cfg(test)]
+        end_hooks::run(end_hooks::CLAIM, child_id);
+        #[cfg(not(test))]
+        let _ = child_id;
+        crate::telemetry::death_claim(owner, incarnation, child);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +1254,8 @@ pub(crate) struct RunParts<A: Actor> {
     _abort_reason: AbortReason,
     system_rx: SystemPlane,
     stop_rx: LaneRx,
-    turn_clock: TurnClock,
+    // Clears the turn in flight when the task ends on any path.
+    turn_clock: TurnGuard,
     // Declared after everything the actor owns: on an abort before the first
     // poll it frees the name, then releases its status sender and its
     // subtree hold, after the value, the context and the queued messages
@@ -900,6 +1274,19 @@ pub(crate) struct RunParts<A: Actor> {
     // nothing, so no drop order depends on them.
     workers: usize,
     same_thread: bool,
+}
+
+/// The size of the run future of an actor type, for the size test.
+#[cfg(test)]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
+pub(crate) fn run_future_size<A: Actor>() -> usize {
+    fn size_of_output<P, F>(_: impl FnOnce(P) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    size_of_output(run_actor::<A>)
 }
 
 async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
@@ -924,10 +1311,23 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         let parts = parts;
         *parts
     };
+    // The loop reads one fact of the worker count, so it keeps one byte.
+    let single_worker = workers <= 1;
     let actor = actor_slot.get_mut();
     let ctx = ctx_slot.get_mut();
     let mailbox = mailbox_slot.mailbox_mut();
     let priority = priority_slot.lane_mut();
+    // When the start began, read only while a sink takes `ActorStarted`:
+    // one plus the clock offset, or 0.
+    let started_at = if armed_for(
+        ctx.stop_lane().abort_record(),
+        None,
+        EventKind::ActorStarted,
+    ) {
+        now_nanos().saturating_add(1)
+    } else {
+        0
+    };
 
     // Phase 1 + 2: pre_start/on_started validation (fail-fast gate). A panic
     // is a failed init, exactly like `Err` (self-cleaning contract:
@@ -949,14 +1349,30 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         }
 
         // Phase 1: pre_start validation.
-        turn_clock.begin();
-        let phase1 = match catch_hook(|| actor.pre_start(ctx)).await {
-            Ok(result) => result,
-            Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
-        };
-        turn_clock.end();
-        if let Err(err) = phase1 {
-            break 'init Err(err);
+        {
+            let phase1 = {
+                let turn = turn_clock.begin();
+                let result =
+                    catch_hook_t(turn_clock.caller_token(turn), || actor.pre_start(ctx)).await;
+                if !turn.is_idle() {
+                    let took = turn_clock.end_timed(turn);
+                    push_turn(
+                        ctx.stop_lane().abort_record(),
+                        turn,
+                        took,
+                        HookKind::PreStart,
+                        outcome_of(&result),
+                    );
+                }
+                result
+            };
+            let phase1 = match phase1 {
+                Ok(result) => result,
+                Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+            };
+            if let Err(err) = phase1 {
+                break 'init Err(err);
+            }
         }
         if init_kill_check(stop_rx.borrow().reason.as_ref()) == InitStep::KillNow {
             killed_in_init = true;
@@ -964,14 +1380,47 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         }
 
         // Phase 2: on_started initialization.
-        turn_clock.begin();
-        let phase2 = match catch_hook(|| actor.on_started(ctx)).await {
-            Ok(result) => result,
-            Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+        // Scoped, so the hook's result is not kept across the strict wait.
+        let strict = {
+            let phase2 = {
+                let turn = turn_clock.begin();
+                let result =
+                    catch_hook_t(turn_clock.caller_token(turn), || actor.on_started(ctx)).await;
+                if !turn.is_idle() {
+                    let took = turn_clock.end_timed(turn);
+                    push_turn(
+                        ctx.stop_lane().abort_record(),
+                        turn,
+                        took,
+                        HookKind::OnStarted,
+                        outcome_of(&result),
+                    );
+                }
+                result
+            };
+            let phase2 = match phase2 {
+                Ok(result) => result,
+                Err(payload) => Err(ActorError::Panic(payload_into_string(payload))),
+            };
+            // The children spawned from here on are not part of the start.
+            let strict = ctx.end_init_phase();
+            if let Err(err) = phase2 {
+                break 'init Err(err);
+            }
+            strict
         };
-        turn_clock.end();
-        if let Err(err) = phase2 {
-            break 'init Err(err);
+
+        // Strict start: the supervisor's own start waits for the children it
+        // spawned while starting, and the first that fails fails it.
+        if strict {
+            match Box::pin(await_strict_children(ctx, &stop_rx)).await {
+                StrictOutcome::Done => {}
+                StrictOutcome::Killed => {
+                    killed_in_init = true;
+                    break 'init Ok(());
+                }
+                StrictOutcome::Failed(err) => break 'init Err(err),
+            }
         }
 
         Ok(())
@@ -997,6 +1446,18 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 if let Some(tx) = ack.take() {
                     let _ = send_contained(tx, Ok(()));
                 }
+                if started_at != 0 {
+                    let took = Duration::from_nanos(now_nanos().saturating_sub(started_at - 1));
+                    push_about(
+                        ctx.stop_lane().abort_record(),
+                        None,
+                        EventKind::ActorStarted,
+                        |actor| TelemetryEvent::ActorStarted {
+                            actor: actor.clone(),
+                            took,
+                        },
+                    );
+                }
                 StopReason::Graceful
             }
             Err(err) => {
@@ -1020,6 +1481,13 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         let lane_slot = SlotHold(ctx.stop_lane().abort_record().clone());
         let mut drain = ReplyDrain::new();
         let mut fp_skip: u32 = 0;
+        // The sleep for the nearest threshold of the idle spell, made at the
+        // first select entry that has one; nothing for an actor that sets no
+        // deadline.
+        let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        // Whether the message `continue_with` asked for in a start hook still
+        // has to run, before the first branch is read.
+        let mut post_init = true;
         // The turn quantum (see `TURN_QUANTUM`): whether the next fast-path
         // take starts a run, when the run started, the last clock read, takes
         // since that read, and how many takes between reads.
@@ -1028,12 +1496,198 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         let mut last_read = turn_start;
         let mut q_takes: u32 = 0;
         let mut q_stride: u32 = 8;
+        // The takes of the run in flight, and this loop's copy of the handler
+        // list that hot events are delivered from.
+        let mut takes: u32 = 0;
+        let mut hot = HotCache::new();
+        // Ends the run in flight, if any, and starts over at the next take.
+        // The event reaches the handlers on this task: every point that ends
+        // a run owes nothing but the loop's next step.
+        macro_rules! close_run {
+            () => {
+                if !run_fresh {
+                    crate::telemetry::emit_hot(
+                        &lane_slot.0,
+                        None,
+                        &mut hot,
+                        EventKind::RunFinished,
+                        |actor| TelemetryEvent::RunFinished {
+                            actor: Cow::Borrowed(actor),
+                            takes,
+                            took: turn_start.elapsed(),
+                        },
+                    );
+                }
+                run_fresh = true;
+            };
+        }
         // `workers` and `same_thread` come from the spawn (see `RunParts`):
         // `same_thread` is whether a requester that is not a runtime task is
         // woken on this thread (see `ReplyDrain`).
         #[cfg(test)]
         loop_facts::record(ctx.actor_id(), workers, same_thread);
+        // Whether the turn that just ran gave the worker up (a poll of its
+        // handler or of a chain step returned pending). Reset by each
+        // fast-path turn; the select's mailbox arm leaves it unread.
+        let mut gave_back = false;
+        // One plain turn of the loop, in the loop's own body: the handler
+        // runs here, and the common end (an `Ok` that did not stop the actor)
+        // is finished here, so the turn moves nothing the size of a
+        // `ControlFlow<StopReason>` through memory. The signal envelope, the
+        // end of a failed or self-stopping turn, the turn's hot events and
+        // the chain of `continue_with` steps are out-of-line functions.
+        // Evaluates to the one-byte `TurnEnd`; a stop has written
+        // `stop_reason`.
+        macro_rules! plain_turn {
+            ($env:expr) => {{
+                // The turn proper lives in its own block, so none of its
+                // locals is held while a chain of `continue_with` steps runs.
+                let mut end = 'run: {
+                    let (payload, responder) = match { $env } {
+                        Envelope::Message { payload, responder } => (payload, responder),
+                        Envelope::Signal { tag, payload } => match open_signal(ctx, tag, payload) {
+                            Ok(payload) => (payload, None),
+                            Err(flow) => break 'run settle(flow, &mut stop_reason),
+                        },
+                    };
+                    let mut responder = AnswerHold::new(responder);
+                    ctx.clear_self_stop();
+                    let turn = turn_clock.begin();
+                    // The debug state, when the actor has any option on: the
+                    // message is counted and logged inside the turn. An actor
+                    // with none pays this one test.
+                    if let Some(state) = ctx.debug_mut() {
+                        state.message_in(responder.is_some(), false);
+                    }
+                    // The reply of a handler that returned `Ok` leaves the
+                    // poll by itself and is all the turn reads back. Any
+                    // other outcome (an `Err`, a panic) leaves boxed, so the
+                    // common turn never copies the whole outcome out of the
+                    // poll's result slot.
+                    macro_rules! handler_step {
+                        ($hook:expr) => {{
+                            let mut handler = std::pin::pin!($hook);
+                            std::future::poll_fn(|cx| match handler.as_mut().poll(cx) {
+                                Poll::Pending => {
+                                    gave_back = true;
+                                    Poll::Pending
+                                }
+                                Poll::Ready(Ok(Ok(response))) => Poll::Ready(Ok(response)),
+                                Poll::Ready(other) => Poll::Ready(Err(Box::new(other))),
+                            })
+                            .await
+                        }};
+                    }
+                    // One poll site: the caller token is `0`, and sets
+                    // nothing, for a turn that records no wait (two sites
+                    // would keep the responder and the turn's mode live
+                    // across two suspend points, which the compiler then
+                    // places in every state of the loop's future).
+                    let step = handler_step!(catch_hook_t(turn_clock.caller_token(turn), || {
+                        actor.handle(payload, ctx)
+                    }));
+                    let took = if turn.is_idle() {
+                        None
+                    } else {
+                        turn_clock.end_timed(turn)
+                    };
+                    #[cfg(test)]
+                    end_hooks::run(end_hooks::TURN, ctx.actor_id());
+                    match step {
+                        Ok(response) if !ctx.self_stop_set() => {
+                            let mut out = None;
+                            match deliver::<A>(&mut drain, &mut responder, response, &mut out) {
+                                None => {
+                                    // The reply is sent and the loop owes only
+                                    // its next take: the handlers run here.
+                                    if ctx.debug_on() || turn.armed(EventKind::TurnFinished) {
+                                        turn_done_hot(ctx, &mut hot, turn, took, out);
+                                    }
+                                    TurnEnd::Next
+                                }
+                                Some(payload) => {
+                                    push_turn(
+                                        ctx.stop_lane().abort_record(),
+                                        turn,
+                                        took,
+                                        HookKind::Handle,
+                                        TurnOutcome::Panicked,
+                                    );
+                                    settle(undelivered_panic(ctx, payload), &mut stop_reason)
+                                }
+                            }
+                        }
+                        Ok(response) => settle(
+                            finish_turn(
+                                ctx,
+                                responder,
+                                Ok(Ok(response)),
+                                &mut drain,
+                                &mut held,
+                                turn,
+                                took,
+                                Some(&mut hot),
+                            ),
+                            &mut stop_reason,
+                        ),
+                        Err(other) => settle(
+                            finish_turn(
+                                ctx,
+                                responder,
+                                *other,
+                                &mut drain,
+                                &mut held,
+                                turn,
+                                took,
+                                Some(&mut hot),
+                            ),
+                            &mut stop_reason,
+                        ),
+                    }
+                };
+                if ctx.has_continuation() {
+                    let flow = flow_of(end, &mut stop_reason);
+                    let flow = Box::pin(chain_after(
+                        actor,
+                        ctx,
+                        flow,
+                        &turn_clock,
+                        &mut drain,
+                        &mut held,
+                        &mut gave_back,
+                        &mut hot,
+                    ))
+                    .await;
+                    end = settle(flow, &mut stop_reason);
+                }
+                end
+            }};
+        }
         loop {
+            if post_init {
+                post_init = false;
+                // A start hook that stopped its own actor ends the chain
+                // before its first step: the stop is read first.
+                if ctx.take_self_stop() {
+                    ctx.drop_continuation();
+                }
+                if ctx.has_continuation() {
+                    let chain = Box::pin(continue_chain(
+                        actor,
+                        ctx,
+                        ControlFlow::Continue(()),
+                        &turn_clock,
+                        &mut drain,
+                        &mut held,
+                        Some(&mut hot),
+                    ))
+                    .await;
+                    if let ControlFlow::Break(reason) = chain {
+                        stop_reason = reason;
+                        break;
+                    }
+                }
+            }
             let fp_off = fp_skip_step(&mut fp_skip);
             // A requester answered by this poll runs once the poll ends: end it
             // here when a backlog would otherwise keep the poll going.
@@ -1041,6 +1695,8 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 if mailbox.is_empty() && priority.as_ref().is_none_or(|lane| lane.is_empty()) {
                     drain = ReplyDrain::new();
                 } else if drain.step() {
+                    // The run ends where the worker is given up.
+                    close_run!();
                     #[cfg(test)]
                     hand_backs::bump(ctx.actor_id());
                     if same_thread {
@@ -1057,7 +1713,6 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                         .await;
                     }
                     // The hand-back gave the worker up: the run starts over.
-                    run_fresh = true;
                 }
             }
             // Turn boundary fast path: every branch above the mailbox reads
@@ -1067,7 +1722,8 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
             // the branches above. Anything else, an empty mailbox, or a
             // receive that is not ready now runs the select.
             if !tokio::task::coop::has_budget_remaining() {
-                if workers <= 1 {
+                close_run!();
+                if single_worker {
                     defer_armed(lane_slot.0.reader(), || {
                         hand_back_idle(&stop_rx, &system_rx, ctx, priority)
                     })
@@ -1075,11 +1731,11 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 } else {
                     requeue().await;
                 }
-                run_fresh = true;
             }
             if !fp_off
                 && !mailbox_closed
                 && !mailbox.is_empty()
+                && !is_suspended(ctx)
                 && upper_idle(&stop_rx, &system_rx, ctx, priority)
             {
                 if let Some(env) = poll_now(mailbox).await {
@@ -1090,20 +1746,17 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                         turn_start = std::time::Instant::now();
                         last_read = turn_start;
                         q_takes = 0;
+                        takes = 0;
                     }
-                    let mut gave_back = false;
-                    match watch_yield(
-                        dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held),
-                        &mut gave_back,
-                    )
-                    .await
-                    {
-                        ControlFlow::Continue(()) => {
+                    takes += 1;
+                    gave_back = false;
+                    match plain_turn!(env) {
+                        TurnEnd::Next => {
                             if gave_back {
                                 // The handler gave the worker back: the senders
                                 // and the driver had their turn, and the run of
                                 // takes starts over.
-                                run_fresh = true;
+                                close_run!();
                                 continue;
                             }
                             let mut pace = false;
@@ -1122,7 +1775,8 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                                 }
                             }
                             if pace {
-                                if workers <= 1 {
+                                close_run!();
+                                if single_worker {
                                     defer_armed(lane_slot.0.reader(), || {
                                         hand_back_idle(&stop_rx, &system_rx, ctx, priority)
                                     })
@@ -1130,20 +1784,39 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                                 } else {
                                     requeue().await;
                                 }
-                                run_fresh = true;
                             }
                             continue;
                         }
-                        ControlFlow::Break(reason) => {
-                            stop_reason = reason;
-                            break;
-                        }
+                        TurnEnd::Stop => break,
                     }
                 }
             }
             // The select may wait: the next fast-path take starts a new run.
-            run_fresh = true;
+            close_run!();
             q_takes = 0;
+            // The nearest threshold of the idle spell, if the actor set any:
+            // the spell starts here when the loop is about to wait with both
+            // queues empty. The fast path never reaches this line.
+            let mut idle_kind = None;
+            if ctx.idle_armed() {
+                let quiet =
+                    mailbox.is_empty() && priority.as_ref().is_none_or(|lane| lane.is_empty());
+                if let Some((at, kind)) = ctx.idle_next(Instant::now(), quiet) {
+                    match idle_sleep.as_mut() {
+                        Some(sleep) => {
+                            // The timer driver is touched only for a new
+                            // deadline.
+                            if sleep.deadline() != at {
+                                sleep.as_mut().reset(at);
+                            }
+                        }
+                        None => idle_sleep = Some(Box::pin(tokio::time::sleep_until(at))),
+                    }
+                    idle_kind = Some(kind);
+                }
+            }
+            // Read once per pass: only this loop changes it, between passes.
+            let suspended = is_suspended(ctx);
             tokio::select! {
                 biased;
 
@@ -1159,13 +1832,28 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                         stop_reason = StopReason::Kill;
                         break;
                     }
-                    // Tier 1 (Graceful/ParentRequest): pre_stop gate, vetoable.
-                    // A pre_stop panic lets the stop proceed as a Failure.
-                    if matches!(reason, StopReason::Graceful | StopReason::ParentRequest) {
-                        turn_clock.begin();
-                        let pre_stop_result =
-                            catch_hook(|| actor.pre_stop(&reason, ctx)).await;
-                        turn_clock.end();
+                    // Tier 1 (Graceful/ParentRequest/Shutdown): pre_stop gate,
+                    // vetoable. A pre_stop panic lets the stop proceed as a
+                    // Failure.
+                    if StopSeverity::is_vetoable(&reason) {
+                        let pre_stop_result = {
+                            let turn = turn_clock.begin();
+                            let result = catch_hook_t(turn_clock.caller_token(turn), || {
+                                actor.pre_stop(&reason, ctx)
+                            })
+                            .await;
+                            if !turn.is_idle() {
+                                let took = turn_clock.end_timed(turn);
+                                push_turn(
+                                    ctx.stop_lane().abort_record(),
+                                    turn,
+                                    took,
+                                    HookKind::PreStop,
+                                    outcome_plain(&result),
+                                );
+                            }
+                            result
+                        };
                         // Read without marking the lane's current version as
                         // seen: only the `select!` arm's own `changed()` may
                         // consume a version, so a same-severity raise that
@@ -1228,9 +1916,22 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                                     stop_reason = latest.unwrap_or(reason);
                                     break;
                                 }
-                                _ => continue, // Actor rejected the stop; a
-                                    // later same-severity raise bumps the
-                                    // generation and re-fires this gate.
+                                // Actor rejected the stop; a later same-severity
+                                // raise bumps the generation and re-fires this
+                                // gate. The reply a self-stop held goes out now,
+                                // since the actor keeps running.
+                                _ => {
+                                    // The chain does not run after a veto: a
+                                    // message `pre_stop` asked for is dropped.
+                                    ctx.drop_continuation();
+                                    if let Some(payload) = held.release_now() {
+                                        let err = ActorError::Panic(payload);
+                                        ctx.record_failure(err.clone());
+                                        stop_reason = StopReason::Failure(err);
+                                        break;
+                                    }
+                                    continue;
+                                }
                             },
                         }
                     }
@@ -1241,18 +1942,47 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
 
                 // System channel - priority over user messages
                 sys_msg = system_rx.recv() => {
-                    match sys_msg {
-                        Some(SystemMessage::GetStatus(request)) => {
-                            let info = build_status_info(ctx);
-                            answer_status(
-                                request,
-                                info,
-                                same_thread,
-                                &mut fp_skip,
-                                &mut drain,
-                            );
-                        }
+                    // The message is consumed before the request is served, so
+                    // the run loop's state holds no copy of it across the
+                    // wait.
+                    let request = match sys_msg {
+                        Some(message) => match message {
+                            SystemMessage::Supervise(request) => Some(request),
+                            SystemMessage::GetStatus(request) => {
+                                let info = sys_state::status_info(actor, ctx, &turn_clock);
+                                answer_status(
+                                    request,
+                                    info,
+                                    same_thread,
+                                    &mut fp_skip,
+                                    &mut drain,
+                                );
+                                None
+                            }
+                            SystemMessage::Signals => {
+                                crate::actor::link::drain_signals(ctx);
+                                None
+                            }
+                            SystemMessage::Sys(command) => {
+                                match sys_serve::serve(*command, actor, ctx, &turn_clock) {
+                                    ControlFlow::Continue(()) => None,
+                                    ControlFlow::Break(reason) => {
+                                        stop_reason = reason;
+                                        break;
+                                    }
+                                }
+                            }
+                        },
                         None => break, // system channel closed
+                    };
+                    if let Some(request) = request {
+                        match Box::pin(crate::actor::supervisor_ref::serve(ctx, request)).await {
+                            ControlFlow::Continue(()) => {}
+                            ControlFlow::Break(reason) => {
+                                stop_reason = reason;
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1264,13 +1994,14 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 // branch. Pends forever with no supervision config or nothing
                 // currently in flight on either plane, so this never becomes
                 // a busy poll.
-                event = next_supervision_event(ctx) => {
+                event = next_supervision_event(ctx), if !suspended => {
+                    let verdict_woke = matches!(event, Some(SupervisionEvent::Verdict));
                     match event {
                         Some(SupervisionEvent::Restart(Ok((task, outcome)))) => {
                             if let Some(sup) = ctx.supervision_mut() {
                                 sup.task_owner.remove(&task);
                             }
-                            match Box::pin(handle_restart_outcome(actor, ctx, outcome)).await {
+                            match Box::pin(handle_restart_outcome(actor, ctx, *outcome)).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1336,9 +2067,10 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                         None => {} // unreachable: `next_supervision_event` never resolves to `None`
                     }
                     // A pending group restart that can make progress only
-                    // through unresponsive members ends the supervisor: its
-                    // own parent decides.
-                    if let Some(reason) = check_verdicts(ctx) {
+                    // through unresponsive members ends the supervisor, and
+                    // so does a stop with no caller left to report its
+                    // verdict: its own parent decides.
+                    if let Some(reason) = check_verdicts(ctx, verdict_woke) {
                         stop_reason = reason;
                         break;
                     }
@@ -1353,10 +2085,35 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 // itself is drained and closed, the loop keeps draining the
                 // mailbox until IT also reports closed (see the mailbox arm
                 // below).
-                envelope = recv_optional(priority), if priority.is_some() => {
+                envelope = recv_optional(priority), if priority.is_some() && !suspended => {
                     match envelope {
                         Some(env) => {
-                            match dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held).await {
+                            let flow = dispatch_one(
+                                actor,
+                                ctx,
+                                env,
+                                &turn_clock,
+                                &mut drain,
+                                &mut held,
+                                true,
+                                Some(&mut hot),
+                            )
+                            .await;
+                            let flow = if ctx.has_continuation() {
+                                Box::pin(continue_chain(
+                                    actor,
+                                    ctx,
+                                    flow,
+                                    &turn_clock,
+                                    &mut drain,
+                                    &mut held,
+                                    Some(&mut hot),
+                                ))
+                                .await
+                            } else {
+                                flow
+                            };
+                            match flow {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1381,10 +2138,26 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                 // User mailbox - disabled once it has already reported
                 // closed, so a still-open priority lane keeps being drained
                 // instead of this arm firing again on every iteration.
-                envelope = mailbox.recv(), if !mailbox_closed => {
-                    match envelope {
-                        Some(env) => {
-                            match dispatch(actor, ctx, env, &turn_clock, &mut drain, &mut held).await {
+                //
+                // The idle spell's threshold - the lowest branch - is polled
+                // inside this one, after the mailbox found nothing, and only
+                // for an actor that set a deadline: an actor that set none
+                // passes no sleep, and its select has no branch for it. A fire
+                // that finds anything queued does nothing and lets the loop
+                // read it; one that finds a `Kill` stored ends the actor as
+                // the lane would.
+                wake = mail_or_idle(mailbox, mailbox_closed, idle_kind.and(idle_sleep.as_mut())), if !suspended && (!mailbox_closed || idle_kind.is_some()) => {
+                    match wake {
+                        Wake::Idle => {
+                            let Some(kind) = idle_kind else { continue };
+                            if !mailbox.is_empty() || priority.as_ref().is_some_and(|lane| !lane.is_empty()) {
+                                continue;
+                            }
+                            if kill_stored(&stop_rx) {
+                                stop_reason = StopReason::Kill;
+                                break;
+                            }
+                            match Box::pin(fire_idle(actor, ctx, kind, &turn_clock, &mut drain, &mut held, Some(&mut hot))).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {
                                     stop_reason = reason;
@@ -1392,11 +2165,18 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
                                 }
                             }
                         }
-                        None => {
-                            // Mailbox closed (all handles dropped). Exit only
-                            // if the priority lane is also gone (or never
-                            // existed); otherwise it alone still justifies
-                            // running.
+                        Wake::Mail(env) => {
+                            if plain_turn!(env) == TurnEnd::Stop {
+                                break;
+                            }
+                        }
+                        Wake::Closed => {
+                            // The mailbox has ended: nothing is queued and no
+                            // sender is left. Dropping outside handles does
+                            // not end it, since the context holds a handle of
+                            // its own. Exit only if the priority lane is also
+                            // gone (or never existed); otherwise it alone
+                            // still justifies running.
                             if priority.is_none() {
                                 break;
                             }
@@ -1407,7 +2187,22 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
             }
         }
 
+        // The run still open when the loop exits ends before the stop
+        // sequence, which it must not wait for.
+        if !run_fresh {
+            push_run(&lane_slot.0, takes, turn_start);
+        }
+        // The log keeps the reason the loop ended with.
+        if let Some(state) = ctx.debug_mut() {
+            state.stopping(&stop_reason);
+        }
+        drop(hot);
         drop(lane_slot);
+        // A message a callback asked to handle next is not handled once the
+        // loop has ended.
+        ctx.drop_continuation();
+        #[cfg(test)]
+        end_hooks::pause(end_hooks::LOOP_ENDED, ctx.actor_id()).await;
 
         // The final deliveries, then Phase 4: on_stopped (terminate/2 parity:
         // runs on failures and panics, skipped only for Kill / brutal_kill).
@@ -1441,7 +2236,39 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
             } else {
                 tokio::task::yield_now().await;
             }
+            #[cfg(test)]
+            end_hooks::pause(end_hooks::FINAL_DONE, ctx.actor_id()).await;
+            // The notices of the monitors this actor holds, owed since the
+            // watched actors ended, are delivered after a supervisor's
+            // child reports: the death plane outranks them.
+            if !matches!(stop_reason, StopReason::Kill)
+                && ctx.has_end_state()
+                && (ctx.monitor_count() != 0 || ctx.link_work())
+            {
+                match Box::pin(monitor_drain(
+                    actor,
+                    ctx,
+                    &stop_rx,
+                    &stop_reason,
+                    &turn_clock,
+                    &mut *mailbox,
+                    priority.as_mut(),
+                    &mut drain,
+                    &mut held,
+                ))
+                .await
+                {
+                    FinalOutcome::Killed => stop_reason = StopReason::Kill,
+                    FinalOutcome::Done { pending } => {
+                        if !matches!(pending_exit, Some(StopReason::Failure(_))) {
+                            pending_exit = pending.or(pending_exit);
+                        }
+                    }
+                }
+            }
         }
+        #[cfg(test)]
+        end_hooks::pause(end_hooks::STAGE_DONE, ctx.actor_id()).await;
         // The loop can end for a reason that read no lane (a handler's `Err`
         // or panic, an `Err` from a child report, an exhausted budget, a
         // closed channel): a `Kill` stored by now still skips `on_stopped`,
@@ -1452,9 +2279,24 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
             stop_reason = StopReason::Kill;
         }
         if !matches!(stop_reason, StopReason::Kill) {
-            turn_clock.begin();
-            let stopped = catch_hook(|| actor.on_stopped(&stop_reason, ctx)).await;
-            turn_clock.end();
+            let stopped = {
+                let turn = turn_clock.begin();
+                let result = catch_hook_t(turn_clock.caller_token(turn), || {
+                    actor.on_stopped(&stop_reason, ctx)
+                })
+                .await;
+                if !turn.is_idle() {
+                    let took = turn_clock.end_timed(turn);
+                    push_turn(
+                        ctx.stop_lane().abort_record(),
+                        turn,
+                        took,
+                        HookKind::OnStopped,
+                        outcome_of(&result),
+                    );
+                }
+                result
+            };
             // A failed final delivery makes the exit reason a failure once
             // `on_stopped` has returned; `on_stopped`'s own result is applied
             // after it, the same way.
@@ -1519,7 +2361,8 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
         // decided. Tokio ends its wake at that waker, so the senders behind it
         // may stay unwoken, and their futures find the lane closed at their
         // next poll.
-        contain_waker_panic("priority lane", Some(ctx.actor_id()), || priority.close());
+        let who = ctx.actor_id().as_who();
+        contain_waker_panic("priority lane", Some(who), || priority.close());
     }
 
     // Phase 5: Stop all children (reverse start order, a pool all at once,
@@ -1531,7 +2374,7 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     // glue, raising Kill on that child's lane and repeating the same
     // inversion one level down, without this task ever awaiting the subtree
     // it is discarding.
-    let actor_id = ctx.actor_id().clone();
+    let owner = ctx.owner();
     // Boxed, and skipped without a supervision state, where it returns
     // `Done` at once: only a supervisor's teardown pays for this state.
     if !matches!(stop_reason, StopReason::Kill)
@@ -1543,15 +2386,16 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     }
     if matches!(stop_reason, StopReason::Kill) {
         if let Some(sup) = ctx.take_supervision() {
-            keep_first_of(
-                &mut teardown_panic,
-                end_supervision(sup, &actor_id),
-                &actor_id,
-            );
+            keep_first_of(&mut teardown_panic, end_supervision(sup, &owner), &owner);
         }
     }
     if let Some(payload) = teardown_panic {
-        end_drop_panicked(&mut stop_reason, payload, &actor_id);
+        end_drop_panicked(
+            &mut stop_reason,
+            payload,
+            &owner,
+            ctx.stop_lane().abort_record(),
+        );
     }
 
     // RegistryGuard::drop unregisters the actor: the registered name is free
@@ -1563,6 +2407,8 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     // task's JoinHandle only after every drop, so the name is free before
     // the parent acts on the death either way.
     drop(registry_guard);
+    #[cfg(test)]
+    end_hooks::run(end_hooks::GUARD_RELEASED, &owner);
 
     // Every timer and stream forwarder is ended and awaited first, each
     // future dropped with the stream, message or factory it owns; a panic in
@@ -1578,15 +2424,33 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     // the last await of the task: from the seal on, the end runs without a
     // yield, so an abort that lands while the queued messages or the value
     // drop cannot change how the task ends.
-    if let Some(payload) = ctx.end_forwarders().await {
-        end_drop_panicked(&mut stop_reason, payload, &actor_id);
+    #[cfg(test)]
+    end_hooks::pause(end_hooks::TEARDOWN_DONE, &owner).await;
+    let end_panic = ctx.end_forwarders().await;
+    // The one read of the signal maps' panics: every forwarder is ended and
+    // joined, so no map function runs from here on, and the reason is not
+    // yet chosen. It covers every window since the loop ended (the final
+    // child reports, the stage's deliveries, `on_stopped`, the children's
+    // stop), whichever signal's map panicked.
+    collect_map_panic(ctx, &mut stop_reason);
+    if let Some(payload) = end_panic {
+        end_drop_panicked(
+            &mut stop_reason,
+            payload,
+            &owner,
+            ctx.stop_lane().abort_record(),
+        );
     }
 
     // Seal the lane: every `Kill` a caller was told was accepted was either
     // observed above or is read here, and every request from here on is
     // refused with `Closed`, just before the queued messages and the actor
     // value are dropped. The receiver is dropped with it.
-    if let Some(StopReason::Kill) = ctx.stop_lane().seal() {
+    // The cause a `Kill` carries comes back with it, read in the same step:
+    // every classification above and below the seal sees `Kill`, and only
+    // the final reason is the cause.
+    let (sealed_reason, kill_cause) = ctx.stop_lane().seal_caused();
+    if let Some(StopReason::Kill) = sealed_reason {
         stop_reason = StopReason::Kill;
     }
     drop(stop_rx);
@@ -1598,16 +2462,39 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     // the reason is written, so a caller that finds its queue closed reads the
     // answer after the reason (`ActorHandle::send`), and a `Kill` accepted
     // before the seal is the reason the caller reads.
-    held.deliver(&stop_reason);
+    if let Some(payload) = held.deliver(&stop_reason) {
+        end_drop_panicked(
+            &mut stop_reason,
+            payload,
+            &owner,
+            ctx.stop_lane().abort_record(),
+        );
+    }
     #[cfg(test)]
-    end_hooks::run(end_hooks::ANSWER, &actor_id);
+    end_hooks::run(end_hooks::ANSWER, &owner);
 
     // The reason is final here, written into the status plane once: a panic
     // in a forwarder's drop at the end (see above) already made any reason
     // but a `Kill` or a `Failure` a failure, and the seal's `Kill` is read.
     // Readers of the plane (a request whose reply is dropped, `wait_stopped`,
-    // a stop report) read this reason, as the task's return does.
-    write_final_reason(&status, &stop_reason);
+    // a stop report) read this reason, as the task's return does. A `Kill`
+    // raised for an exit signal ends the actor with that signal's reason.
+    // Below this point `stop_reason` still says `Kill` for the classifications
+    // that read the kind of the end (the init ack, the crash report), and
+    // `ended_with` is the value the plane, the end event, the log and the
+    // task's return carry.
+    let cause_reason = final_cause(&stop_reason, kill_cause);
+    let ended_with = cause_reason.as_ref().unwrap_or(&stop_reason);
+    let ended = write_final_reason(&status, ended_with)
+        // This call wrote the final reason: the end event follows the
+        // writer, after the name is free and the lane sealed, with no guard
+        // held.
+        .then(|| emit_actor_ended(None, ctx.stop_lane().abort_record(), ended_with))
+        .flatten();
+    #[cfg(feature = "tracing")]
+    let fields = crate::telemetry::LogFields::released(ended, ctx.stop_lane().abort_record());
+    #[cfg(not(feature = "tracing"))]
+    drop(ended);
 
     // The init ack resolves here, after the seal and before the queued
     // messages and the value are dropped: however long one of their `Drop`s
@@ -1631,18 +2518,21 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
             Err(err) => {
                 #[cfg(feature = "tracing")]
                 caught_log!(warn,
-                    actor_id = %actor_id,
-                    error = %err,
+                    actor_id = %owner,
+                    actor_name = fields.name(),
+                    incarnation = fields.incarnation(),
+                    system = fields.system(),
+                    error = %fields.text(&err.to_string()),
                     "the actor's initialization failed and a Kill reached its end before the reason was final; the spawn reads Killed"
                 );
                 #[cfg(not(feature = "tracing"))]
                 let _ = err;
-                contain_waker_panic("start ack", Some(&actor_id), move || drop(tx));
+                contain_waker_panic("start ack", Some(owner.id().as_who()), move || drop(tx));
             }
             // An init a `Kill` cut before it began: the ack is dropped
             // unanswered, contained the same way.
             Ok(()) => {
-                contain_waker_panic("start ack", Some(&actor_id), move || drop(tx));
+                contain_waker_panic("start ack", Some(owner.id().as_who()), move || drop(tx));
             }
         }
     }
@@ -1655,31 +2545,49 @@ async fn run_actor<A: Actor>(parts: Box<RunParts<A>>) -> StopReason {
     // still published, and with the `tracing` feature each panic is logged
     // once with the actor's id: the first below, a later one where it is
     // discarded.
-    let mut late_panic = mailbox_slot.end();
-    keep_first_of(&mut late_panic, priority_slot.end(), &actor_id);
-    keep_first_of(&mut late_panic, actor_slot.end(), &actor_id);
-    keep_first_of(&mut late_panic, ctx_slot.end(), &actor_id);
+    let record = ctx.stop_lane().abort_record();
+    let mut late_panic = mailbox_slot.end(Some(record));
+    keep_first_of(&mut late_panic, priority_slot.end(Some(record)), &owner);
+    let crash = reports::crash_text(
+        actor_slot.peek(),
+        &stop_reason,
+        record,
+        ctx.debug_ring(),
+        &turn_clock,
+    );
+    keep_first_of(&mut late_panic, actor_slot.end(), &owner);
+    keep_first_of(&mut late_panic, ctx_slot.end(), &owner);
     #[cfg(feature = "tracing")]
     if let Some(payload) = &late_panic {
         caught_log!(warn,
-            actor_id = %actor_id,
-            reason = %stop_reason,
-            panic = %payload,
+            actor_id = %owner,
+            actor_name = fields.name(),
+            incarnation = fields.incarnation(),
+            system = fields.system(),
+            reason = %fields.reason_text(ended_with),
+            panic = %fields.panic_text(payload),
             "a drop after the actor's reason was final panicked; the reason stands"
         );
     }
     #[cfg(not(feature = "tracing"))]
     let _ = late_panic;
     publish_stopped(&status);
+    #[cfg(feature = "tracing")]
+    reports::crash_log(crash, &owner, &fields, &stop_reason);
+    #[cfg(not(feature = "tracing"))]
+    reports::crash_log(crash, &owner);
 
     #[cfg(feature = "tracing")]
     caught_log!(info,
-        actor_id = %actor_id,
-        reason = %stop_reason,
+        actor_id = %owner,
+        actor_name = fields.name(),
+        incarnation = fields.incarnation(),
+        system = fields.system(),
+        reason = %fields.reason_text(ended_with),
         "Actor stopped"
     );
 
-    stop_reason
+    cause_reason.unwrap_or(stop_reason)
 }
 
 /// The run loop's hold on its waker slot: clears the slot when it drops, so
@@ -1737,16 +2645,47 @@ impl TaskMarker {
 /// `run_actor` and clears it after, through a guard that also clears it on
 /// an unwind. On this task's own panic, everything inside the future drops
 /// during the unwind of the inner poll, while the marker is still set.
+///
+/// It also records, for the length of each poll, which incarnation the thread
+/// is running and in which task (`PollScope`), so a request the actor sends to
+/// itself from its own task is refused (`AskError::CallingSelf`). The record
+/// is put back by a guard on every path out of the poll. The future's state
+/// drops inside the same record when the future is dropped before it ended (an
+/// abort, a runtime shutting down, an unwind), so a drop that calls back into
+/// the actor is refused as well.
 struct MarkedRun<F> {
     marker: TaskMarker,
-    inner: Pin<Box<F>>,
+    /// The incarnation this future runs.
+    incarnation: Incarnation,
+    /// The id of the task that polls this future, read at its first poll
+    /// inside a task and never again: a future is polled by one task for its
+    /// whole life.
+    task: Option<tokio::task::Id>,
+    /// Taken when the future ends, inside the record of its last poll.
+    inner: Option<Pin<Box<F>>>,
 }
 
 impl<F: Future> MarkedRun<F> {
-    fn new(marker: TaskMarker, inner: F) -> Self {
+    fn new(marker: TaskMarker, incarnation: Incarnation, inner: F) -> Self {
         Self {
             marker,
-            inner: Box::pin(inner),
+            incarnation,
+            task: None,
+            inner: Some(Box::pin(inner)),
+        }
+    }
+}
+
+impl<F> Drop for MarkedRun<F> {
+    fn drop(&mut self) {
+        // An ended future has nothing left. One cut short drops its state
+        // here, in the record of its incarnation and its task.
+        if let Some(inner) = self.inner.take() {
+            // A future that was never polled has read no id yet: the drop runs
+            // in the task that was to poll it.
+            let task = self.task.or_else(tokio::task::try_id);
+            let _scope = PollScope::enter(self.incarnation, task);
+            drop(inner);
         }
     }
 }
@@ -1765,9 +2704,20 @@ impl<F: Future> Future for MarkedRun<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
         let this = self.get_mut();
+        if this.task.is_none() {
+            this.task = tokio::task::try_id();
+        }
+        let _scope = PollScope::enter(this.incarnation, this.task);
         this.marker.0.store(true, Ordering::Relaxed);
         let _clear = ClearMarker(&this.marker.0);
-        this.inner.as_mut().poll(cx)
+        let inner = this
+            .inner
+            .as_mut()
+            .expect("a future is not polled after it ended");
+        let output = std::task::ready!(inner.as_mut().poll(cx));
+        // Its state drops here, inside the record and the marker.
+        this.inner = None;
+        Poll::Ready(output)
     }
 }
 
@@ -1802,12 +2752,29 @@ impl AbortReason {
 
 impl Drop for AbortReason {
     fn drop(&mut self) {
-        if self.status.borrow().reason.is_some() {
+        if self.status.reason_written() || self.status.borrow().reason.is_some() {
             return;
         }
         #[cfg(test)]
         end_hooks::run(end_hooks::REASON, &self.owner);
-        StatusValue::write_reason(&self.status, self.marker.abort_reason(), false);
+        let reason = aborted_reason(&self.status, &self.marker);
+        if crate::telemetry::engaged_for(self.status.abort_record(), None) {
+            self.write_reason_noted(reason);
+            return;
+        }
+        StatusValue::write_reason(&self.status, reason, false);
+    }
+}
+
+impl AbortReason {
+    /// The tail of the drop for a system that takes telemetry events or holds
+    /// an identity: the reason is copied for the end event.
+    #[inline(never)]
+    fn write_reason_noted(&self, reason: StopReason) {
+        let kept = reason.clone();
+        if StatusValue::write_reason(&self.status, reason, false) {
+            emit_actor_ended(None, self.status.abort_record(), &kept);
+        }
     }
 }
 
@@ -1815,12 +2782,26 @@ impl Drop for AbortReason {
 /// runs just before an abort guard writes its reason,
 /// [`NAME`](end_hooks::NAME) just before a registry guard frees the name,
 /// [`NAME_FREED`](end_hooks::NAME_FREED) just after it freed the name,
+/// [`GUARD_RELEASED`](end_hooks::GUARD_RELEASED) just after the guard and
+/// the system it held were released, before the stop lane is sealed,
 /// [`ANSWER`](end_hooks::ANSWER) just after the answer to a failed request is
 /// sent, before the reason is written,
 /// [`WALK`](end_hooks::WALK) in a supervisor's teardown, before it orders a
-/// child that is still in its registry to stop (keyed by the supervisor), and
+/// child that is still in its registry to stop (keyed by the supervisor),
 /// [`TURN`](end_hooks::TURN) in a turn, after the handler returned and before
-/// the turn applies its outcome, while the request's sender is still held.
+/// the turn applies its outcome, while the request's sender is still held,
+/// [`CLAIM`](end_hooks::CLAIM) just before a supervisor claims a child's
+/// death, [`SETTLED`](end_hooks::SETTLED) just after a restart attempt of the
+/// child settled, [`REPORTED_WAIT`](end_hooks::REPORTED_WAIT) when a
+/// supervisor's teardown begins to wait for the incarnations whose ends its
+/// final collection took from their status planes (keyed by the supervisor),
+/// [`ATTEMPT_WAIT`](end_hooks::ATTEMPT_WAIT) when a supervisor's final
+/// collection begins to wait for restart attempts (keyed by the supervisor),
+/// and [`PLANE_REPORT`](end_hooks::PLANE_REPORT) just after the final
+/// collection took a child's death from its status plane (keyed by the
+/// child). A hold attached at [`ACK`](end_hooks::ACK) makes a restart attempt
+/// wait, after it received its child's acknowledgment and before it reads its
+/// stop order, until the hold is notified (keyed by the child).
 #[cfg(test)]
 pub(crate) mod end_hooks {
     use std::collections::HashMap;
@@ -1832,9 +2813,39 @@ pub(crate) mod end_hooks {
     pub(crate) const REASON: &str = "reason";
     pub(crate) const NAME: &str = "name";
     pub(crate) const NAME_FREED: &str = "name freed";
+    pub(crate) const GUARD_RELEASED: &str = "guard released";
     pub(crate) const ANSWER: &str = "answer";
     pub(crate) const WALK: &str = "walk";
     pub(crate) const TURN: &str = "turn";
+    pub(crate) const PG_MARKED: &str = "pg marked";
+    /// The message loop ended, before the supervisor's final child reports.
+    pub(crate) const LOOP_ENDED: &str = "loop ended";
+    /// The final child reports are delivered, before the monitor stage.
+    pub(crate) const FINAL_DONE: &str = "final done";
+    /// The monitor stage is done, before `on_stopped`.
+    pub(crate) const STAGE_DONE: &str = "stage done";
+    /// The children are stopped, before the forwarders end.
+    pub(crate) const TEARDOWN_DONE: &str = "teardown done";
+    pub(crate) const CLAIM: &str = "claim";
+    pub(crate) const SETTLED: &str = "settled";
+    pub(crate) const REPORTED_WAIT: &str = "reported wait";
+    pub(crate) const ATTEMPT_WAIT: &str = "attempt wait";
+    pub(crate) const PLANE_REPORT: &str = "plane report";
+    pub(crate) const ACK: &str = "ack";
+    /// A hold that parks a restart attempt after its incarnation is spawned
+    /// and published, before the attempt goes on (keyed by the child).
+    pub(crate) const SPAWNED: &str = "spawned";
+    /// A hold that parks a restart attempt's acknowledgment branch before it
+    /// reads the channel (keyed by the child), so the join branch can read
+    /// the incarnation's end first.
+    pub(crate) const ACK_GAP: &str = "ack gap";
+    /// A restart attempt's join branch found the acknowledgment stored
+    /// (keyed by the child).
+    pub(crate) const ACK_LATE: &str = "ack late";
+    /// A task of the death plane that followed a child's incarnation failed
+    /// instead of returning its outcome, and its supervisor accounts for the
+    /// loss (keyed by the child).
+    pub(crate) const RUNNER_LOST: &str = "runner lost";
 
     type Hook = Box<dyn Fn() + Send + Sync>;
 
@@ -1859,9 +2870,87 @@ pub(crate) mod end_hooks {
         }
     }
 
-    pub(crate) fn run(point: &'static str, id: &ActorId) {
-        if point == TURN && TURN_HOOKS.load(Ordering::SeqCst) == 0 {
+    /// A point the actor waits at: it signals `reached`, then waits for a
+    /// permit in `release`.
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Notify,
+        pub(crate) release: tokio::sync::Semaphore,
+    }
+
+    impl Gate {
+        pub(crate) fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        /// Signals `reached`, then waits for a permit in `release`.
+        pub(crate) async fn pass(&self) {
+            self.reached.notify_one();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
+    type Gates = Mutex<HashMap<(&'static str, ActorId), std::sync::Arc<Gate>>>;
+
+    fn gates() -> &'static Gates {
+        static GATES: OnceLock<Gates> = OnceLock::new();
+        GATES.get_or_init(Default::default)
+    }
+
+    /// How many gates are attached, so a point with none takes no lock.
+    static GATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Attaches a gate at `point` of the actor `id`; the actor waits there
+    /// once.
+    pub(crate) fn attach_gate(point: &'static str, id: ActorId) -> std::sync::Arc<Gate> {
+        let gate = Gate::new();
+        gates().lock().unwrap().insert((point, id), gate.clone());
+        GATE_COUNT.fetch_add(1, Ordering::SeqCst);
+        gate
+    }
+
+    /// Waits at the gate attached at `point` of the actor `id`, if any.
+    pub(crate) async fn pause(point: &'static str, id: &ActorId) {
+        if GATE_COUNT.load(Ordering::SeqCst) == 0 {
             return;
+        }
+        let gate = gates().lock().unwrap().remove(&(point, id.clone()));
+        if let Some(gate) = gate {
+            GATE_COUNT.fetch_sub(1, Ordering::SeqCst);
+            gate.pass().await;
+        }
+    }
+
+    type Hold = std::sync::Arc<tokio::sync::Notify>;
+
+    fn holds() -> &'static Mutex<HashMap<(&'static str, ActorId), Hold>> {
+        static HOLDS: OnceLock<Mutex<HashMap<(&'static str, ActorId), Hold>>> = OnceLock::new();
+        HOLDS.get_or_init(Default::default)
+    }
+
+    /// Makes the task that reaches `point` of the actor `id` wait, once,
+    /// until `hold` is notified.
+    pub(crate) fn attach_hold(point: &'static str, id: ActorId, hold: Hold) {
+        holds().lock().unwrap().insert((point, id), hold);
+    }
+
+    /// Waits on the hold attached at `point` of the actor `id`, if any.
+    pub(crate) async fn wait_hold(point: &'static str, id: &ActorId) {
+        let hold = holds().lock().unwrap().remove(&(point, id.clone()));
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+    }
+
+    /// Runs the hook attached at `point` of the actor `id`, if any, and says
+    /// whether one ran.
+    pub(crate) fn run(point: &'static str, id: &ActorId) -> bool {
+        if point == TURN && TURN_HOOKS.load(Ordering::SeqCst) == 0 {
+            return false;
         }
         let hook = hooks().lock().unwrap().remove(&(point, id.clone()));
         if let Some(hook) = hook {
@@ -1869,7 +2958,9 @@ pub(crate) mod end_hooks {
                 TURN_HOOKS.fetch_sub(1, Ordering::SeqCst);
             }
             hook();
+            return true;
         }
+        false
     }
 }
 
@@ -1878,10 +2969,80 @@ fn catch_drop(drop: impl FnOnce()) -> Result<(), String> {
     catch_sync(drop).map_err(payload_into_string)
 }
 
+/// The actor a drop belongs to, as the log lines of a drop panic name it: its
+/// id, and whether it is sensitive, so a line about a panic whose text the
+/// crate does not know the origin of still hides that text for a sensitive
+/// actor. It is made from one incarnation's record (see [`Owner::of`]) or at
+/// that incarnation's spawn, never from an id alone. The sensitive form holds
+/// the id behind a pointer, which keeps the type the size of an `ActorId`.
+#[derive(Clone)]
+pub(crate) enum Owner {
+    /// An actor whose failure text its log lines print.
+    Open(ActorId),
+    /// An actor whose failure text no log line prints.
+    Sensitive(Arc<ActorId>),
+}
+
+impl Owner {
+    /// The owner of an incarnation whose sensitivity the caller knows.
+    #[inline]
+    pub(crate) fn new(id: ActorId, sensitive: bool) -> Self {
+        if sensitive {
+            Self::Sensitive(Arc::new(id))
+        } else {
+            Self::Open(id)
+        }
+    }
+
+    /// The owner of the incarnation `record` belongs to, named `id`.
+    #[inline]
+    pub(crate) fn of(id: &ActorId, record: &AbortRecord) -> Self {
+        Self::new(
+            id.clone(),
+            record.sys_bits() & crate::actor::subtree::SYS_SENSITIVE != 0,
+        )
+    }
+
+    /// The actor's id.
+    pub(crate) fn id(&self) -> &ActorId {
+        match self {
+            Self::Open(id) => id,
+            Self::Sensitive(id) => id,
+        }
+    }
+
+    /// The identity fields of a line about this actor that carries a panic's
+    /// text.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn fields(&self) -> crate::telemetry::LogFields<'static> {
+        crate::telemetry::LogFields::of_sensitive(matches!(self, Self::Sensitive(_)))
+    }
+}
+
+impl std::ops::Deref for Owner {
+    type Target = ActorId;
+
+    fn deref(&self) -> &ActorId {
+        self.id()
+    }
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.id().fmt(f)
+    }
+}
+
+impl std::fmt::Debug for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.id().fmt(f)
+    }
+}
+
 /// Keeps the first of two panics of one step of the actor `owner`'s end. A
 /// later one is discarded, and with the `tracing` feature it is logged,
 /// naming the actor, so every panic leaves a record.
-pub(crate) fn keep_first_of(first: &mut Option<String>, next: Option<String>, owner: &ActorId) {
+pub(crate) fn keep_first_of(first: &mut Option<String>, next: Option<String>, owner: &Owner) {
     match (first.is_some(), next) {
         (false, next) => *first = next,
         (true, Some(discarded)) => log_discarded(&discarded, owner),
@@ -1891,11 +3052,11 @@ pub(crate) fn keep_first_of(first: &mut Option<String>, next: Option<String>, ow
 
 /// Logs, with the `tracing` feature, a panic a step discards because it
 /// keeps an earlier one.
-pub(crate) fn log_discarded(payload: &str, owner: &ActorId) {
+pub(crate) fn log_discarded(payload: &str, owner: &Owner) {
     #[cfg(feature = "tracing")]
     caught_log!(warn,
         actor_id = %owner,
-        panic = %payload,
+        panic = %owner.fields().panic_text(payload),
         "a drop panicked after an earlier panic of the same step was kept; this panic is discarded"
     );
     #[cfg(not(feature = "tracing"))]
@@ -1911,14 +3072,14 @@ pub(crate) fn log_discarded(payload: &str, owner: &ActorId) {
 /// (`Failure(Panic(..))`) does.
 pub(crate) struct CaughtDrop<T> {
     value: Option<T>,
-    end: fn(T, &ActorId) -> Option<String>,
+    end: fn(T, &Owner) -> Option<String>,
     /// The actor that owns the value, passed to `end` on every path (the
     /// end of the task, an abort or an unwind) so each log line names it.
-    owner: ActorId,
+    owner: Owner,
 }
 
 impl<T> CaughtDrop<T> {
-    pub(crate) fn new(value: T, end: fn(T, &ActorId) -> Option<String>, owner: ActorId) -> Self {
+    pub(crate) fn new(value: T, end: fn(T, &Owner) -> Option<String>, owner: Owner) -> Self {
         Self {
             value: Some(value),
             end,
@@ -1930,6 +3091,11 @@ impl<T> CaughtDrop<T> {
         self.value
             .as_mut()
             .expect("the value is held until its end")
+    }
+
+    /// The value, while it is held.
+    fn peek(&self) -> Option<&T> {
+        self.value.as_ref()
     }
 
     /// Drops the value now; returns the first panic its drop raised.
@@ -1946,7 +3112,7 @@ impl<T> Drop for CaughtDrop<T> {
         if let Some(payload) = &panic {
             caught_log!(warn,
                 actor_id = %self.owner,
-                panic = %payload,
+                panic = %self.owner.fields().panic_text(payload),
                 "a drop at the abort or the unwind of the actor's task panicked; the task ends as the abort or the unwind does"
             );
         }
@@ -1969,11 +3135,11 @@ pub(crate) struct QueueSlot<R: QueueRx> {
     rx: Option<R>,
     /// Held only while there is a receiver to hand off.
     system: Option<Arc<ActorSystem>>,
-    owner: ActorId,
+    owner: Owner,
 }
 
 impl<R: QueueRx> QueueSlot<R> {
-    pub(crate) fn new(rx: Option<R>, system: &Arc<ActorSystem>, owner: ActorId) -> Self {
+    pub(crate) fn new(rx: Option<R>, system: &Arc<ActorSystem>, owner: Owner) -> Self {
         let system = rx.is_some().then(|| system.clone());
         Self { rx, system, owner }
     }
@@ -1989,11 +3155,12 @@ impl<R: QueueRx> QueueSlot<R> {
         &mut self.rx
     }
 
-    /// Ends the queue now; returns the first panic a drop raised.
-    fn end(&mut self) -> Option<String> {
+    /// Ends the queue now; returns the first panic a drop raised. `record` is
+    /// the actor's abort record when the caller has it.
+    fn end(&mut self, record: Option<&AbortRecord>) -> Option<String> {
         let rx = self.rx.take()?;
         let panic = match self.system.take() {
-            Some(system) => end_queue_late(rx, &system, &self.owner),
+            Some(system) => end_queue_late(rx, &system, &self.owner, record),
             None => end_queue(rx, &self.owner),
         };
         #[cfg(test)]
@@ -2004,12 +3171,12 @@ impl<R: QueueRx> QueueSlot<R> {
 
 impl<R: QueueRx> Drop for QueueSlot<R> {
     fn drop(&mut self) {
-        let panic = self.end();
+        let panic = self.end(None);
         #[cfg(feature = "tracing")]
         if let Some(payload) = &panic {
             caught_log!(warn,
                 actor_id = %self.owner,
-                panic = %payload,
+                panic = %self.owner.fields().panic_text(payload),
                 "a drop at the abort or the unwind of the actor's task panicked; the task ends as the abort or the unwind does"
             );
         }
@@ -2035,13 +3202,13 @@ impl<R: QueueRx> Drop for QueueSlot<R> {
 ///
 /// Returns the first panic of the drain's drops and whether a value can still
 /// arrive.
-fn close_and_drain<R: QueueRx>(rx: &mut R, owner: &ActorId) -> (Option<String>, bool) {
+fn close_and_drain<R: QueueRx>(rx: &mut R, owner: &Owner) -> (Option<String>, bool) {
     // Closing a tokio channel wakes the senders parked for room, whose wakers
     // belong to their own tasks: a panic of one stays in this call, and the
     // drain below still runs. Tokio ends its wake at that waker, so the
     // senders behind it may stay unwoken and find the queue closed at their
     // next poll.
-    contain_waker_panic("queue close", Some(owner), || rx.close());
+    contain_waker_panic("queue close", Some(owner.id().as_who()), || rx.close());
     std::sync::atomic::fence(Ordering::SeqCst);
     let mut first = None;
     loop {
@@ -2054,7 +3221,7 @@ fn close_and_drain<R: QueueRx>(rx: &mut R, owner: &ActorId) -> (Option<String>, 
 
 /// Ends a queue that cannot have a slot out for a sender that is still to
 /// push: closed, drained, dropped.
-pub(crate) fn end_queue<R: QueueRx>(mut rx: R, owner: &ActorId) -> Option<String> {
+pub(crate) fn end_queue<R: QueueRx>(mut rx: R, owner: &Owner) -> Option<String> {
     let (mut first, _) = close_and_drain(&mut rx, owner);
     keep_first_of(&mut first, end_value(rx), owner);
     first
@@ -2082,7 +3249,8 @@ pub(crate) fn end_queue<R: QueueRx>(mut rx: R, owner: &ActorId) -> Option<String
 pub(crate) fn end_queue_late<R: QueueRx>(
     mut rx: R,
     system: &ActorSystem,
-    owner: &ActorId,
+    owner: &Owner,
+    record: Option<&AbortRecord>,
 ) -> Option<String> {
     let (mut first, open) = close_and_drain(&mut rx, owner);
     // The queue is empty, and a value can still arrive only through a push
@@ -2092,8 +3260,9 @@ pub(crate) fn end_queue_late<R: QueueRx>(
         if let Ok(rt) = Handle::try_current() {
             // The slot records the task's end, whichever way it ends.
             let task_owner = owner.clone();
+            let helper_owner = HelperOwner::new(owner.id().clone(), record.cloned());
             drop(
-                system.spawn_helper(&rt, HelperKind::LateDrain, Some(owner.clone()), |end| {
+                system.spawn_helper(&rt, HelperKind::LateDrain, Some(helper_owner), |end| {
                     drain_late(LateDrain::new(rx, task_owner, end))
                 }),
             );
@@ -2106,7 +3275,7 @@ pub(crate) fn end_queue_late<R: QueueRx>(
 
 /// Closes a queue, then drops what it holds one value at a time, each drop
 /// caught; returns the first panic.
-fn end_remaining<R: QueueRx>(mut rx: R, owner: &ActorId) -> Option<String> {
+fn end_remaining<R: QueueRx>(mut rx: R, owner: &Owner) -> Option<String> {
     let (mut first, _) = close_and_drain(&mut rx, owner);
     keep_first_of(&mut first, end_value(rx), owner);
     first
@@ -2121,7 +3290,7 @@ struct LateDrain<R: QueueRx> {
 }
 
 impl<R: QueueRx> LateDrain<R> {
-    fn new(rx: R, owner: ActorId, end: EndGuard) -> Self {
+    fn new(rx: R, owner: Owner, end: EndGuard) -> Self {
         Self {
             rx: CaughtDrop::new(rx, end_remaining, owner),
             end: Some(end),
@@ -2174,11 +3343,11 @@ async fn drain_late<R: QueueRx>(mut late: LateDrain<R>) {
 
 /// Logs, with the `tracing` feature, a panic raised while dropping a value
 /// that arrived through a slot reserved before its queue closed.
-pub(crate) fn log_late_drop(payload: &str, owner: &ActorId) {
+pub(crate) fn log_late_drop(payload: &str, owner: &Owner) {
     #[cfg(feature = "tracing")]
     caught_log!(warn,
         actor_id = %owner,
-        panic = %payload,
+        panic = %owner.fields().panic_text(payload),
         "a drop of a value that arrived after its queue closed panicked; the panic is contained"
     );
     #[cfg(not(feature = "tracing"))]
@@ -2187,7 +3356,7 @@ pub(crate) fn log_late_drop(payload: &str, owner: &ActorId) {
 
 /// Drops a supervisor's state: its child factories one at a time, each drop
 /// caught, then the rest.
-fn end_supervision(mut sup: SupervisionState, owner: &ActorId) -> Option<String> {
+fn end_supervision(mut sup: SupervisionState, owner: &Owner) -> Option<String> {
     let mut first = None;
     for (_, factory) in std::mem::take(&mut sup.restart_fns) {
         keep_first_of(&mut first, end_value(factory), owner);
@@ -2198,7 +3367,7 @@ fn end_supervision(mut sup: SupervisionState, owner: &ActorId) -> Option<String>
 
 /// Drops an actor's context: its supervision state first, as
 /// [`end_supervision`] does, then the rest, each drop caught.
-fn end_context<A: Actor>(mut ctx: ActorContext<A>, owner: &ActorId) -> Option<String> {
+fn end_context<A: Actor>(mut ctx: ActorContext<A>, owner: &Owner) -> Option<String> {
     let mut first = ctx
         .take_supervision()
         .and_then(|sup| end_supervision(sup, owner));
@@ -2206,10 +3375,108 @@ fn end_context<A: Actor>(mut ctx: ActorContext<A>, owner: &ActorId) -> Option<St
     first
 }
 
+/// The reason an actor ends with: the cause its `Kill` carries when one does,
+/// otherwise the reason the run loop decided. A cause exists only with a
+/// `Kill` on the lane, so every other reason passes through.
+///
+/// Returns the cause when it replaces the decided reason, and `None` when the
+/// decided reason stands, so the common end copies nothing.
+pub(crate) fn final_cause(
+    decided: &StopReason,
+    kill_cause: Option<StopReason>,
+) -> Option<StopReason> {
+    match (decided, kill_cause) {
+        (StopReason::Kill, Some(cause)) => Some(cause),
+        _ => None,
+    }
+}
+
+/// The reason an actor ends with, as a value.
+#[cfg(test)]
+pub(crate) fn final_reason(decided: StopReason, kill_cause: Option<StopReason>) -> StopReason {
+    final_cause(&decided, kill_cause).unwrap_or(decided)
+}
+
+/// The reason a task dropped before it wrote one is given: a panic when its
+/// own poll is unwinding, else the cause the `Kill` on its lane carries, else
+/// `Kill`. The one place the abort guard and the context drop read it.
+pub(crate) fn aborted_reason(status: &StatusTx, marker: &TaskMarker) -> StopReason {
+    match marker.abort_reason() {
+        StopReason::Kill => status.record().kill_cause().unwrap_or(StopReason::Kill),
+        panicked => panicked,
+    }
+}
+
 /// Writes the actor's final reason into its status plane, once: a plane
 /// that already carries a reason keeps it.
-fn write_final_reason(status: &StatusTx, reason: &StopReason) {
-    StatusValue::write_reason(status, reason.clone(), false);
+fn write_final_reason(status: &StatusTx, reason: &StopReason) -> bool {
+    StatusValue::write_reason(status, reason.clone(), false)
+}
+
+/// The supervisor a registry entry names: `None` for a root, else the
+/// spawning supervisor's id and incarnation number. A child spawned with no
+/// supervisor in its birth names one the registry never holds, so nothing is
+/// guessed for it.
+fn registry_parent(is_root: bool, parent: Option<(&ActorId, u64)>) -> Option<(ActorId, u64)> {
+    if is_root {
+        return None;
+    }
+    Some(match parent {
+        Some((id, seq)) => (id.clone(), seq),
+        None => (ActorId::from(""), crate::telemetry::UNKNOWN_INCARNATION),
+    })
+}
+
+/// Raises the end event of an incarnation whose final reason the caller just
+/// wrote, in the system in hand or the one the record names. The event goes to
+/// the pump, from the task's own end as from drop glue, so no handler runs
+/// before the init ack, the mail drop and the `Stopped` publication that still
+/// follow the reason. Whichever writer wins the reason is the only one that
+/// calls this, so one incarnation raises one end event. Returns the identity
+/// for the log lines that follow; an incarnation spawned with none raises
+/// nothing.
+#[inline]
+pub(crate) fn emit_actor_ended(
+    system: Option<&ActorSystem>,
+    record: &AbortRecord,
+    reason: &StopReason,
+) -> Option<Arc<Identity>> {
+    crate::telemetry::with_mode(record, system, |mode| {
+        ended_event(mode, record, system, reason)
+    })
+    .flatten()
+}
+
+/// The part of [`emit_actor_ended`] that runs only while telemetry is on.
+#[inline(never)]
+fn ended_event(
+    mode: &Arc<crate::telemetry::Mode>,
+    record: &AbortRecord,
+    system: Option<&ActorSystem>,
+    reason: &StopReason,
+) -> Option<Arc<Identity>> {
+    if !mode.armed(EventKind::ActorEnded) {
+        // No sink takes the end: only an identity already recorded is read,
+        // for the log lines, and nothing is looked up.
+        #[cfg(feature = "tracing")]
+        return mode.find(record.key());
+        #[cfg(not(feature = "tracing"))]
+        return None;
+    }
+    let Some(identity) = crate::telemetry::identity_for(mode, record, system, None) else {
+        // Nothing names the incarnation: the end event is lost, and the loss
+        // is counted with the other drops.
+        mode.pump.count_dropped();
+        return None;
+    };
+    mode.push_owned(&identity, EventKind::ActorEnded, || {
+        TelemetryEvent::ActorEnded {
+            actor: identity.actor().clone(),
+            reason: reason.clone(),
+            lifetime: identity.lifetime(),
+        }
+    });
+    Some(identity)
 }
 
 /// Publishes `Stopped` on a plane whose reason is already written.
@@ -2220,33 +3487,70 @@ pub(crate) fn publish_stopped(status: &StatusTx) {
     });
 }
 
+/// Reads the first panic of a signal map function (a monitor's, a link's trap
+/// map or a group monitor's) that failed the actor, kept by the site that raised its
+/// `Failure`, and makes it the exit reason unless a `Kill` or a `Failure`
+/// already stands: the first failure stands. The raise on the stop lane
+/// reaches no reader once the message loop has ended, so this read, made
+/// after the last moment a map function can run and before the reason is
+/// chosen, is the only one for a panic that landed after the loop. The
+/// stop-time stage reports a panic of a map it runs itself.
+fn collect_map_panic<A: Actor>(ctx: &mut ActorContext<A>, stop_reason: &mut StopReason) {
+    if !ctx.has_end_state() {
+        return;
+    }
+    let Some(panic) = ctx.stop_lane().abort_record().map_panic() else {
+        return;
+    };
+    if matches!(stop_reason, StopReason::Kill | StopReason::Failure(_)) {
+        return;
+    }
+    let err = ActorError::Panic(panic);
+    ctx.record_failure(err.clone());
+    *stop_reason = StopReason::Failure(err);
+}
+
 /// Applies a panic raised by a drop before the reason is final (a registered
 /// timer's or stream's item at the forwarders' end, see
 /// `ActorContext::end_forwarders`, a child factory or the supervision state
 /// at the teardown): any reason but an earlier `Kill` or `Failure` becomes the
 /// panic. A panic that leaves an earlier `Kill` or `Failure` as the reason is
 /// logged once with the actor's id, as a drop after the seal is.
-fn end_drop_panicked(stop_reason: &mut StopReason, payload: String, actor_id: &ActorId) {
+fn end_drop_panicked(
+    stop_reason: &mut StopReason,
+    payload: String,
+    actor_id: &ActorId,
+    record: &AbortRecord,
+) {
     if !matches!(stop_reason, StopReason::Kill | StopReason::Failure(_)) {
         *stop_reason = StopReason::Failure(ActorError::Panic(payload));
         return;
     }
     #[cfg(feature = "tracing")]
-    caught_log!(warn,
-        actor_id = %actor_id,
-        reason = %stop_reason,
-        panic = %payload,
-        "a drop before the actor's reason was final panicked; the reason stands"
-    );
+    {
+        let fields = crate::telemetry::log_fields(record, None);
+        caught_log!(warn,
+            actor_id = %actor_id,
+            actor_name = fields.name(),
+            incarnation = fields.incarnation(),
+            system = fields.system(),
+            reason = %fields.reason_text(stop_reason),
+            panic = %fields.panic_text(&payload),
+            "a drop before the actor's reason was final panicked; the reason stands"
+        );
+    }
     #[cfg(not(feature = "tracing"))]
-    let _ = (payload, actor_id);
+    let _ = (payload, actor_id, record);
 }
 
 /// One event from either of the supervisor's two `JoinSet` planes, as
 /// returned by [`next_supervision_event`].
 enum SupervisionEvent {
-    /// A restart attempt resolved (see the restart plane, `restart_set`).
-    Restart(Result<(tokio::task::Id, RestartOutcome), JoinError>),
+    /// A restart attempt resolved (see the restart plane, `restart_set`). The
+    /// outcome is boxed: it is large and rare, and the run loop holds the
+    /// event across its awaits, so an outcome kept inline would be part of
+    /// every actor's run future.
+    Restart(Result<(tokio::task::Id, Box<RestartOutcome>), JoinError>),
     /// A child runner completed (see the death plane, `death_set`).
     Death(Result<(tokio::task::Id, DeathOutcome), JoinError>),
     /// An incarnation received the Unresponsive verdict.
@@ -2280,7 +3584,11 @@ async fn next_supervision_event<A: Actor>(ctx: &mut ActorContext<A>) -> Option<S
             tokio::select! {
                 biased;
                 r = restart_set.join_next_with_id(), if restart_pending => {
-                    r.map(SupervisionEvent::Restart)
+                    r.map(|joined| {
+                        SupervisionEvent::Restart(
+                            joined.map(|(task, outcome)| (task, Box::new(outcome))),
+                        )
+                    })
                 }
                 d = death_set.join_next_with_id(), if death_pending => {
                     d.map(SupervisionEvent::Death)
@@ -2316,6 +3624,13 @@ async fn join_forwarder(
 // Dispatch (user messages only - Stop travels on the stop lane)
 // ---------------------------------------------------------------------------
 
+/// A turn of a message and the chain of `continue_with` steps it asks for:
+/// the form of the callers that hand a message over outside the run loop's
+/// own turns (the receive timeout's message and the final deliveries).
+/// `hot` is the run loop's cache of the handler list while the loop runs,
+/// and `None` once it has ended, where every event of the turn goes through
+/// the pump: the end that follows still owes its steps.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch<A: Actor>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
@@ -2323,77 +3638,656 @@ async fn dispatch<A: Actor>(
     turn_clock: &TurnClock,
     drain: &mut ReplyDrain,
     held: &mut HeldAnswer<A::Response>,
+    mut hot: Option<&mut HotCache>,
 ) -> ControlFlow<StopReason> {
-    match envelope {
-        Envelope::Message { payload, responder } => {
-            // The request's sender is held in a guard for the turn: it is
-            // answered below, or handed to `held` for a failed request, and if
-            // this task unwinds first, its caller's waker is woken inside a
-            // catch and adds no second panic to the unwind.
-            let mut responder = AnswerHold::new(responder);
-            // `begin` and `end` bracket the callback exactly, on every
-            // outcome (normal return, an `Err`, or a caught panic), since
-            // `catch_callback` always completes normally here rather than
-            // unwinding through this function.
-            turn_clock.begin();
-            let outcome = catch_hook(|| actor.handle(payload, ctx)).await;
-            turn_clock.end();
-            #[cfg(test)]
-            end_hooks::run(end_hooks::TURN, ctx.actor_id());
+    let flow = dispatch_one(
+        actor,
+        ctx,
+        envelope,
+        turn_clock,
+        drain,
+        held,
+        false,
+        hot.as_deref_mut(),
+    )
+    .await;
+    if !ctx.has_continuation() {
+        return flow;
+    }
+    continue_chain(actor, ctx, flow, turn_clock, drain, held, hot).await
+}
+
+/// Runs the messages `continue_with` asked for after a callback, one after
+/// the other, before the run loop reads any branch. `flow` is the outcome of
+/// the turn that set the first one. The chain ends, and the message in the
+/// cell is dropped, when a turn ends the actor, when the status reads
+/// `Stopping`, and when a `Kill` is stored: the lane is read before each
+/// step, so a `Kill` is not made to wait out the chain. Each step is a turn
+/// of its own, with its turn events (see [`dispatch`] for `hot`).
+async fn continue_chain<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    mut flow: ControlFlow<StopReason>,
+    turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+    mut hot: Option<&mut HotCache>,
+) -> ControlFlow<StopReason> {
+    loop {
+        // Each step is a message: it spends the task's cooperative budget, so
+        // a chain of steps that never await still yields, and a `Kill` raised
+        // by another task meanwhile is read below, before the next step.
+        tokio::task::consume_budget().await;
+        if flow.is_break() {
+            ctx.drop_continuation();
+            return flow;
+        }
+        if !ctx.has_continuation() {
+            return flow;
+        }
+        if ctx.status() == ActorStatus::Stopping
+            || matches!(ctx.stop_lane().reason(), Some(StopReason::Kill))
+        {
+            ctx.drop_continuation();
+            return flow;
+        }
+        let Some(payload) = ctx.take_continuation() else {
+            return flow;
+        };
+        let envelope = Envelope::Message {
+            payload,
+            responder: None,
+        };
+        flow = dispatch_one(
+            actor,
+            ctx,
+            envelope,
+            turn_clock,
+            drain,
+            held,
+            false,
+            hot.as_deref_mut(),
+        )
+        .await;
+    }
+}
+
+/// Fires one threshold of the idle spell, inline on the actor's task: the
+/// receive timeout's message goes through `dispatch`, the idle hook runs
+/// under the turn clock as a hook turn of its own (`HookKind::OnIdle`, with
+/// its caller token and its turn event). The threshold is marked fired
+/// before it runs, and the turns it causes, the chain of `continue_with`
+/// included, do not end the spell or clear the mark, so a zero length fires
+/// once.
+async fn fire_idle<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    kind: IdleKind,
+    turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+    hot: Option<&mut HotCache>,
+) -> ControlFlow<StopReason> {
+    ctx.set_inline(true);
+    ctx.mark_fired(kind);
+    let flow = match kind {
+        IdleKind::Receive => match ctx.make_receive_message() {
+            None => ControlFlow::Continue(()),
+            Some(Ok(payload)) => {
+                let envelope = Envelope::Message {
+                    payload,
+                    responder: None,
+                };
+                dispatch(actor, ctx, envelope, turn_clock, drain, held, hot).await
+            }
+            Some(Err(panic)) => {
+                let err = ActorError::Panic(panic);
+                ctx.record_failure(err.clone());
+                ControlFlow::Break(StopReason::Failure(err))
+            }
+        },
+        IdleKind::Idle => {
+            // A flag left by an earlier `stop` is not this hook's.
+            let _ = ctx.take_self_stop();
+            let outcome = {
+                let turn = turn_clock.begin();
+                let result =
+                    catch_hook_t(turn_clock.caller_token(turn), || actor.on_idle(ctx)).await;
+                if !turn.is_idle() {
+                    let took = turn_clock.end_timed(turn);
+                    push_turn(
+                        ctx.stop_lane().abort_record(),
+                        turn,
+                        took,
+                        HookKind::OnIdle,
+                        outcome_of(&result),
+                    );
+                }
+                result
+            };
             match outcome {
-                Ok(Ok(response)) => {
-                    // A response nobody receives (a notify, or a send whose
-                    // caller is gone) is dropped here, and its drop is user
-                    // code: caught, its panic is a panic of the turn.
-                    let undelivered = match responder.take() {
-                        Some(tx) => {
-                            drain.replied();
-                            send_contained(tx, Ok(response)).err()
-                        }
-                        None => Some(Ok(response)),
-                    };
-                    match undelivered.and_then(end_value) {
-                        None => ControlFlow::Continue(()),
-                        Some(payload) => {
-                            let err = ActorError::Panic(payload);
-                            ctx.record_failure(err.clone());
-                            ControlFlow::Break(StopReason::Failure(err))
-                        }
+                Ok(Ok(())) => {
+                    if ctx.take_self_stop() {
+                        ctx.drop_continuation();
+                        ControlFlow::Continue(())
+                    } else {
+                        continue_chain(
+                            actor,
+                            ctx,
+                            ControlFlow::Continue(()),
+                            turn_clock,
+                            drain,
+                            held,
+                            hot,
+                        )
+                        .await
                     }
                 }
                 Ok(Err(err)) => {
-                    // Cast-exception parity: an `Err` from `handle` stops
-                    // the actor identically on the notify and send paths. The
-                    // send path additionally has a caller to notify, and its
-                    // answer is held until the actor's name is free and its
-                    // lane is sealed (see `HeldAnswer`).
-                    if let Some(tx) = responder.take() {
-                        held.hold(tx, err.clone());
-                    }
+                    ctx.drop_continuation();
                     ctx.record_failure(err.clone());
                     ControlFlow::Break(StopReason::Failure(err))
                 }
                 Err(payload) => {
-                    // A panic crashes the actor on BOTH paths exactly like a
-                    // returned `Err` does (cast-exception parity, same as the
-                    // arm above): the only difference is the panic payload
-                    // has to be caught and wrapped here instead of being
-                    // handed back verbatim. A send() caller still receives it
-                    // as a matchable error, once the actor has ended.
+                    ctx.drop_continuation();
                     let err = ActorError::Panic(payload_into_string(payload));
-                    if let Some(tx) = responder.take() {
-                        held.hold(tx, err.clone());
-                    }
                     ctx.record_failure(err.clone());
                     ControlFlow::Break(StopReason::Failure(err))
                 }
             }
         }
+    };
+    ctx.set_inline(false);
+    flow
+}
+
+/// What ended a wait on the mailbox and the idle sleep.
+enum Wake<T> {
+    /// The mailbox gave a message.
+    Mail(T),
+    /// The mailbox reported itself closed.
+    Closed,
+    /// The idle sleep for the nearest threshold ended.
+    Idle,
+}
+
+/// Waits on the mailbox and then, behind it, on the idle sleep of an actor that
+/// set a deadline. With no sleep it is the mailbox alone, so the select has no
+/// branch of its own for the idle spell.
+fn mail_or_idle<'a, T>(
+    mailbox: &'a mut MailRx<T>,
+    closed: bool,
+    mut idle: Option<&'a mut Pin<Box<tokio::time::Sleep>>>,
+) -> impl Future<Output = Wake<T>> + 'a {
+    std::future::poll_fn(move |cx| {
+        if !closed {
+            if let Poll::Ready(received) = mailbox.poll_recv(cx) {
+                return Poll::Ready(match received {
+                    Some(envelope) => Wake::Mail(envelope),
+                    None => Wake::Closed,
+                });
+            }
+        }
+        match idle.as_mut() {
+            Some(sleep) => sleep.as_mut().poll(cx).map(|()| Wake::Idle),
+            None => Poll::Pending,
+        }
+    })
+}
+
+/// How a plain turn ended, in one byte. The reason a turn ended the actor with
+/// is written to the run loop's `stop_reason` by [`settle`], so nothing the
+/// size of a `ControlFlow<StopReason>` is returned through memory on the
+/// common turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TurnEnd {
+    /// The loop goes on.
+    Next,
+    /// The turn ended the actor; `stop_reason` holds why.
+    Stop,
+}
+
+/// Turns the outcome of a cold path into a [`TurnEnd`], storing the reason of
+/// a stop in `stop_reason`.
+#[cold]
+#[inline(never)]
+fn settle(flow: ControlFlow<StopReason>, stop_reason: &mut StopReason) -> TurnEnd {
+    match flow {
+        ControlFlow::Continue(()) => TurnEnd::Next,
+        ControlFlow::Break(reason) => {
+            *stop_reason = reason;
+            TurnEnd::Stop
+        }
+    }
+}
+
+/// The first step of a signal envelope: a monitor's notice reaches `handle` as
+/// a message with no responder, unless the monitor was revoked with a flush
+/// while the notice was queued: then its payload is dropped, a drop panic
+/// being a panic of the turn, as an undelivered response's is. `Err` is the
+/// outcome of a turn that runs no handler.
+#[cold]
+#[inline(never)]
+fn open_signal<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    tag: crate::types::SignalTag,
+    payload: A::Message,
+) -> Result<A::Message, ControlFlow<StopReason>> {
+    if tag.shared.is_flushed() {
+        return Err(match end_value(payload) {
+            None => ControlFlow::Continue(()),
+            Some(panic) => {
+                let err = ActorError::Panic(panic);
+                ctx.record_failure(err.clone());
+                ControlFlow::Break(StopReason::Failure(err))
+            }
+        });
+    }
+    ctx.finish_signal(&tag);
+    Ok(payload)
+}
+
+/// Sends the reply of a handler that returned `Ok`, or drops it when nobody
+/// receives it. A response nobody receives (a notify, or a send whose caller
+/// is gone) is dropped here, and its drop is user code: caught, its panic is
+/// returned, and is a panic of the turn. `out` is set when the message had a
+/// caller, to whether the reply reached it (for the debug state).
+#[inline(always)]
+fn deliver<A: Actor>(
+    drain: &mut ReplyDrain,
+    responder: &mut AnswerHold<Result<A::Response, ActorError>>,
+    response: A::Response,
+    out: &mut Option<bool>,
+) -> Option<String> {
+    let undelivered = match responder.take() {
+        Some(tx) => {
+            drain.replied();
+            let sent = send_contained(tx, Ok(response)).err();
+            *out = Some(sent.is_none());
+            sent
+        }
+        None => Some(Ok(response)),
+    };
+    undelivered.and_then(end_value)
+}
+
+/// The turn failed because the drop of an undelivered response panicked.
+#[cold]
+#[inline(never)]
+fn undelivered_panic<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    payload: String,
+) -> ControlFlow<StopReason> {
+    ctx.drop_continuation();
+    let err = ActorError::Panic(payload);
+    ctx.record_failure(err.clone());
+    ControlFlow::Break(StopReason::Failure(err))
+}
+
+/// The events of a `handle` turn that returned `Ok` and whose reply was
+/// sent, raised on the run loop's own task: the debug state's trace entries
+/// of the turn and `TurnFinished`. The loop owes only its next take here, so
+/// the handlers run on this task from the loop's cached list. Kept out of the
+/// turn: an actor with no debug option and no sink of `TurnFinished` never
+/// calls it.
+#[cold]
+#[inline(never)]
+fn turn_done_hot<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    hot: &mut HotCache,
+    turn: TurnMode,
+    took: Option<Duration>,
+    out: Option<bool>,
+) {
+    if ctx.debug_on() {
+        for entry in debug_after_turn(ctx, out).into_iter().flatten() {
+            crate::telemetry::emit_hot(
+                ctx.stop_lane().abort_record(),
+                None,
+                hot,
+                EventKind::Trace,
+                |actor| TelemetryEvent::Trace {
+                    actor: Cow::Borrowed(actor),
+                    entry,
+                },
+            );
+        }
+    }
+    if turn.armed(EventKind::TurnFinished) {
+        crate::telemetry::emit_hot(
+            ctx.stop_lane().abort_record(),
+            None,
+            hot,
+            EventKind::TurnFinished,
+            |actor| TelemetryEvent::TurnFinished {
+                actor: Cow::Borrowed(actor),
+                hook: HookKind::Handle,
+                took: took.unwrap_or_default(),
+                outcome: TurnOutcome::Returned,
+            },
+        );
+    }
+}
+
+/// The same events for a turn whose path still owes the crate a step: a
+/// turn after the run loop ended (a final delivery), or a turn whose handler
+/// stopped its own actor. They are queued on the pump, which runs the
+/// handlers on its helper; nothing runs a handler on this task.
+#[cold]
+#[inline(never)]
+fn turn_done_pumped<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    turn: TurnMode,
+    took: Option<Duration>,
+    out: Option<bool>,
+) {
+    if ctx.debug_on() {
+        for entry in debug_after_turn(ctx, out).into_iter().flatten() {
+            push_about(
+                ctx.stop_lane().abort_record(),
+                None,
+                EventKind::Trace,
+                |actor| TelemetryEvent::Trace {
+                    actor: Cow::Owned(actor.clone()),
+                    entry,
+                },
+            );
+        }
+    }
+    push_turn(
+        ctx.stop_lane().abort_record(),
+        turn,
+        took,
+        HookKind::Handle,
+        TurnOutcome::Returned,
+    );
+}
+
+/// Everything a turn does after its handler returned, but the common case: a
+/// handler that returned `Ok` and did not stop its own actor is finished in
+/// the run loop. The request's sender is held in a guard for the turn: it is
+/// answered, or handed to `held` for a failed request, and if this task
+/// unwinds first, its caller's waker is woken inside a catch and adds no
+/// second panic to the unwind. `turn` and `took` are the turn's mode and
+/// length, for its `TurnFinished`; `hot` is the run loop's cache while the
+/// loop runs (see [`dispatch`]).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn finish_turn<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    mut responder: AnswerHold<Result<A::Response, ActorError>>,
+    outcome: Result<Result<A::Response, ActorError>, crate::actor::panic::PanicPayload>,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+    turn: TurnMode,
+    took: Option<Duration>,
+    hot: Option<&mut HotCache>,
+) -> ControlFlow<StopReason> {
+    match outcome {
+        Ok(Ok(response)) => {
+            // The handler stopped its own actor and returned a reply:
+            // the reply is held to the seal of the stop lane, as a
+            // failed request's answer is (see `HeldAnswer`). The lane
+            // is the top branch of the loop, and a raise leaves an
+            // unseen version, so nothing queued is handled before
+            // the stop is read.
+            let response = if ctx.take_self_stop() {
+                ctx.drop_continuation();
+                match responder.take() {
+                    Some(tx) => {
+                        log_discarded_answer(
+                            held.hold(
+                                tx,
+                                Ok(response),
+                                ctx.actor_id(),
+                                ctx.stop_lane().abort_record(),
+                            ),
+                            ctx.actor_id(),
+                            ctx.stop_lane().abort_record(),
+                        );
+                        turn_done_pumped(ctx, turn, took, None);
+                        return ControlFlow::Continue(());
+                    }
+                    None => {
+                        let mut out = None;
+                        return match deliver::<A>(drain, &mut responder, response, &mut out) {
+                            None => {
+                                turn_done_pumped(ctx, turn, took, out);
+                                ControlFlow::Continue(())
+                            }
+                            Some(payload) => {
+                                push_turn(
+                                    ctx.stop_lane().abort_record(),
+                                    turn,
+                                    took,
+                                    HookKind::Handle,
+                                    TurnOutcome::Panicked,
+                                );
+                                undelivered_panic(ctx, payload)
+                            }
+                        };
+                    }
+                }
+            } else {
+                response
+            };
+            let mut out = None;
+            match deliver::<A>(drain, &mut responder, response, &mut out) {
+                None => {
+                    match hot {
+                        Some(hot) => {
+                            if ctx.debug_on() || turn.armed(EventKind::TurnFinished) {
+                                turn_done_hot(ctx, hot, turn, took, out);
+                            }
+                        }
+                        None => turn_done_pumped(ctx, turn, took, out),
+                    }
+                    ControlFlow::Continue(())
+                }
+                Some(payload) => {
+                    push_turn(
+                        ctx.stop_lane().abort_record(),
+                        turn,
+                        took,
+                        HookKind::Handle,
+                        TurnOutcome::Panicked,
+                    );
+                    undelivered_panic(ctx, payload)
+                }
+            }
+        }
+        Ok(Err(err)) => {
+            push_turn(
+                ctx.stop_lane().abort_record(),
+                turn,
+                took,
+                HookKind::Handle,
+                TurnOutcome::Failed,
+            );
+            // Cast-exception parity: an `Err` from `handle` stops
+            // the actor identically on the notify and send paths. The
+            // send path additionally has a caller to notify, and its
+            // answer is held until the actor's name is free and its
+            // lane is sealed (see `HeldAnswer`).
+            if let Some(tx) = responder.take() {
+                log_discarded_answer(
+                    held.hold(
+                        tx,
+                        Err(err.clone()),
+                        ctx.actor_id(),
+                        ctx.stop_lane().abort_record(),
+                    ),
+                    ctx.actor_id(),
+                    ctx.stop_lane().abort_record(),
+                );
+            }
+            ctx.drop_continuation();
+            ctx.record_failure(err.clone());
+            ControlFlow::Break(StopReason::Failure(err))
+        }
+        Err(payload) => {
+            push_turn(
+                ctx.stop_lane().abort_record(),
+                turn,
+                took,
+                HookKind::Handle,
+                TurnOutcome::Panicked,
+            );
+            // A panic crashes the actor on BOTH paths exactly like a
+            // returned `Err` does (cast-exception parity, same as the
+            // arm above): the only difference is the panic payload
+            // has to be caught and wrapped here instead of being
+            // handed back verbatim. A send() caller still receives it
+            // as a matchable error, once the actor has ended.
+            let err = ActorError::Panic(payload_into_string(payload));
+            if let Some(tx) = responder.take() {
+                log_discarded_answer(
+                    held.hold(
+                        tx,
+                        Err(err.clone()),
+                        ctx.actor_id(),
+                        ctx.stop_lane().abort_record(),
+                    ),
+                    ctx.actor_id(),
+                    ctx.stop_lane().abort_record(),
+                );
+            }
+            ctx.drop_continuation();
+            ctx.record_failure(err.clone());
+            ControlFlow::Break(StopReason::Failure(err))
+        }
+    }
+}
+
+/// The general turn, for the callers that are not the run loop's plain path
+/// (the priority lane, the continuation chain, the idle fire and the final
+/// deliveries). It follows the same steps as the plain turn in the run loop,
+/// its turn events included. `priority` says which lane the message came
+/// from, for the debug state; `hot` is the run loop's cache while the loop
+/// runs (see [`dispatch`]).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    envelope: ActorEnvelope<A>,
+    turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+    priority: bool,
+    hot: Option<&mut HotCache>,
+) -> ControlFlow<StopReason> {
+    let (payload, responder) = match envelope {
+        Envelope::Signal { tag, payload } => match open_signal(ctx, tag, payload) {
+            Ok(payload) => (payload, None),
+            Err(flow) => return flow,
+        },
+        Envelope::Message { payload, responder } => (payload, responder),
+    };
+    let responder = AnswerHold::new(responder);
+    // `begin` and `end` bracket the callback exactly, on every
+    // outcome (normal return, an `Err`, or a caught panic), since
+    // `catch_hook_t` always completes normally here rather than
+    // unwinding through this function.
+    ctx.clear_self_stop();
+    let turn = turn_clock.begin();
+    // The debug state, when the actor has any option on: the message is
+    // counted and logged inside the turn, so an installed function that
+    // blocks is a turn the watchdog sees. An actor with none pays this one
+    // test.
+    if let Some(state) = ctx.debug_mut() {
+        state.message_in(responder.is_some(), priority);
+    }
+    // One poll site, as in the run loop's plain turn: the caller token is
+    // `0`, and sets nothing, for a turn that records no wait.
+    let outcome = catch_hook_t(turn_clock.caller_token(turn), || actor.handle(payload, ctx)).await;
+    let took = if turn.is_idle() {
+        None
+    } else {
+        turn_clock.end_timed(turn)
+    };
+    #[cfg(test)]
+    end_hooks::run(end_hooks::TURN, ctx.actor_id());
+    finish_turn(ctx, responder, outcome, drain, held, turn, took, hot)
+}
+
+/// The outcome of a plain turn as the general form, for the chain of
+/// `continue_with` steps: a stop moves its reason out of `stop_reason`, which
+/// [`settle`] writes back when the chain ends.
+#[cold]
+#[inline(never)]
+fn flow_of(end: TurnEnd, stop_reason: &mut StopReason) -> ControlFlow<StopReason> {
+    match end {
+        TurnEnd::Next => ControlFlow::Continue(()),
+        TurnEnd::Stop => ControlFlow::Break(std::mem::replace(stop_reason, StopReason::Graceful)),
+    }
+}
+
+/// Runs the messages `continue_with` asked for after a turn of the run loop's
+/// plain path. Kept out of line: a turn that set none never gets here.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+async fn chain_after<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    flow: ControlFlow<StopReason>,
+    turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+    gave_back: &mut bool,
+    hot: &mut HotCache,
+) -> ControlFlow<StopReason> {
+    watch_yield(
+        || continue_chain(actor, ctx, flow, turn_clock, drain, held, Some(hot)),
+        gave_back,
+    )
+    .await
+}
+
+/// Logs, with the `tracing` feature, the panic from dropping an earlier held
+/// answer that a newer one replaced. The newer answer decides the turn, so the
+/// panic is not the actor's reason.
+fn log_discarded_answer(panic: Option<String>, owner: &ActorId, record: &AbortRecord) {
+    #[cfg(feature = "tracing")]
+    if let Some(panic) = &panic {
+        caught_log!(warn,
+            actor_id = %owner,
+            panic = %crate::telemetry::log_fields(record, None).panic_text(panic),
+            "dropping an answer a newer one replaced panicked; the panic is contained"
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (panic, owner, record);
+}
+
+/// What the debug state does once a turn returned and its reply is sent: the
+/// reply is counted and logged when the message had a caller (`out` carries
+/// whether it was delivered), and the entries of the turn come back for the
+/// trace to raise, none while the trace is off. Kept out of the turn's future,
+/// which an actor with no debug option never enters.
+#[inline(never)]
+fn debug_after_turn<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    out: Option<bool>,
+) -> [Option<DebugEntry>; 2] {
+    let Some(state) = ctx.debug_mut() else {
+        return [None, None];
+    };
+    if let Some(delivered) = out {
+        state.message_out(delivered);
+    }
+    if state.is_tracing() {
+        state.take_traced()
+    } else {
+        [None, None]
     }
 }
 
 /// The answer to the one request whose handler failed (an `Err` or a panic),
-/// held by the run loop to the seal of its stop lane.
+/// or whose handler stopped its own actor and replied, held by the run loop
+/// to the seal of its stop lane.
 ///
 /// A caller reads a crash the way an Erlang/OTP `gen_server:call` caller does,
 /// through its monitor, after the process is dead: the answer goes out when
@@ -2405,47 +4299,119 @@ async fn dispatch<A: Actor>(
 /// end of its runtime, its own unwind), drop the sender unanswered, and the
 /// caller reads the final reason from the status plane. The sender is held in
 /// an [`AnswerHold`], so the drop that wakes the caller never panics into an
-/// unwind of the task. The slot is boxed, so an actor that never fails a
-/// request holds one pointer.
+/// unwind of the task, and the answer's value is dropped inside a catch on
+/// every path, the task's end before the seal included, a panic of that drop
+/// logged with the actor's id. The slot is boxed, so an actor that never fails
+/// a request holds one pointer.
 struct HeldAnswer<R> {
     slot: Option<Box<HeldReply<R>>>,
 }
 
-/// A failed request's reply channel and the error its caller is answered with.
-type HeldReply<R> = (AnswerHold<Result<R, ActorError>>, ActorError);
+/// A held request's reply channel and the answer its caller is answered with:
+/// the handler's error, or the reply of a handler that stopped its actor; with
+/// the actor's id and record, which name the actor in the log line of a panic
+/// from dropping the answer.
+struct HeldReply<R> {
+    sender: AnswerHold<Result<R, ActorError>>,
+    answer: Result<R, ActorError>,
+    owner: ActorId,
+    record: AbortRecord,
+}
 
 impl<R> HeldAnswer<R> {
     const fn new() -> Self {
         Self { slot: None }
     }
 
-    /// Keeps the answer for the seal. The loop ends at the failed request, so
-    /// at most one is held.
-    fn hold(&mut self, tx: oneshot::Sender<Result<R, ActorError>>, err: ActorError) {
-        debug_assert!(
-            self.slot.is_none(),
-            "a loop that failed ends at the request"
-        );
-        self.slot = Some(Box::new((AnswerHold::new(Some(tx)), err)));
+    /// Keeps the answer for the seal. A failed request ends the loop at that
+    /// request, and a self-stop is read by the loop before the next message
+    /// is taken, so one answer is held at a time; an earlier one is sent
+    /// first, so no caller is left unanswered. Returns the payload of a panic
+    /// from dropping that earlier answer, which the caller logs: the answer
+    /// that is held now decides the turn.
+    fn hold(
+        &mut self,
+        tx: oneshot::Sender<Result<R, ActorError>>,
+        answer: Result<R, ActorError>,
+        owner: &ActorId,
+        record: &AbortRecord,
+    ) -> Option<String> {
+        let discarded = self.release_now();
+        self.slot = Some(Box::new(HeldReply {
+            sender: AnswerHold::new(Some(tx)),
+            answer,
+            owner: owner.clone(),
+            record: record.clone(),
+        }));
+        discarded
+    }
+
+    /// Sends the held answer at once, whatever the actor's end: the stop that
+    /// held it was vetoed, and the actor keeps running. Returns the payload of
+    /// a panic from dropping an answer nobody received.
+    fn release_now(&mut self) -> Option<String> {
+        let HeldReply {
+            mut sender, answer, ..
+        } = *self.slot.take()?;
+        let Some(tx) = sender.take() else {
+            return end_value(answer);
+        };
+        send_contained(tx, answer).err().and_then(end_value)
     }
 
     /// Sends the held answer unless a `Kill` ended the actor: its caller then
-    /// reads the final reason, `Kill`, from the status plane.
-    fn deliver(&mut self, final_reason: &StopReason) {
-        if let Some(held) = self.slot.take() {
-            let (mut answer, err) = *held;
-            if let Some(tx) = answer.take() {
-                if matches!(final_reason, StopReason::Kill) {
-                    // Dropping the sender wakes the caller, who then reads
-                    // `Kill`; a panic from that caller's waker stays out of
-                    // this task.
-                    contain_waker_panic("reply", None, move || drop(tx));
-                } else {
-                    let _ = send_contained(tx, Err(err));
-                }
-            }
+    /// reads the final reason, `Kill`, from the status plane. Returns the
+    /// payload of a panic from dropping an answer nobody received.
+    fn deliver(&mut self, final_reason: &StopReason) -> Option<String> {
+        if !matches!(final_reason, StopReason::Kill) {
+            return self.release_now();
         }
+        let HeldReply {
+            mut sender, answer, ..
+        } = *self.slot.take()?;
+        if let Some(tx) = sender.take() {
+            // Dropping the sender wakes the caller, who then reads `Kill`; a
+            // panic from that caller's waker stays out of this task.
+            contain_waker_panic("reply", None, move || drop(tx));
+        }
+        end_value(answer)
     }
+}
+
+/// A task that ends before the seal (an abort, the end of its runtime, its
+/// own unwind) drops the held answer here: the sender unanswered, inside the
+/// catch of its [`AnswerHold`], and the value inside a catch, so a panic of
+/// its drop neither leaves the task's drop nor adds a second panic to an
+/// unwind.
+impl<R> Drop for HeldAnswer<R> {
+    fn drop(&mut self) {
+        let Some(held) = self.slot.take() else {
+            return;
+        };
+        let HeldReply {
+            sender,
+            answer,
+            owner,
+            record,
+        } = *held;
+        drop(sender);
+        log_unsealed_answer(end_value(answer), &owner, &record);
+    }
+}
+
+/// Logs, with the `tracing` feature, a panic from dropping a held answer at a
+/// task end before the seal.
+fn log_unsealed_answer(panic: Option<String>, owner: &ActorId, record: &AbortRecord) {
+    #[cfg(feature = "tracing")]
+    if let Some(panic) = &panic {
+        caught_log!(warn,
+            actor_id = %owner,
+            panic = %crate::telemetry::log_fields(record, None).panic_text(panic),
+            "dropping a held answer at the end of the actor's task panicked; the panic is contained"
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (panic, owner, record);
 }
 
 /// How many turns the run loop may run, once a reply is known to stand alone,
@@ -2479,7 +4445,7 @@ fn answer_status(
     drain: &mut ReplyDrain,
 ) {
     let crate::types::StatusRequest { reply, task } = request;
-    let delivered = send_contained(reply, info).is_ok();
+    let delivered = send_contained(reply, Box::new(info)).is_ok();
     if !task {
         *fp_skip = STATUS_FAST_PATH_OFF_TURNS;
     }
@@ -2533,8 +4499,8 @@ async fn requeue() {
 
 /// Polls a turn's future and records whether it returned pending, that is,
 /// whether the task gave its worker back while the turn ran.
-async fn watch_yield<F: Future>(turn: F, yielded: &mut bool) -> F::Output {
-    let mut turn = std::pin::pin!(turn);
+async fn watch_yield<F: Future>(start: impl FnOnce() -> F, yielded: &mut bool) -> F::Output {
+    let mut turn = std::pin::pin!(start());
     std::future::poll_fn(|cx| {
         let polled = turn.as_mut().poll(cx);
         if polled.is_pending() {
@@ -2903,7 +4869,7 @@ fn route_report(
     };
     let record = |sup: &mut SupervisionState, pending: DownPending| {
         if let Some(child) = sup.registry.get_mut(id) {
-            let _ = child.transition(ChildLifecycle::Down {
+            child.transition_expected(ChildLifecycle::Down {
                 incarnation,
                 pending,
             });
@@ -3017,16 +4983,108 @@ fn take_chain_order(sup: &mut SupervisionState) -> Option<ChainStart> {
     }
 }
 
+/// Queues the death event of the child incarnation `incarnation`, with the
+/// decision the event carries: the supervisor's own identity names the
+/// supervisor (its id read as a root with incarnation 0 when it was spawned
+/// with none), and the child's reference is rebuilt from it. Called before
+/// the callback, with the decision already made, so the budget event of the
+/// same death comes first.
+fn emit_child_died<A: Actor>(ctx: &ActorContext<A>, event: &ChildEvent, incarnation: u64) {
+    crate::telemetry::with_mode(
+        ctx.stop_lane().abort_record(),
+        ctx.system_in_hand(),
+        |mode| {
+            if !mode.armed(EventKind::ChildDied) {
+                return;
+            }
+            let (supervisor, owner) = crate::telemetry::supervisor_of(
+                mode,
+                ctx.stop_lane().abort_record(),
+                ctx.actor_id(),
+            );
+            crate::telemetry::push_for(mode, owner.as_ref(), EventKind::ChildDied, || {
+                TelemetryEvent::ChildDied {
+                    child: ActorRef::for_child_of(&supervisor, event.child_id.clone(), incarnation),
+                    supervisor,
+                    reason: event.reason.clone(),
+                    decision: event.action,
+                }
+            });
+        },
+    );
+}
+
+/// Queues the budget event of one charge against the restart budget of the
+/// supervisor behind `ctx`: the death of `child` (the incarnation
+/// `incarnation`) was charged, and the charge stands as `charge` says.
+fn emit_restart_budget<A: Actor>(
+    ctx: &ActorContext<A>,
+    child: &ActorId,
+    incarnation: u64,
+    charge: &BudgetCharge,
+) {
+    // The charge that exhausts the budget is the one the supervisor does not
+    // accept: it stops there, so this is the only report of it.
+    if !charge.accepted {
+        reports::reached_max_restart_intensity(
+            ctx.actor_id(),
+            child,
+            incarnation,
+            charge.max,
+            charge.window,
+        );
+    }
+    crate::telemetry::with_mode(
+        ctx.stop_lane().abort_record(),
+        ctx.system_in_hand(),
+        |mode| {
+            if !mode.armed(EventKind::RestartBudget) {
+                return;
+            }
+            let (supervisor, owner) = crate::telemetry::supervisor_of(
+                mode,
+                ctx.stop_lane().abort_record(),
+                ctx.actor_id(),
+            );
+            crate::telemetry::push_for(mode, owner.as_ref(), EventKind::RestartBudget, || {
+                TelemetryEvent::RestartBudget {
+                    child: ActorRef::for_child_of(&supervisor, child.clone(), incarnation),
+                    supervisor,
+                    used: charge.used,
+                    max: charge.max,
+                    window: charge.window,
+                    accepted: charge.accepted,
+                }
+            });
+        },
+    );
+}
+
 /// Delivers one `on_child_stopped`; a failing callback stops the supervisor.
 async fn deliver_child_event<A: Actor>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
     event: &ChildEvent,
+    incarnation: u64,
 ) -> ControlFlow<StopReason> {
+    emit_child_died(ctx, event, incarnation);
     let clock = ctx.turn_clock();
-    clock.begin();
-    let delivered = catch_hook(|| actor.on_child_stopped(event, ctx)).await;
-    clock.end();
+    let turn = clock.begin();
+    let delivered = catch_hook_t(clock.caller_token(turn), || {
+        actor.on_child_stopped(event, ctx)
+    })
+    .await;
+    let took = clock.end_timed(turn);
+    push_turn(
+        ctx.stop_lane().abort_record(),
+        turn,
+        took,
+        HookKind::OnChildStopped,
+        outcome_of(&delivered),
+    );
+    // The chain does not run after this callback: a message it asked for is
+    // dropped here, not carried to a later event.
+    ctx.drop_continuation();
     match delivered {
         Ok(Ok(())) => ControlFlow::Continue(()),
         Ok(Err(err)) => {
@@ -3071,10 +5129,23 @@ async fn handle_child_stopped<A: Actor>(
     ctx: &mut ActorContext<A>,
     event: ChildStoppedInternal,
 ) -> ControlFlow<StopReason> {
+    handle_child_stopped_with(actor, ctx, event, true).await
+}
+
+/// [`handle_child_stopped`]. `terminated` says whether the supervisor's
+/// report `child_terminated` covers the first report: false for the end of a
+/// restart attempt that never started an incarnation, which is reported as a
+/// `start_error` where the attempt's outcome is handled.
+async fn handle_child_stopped_with<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    event: ChildStoppedInternal,
+    terminated: bool,
+) -> ControlFlow<StopReason> {
     // The report in hand is held apart from the worklist, so the worklist
     // allocates only when a second report queues behind it.
     let mut work: VecDeque<ChildStoppedInternal> = VecDeque::new();
-    let flow = handle_worklist(actor, ctx, Some(event), &mut work).await;
+    let flow = handle_worklist_with(actor, ctx, Some(event), &mut work, terminated).await;
     if flow.is_break() {
         // The loop ends with reports still in the worklist: they are
         // collected for their own deliveries.
@@ -3085,16 +5156,82 @@ async fn handle_child_stopped<A: Actor>(
     flow
 }
 
+/// The debt of one reported death: owed to the supervision state's decision
+/// until the pass over it ends, which clears it on every path out, an early
+/// return or an unwind included, unless the pass keeps it.
+struct Decision {
+    owner: Option<AbortRecord>,
+    incarnation: u64,
+    kept: bool,
+}
+
+impl Decision {
+    fn new(owner: Option<AbortRecord>, incarnation: u64) -> Self {
+        Self {
+            owner,
+            incarnation,
+            kept: false,
+        }
+    }
+
+    /// The report is parked or goes through the worklist again: the debt
+    /// stays until the pass that decides it.
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Decision {
+    fn drop(&mut self) {
+        if !self.kept {
+            if let Some(owner) = &self.owner {
+                crate::telemetry::death_decided(owner, self.incarnation);
+            }
+        }
+    }
+}
+
 /// Runs the worklist of [`handle_child_stopped`] until it is empty: `first`
 /// is handled before anything in `work`, and a report pushed back to the
 /// front of `work` is handled next.
 async fn handle_worklist<A: Actor>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
-    mut first: Option<ChildStoppedInternal>,
+    first: Option<ChildStoppedInternal>,
     work: &mut VecDeque<ChildStoppedInternal>,
 ) -> ControlFlow<StopReason> {
+    handle_worklist_with(actor, ctx, first, work, true).await
+}
+
+/// [`handle_worklist`]; `first_terminated` says whether the supervisor's
+/// report `child_terminated` covers `first`.
+async fn handle_worklist_with<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    mut first: Option<ChildStoppedInternal>,
+    work: &mut VecDeque<ChildStoppedInternal>,
+    first_terminated: bool,
+) -> ControlFlow<StopReason> {
+    let mut terminated = first_terminated;
     while let Some(ev) = first.take().or_else(|| work.pop_front()) {
+        // Only the first report of the call can be an attempt's: the rest
+        // came from the worklist and are deaths of incarnations.
+        let reports_death = std::mem::replace(&mut terminated, true);
+        // The death in hand is owed a decision until this pass over it ends
+        // (the restart it started has its ticket by then), whichever way it
+        // ends; a pass that parks or re-queues the report keeps the debt.
+        let mut decision = Decision::new(
+            ctx.supervision_ref()
+                .and_then(|sup| sup.registry.owner_record()),
+            ev.incarnation,
+        );
+        // The end of a child whose awaited start failed: it kept no spec, so
+        // its report changes nothing and reaches no callback.
+        if ctx.supervision_mut().is_some_and(|sup| {
+            !sup.silenced.is_empty() && sup.take_silenced(&ev.child_id, ev.incarnation)
+        }) {
+            continue;
+        }
         // Manual-completion delivery: `stop_child`/`terminate_child` already
         // classified this exact incarnation's disposition the moment its real
         // fate was observed (see `ActorContext::manual_stop_child`) and
@@ -3143,7 +5280,7 @@ async fn handle_worklist<A: Actor>(
                             pending: DownPending::Snapshot,
                         })
                     {
-                        let _ = child.transition(ChildLifecycle::Down {
+                        child.transition_expected(ChildLifecycle::Down {
                             incarnation: ev.incarnation,
                             pending: DownPending::None,
                         });
@@ -3170,7 +5307,7 @@ async fn handle_worklist<A: Actor>(
                     advance_and_initiate(ctx, work);
                 }
             }
-            deliver_child_event(actor, ctx, &child_event).await?;
+            deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
             continue;
         }
 
@@ -3197,6 +5334,7 @@ async fn handle_worklist<A: Actor>(
                 kind,
                 ev.reason.clone(),
             );
+            decision.keep();
             work.push_front(ev);
             // The report goes on through the worklist; on a panic of the
             // factory's drop it stays there, first, for the final deliveries.
@@ -3225,7 +5363,10 @@ async fn handle_worklist<A: Actor>(
         };
 
         match routed {
-            Routed::Queued => continue,
+            Routed::Queued => {
+                decision.keep();
+                continue;
+            }
             Routed::Deliver(mut action) => {
                 // A caller's `terminate_child` on this member during the
                 // group's Stopping phase wins over the group's default
@@ -3256,7 +5397,7 @@ async fn handle_worklist<A: Actor>(
                     reason: ev.reason,
                     action,
                 };
-                deliver_child_event(actor, ctx, &child_event).await?;
+                deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
                 continue;
             }
             Routed::ChainRetry => {
@@ -3264,10 +5405,13 @@ async fn handle_worklist<A: Actor>(
                 // spawn error, or the fresh incarnation died before
                 // adoption): the whole group is laid out again, charging the
                 // budget once (OTP try_again_restart parity).
-                let budget_ok = ctx
+                let charge = ctx
                     .supervision_mut()
-                    .map(|sup| sup.budget.check_and_record())
-                    .unwrap_or(false);
+                    .map(|sup| sup.budget.check_and_record());
+                if let Some(charge) = &charge {
+                    emit_restart_budget(ctx, &ev.child_id, ev.incarnation, charge);
+                }
+                let budget_ok = charge.is_some_and(|charge| charge.accepted);
                 if budget_ok {
                     retry_group(actor, ctx, work, &ev).await?;
                     continue;
@@ -3282,7 +5426,7 @@ async fn handle_worklist<A: Actor>(
                     reason: ev.reason,
                     action: SupervisionAction::BudgetExhausted,
                 };
-                deliver_child_event(actor, ctx, &child_event).await?;
+                deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
                 ctx.record_failure(SupervisionError::BudgetExhausted.into());
                 return ControlFlow::Break(StopReason::ParentRequest);
             }
@@ -3295,9 +5439,34 @@ async fn handle_worklist<A: Actor>(
             .and_then(|sup| sup.registry.get(&ev.child_id))
             .and_then(|child| child.name.as_deref().map(str::to_string));
 
-        let outcome = ctx
-            .supervision_mut()
-            .map(|sup| evaluate_strategy(sup, &ev.child_id, &ev.reason));
+        // The supervisor's report of the death, before the decision it leads
+        // to, as Erlang/OTP's `do_restart` writes it.
+        if cfg!(feature = "tracing") && reports_death {
+            if let Some((restart_type, sensitive)) = ctx
+                .supervision_ref()
+                .and_then(|sup| sup.registry.get(&ev.child_id))
+                .map(|child| (child.spec.restart_type, child.spec.sys.sensitive))
+            {
+                reports::child_terminated(
+                    ctx.actor_id(),
+                    &ev.child_id,
+                    ev.incarnation,
+                    restart_type,
+                    &ev.reason,
+                    sensitive,
+                );
+            }
+        }
+
+        let mut charged = None;
+        let outcome = ctx.supervision_mut().map(|sup| {
+            evaluate_strategy_charged(sup, &ev.child_id, &ev.reason, &mut |incarnation, charge| {
+                charged = Some((incarnation, charge));
+            })
+        });
+        if let Some((incarnation, charge)) = &charged {
+            emit_restart_budget(ctx, &ev.child_id, *incarnation, charge);
+        }
 
         let mut removed = None;
         let action = match outcome {
@@ -3359,13 +5528,24 @@ async fn handle_worklist<A: Actor>(
                         manual_overrides: HashMap::new(),
                         scope,
                     }));
+                    sup.note_group();
                     advance_stop_queue(sup);
                 }
                 SupervisionAction::RestartInitiated
             }
             Some(StrategyOutcome::Remove) => {
+                // Read before the spec is pruned: the end is one the
+                // supervisor did not order, so it may shut the supervisor
+                // down.
+                let due = ctx
+                    .supervision_ref()
+                    .is_some_and(|sup| sup.auto_shutdown_due(&ev.child_id));
                 removed = prune_spec_if_needed(ctx, &ev.child_id);
-                SupervisionAction::Removed
+                if due {
+                    SupervisionAction::AutoShutdown
+                } else {
+                    SupervisionAction::Removed
+                }
             }
             Some(StrategyOutcome::BudgetExhausted) => SupervisionAction::BudgetExhausted,
         };
@@ -3380,7 +5560,7 @@ async fn handle_worklist<A: Actor>(
             reason: ev.reason,
             action,
         };
-        deliver_child_event(actor, ctx, &child_event).await?;
+        deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
 
         if matches!(action, SupervisionAction::BudgetExhausted) {
             ctx.record_failure(SupervisionError::BudgetExhausted.into());
@@ -3388,6 +5568,15 @@ async fn handle_worklist<A: Actor>(
             // `shutdown` (our ParentRequest), so its own supervisor's
             // Transient policy does not restart it. Direct break: not
             // vetoable by pre_stop.
+            return ControlFlow::Break(StopReason::ParentRequest);
+        }
+
+        if matches!(action, SupervisionAction::AutoShutdown) {
+            // The supervisor shuts down as OTP's `shutdown` exit (our
+            // ParentRequest), with nothing recorded as a failure: its own
+            // supervisor's Transient policy does not restart it. Direct
+            // break, not vetoable by pre_stop; the deaths still pending are
+            // delivered as `SupervisorStopping` before `on_stopped`.
             return ControlFlow::Break(StopReason::ParentRequest);
         }
     }
@@ -3472,6 +5661,7 @@ async fn retry_group<A: Actor>(
             manual_overrides: overrides,
             scope,
         }));
+        sup.note_group();
         advance_stop_queue(sup);
     }
     // The ledger and the group hold the whole plan: the factories the
@@ -3503,6 +5693,7 @@ fn start_restart_chain<A: Actor>(
             started: HashMap::new(),
             scope: start.scope,
         });
+        sup.note_group();
         advance_restart_chain(sup, work)
     } else {
         ChainStep::Done
@@ -3522,6 +5713,7 @@ async fn handle_restart_outcome<A: Actor>(
     ctx: &mut ActorContext<A>,
     outcome: RestartOutcome,
 ) -> ControlFlow<StopReason> {
+    let stopped = matches!(outcome, RestartOutcome::Stopped { .. });
     match outcome {
         RestartOutcome::Adopted {
             child_id,
@@ -3530,6 +5722,7 @@ async fn handle_restart_outcome<A: Actor>(
             new_join,
             guard,
             io,
+            ended,
         } => {
             adopt_restart(
                 actor,
@@ -3538,6 +5731,7 @@ async fn handle_restart_outcome<A: Actor>(
                 incarnation,
                 new_stop_lane,
                 new_join,
+                ended,
                 guard,
                 io,
             )
@@ -3553,6 +5747,32 @@ async fn handle_restart_outcome<A: Actor>(
             incarnation,
             reason,
         } => {
+            if let Some(sup) = ctx.supervision_mut() {
+                sup.settle_attempt(&child_id, incarnation, || {
+                    if stopped {
+                        AttemptOutcome::Abandoned
+                    } else {
+                        AttemptOutcome::Failed {
+                            reason: reason.clone(),
+                        }
+                    }
+                });
+            }
+            // An attempt that failed to start is a `start_error` of the
+            // supervisor; one that ended under a stop order is not.
+            if cfg!(feature = "tracing") && !stopped {
+                let sensitive = ctx
+                    .supervision_ref()
+                    .and_then(|sup| sup.registry.get(&child_id))
+                    .is_some_and(|child| child.spec.sys.sensitive);
+                reports::start_error(
+                    ctx.actor_id(),
+                    &child_id,
+                    Some(incarnation),
+                    || reason.clone(),
+                    sensitive,
+                );
+            }
             // An attempt's incarnation that ended under a stop order is
             // reported like a failed one: the end of the incarnation the
             // ledger holds as the attempt's.
@@ -3561,7 +5781,7 @@ async fn handle_restart_outcome<A: Actor>(
                 reason,
                 incarnation,
             };
-            handle_child_stopped(actor, ctx, event).await
+            handle_child_stopped_with(actor, ctx, event, false).await
         }
         RestartOutcome::Cancelled {
             child_id,
@@ -3574,6 +5794,7 @@ async fn handle_restart_outcome<A: Actor>(
             // delivered.
             let mut begin_chain = None;
             if let Some(sup) = ctx.supervision_mut() {
+                sup.settle_attempt(&child_id, incarnation, || AttemptOutcome::Abandoned);
                 record_cancelled(sup, &child_id, incarnation);
                 if settle_barrier(sup, &child_id, incarnation) {
                     begin_chain = advance_group_stop(sup);
@@ -3610,10 +5831,13 @@ async fn handle_restart_outcome<A: Actor>(
             // is down with nothing owed, and nothing is charged, delivered or
             // evaluated. The supervisor leaves its loop with the failure, so
             // its own supervisor decides.
+            let err: ActorError = SupervisionError::ChildUnresponsive(child_id.clone()).into();
             if let Some(sup) = ctx.supervision_mut() {
+                sup.settle_attempt(&child_id, incarnation, || AttemptOutcome::Failed {
+                    reason: StopReason::Failure(err.clone()),
+                });
                 record_cancelled(sup, &child_id, incarnation);
             }
-            let err: ActorError = SupervisionError::ChildUnresponsive(child_id).into();
             ctx.record_failure(err.clone());
             ControlFlow::Break(StopReason::Failure(err))
         }
@@ -3626,7 +5850,7 @@ fn record_cancelled(sup: &mut SupervisionState, child_id: &ActorId, incarnation:
     if let Some(child) = sup.registry.get_mut(child_id) {
         if matches!(child.lifecycle, ChildLifecycle::Restarting { next, .. } if next == incarnation)
         {
-            let _ = child.transition(ChildLifecycle::Down {
+            child.transition_expected(ChildLifecycle::Down {
                 incarnation,
                 pending: DownPending::None,
             });
@@ -3658,6 +5882,7 @@ async fn adopt_restart<A: Actor>(
     seq: u64,
     new_stop_lane: StopLane,
     new_join: JoinHandle<StopReason>,
+    ended: Option<StopReason>,
     guard: ChildLinkGuard,
     io: SlotIo,
 ) -> ControlFlow<StopReason> {
@@ -3673,6 +5898,28 @@ async fn adopt_restart<A: Actor>(
         accepted,
         "an adoption concerns the attempt the ledger holds"
     );
+    if let Some(sup) = ctx.supervision_mut() {
+        // The runner's claim comes before the attempt settles: an adopted
+        // incarnation that already ended is owed from here, so the attempt
+        // in flight and the death owed are never both absent.
+        if accepted {
+            claim_death(
+                sup.registry.owner_record().as_ref(),
+                &child_id,
+                seq,
+                new_stop_lane.abort_record(),
+            );
+        }
+        sup.settle_attempt(&child_id, seq, || {
+            if accepted {
+                AttemptOutcome::Adopted
+            } else {
+                AttemptOutcome::Abandoned
+            }
+        });
+        #[cfg(test)]
+        end_hooks::run(end_hooks::SETTLED, &child_id);
+    }
     if !accepted {
         // Superseded restart (a newer seq is pending or the spec is gone):
         // dropping the guard kills the stray instance through the ordinary
@@ -3682,6 +5929,24 @@ async fn adopt_restart<A: Actor>(
         drop(guard);
         drop(new_join);
         return ControlFlow::Continue(());
+    }
+    // A restart the supervisor decided is reported at info, one the caller
+    // asked for with `restart_child` at debug.
+    if cfg!(feature = "tracing") {
+        let by_hand = ctx
+            .supervision_ref()
+            .and_then(|sup| sup.registry.get(&child_id))
+            .is_some_and(|child| child.origin == Origin::Manual);
+        reports::progress(
+            ctx.actor_id(),
+            &child_id,
+            seq,
+            if by_hand {
+                reports::Progress::Started
+            } else {
+                reports::Progress::Restarted
+            },
+        );
     }
 
     let mut step = ChainStep::Hold;
@@ -3693,15 +5958,18 @@ async fn adopt_restart<A: Actor>(
             .registry
             .get(&child_id)
             .map_or(DEFAULT_KILL_GRACE, |child| child.spec.kill_grace);
+        let owner = sup.registry.owner_record();
         let task = spawn_runner(
             &mut sup.death_set,
             child_id.clone(),
             seq,
             new_join,
+            ended,
             new_stop_lane,
             io,
             guard,
             kill_grace,
+            owner,
         );
         sup.task_owner
             .insert(task.id(), (child_id.clone(), seq, TaskPlane::Death));
@@ -4005,8 +6273,11 @@ fn absorb_records(
                     (None, None) => None,
                 };
                 if let Some(report) = report {
+                    // Absorbed into the group's restart: no decision of its
+                    // own is owed.
+                    sup.death_decided(report.incarnation);
                     if let Some(child) = sup.registry.get_mut(id) {
-                        let _ = child.transition(ChildLifecycle::Down {
+                        child.transition_expected(ChildLifecycle::Down {
                             incarnation: n,
                             pending: DownPending::None,
                         });
@@ -4042,7 +6313,7 @@ fn absorb_records(
                     .get(id)
                     .map_or(StopReason::Kill, |child| child.ctl.end_reason());
                 if let Some(child) = sup.registry.get_mut(id) {
-                    let _ = child.transition(ChildLifecycle::Down {
+                    child.transition_expected(ChildLifecycle::Down {
                         incarnation: n,
                         pending: DownPending::Snapshot,
                     });
@@ -4094,8 +6365,10 @@ async fn deliver_absorbed<A: Actor>(
     ctx: &mut ActorContext<A>,
     mut deliveries: VecDeque<(ChildEvent, u64)>,
 ) -> ControlFlow<StopReason> {
-    while let Some((event, _)) = deliveries.pop_front() {
-        if let ControlFlow::Break(reason) = deliver_child_event(actor, ctx, &event).await {
+    while let Some((event, incarnation)) = deliveries.pop_front() {
+        if let ControlFlow::Break(reason) =
+            deliver_child_event(actor, ctx, &event, incarnation).await
+        {
             owe_deliveries(ctx, deliveries);
             return ControlFlow::Break(reason);
         }
@@ -4136,7 +6409,7 @@ fn drop_removed<A: Actor>(
     ctx: &mut ActorContext<A>,
     removed: impl IntoIterator<Item = RestartFn>,
 ) -> Option<ActorError> {
-    let owner = ctx.actor_id().clone();
+    let owner = ctx.owner();
     let mut first = None;
     for factory in removed {
         keep_first_of(&mut first, end_value(factory), &owner);
@@ -4179,20 +6452,38 @@ fn owe_deliveries<A: Actor>(ctx: &mut ActorContext<A>, deliveries: VecDeque<(Chi
 /// closure (which captured the child's id, name, and config by value).
 fn initiate_restart<A: Actor>(ctx: &mut ActorContext<A>, child_id: &ActorId, origin: Origin) {
     let seq = ctx.resolved_system().next_incarnation();
-    if let Some(sup) = ctx.supervision_mut() {
-        sup.initiate(child_id, seq, origin);
-    }
+    ctx.initiate_attempt(child_id, seq, origin);
 }
 
 /// A pending group restart that can make progress only through members that
 /// carry the Unresponsive verdict ends the supervisor: it records and stops
 /// with `ChildUnresponsive` for the first such member in reverse start order,
-/// so its own parent decides.
+/// so its own parent decides. So does a stop in progress whose occupant
+/// carries the verdict when no caller waits on it or was told (`orphans`,
+/// read when a verdict woke the loop): a `begin_stop_child`, a
+/// `begin_terminate_child`, or an awaited stop whose caller dropped its
+/// future. A verdict a caller waits for, or was told, is that caller's to
+/// decide.
+fn check_verdicts<A: Actor>(ctx: &mut ActorContext<A>, orphans: bool) -> Option<StopReason> {
+    let sup = ctx.supervision_ref()?;
+    let id = group_blocked_verdict(sup).or_else(|| {
+        if orphans {
+            unreported_stop_verdict(sup)
+        } else {
+            None
+        }
+    })?;
+    let err: ActorError = SupervisionError::ChildUnresponsive(id).into();
+    ctx.record_failure(err.clone());
+    Some(StopReason::Failure(err))
+}
+
+/// The member the pending group restart is blocked on, when it can make
+/// progress only through members that carry the verdict.
 ///
 /// In the stop phase the members are those the barrier still waits for; in
 /// the chain phase it is the front member's own restart attempt.
-fn check_verdicts<A: Actor>(ctx: &mut ActorContext<A>) -> Option<StopReason> {
-    let sup = ctx.supervision_ref()?;
+fn group_blocked_verdict(sup: &SupervisionState) -> Option<ActorId> {
     let entries: Vec<(ActorId, bool)> = match sup.pending_group.as_ref()? {
         GroupPhase::Stopping(group) => {
             let mut entries: Vec<(ActorId, bool)> = sup
@@ -4220,10 +6511,25 @@ fn check_verdicts<A: Actor>(ctx: &mut ActorContext<A>) -> Option<StopReason> {
             }
         }
     };
-    let id = rules::barrier_blocked_only_by_verdicts(&entries)?;
-    let err: ActorError = SupervisionError::ChildUnresponsive(id).into();
-    ctx.record_failure(err.clone());
-    Some(StopReason::Failure(err))
+    rules::barrier_blocked_only_by_verdicts(&entries)
+}
+
+/// The child, newest first, whose stop in progress carries the Unresponsive
+/// verdict with no caller to report it.
+fn unreported_stop_verdict(sup: &SupervisionState) -> Option<ActorId> {
+    // Newest first, each entry read only when the scan reaches it.
+    rules::unreported_verdict(sup.registry.iter().rev().map(|child| {
+        let stopping = matches!(child.lifecycle, ChildLifecycle::Stopping { .. });
+        (
+            &child.id,
+            rules::StopVerdictFact {
+                stopping,
+                verdict: stopping && child.ctl.is_unresponsive(),
+                ended: child.ctl.fate().is_some() || child.ctl.status_ended(),
+                audience: child.ctl.verdict_has_audience(),
+            },
+        )
+    }))
 }
 
 /// What the teardown reads of a child when its turn comes.
@@ -4243,24 +6549,28 @@ fn walk_child(child: &ChildState) -> rules::WalkChild {
     }
 }
 
-/// Logs the end of a child its supervisor's teardown stopped, when the end
-/// is not an orderly one. Changes no state and runs no callback.
+/// Logs, at error level on the `tokio_actors::supervisor` target, the end of a
+/// child its supervisor's teardown stopped, when the end is not an orderly
+/// one. Changes no state and runs no callback.
 #[allow(unused_variables)]
-fn warn_unexpected_end(
+fn report_unexpected_end(
     supervisor: &ActorId,
     child: &ActorId,
     incarnation: u64,
     reason: &StopReason,
     restart_type: RestartType,
     shutdown: Shutdown,
+    sensitive: bool,
 ) {
     if !rules::teardown_end_is_orderly(reason, restart_type, shutdown) {
         #[cfg(feature = "tracing")]
-        caught_log!(warn,
+        caught_log!(error,
+            target: "tokio_actors::supervisor",
+            report = "shutdown_error",
             supervisor = %supervisor,
             child = %child,
             incarnation,
-            reason = %reason,
+            reason = %crate::telemetry::LogFields::of_sensitive(sensitive).reason_text(reason),
             "child ended unexpectedly while its supervisor stopped it"
         );
     }
@@ -4276,11 +6586,12 @@ fn warn_unexpected_end(
 /// attempt was adopted, and the end it reported, if any.
 fn record_restart_outcome(
     sup: &mut SupervisionState,
-    supervisor: &ActorId,
+    supervisor: &Owner,
     outcome: RestartOutcome,
     warn: bool,
     drop_panic: &mut Option<String>,
 ) -> (ActorId, u64, Option<AdoptedRunner>, Option<StopReason>) {
+    let stopped = matches!(outcome, RestartOutcome::Stopped { .. });
     match outcome {
         RestartOutcome::Adopted {
             child_id,
@@ -4289,10 +6600,29 @@ fn record_restart_outcome(
             new_join,
             guard,
             io,
+            ended,
         } => {
             let accepted = sup.registry.get(&child_id).is_some_and(|child| {
                 matches!(child.lifecycle, ChildLifecycle::Restarting { next, .. } if next == incarnation)
             });
+            // Claimed before the settle, as an adoption in the loop is.
+            if accepted {
+                claim_death(
+                    sup.registry.owner_record().as_ref(),
+                    &child_id,
+                    incarnation,
+                    new_stop_lane.abort_record(),
+                );
+            }
+            sup.settle_attempt(&child_id, incarnation, || {
+                if accepted {
+                    AttemptOutcome::Adopted
+                } else {
+                    AttemptOutcome::Abandoned
+                }
+            });
+            #[cfg(test)]
+            end_hooks::run(end_hooks::SETTLED, &child_id);
             if !accepted {
                 // Superseded: dropping the guard kills the stray
                 // incarnation through the ordinary ladder.
@@ -4304,15 +6634,18 @@ fn record_restart_outcome(
                 .registry
                 .get(&child_id)
                 .map_or(DEFAULT_KILL_GRACE, |child| child.spec.kill_grace);
+            let owner = sup.registry.owner_record();
             let task = spawn_runner(
                 &mut sup.death_set,
                 child_id.clone(),
                 incarnation,
                 new_join,
+                ended,
                 new_stop_lane,
                 io,
                 guard,
                 kill_grace,
+                owner,
             );
             sup.task_owner
                 .insert(task.id(), (child_id.clone(), incarnation, TaskPlane::Death));
@@ -4344,14 +6677,24 @@ fn record_restart_outcome(
             incarnation,
             reason,
         } => {
+            sup.settle_attempt(&child_id, incarnation, || {
+                if stopped {
+                    AttemptOutcome::Abandoned
+                } else {
+                    AttemptOutcome::Failed {
+                        reason: reason.clone(),
+                    }
+                }
+            });
             if let (true, Some(child)) = (warn, sup.registry.get(&child_id)) {
-                warn_unexpected_end(
+                report_unexpected_end(
                     supervisor,
                     &child_id,
                     incarnation,
                     &reason,
                     child.spec.restart_type,
                     child.spec.shutdown,
+                    child.spec.sys.sensitive,
                 );
             }
             (child_id, incarnation, None, Some(reason))
@@ -4361,6 +6704,7 @@ fn record_restart_outcome(
             incarnation,
             drop_panic: panic,
         } => {
+            sup.settle_attempt(&child_id, incarnation, || AttemptOutcome::Abandoned);
             record_cancelled(sup, &child_id, incarnation);
             keep_first_of(drop_panic, panic, supervisor);
             (child_id, incarnation, None, None)
@@ -4369,6 +6713,11 @@ fn record_restart_outcome(
             child_id,
             incarnation,
         } => {
+            sup.settle_attempt(&child_id, incarnation, || AttemptOutcome::Failed {
+                reason: StopReason::Failure(
+                    SupervisionError::ChildUnresponsive(child_id.clone()).into(),
+                ),
+            });
             record_cancelled(sup, &child_id, incarnation);
             (child_id, incarnation, None, None)
         }
@@ -4489,8 +6838,16 @@ mod status_sender_tests;
 mod status_fast_path_tests;
 
 #[cfg(test)]
+#[path = "task_key_tests.rs"]
+mod task_key_tests;
+
+#[cfg(test)]
 #[path = "bounded_run.rs"]
 mod bounded_run;
+
+#[cfg(test)]
+#[path = "system_hold_tests.rs"]
+mod system_hold_tests;
 
 #[cfg(test)]
 #[path = "own_unwind_tests.rs"]
@@ -4511,7 +6868,7 @@ mod keep_first_tests {
         #[cfg(feature = "tracing")]
         let logged = crate::actor::supervision::lost_runner::capture::install();
         let token = uuid::Uuid::new_v4();
-        let owner = ActorId::from(format!("keep-first-{token}"));
+        let owner = Owner::new(ActorId::from(format!("keep-first-{token}")), false);
         let mut first = None;
         keep_first_of(&mut first, None, &owner);
         keep_first_of(&mut first, Some(format!("kept {token}")), &owner);
@@ -4587,6 +6944,8 @@ mod teardown_adoption_tests {
                 start_timeout: None,
                 kill_grace: DEFAULT_KILL_GRACE,
                 is_supervisor: false,
+                significant: false,
+                sys: crate::actor::sys::SysOptions::default(),
             },
             ctl,
             lifecycle: ChildLifecycle::Restarting {
@@ -4631,8 +6990,9 @@ mod teardown_adoption_tests {
             new_join: join,
             guard,
             io,
+            ended: None,
         };
-        let supervisor = ActorId::from("supervisor");
+        let supervisor = Owner::new(ActorId::from("supervisor"), false);
         let (_, _, adopted, _) =
             record_restart_outcome(&mut sup, &supervisor, outcome, false, &mut None);
         assert!(adopted.is_some(), "the attempt is adopted");
@@ -4669,7 +7029,7 @@ fn record_collected_end(sup: &mut SupervisionState, child_id: &ActorId, incarnat
             ChildLifecycle::Down { incarnation: n, .. } => n,
         };
         if held == incarnation {
-            let _ = child.transition(ChildLifecycle::Down {
+            child.transition_expected(ChildLifecycle::Down {
                 incarnation,
                 pending: DownPending::None,
             });
@@ -4693,13 +7053,18 @@ fn drain_restart_for_teardown<A: Actor>(
     joined: Result<(tokio::task::Id, RestartOutcome), JoinError>,
     drop_panic: &mut Option<String>,
 ) -> Option<(ActorId, u64, bool)> {
-    let supervisor = ctx.actor_id().clone();
+    let supervisor = ctx.owner();
     match joined {
         Ok((task, outcome)) => {
             let sup = ctx.supervision_mut()?;
-            sup.task_owner.remove(&task);
+            // An attempt the final collection reported from its status plane
+            // was not stopped by the teardown: its end is not logged as one.
+            let warn = !sup
+                .task_owner
+                .remove(&task)
+                .is_some_and(|(child, incarnation, _)| sup.reported_early(&child, incarnation));
             let (child, incarnation, adopted, ended) =
-                record_restart_outcome(sup, &supervisor, outcome, true, drop_panic);
+                record_restart_outcome(sup, &supervisor, outcome, warn, drop_panic);
             if ended.is_some() {
                 record_collected_end(sup, &child, incarnation);
             }
@@ -4727,32 +7092,167 @@ fn drain_restart_for_teardown<A: Actor>(
 }
 
 /// One stop the teardown waits for: the child, the incarnation whose end
-/// settles it, whether the incarnation is a restart attempt, and the watch on
-/// its slot's cell.
+/// settles it, whether the incarnation is a restart attempt, whether the
+/// final collection already collected its end (so the end is not logged as
+/// one of a stop the teardown made), and the watch on its slot's cell.
 struct StopWait {
     id: ActorId,
     token: u64,
     attempt: bool,
+    collected: bool,
     watch: CellWatch,
 }
 
 /// A wait on a slot's cell that owns its watch.
 type CellWait = Pin<Box<dyn Future<Output = CellOutcome> + Send>>;
 
-/// Resolves with the index and outcome of the first of `cells` that settled,
-/// and drops it. Pending while none has.
-fn next_settled(cells: &mut [Option<CellWait>]) -> impl Future<Output = (usize, CellOutcome)> + '_ {
-    std::future::poll_fn(move |cx| {
-        for (index, slot) in cells.iter_mut().enumerate() {
-            if let Some(wait) = slot {
-                if let Poll::Ready(outcome) = wait.as_mut().poll(cx) {
-                    *slot = None;
+/// The waits of a teardown, each polled only after its own waker fired, so
+/// one settled wait costs one poll of that wait and not a poll of every wait
+/// still pending.
+///
+/// Each wait gets a waker of its own ([`WaitWaker`]). Its wake puts the
+/// wait's index on the shared queue, once until the wait is polled again, and
+/// wakes the task that polls the set, inside the crate's catch. A poll takes
+/// the queue and polls only those waits. The queue's lock is never held
+/// across a poll of a wait or a wake.
+struct SettleSet {
+    waits: Vec<Option<CellWait>>,
+    wakers: Vec<(Arc<WaitWaker>, std::task::Waker)>,
+    woken: Arc<Woken>,
+    pending: usize,
+    #[cfg(test)]
+    polls: usize,
+}
+
+/// The indices of the waits woken since the set last took them, and the
+/// waker of the task that polls the set.
+#[derive(Default)]
+struct Woken(std::sync::Mutex<WokenQueue>);
+
+#[derive(Default)]
+struct WokenQueue {
+    indices: VecDeque<usize>,
+    parent: Option<std::task::Waker>,
+}
+
+impl Woken {
+    fn queue(&self) -> std::sync::MutexGuard<'_, WokenQueue> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The waker of one wait of a [`SettleSet`].
+struct WaitWaker {
+    index: usize,
+    /// Whether the index is on the queue and the wait not yet polled since.
+    queued: AtomicBool,
+    woken: Arc<Woken>,
+}
+
+impl std::task::Wake for WaitWaker {
+    fn wake(self: Arc<Self>) {
+        self.put_on_queue();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.put_on_queue();
+    }
+}
+
+impl WaitWaker {
+    /// Queues the wait's index, unless it is queued already, and wakes the
+    /// task that polls the set.
+    fn put_on_queue(&self) {
+        if self.queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let parent = {
+            let mut queue = self.woken.queue();
+            queue.indices.push_back(self.index);
+            queue.parent.clone()
+        };
+        if let Some(parent) = parent {
+            contain_waker_panic("teardown wait", None, move || parent.wake());
+        }
+    }
+}
+
+impl SettleSet {
+    /// Every wait starts on the queue, so its first poll registers it.
+    fn new(waits: Vec<CellWait>) -> Self {
+        let woken = Arc::new(Woken::default());
+        let wakers = (0..waits.len())
+            .map(|index| {
+                let waker = Arc::new(WaitWaker {
+                    index,
+                    queued: AtomicBool::new(true),
+                    woken: woken.clone(),
+                });
+                let handle = std::task::Waker::from(waker.clone());
+                (waker, handle)
+            })
+            .collect();
+        woken.queue().indices.extend(0..waits.len());
+        Self {
+            pending: waits.len(),
+            waits: waits.into_iter().map(Some).collect(),
+            wakers,
+            woken,
+            #[cfg(test)]
+            polls: 0,
+        }
+    }
+
+    /// The waits that have not settled.
+    fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// Resolves with the index and outcome of a wait that settled, and drops
+    /// it. Pending while none of the woken waits has.
+    fn next_settled(&mut self) -> impl Future<Output = (usize, CellOutcome)> + '_ {
+        std::future::poll_fn(move |cx| {
+            let mut taken = {
+                let mut queue = self.woken.queue();
+                if !queue
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.will_wake(cx.waker()))
+                {
+                    queue.parent = Some(cx.waker().clone());
+                }
+                std::mem::take(&mut queue.indices)
+            };
+            while let Some(index) = taken.pop_front() {
+                let (flag, waker) = &self.wakers[index];
+                // Cleared before the poll: a wake from here on queues the
+                // wait again.
+                flag.queued.swap(false, Ordering::AcqRel);
+                let Some(wait) = self.waits[index].as_mut() else {
+                    continue;
+                };
+                #[cfg(test)]
+                {
+                    self.polls += 1;
+                }
+                let mut wait_cx = std::task::Context::from_waker(waker);
+                if let Poll::Ready(outcome) = wait.as_mut().poll(&mut wait_cx) {
+                    self.waits[index] = None;
+                    self.pending -= 1;
+                    if !taken.is_empty() {
+                        // Not polled yet: still queued, so put them back first.
+                        let mut queue = self.woken.queue();
+                        taken.append(&mut queue.indices);
+                        queue.indices = taken;
+                    }
                     return Poll::Ready((index, outcome));
                 }
             }
-        }
-        Poll::Pending
-    })
+            Poll::Pending
+        })
+    }
 }
 
 /// Waits for the given stops to settle and records the ends. The restart
@@ -4763,6 +7263,11 @@ fn next_settled(cells: &mut [Option<CellWait>]) -> impl Future<Output = (usize, 
 /// restart-plane task working for it (its report was taken before the wait);
 /// an Unresponsive verdict ends it at once. A factory drop panic a drained
 /// attempt carries is kept in `drop_panic`.
+///
+/// No restart-plane task is started while the teardown waits (the factories
+/// are gone), so the restart-plane keys of the targets, read once here, change
+/// only when this wait drains one of their tasks, and a counter of the
+/// targets not yet done replaces a scan of every target at every wake.
 async fn settle_children<A: Actor>(
     ctx: &mut ActorContext<A>,
     waits: Vec<StopWait>,
@@ -4771,47 +7276,66 @@ async fn settle_children<A: Actor>(
 ) -> Teardown {
     let supervisor = ctx.actor_id().clone();
     let mut targets: Vec<(ActorId, u64, bool)> = Vec::with_capacity(waits.len());
-    let mut cells: Vec<Option<CellWait>> = Vec::with_capacity(waits.len());
+    let mut cells: Vec<CellWait> = Vec::with_capacity(waits.len());
+    let mut reported = Vec::with_capacity(waits.len());
     for wait in waits {
         let StopWait {
             id,
             token,
             attempt,
+            collected,
             mut watch,
         } = wait;
         targets.push((id, token, attempt));
-        cells.push(Some(Box::pin(async move {
-            await_cell(&mut watch, token).await
-        })));
+        reported.push(collected);
+        cells.push(Box::pin(async move { await_cell(&mut watch, token).await }));
     }
+    let mut cells = SettleSet::new(cells);
     let mut settled: Vec<Option<CellOutcome>> = targets.iter().map(|_| None).collect();
-    let mut reported = vec![false; targets.len()];
+    let mut done = vec![false; targets.len()];
+    let mut remaining = targets.len();
+    // Every target by its key, and the keys a restart-plane task works for.
+    let mut by_key: HashMap<(ActorId, u64), Vec<usize>> = HashMap::new();
+    for (index, (id, token, _)) in targets.iter().enumerate() {
+        by_key.entry((id.clone(), *token)).or_default().push(index);
+    }
+    let mut restart_keys: HashSet<(ActorId, u64)> = ctx
+        .supervision_ref()
+        .map(|sup| {
+            sup.task_owner
+                .values()
+                .filter(|(owner, incarnation, plane)| {
+                    *plane == TaskPlane::Restart
+                        && by_key.contains_key(&(owner.clone(), *incarnation))
+                })
+                .map(|(owner, incarnation, _)| (owner.clone(), *incarnation))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A target is done once its cell settled and, for an attempt, its own
+    // report was drained, or no task of the restart plane works for it any
+    // more (its report was taken before this wait: the final collection
+    // takes it); an Unresponsive verdict ends it at once.
+    let finished = |index: usize,
+                    targets: &[(ActorId, u64, bool)],
+                    settled: &[Option<CellOutcome>],
+                    restart_keys: &HashSet<(ActorId, u64)>| {
+        let (id, token, attempt) = &targets[index];
+        settled[index].as_ref().is_some_and(|outcome| {
+            !attempt
+                || matches!(outcome, CellOutcome::Unresponsive)
+                || !restart_keys.contains(&(id.clone(), *token))
+        })
+    };
     if kill_stored(stop_rx) {
         return Teardown::Killed;
     }
     while let Some(sup) = ctx.supervision_mut() {
-        // A target is done once its cell settled and, for an attempt, its own
-        // report was drained, or no task of the restart plane works for it
-        // any more (its report was taken before this wait: the final
-        // collection takes it); an Unresponsive verdict ends it at once.
-        let all_done = targets
-            .iter()
-            .zip(&settled)
-            .all(|((id, token, attempt), outcome)| match outcome {
-                Some(outcome) => {
-                    !attempt
-                        || matches!(outcome, CellOutcome::Unresponsive)
-                        || !sup.task_owner.values().any(|(owner, incarnation, plane)| {
-                            owner == id && incarnation == token && *plane == TaskPlane::Restart
-                        })
-                }
-                None => false,
-            });
-        if all_done {
+        if remaining == 0 {
             break;
         }
         let restart_pending = !sup.restart_set.is_empty();
-        let cells_pending = cells.iter().any(Option::is_some);
+        let cells_pending = cells.pending() > 0;
         tokio::select! {
             biased;
             // A `Kill` raised while the teardown waits turns the rest of it
@@ -4824,19 +7348,43 @@ async fn settle_children<A: Actor>(
                     Ok(()) => {}
                 }
             }
-            (index, outcome) = next_settled(&mut cells), if cells_pending => {
+            (index, outcome) = cells.next_settled(), if cells_pending => {
                 settled[index] = Some(outcome);
+                if !done[index] && finished(index, &targets, &settled, &restart_keys) {
+                    done[index] = true;
+                    remaining -= 1;
+                }
             }
             joined = sup.restart_set.join_next_with_id(), if restart_pending => {
                 if let Some(joined) = joined {
-                    if let Some((child, incarnation, adopted)) =
-                        drain_restart_for_teardown(ctx, joined, drop_panic)
-                    {
-                        for (index, (id, token, attempt)) in targets.iter_mut().enumerate() {
-                            if *id == child && *token == incarnation {
-                                *attempt = false;
-                                reported[index] = !adopted;
-                            }
+                    let task = match &joined {
+                        Ok((task, _)) => *task,
+                        Err(err) => err.id(),
+                    };
+                    let joined_key = sup
+                        .task_owner
+                        .get(&task)
+                        .filter(|(_, _, plane)| *plane == TaskPlane::Restart)
+                        .map(|(owner, incarnation, _)| (owner.clone(), *incarnation));
+                    let drained = drain_restart_for_teardown(ctx, joined, drop_panic);
+                    let mut touched: Vec<usize> = Vec::new();
+                    if let Some(key) = joined_key {
+                        restart_keys.remove(&key);
+                        touched.extend(by_key.get(&key).into_iter().flatten().copied());
+                    }
+                    if let Some((child, incarnation, adopted)) = drained {
+                        let key = (child, incarnation);
+                        restart_keys.remove(&key);
+                        for &index in by_key.get(&key).into_iter().flatten() {
+                            targets[index].2 = false;
+                            reported[index] |= !adopted;
+                            touched.push(index);
+                        }
+                    }
+                    for index in touched {
+                        if !done[index] && finished(index, &targets, &settled, &restart_keys) {
+                            done[index] = true;
+                            remaining -= 1;
                         }
                     }
                 }
@@ -4852,13 +7400,14 @@ async fn settle_children<A: Actor>(
         }
         let (id, token, _) = &targets[index];
         if let Some(child) = ctx.supervision_ref().and_then(|sup| sup.registry.get(id)) {
-            warn_unexpected_end(
+            report_unexpected_end(
                 &supervisor,
                 id,
                 *token,
                 &fate.reason,
                 child.spec.restart_type,
                 child.spec.shutdown,
+                child.spec.sys.sensitive,
             );
         }
     }
@@ -4910,6 +7459,7 @@ fn begin_child_stop(id: &ActorId, child: &ChildState, action: TeardownAction) ->
         id: id.clone(),
         token,
         attempt,
+        collected: false,
         watch: child.ctl.watch(),
     })
 }
@@ -4942,7 +7492,10 @@ async fn stop_all_children<A: Actor>(
         Some(sup) => {
             let factories = std::mem::take(&mut sup.restart_fns);
             sup.pending_group = None;
-            sup.queued_triggers.clear();
+            sup.note_group();
+            for report in std::mem::take(&mut sup.queued_triggers) {
+                sup.death_decided(report.incarnation);
+            }
             (
                 sup.config.strategy,
                 sup.registry
@@ -4955,7 +7508,7 @@ async fn stop_all_children<A: Actor>(
         None => return Teardown::Done,
     };
     // The child factories are dropped one at a time, each drop caught.
-    let supervisor = ctx.actor_id().clone();
+    let supervisor = ctx.owner();
     for (_, factory) in factories {
         keep_first_of(drop_panic, end_value(factory), &supervisor);
     }
@@ -5005,6 +7558,43 @@ async fn stop_all_children<A: Actor>(
             }
         }
     }
+    // The incarnations whose ends the final collection took from their
+    // status planes and whose tasks have not returned: the ledger holds them
+    // down, and the supervisor publishes its end only once each incarnation
+    // ended. No signal is raised: each is ending already. An attempt's wait
+    // is bounded by the attempt's own ladder; a runner's ladder is armed with
+    // the child's own policy, as the walk's order would arm it.
+    let reported: Vec<StopWait> = ctx
+        .supervision_ref()
+        .map(|sup| {
+            sup.reported_ends()
+                .into_iter()
+                .map(|(id, token, attempt, watch)| {
+                    if !attempt {
+                        if let Some(child) = sup.registry.get(&id) {
+                            if let Some(ctl) = child.slot_of(token) {
+                                ctl.order_bound(child.spec.shutdown);
+                            }
+                        }
+                    }
+                    StopWait {
+                        id,
+                        token,
+                        attempt,
+                        collected: true,
+                        watch,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !reported.is_empty() {
+        #[cfg(test)]
+        end_hooks::run(end_hooks::REPORTED_WAIT, &supervisor);
+        if settle_children(ctx, reported, stop_rx, drop_panic).await == Teardown::Killed {
+            return Teardown::Killed;
+        }
+    }
     if let Some(sup) = ctx.take_supervision() {
         keep_first_of(drop_panic, end_supervision(sup, &supervisor), &supervisor);
     }
@@ -5033,6 +7623,130 @@ fn kill_stored(stop_rx: &LaneRx) -> bool {
     matches!(stop_rx.borrow().reason, Some(StopReason::Kill))
 }
 
+/// How the strict start's wait for the supervisor's children ended.
+enum StrictOutcome {
+    /// Every child spawned while starting finished its initialization.
+    Done,
+    /// A `Kill` is stored on the supervisor's lane.
+    Killed,
+    /// A child's initialization failed: the supervisor's start fails with it.
+    Failed(ActorError),
+}
+
+/// Resolves when a `Kill` is stored on the lane, without marking any version
+/// seen: a request of another kind stays for the message loop, which reads it
+/// after the start. The wake slot is the run loop's own, armed only while
+/// this future is polled and disarmed when it drops.
+struct KillStored<'a> {
+    rx: &'a LaneRx,
+    slot: &'a crate::types::WakeSlot,
+}
+
+impl Future for KillStored<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if kill_stored(self.rx) {
+            return Poll::Ready(());
+        }
+        self.slot.register(cx.waker());
+        if kill_stored(self.rx) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for KillStored<'_> {
+    fn drop(&mut self) {
+        self.slot.disarm();
+    }
+}
+
+/// The strict start's wait: for each child spawned while the supervisor
+/// started, in the order they were spawned, until its initialization is
+/// acknowledged. The children initialize concurrently; only the wait is in
+/// order. The wait has no bound of its own (the start bound of the
+/// supervisor's spawn, if any, cuts it); a `Kill` ends it at once. A child
+/// that fails, or ended before its initialization finished without its
+/// supervisor removing, replacing or ordering that end, fails the start with
+/// [`ActorError::ChildStart`]. Each acknowledgment belongs to the incarnation
+/// that owes it: what the ledger holds for the child decides only for that
+/// incarnation, and its failure reason is read from that incarnation's slot.
+async fn await_strict_children<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    stop_rx: &LaneRx,
+) -> StrictOutcome {
+    let acks = match ctx.supervision_mut() {
+        Some(sup) => sup.take_strict_acks(),
+        None => return StrictOutcome::Done,
+    };
+    let record = ctx.stop_lane().abort_record().clone();
+    for (child, incarnation, mut ack) in acks {
+        let answer = tokio::select! {
+            biased;
+            () = KillStored { rx: stop_rx, slot: record.reader() } => {
+                return StrictOutcome::Killed;
+            }
+            answer = &mut ack => answer,
+        };
+        let kind = match &answer {
+            Ok(Ok(())) => StrictAckKind::Ok,
+            Ok(Err(_)) => StrictAckKind::Err,
+            Err(_closed) => StrictAckKind::Closed {
+                ordered: {
+                    let held = ctx
+                        .supervision_ref()
+                        .and_then(|sup| sup.registry.get(&child));
+                    strict_closed_ordered(
+                        held.map(|state| state.lifecycle.occupant()),
+                        incarnation,
+                        held.and_then(|state| state.slot_of(incarnation))
+                            .is_some_and(|ctl| ctl.order_before_end()),
+                    )
+                },
+            },
+        };
+        if strict_step(kind) == StrictStep::Next {
+            continue;
+        }
+        let error = match answer {
+            Ok(Err(err)) => err,
+            _ => {
+                // The child ended before it acknowledged: its final reason is
+                // the error, `Failure`'s own, else a description.
+                let status = ctx
+                    .supervision_ref()
+                    .and_then(|sup| sup.registry.get(&child))
+                    .and_then(|state| state.slot_of(incarnation))
+                    .and_then(|ctl| ctl.status());
+                let reason = match status {
+                    Some(mut status) => {
+                        tokio::select! {
+                            biased;
+                            () = KillStored { rx: stop_rx, slot: record.reader() } => {
+                                return StrictOutcome::Killed;
+                            }
+                            reason = crate::system::wait_final_reason(&mut status) => reason,
+                        }
+                    }
+                    None => StopReason::Kill,
+                };
+                match reason {
+                    StopReason::Failure(err) => err,
+                    other => ActorError::user(format!("child ended during start: {other}")),
+                }
+            }
+        };
+        return StrictOutcome::Failed(ActorError::ChildStart {
+            child,
+            error: Box::new(error),
+        });
+    }
+    StrictOutcome::Done
+}
+
 /// Pushes one collected report, with the child's name as the ledger (or a
 /// pending snapshot of the end) holds it, and records the end in the ledger.
 fn collect_report(
@@ -5040,6 +7754,11 @@ fn collect_report(
     out: &mut Vec<Collected>,
     report: ChildStoppedInternal,
 ) {
+    // Collected for the final deliveries: no restart is owed for it.
+    sup.death_decided(report.incarnation);
+    if !sup.silenced.is_empty() && sup.take_silenced(&report.child_id, report.incarnation) {
+        return;
+    }
     let name = sup
         .registry
         .get(&report.child_id)
@@ -5057,6 +7776,21 @@ fn collect_report(
     out.push(Collected { report, name });
 }
 
+/// As [`collect_report`], for the report a runner returned to the final
+/// collection: dropped when the collection already took that incarnation's
+/// death from its status plane (`early`), so each death is collected once.
+fn collect_runner(
+    sup: &mut SupervisionState,
+    out: &mut Vec<Collected>,
+    early: &HashSet<(ActorId, u64)>,
+    report: ChildStoppedInternal,
+) {
+    if early.contains(&(report.child_id.clone(), report.incarnation)) {
+        return;
+    }
+    collect_report(sup, out, report);
+}
+
 /// Collects, delivering nothing yet, every report of an incarnation's end
 /// that was still pending when the supervisor's message loop ended.
 ///
@@ -5065,10 +7799,21 @@ fn collect_report(
 /// fate and returns after the task published `Stopped`, so reading the
 /// planes at once would miss a child that ended just before the loop did.
 /// The set collected is fixed by this collection: an incarnation whose end
-/// it does not see is the teardown's. Then, in this order: the worklist a
+/// it does not see is the teardown's. An incarnation that ended on its own,
+/// its final reason written, while its task has not published its end (it
+/// may still be dropping what it holds) is collected as it would be once
+/// the task ended, without waiting for the task, which the teardown then
+/// waits for: an attempt whose start failed, was cut or was ordered to stop
+/// is reported from that reason with the outcome the attempt reports
+/// itself; an attempt whose start completed hands the incarnation over, the
+/// collection awaiting the attempt, which returns at its next poll; and a
+/// runner's incarnation has its death collected with that reason. Then, in
+/// this order: the worklist a
 /// completing group left, the deferred triggers, the restart plane (an
-/// adopted attempt is adopted, nothing is delivered for it) and the death
-/// plane, each read until empty. Each collected report is recorded as the
+/// adopted attempt is adopted, nothing is delivered for it), the attempts
+/// reported from their status planes, and the death
+/// plane, each read until empty, the death plane then read from the status
+/// planes of the runners it still holds. Each collected report is recorded as the
 /// teardown records a drain: the ledger reaches `Down` with nothing owed, a
 /// snapshot of the end is dropped, a barrier entry is released. No strategy,
 /// charge, restart or group step runs.
@@ -5076,14 +7821,30 @@ async fn collect_final<A: Actor>(
     ctx: &mut ActorContext<A>,
     drop_panic: &mut Option<String>,
 ) -> Vec<Collected> {
-    let supervisor = ctx.actor_id().clone();
+    let supervisor = ctx.owner();
     let mut out: Vec<Collected> = Vec::new();
     let Some(sup) = ctx.supervision_ref() else {
         return out;
     };
-    let (mut runners, mut attempts) = sup.final_await_sets();
+    let crate::actor::supervision::FinalSets {
+        mut runners,
+        mut attempts,
+        adopts,
+        mut reported,
+    } = sup.final_await_sets();
     // Runners of adopted attempts whose incarnation ended in transit.
     let mut adopted: std::collections::HashSet<tokio::task::Id> = Default::default();
+    // The attempts that hand their incarnation over at their next poll: the
+    // wait on one ends early when its cell settles first.
+    let mut adopting: Vec<(tokio::task::Id, ActorId, u64)> = Vec::with_capacity(adopts.len());
+    let mut cells: Vec<CellWait> = Vec::with_capacity(adopts.len());
+    for (task, child_id, incarnation, mut watch) in adopts {
+        adopting.push((task, child_id, incarnation));
+        cells.push(Box::pin(async move {
+            await_cell(&mut watch, incarnation).await
+        }));
+    }
+    let mut cells = SettleSet::new(cells);
 
     // The runners of the incarnations that ended.
     while !runners.is_empty() {
@@ -5114,32 +7875,24 @@ async fn collect_final<A: Actor>(
         }
     }
 
-    // The attempts whose incarnations ended.
+    // The attempts whose incarnations ended, and those that hand their
+    // incarnation over.
+    #[cfg(test)]
+    if !attempts.is_empty() {
+        end_hooks::run(end_hooks::ATTEMPT_WAIT, &supervisor);
+    }
     while !attempts.is_empty() {
         let Some(sup) = ctx.supervision_mut() else {
             break;
         };
-        match sup.restart_set.join_next_with_id().await {
-            None => break,
-            Some(Ok((task, outcome))) => {
-                sup.task_owner.remove(&task);
-                attempts.remove(&task);
-                collect_restart_outcome(
-                    sup,
-                    &supervisor,
-                    &mut out,
-                    &mut adopted,
-                    outcome,
-                    drop_panic,
-                );
-            }
-            Some(Err(err)) => {
-                attempts.remove(&err.id());
-                let (outcome, replacement) = ctx.lost_restart_task(err);
-                if let Some(replacement) = replacement {
-                    adopted.insert(replacement);
-                }
-                if let (Some(outcome), Some(sup)) = (outcome, ctx.supervision_mut()) {
+        let watching = cells.pending() > 0;
+        tokio::select! {
+            biased;
+            joined = sup.restart_set.join_next_with_id() => match joined {
+                None => break,
+                Some(Ok((task, outcome))) => {
+                    sup.task_owner.remove(&task);
+                    attempts.remove(&task);
                     collect_restart_outcome(
                         sup,
                         &supervisor,
@@ -5148,6 +7901,44 @@ async fn collect_final<A: Actor>(
                         outcome,
                         drop_panic,
                     );
+                }
+                Some(Err(err)) => {
+                    attempts.remove(&err.id());
+                    let (outcome, replacement) = ctx.lost_restart_task(err);
+                    if let Some(replacement) = replacement {
+                        adopted.insert(replacement);
+                    }
+                    if let (Some(outcome), Some(sup)) = (outcome, ctx.supervision_mut()) {
+                        collect_restart_outcome(
+                            sup,
+                            &supervisor,
+                            &mut out,
+                            &mut adopted,
+                            outcome,
+                            drop_panic,
+                        );
+                    }
+                }
+            },
+            // The cell of an attempt read as handing its incarnation over
+            // settled before the attempt returned: its ladder left its idle
+            // step meanwhile, so it hands nothing over, and it is reported
+            // from its incarnation's final reason, as it reports itself.
+            (index, _) = cells.next_settled(), if watching => {
+                let (task, child_id, incarnation) = &adopting[index];
+                if attempts.remove(task) {
+                    let outcome = sup
+                        .registry
+                        .get(child_id)
+                        .and_then(|child| child.slot_of(*incarnation))
+                        .and_then(|ctl| crate::actor::supervision::slot::settled_attempt(
+                            ctl,
+                            child_id,
+                            *incarnation,
+                        ));
+                    if let Some(outcome) = outcome {
+                        reported.push((*task, outcome));
+                    }
                 }
             }
         }
@@ -5199,23 +7990,80 @@ async fn collect_final<A: Actor>(
         }
     }
 
+    // The attempts whose incarnation's start failed with its final reason
+    // written and whose task had not published its end: each is reported
+    // with the outcome the attempt reports itself, unless a join above
+    // already took it. Its task stays registered, so the teardown waits for
+    // it; nothing here waits for the incarnation's drops.
+    if let Some(sup) = ctx.supervision_mut() {
+        for (task, outcome) in reported {
+            if sup.task_owner.contains_key(&task) {
+                collect_restart_outcome(
+                    sup,
+                    &supervisor,
+                    &mut out,
+                    &mut adopted,
+                    outcome,
+                    drop_panic,
+                );
+            }
+        }
+    }
+
     // The death plane: the runners the adoptions above spawned for
     // incarnations that ended in transit first, then everything it holds.
+    // Once it holds no runner that has returned, the runners left are read
+    // from their status planes: a runner whose incarnation published its
+    // end is awaited, and an incarnation that ended on its own with its task
+    // still dropping has its death collected with its final reason, without
+    // waiting for the task. Each pass that collects or awaits anything is
+    // followed by another. A death collected from its plane is recorded in
+    // `early`, keyed by child and incarnation, and its runner's own report,
+    // when the collection joins it, is dropped.
+    let mut early: HashSet<(ActorId, u64)> = HashSet::new();
     loop {
-        while !adopted.is_empty() {
+        loop {
+            while !adopted.is_empty() {
+                let Some(sup) = ctx.supervision_mut() else {
+                    break;
+                };
+                match sup.death_set.join_next_with_id().await {
+                    None => {
+                        adopted.clear();
+                    }
+                    Some(Ok((task, (child_id, reason, incarnation)))) => {
+                        sup.task_owner.remove(&task);
+                        adopted.remove(&task);
+                        collect_runner(
+                            sup,
+                            &mut out,
+                            &early,
+                            ChildStoppedInternal {
+                                child_id,
+                                reason,
+                                incarnation,
+                            },
+                        );
+                    }
+                    Some(Err(err)) => {
+                        adopted.remove(&err.id());
+                        if let Some(replacement) = ctx.lost_death_task(err) {
+                            adopted.insert(replacement);
+                        }
+                    }
+                }
+            }
             let Some(sup) = ctx.supervision_mut() else {
                 break;
             };
-            match sup.death_set.join_next_with_id().await {
-                None => {
-                    adopted.clear();
-                }
+            match sup.death_set.try_join_next_with_id() {
+                None => break,
                 Some(Ok((task, (child_id, reason, incarnation)))) => {
                     sup.task_owner.remove(&task);
-                    adopted.remove(&task);
-                    collect_report(
+                    collect_runner(
                         sup,
                         &mut out,
+                        &early,
                         ChildStoppedInternal {
                             child_id,
                             reason,
@@ -5224,7 +8072,6 @@ async fn collect_final<A: Actor>(
                     );
                 }
                 Some(Err(err)) => {
-                    adopted.remove(&err.id());
                     if let Some(replacement) = ctx.lost_death_task(err) {
                         adopted.insert(replacement);
                     }
@@ -5234,25 +8081,17 @@ async fn collect_final<A: Actor>(
         let Some(sup) = ctx.supervision_mut() else {
             break;
         };
-        match sup.death_set.try_join_next_with_id() {
-            None => break,
-            Some(Ok((task, (child_id, reason, incarnation)))) => {
-                sup.task_owner.remove(&task);
-                collect_report(
-                    sup,
-                    &mut out,
-                    ChildStoppedInternal {
-                        child_id,
-                        reason,
-                        incarnation,
-                    },
-                );
-            }
-            Some(Err(err)) => {
-                if let Some(replacement) = ctx.lost_death_task(err) {
-                    adopted.insert(replacement);
-                }
-            }
+        let (ended, deaths) = sup.final_deaths(&early);
+        if ended.is_empty() && deaths.is_empty() {
+            break;
+        }
+        adopted.extend(ended);
+        for report in deaths {
+            let key = (report.child_id.clone(), report.incarnation);
+            collect_report(sup, &mut out, report);
+            #[cfg(test)]
+            end_hooks::run(end_hooks::PLANE_REPORT, &key.0);
+            early.insert(key);
         }
     }
 
@@ -5260,6 +8099,10 @@ async fn collect_final<A: Actor>(
     // delivery reads no member as awaiting a restart that will not be made.
     if let Some(sup) = ctx.supervision_mut() {
         sup.pending_group = None;
+        sup.note_group();
+        // An attempt that reached no outcome ends with the supervisor: it
+        // reports before the supervisor's own end event.
+        sup.verdicts.settle_unsettled();
     }
     out
 }
@@ -5272,7 +8115,7 @@ async fn collect_final<A: Actor>(
 /// with the teardown's, for the end to apply before the reason is final.
 fn collect_restart_outcome(
     sup: &mut SupervisionState,
-    supervisor: &ActorId,
+    supervisor: &Owner,
     out: &mut Vec<Collected>,
     adopted: &mut std::collections::HashSet<tokio::task::Id>,
     outcome: RestartOutcome,
@@ -5329,15 +8172,29 @@ async fn final_drain<A: Actor>(
             reason: report.reason,
             action: SupervisionAction::SupervisorStopping,
         };
+        emit_child_died(ctx, &event, report.incarnation);
         if let Some(sup) = ctx.supervision_mut() {
             sup.final_delivery = true;
         }
-        clock.begin();
-        let result = catch_hook(|| actor.on_child_stopped(&event, ctx)).await;
-        clock.end();
+        let turn = clock.begin();
+        let result = catch_hook_t(clock.caller_token(turn), || {
+            actor.on_child_stopped(&event, ctx)
+        })
+        .await;
+        let took = clock.end_timed(turn);
+        push_turn(
+            ctx.stop_lane().abort_record(),
+            turn,
+            took,
+            HookKind::OnChildStopped,
+            outcome_of(&result),
+        );
         if let Some(sup) = ctx.supervision_mut() {
             sup.final_delivery = false;
         }
+        // The chain does not run after this callback: a message it asked for
+        // is dropped here, not carried to a later delivery or to the end.
+        ctx.drop_continuation();
         // An earlier failure stands, whether the delivery returns an error or
         // panics.
         let failed = matches!(accepted, StopReason::Failure(_))
@@ -5360,6 +8217,254 @@ async fn final_drain<A: Actor>(
         }
     }
     FinalOutcome::Done { pending }
+}
+
+/// The stop-time stage for monitors, for any actor whose message loop ended
+/// for a reason but `Kill`, between the loop (and a supervisor's final child
+/// reports) and `on_stopped`: every notice the actor is still owed is
+/// delivered once through `handle`, the status reading `Stopping`, the stop
+/// lane read before each delivery, none once a `Kill` is stored. A delivery
+/// that returns an `Err` or panics makes the exit reason a `Failure` once
+/// `on_stopped` returns unless one already stands, and the remaining
+/// deliveries still run.
+///
+/// Owed are the notices queued in the mailbox or the priority lane, in queue
+/// order, then the monitors whose watched actor ended and whose task has not
+/// queued a notice, in monitor order. The stage first closes every monitor
+/// nobody has taken, so no task queues another notice from then on; a task
+/// that took its notice before is waited for, a few instructions, because it
+/// queues no user code. The messages the stage takes from the queues while
+/// it looks are kept in the monitor state and dropped with the context.
+#[allow(clippy::too_many_arguments)]
+async fn monitor_drain<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    stop_rx: &LaneRx,
+    accepted: &StopReason,
+    turn_clock: &TurnClock,
+    mailbox: &mut MailRx<ActorEnvelope<A>>,
+    mut priority: Option<&mut mpsc::Receiver<ActorEnvelope<A>>>,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+) -> FinalOutcome {
+    let mut seen: std::collections::HashSet<MonitorId> = std::collections::HashSet::new();
+    let mut queued: Vec<ActorEnvelope<A>> = Vec::new();
+    let mut owed: Vec<(MonitorId, DownReason)> = Vec::new();
+    let mut link_owed: Vec<(MonitorId, LinkExit)> = Vec::new();
+    loop {
+        owed.extend(
+            ctx.monitors_mut()
+                .map(|state| state.close_pass())
+                .unwrap_or_default(),
+        );
+        link_owed.extend(ctx.close_links());
+        if !notice_in_flight(ctx, &seen) {
+            break;
+        }
+        // Take what is queued now: at most the queued count, so a producer
+        // that refills the queue cannot hold the stage.
+        let mut take = mailbox.len();
+        while take != 0 {
+            take -= 1;
+            match mailbox.try_recv_one() {
+                Ok(envelope) => keep_or_queue(ctx, envelope, &mut seen, &mut queued),
+                Err(_) => break,
+            }
+        }
+        if let Some(lane) = priority.as_deref_mut() {
+            let mut take = lane.len();
+            while take != 0 {
+                take -= 1;
+                match lane.try_recv_one() {
+                    Ok(envelope) => keep_or_queue(ctx, envelope, &mut seen, &mut queued),
+                    Err(_) => break,
+                }
+            }
+        }
+        if !notice_in_flight(ctx, &seen) {
+            break;
+        }
+        // A task took its notice and is putting it in the queue.
+        tokio::task::yield_now().await;
+    }
+    let mut pending: Option<StopReason> = None;
+    let failed = |pending: &Option<StopReason>| {
+        matches!(accepted, StopReason::Failure(_))
+            || matches!(pending, Some(StopReason::Failure(_)))
+    };
+    let mut queued = queued.into_iter();
+    while let Some(envelope) = queued.next() {
+        if kill_stored(stop_rx) {
+            // The notice in hand and those behind it hold the user's
+            // messages: each is dropped inside a catch, as every other value
+            // the stage leaves behind is.
+            drop_queued(std::iter::once(envelope).chain(queued), ctx);
+            return FinalOutcome::Killed;
+        }
+        if let ControlFlow::Break(reason) =
+            dispatch(actor, ctx, envelope, turn_clock, drain, held, None).await
+        {
+            if !failed(&pending) {
+                pending = Some(reason);
+            }
+        }
+    }
+    for (id, reason) in owed {
+        if kill_stored(stop_rx) {
+            return FinalOutcome::Killed;
+        }
+        let made = ctx
+            .monitors_mut()
+            .and_then(|state| state.owed_message(id, reason));
+        let outcome = match made {
+            None => continue,
+            Some(Ok(payload)) => {
+                ctx.finish_monitor(id);
+                let envelope = Envelope::Message {
+                    payload,
+                    responder: None,
+                };
+                dispatch(actor, ctx, envelope, turn_clock, drain, held, None).await
+            }
+            Some(Err(panic)) => {
+                ctx.finish_monitor(id);
+                let err = ActorError::Panic(panic);
+                ctx.record_failure(err.clone());
+                ControlFlow::Break(StopReason::Failure(err))
+            }
+        };
+        if let ControlFlow::Break(reason) = outcome {
+            if !failed(&pending) {
+                pending = Some(reason);
+            }
+        }
+    }
+    for (id, exit) in link_owed {
+        if kill_stored(stop_rx) {
+            return FinalOutcome::Killed;
+        }
+        let made = ctx
+            .monitors_mut()
+            .and_then(|state| state.link_owed_message(id, exit));
+        if let Some(made) = made {
+            ctx.finish_monitor(id);
+            if let ControlFlow::Break(reason) =
+                deliver_made(actor, ctx, made, turn_clock, drain, held).await
+            {
+                if !failed(&pending) {
+                    pending = Some(reason);
+                }
+            }
+        }
+    }
+    // The exit signals queued in the inbox are the last of the stage, and
+    // the inbox is sealed: a signal sent from here on is refused.
+    let deliver = ctx.can_deliver_exits();
+    for item in ctx.stop_lane().abort_record().take_and_seal_signals() {
+        let InboxItem::Exit { from, reason, .. } = item else {
+            continue;
+        };
+        if !deliver {
+            continue;
+        }
+        if kill_stored(stop_rx) {
+            return FinalOutcome::Killed;
+        }
+        let exit = LinkExit {
+            actor_id: from.actor_id,
+            incarnation: Some(from.incarnation),
+            reason: DownReason::Stopped(reason),
+        };
+        let made = ctx
+            .monitors_mut()
+            .and_then(|state| state.exit_message(exit));
+        if let Some(made) = made {
+            if let ControlFlow::Break(reason) =
+                deliver_made(actor, ctx, made, turn_clock, drain, held).await
+            {
+                if !failed(&pending) {
+                    pending = Some(reason);
+                }
+            }
+        }
+    }
+    if let Some(state) = ctx.monitors_mut() {
+        state.clear();
+    }
+    FinalOutcome::Done { pending }
+}
+
+/// Drops the notices a stage leaves undelivered when a `Kill` ends it, each
+/// inside a catch: the message in a notice is the user's, and its drop can
+/// panic. The panic is logged with the actor's id under `tracing`, and the
+/// actor still ends as `Kill`.
+fn drop_queued<A: Actor>(notices: impl Iterator<Item = ActorEnvelope<A>>, ctx: &ActorContext<A>) {
+    for notice in notices {
+        if let Some(panic) = end_value(notice) {
+            log_late_drop(&panic, &ctx.owner());
+        }
+    }
+}
+
+/// Delivers a message the stage made from an exit: through `handle`, or, when
+/// the map panicked, as the failure of the stage.
+async fn deliver_made<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    made: Result<A::Message, String>,
+    turn_clock: &TurnClock,
+    drain: &mut ReplyDrain,
+    held: &mut HeldAnswer<A::Response>,
+) -> ControlFlow<StopReason> {
+    match made {
+        Ok(payload) => {
+            let envelope = Envelope::Message {
+                payload,
+                responder: None,
+            };
+            dispatch(actor, ctx, envelope, turn_clock, drain, held, None).await
+        }
+        Err(panic) => {
+            let err = ActorError::Panic(panic);
+            ctx.record_failure(err.clone());
+            ControlFlow::Break(StopReason::Failure(err))
+        }
+    }
+}
+
+/// Whether a monitor's task took its notice and the stage has not yet found
+/// it in a queue.
+fn notice_in_flight<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    seen: &std::collections::HashSet<MonitorId>,
+) -> bool {
+    ctx.monitors_mut()
+        .is_some_and(|state| state.in_flight(seen))
+}
+
+/// Sorts a message the stage took from a queue: a notice of a monitor the
+/// actor still holds goes to the deliveries, anything else is kept until the
+/// context drops.
+fn keep_or_queue<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    envelope: ActorEnvelope<A>,
+    seen: &mut std::collections::HashSet<MonitorId>,
+    queued: &mut Vec<ActorEnvelope<A>>,
+) {
+    let Some(state) = ctx.monitors_mut() else {
+        return;
+    };
+    match &envelope {
+        Envelope::Signal { tag, .. } => {
+            seen.insert(tag.shared.id());
+            if state.wants(tag) {
+                queued.push(envelope);
+                return;
+            }
+        }
+        Envelope::Message { .. } => {}
+    }
+    state.stash(envelope);
 }
 
 // ---------------------------------------------------------------------------
@@ -5406,12 +8511,16 @@ pub(crate) fn bounded_wait(dur: Duration) -> Duration {
     dur.min(FAR_FUTURE)
 }
 
-fn build_status_info<A: Actor>(ctx: &ActorContext<A>) -> ActorStatusInfo {
+pub(crate) fn build_status_info<A: Actor>(
+    ctx: &ActorContext<A>,
+    suspended: bool,
+    state: Option<String>,
+) -> ActorStatusInfo {
     let (child_count, name) = ctx
         .supervision_ref()
         .map(|sup| (sup.registry.len(), ctx.actor_name().map(str::to_string)))
         .unwrap_or((0, ctx.actor_name().map(str::to_string)));
-    let handle = ctx.self_handle();
+    let handle = ctx.self_handle_ref();
 
     ActorStatusInfo {
         id: ctx.actor_id().clone(),
@@ -5424,12 +8533,97 @@ fn build_status_info<A: Actor>(ctx: &ActorContext<A>) -> ActorStatusInfo {
         child_count,
         timer_count: ctx.active_timer_count(),
         stream_count: ctx.active_stream_count(),
+        incarnation: ctx.stop_lane().abort_record().incarnation(),
+        monitors: ctx.monitor_count(),
+        monitored_by: ctx.stop_lane().abort_record().monitored_by(),
+        trap_exit: ctx.stop_lane().abort_record().trap(),
+        links: ctx.link_count(),
+        pg_groups: ctx.stop_lane().abort_record().pg_joined(),
+        group_monitors: ctx.group_monitor_count(),
+        aliases: ctx.alias_count(),
+        requests_in_flight: ctx.request_count(),
+        suspended,
+        state,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A teardown's waits are polled only after their own wakers fired: 64
+    /// waits that settle one at a time, the last first, cost one poll each
+    /// to register and one to settle, where polling every pending wait at
+    /// every wake costs 2,080.
+    #[test]
+    fn a_teardown_wait_polls_only_the_waits_that_were_woken() {
+        const WAITS: usize = 64;
+        let mut senders = Vec::with_capacity(WAITS);
+        let mut waits: Vec<CellWait> = Vec::with_capacity(WAITS);
+        for _ in 0..WAITS {
+            let (tx, mut rx) = oneshot::channel::<()>();
+            senders.push(Some(tx));
+            waits.push(Box::pin(std::future::poll_fn(move |cx| {
+                Pin::new(&mut rx).poll(cx).map(|_| CellOutcome::Cancelled)
+            })));
+        }
+        let mut set = SettleSet::new(waits);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        {
+            let mut first = std::pin::pin!(set.next_settled());
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+        }
+        for index in (0..WAITS).rev() {
+            let _ = senders[index].take().unwrap().send(());
+            let mut next = std::pin::pin!(set.next_settled());
+            match next.as_mut().poll(&mut cx) {
+                Poll::Ready((settled, CellOutcome::Cancelled)) => assert_eq!(settled, index),
+                other => panic!("wait {index} did not settle: {:?}", other.is_ready()),
+            }
+        }
+        assert_eq!(set.pending(), 0);
+        assert!(set.polls <= 2 * WAITS, "{} polls", set.polls);
+    }
+
+    /// An answer nobody receives is dropped inside a catch: a panic of its
+    /// drop comes back as a payload, at a veto and at the seal alike.
+    #[test]
+    fn an_undelivered_answer_whose_drop_panics_is_reported() {
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    panic!("answer drop");
+                }
+            }
+        }
+        let mut held = HeldAnswer::<Bomb>::new();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        held.hold(tx, Ok(Bomb), &held_owner(), &AbortRecord::new());
+        assert_eq!(held.release_now().as_deref(), Some("answer drop"));
+
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        held.hold(tx, Ok(Bomb), &held_owner(), &AbortRecord::new());
+        assert_eq!(
+            held.deliver(&StopReason::Graceful).as_deref(),
+            Some("answer drop")
+        );
+
+        // A task that ends before the seal drops the held answer inside the
+        // catch: the panic of its drop does not leave the drop.
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        held.hold(tx, Ok(Bomb), &held_owner(), &AbortRecord::new());
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(held)));
+        assert!(ended.is_ok(), "the held value's drop panic was contained");
+    }
+
+    /// The id a held answer of these tests is logged under.
+    fn held_owner() -> ActorId {
+        ActorId::from("held")
+    }
 
     #[tokio::test]
     async fn saturating_deadline_always_leaves_timer_headroom() {
@@ -5487,6 +8681,7 @@ mod tests {
             strategy: RestartStrategy::OneForAll,
             max_restarts: 1,
             restart_window: Duration::from_secs(60),
+            ..SupervisionConfig::default()
         });
         for (id, life) in lives {
             let (ctl, _io) = slot_pair(Default::default());
@@ -5499,6 +8694,8 @@ mod tests {
                     start_timeout: None,
                     kill_grace: DEFAULT_KILL_GRACE,
                     is_supervisor: false,
+                    significant: false,
+                    sys: crate::actor::sys::SysOptions::default(),
                 },
                 ctl,
                 lifecycle: *life,
@@ -5529,40 +8726,6 @@ mod tests {
             incarnation,
         }
     }
-
-    #[test]
-    fn the_end_of_a_queued_member_behind_the_front_is_the_groups_and_charges_nothing() {
-        // The front is down; the second member runs an incarnation the chain
-        // did not start. Its end belongs to the group: it is delivered as the
-        // restart, the member reads down, the chain does not advance and
-        // nothing is charged.
-        let mut sup = a_chain(
-            &["front", "second"],
-            &[("front", down(1)), ("second", ChildLifecycle::Running(5))],
-        );
-        let mut steps = GroupSteps::default();
-        let routed = route_report(&mut sup, &crash_of("second", 5), &mut steps);
-        assert!(matches!(
-            routed,
-            Routed::Deliver(SupervisionAction::RestartInitiated)
-        ));
-        assert!(!steps.advance_chain);
-        assert!(!steps.manual_override);
-        assert_eq!(
-            sup.registry
-                .get(&ActorId::from("second"))
-                .unwrap()
-                .lifecycle,
-            ChildLifecycle::Down {
-                incarnation: 5,
-                pending: DownPending::None
-            }
-        );
-        assert!(
-            sup.budget.check_and_record(),
-            "the budget of one was not charged"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -5577,14 +8740,18 @@ mod task_marker_tests {
         let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let marker = TaskMarker::default();
         let guard = AbortReason::new(status_tx.clone(), marker.clone(), ActorId::from("unwound"));
-        let join = tokio::spawn(MarkedRun::new(marker, async move {
-            let _guard = guard;
-            tokio::task::yield_now().await;
-            if std::hint::black_box(true) {
-                panic!("the crate's own code panics in the task's poll");
-            }
-            StopReason::Graceful
-        }));
+        let join = tokio::spawn(MarkedRun::new(
+            marker,
+            AbortRecord::new().incarnation(),
+            async move {
+                let _guard = guard;
+                tokio::task::yield_now().await;
+                if std::hint::black_box(true) {
+                    panic!("the crate's own code panics in the task's poll");
+                }
+                StopReason::Graceful
+            },
+        ));
         let res = join.await;
         assert!(res.as_ref().is_err_and(|err| err.is_panic()));
         let plane = status_rx.borrow().reason.clone();
@@ -5597,9 +8764,31 @@ mod task_marker_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unwind_of_the_task_s_own_poll_reads_one_panic_multi_thread() {
-        an_unwind_of_the_task_s_own_poll_reads_one_panic().await;
+    /// The guard of a task aborted while suspended writes `Kill`, and the
+    /// runner reads `Kill`.
+    async fn an_abort_of_a_suspended_task_reads_kill() {
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+        let marker = TaskMarker::default();
+        let guard = AbortReason::new(status_tx.clone(), marker.clone(), ActorId::from("aborted"));
+        let join = tokio::spawn(MarkedRun::new(
+            marker,
+            AbortRecord::new().incarnation(),
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                StopReason::Graceful
+            },
+        ));
+        tokio::task::yield_now().await;
+        join.abort();
+        let res = join.await;
+        assert!(res.as_ref().is_err_and(|err| err.is_cancelled()));
+        let plane = status_rx.borrow().reason.clone();
+        assert_eq!(plane, Some(StopReason::Kill));
+        assert_eq!(
+            crate::actor::supervision::joined_reason(res, || plane, None),
+            StopReason::Kill
+        );
     }
 }
 
@@ -5645,5 +8834,115 @@ mod upper_branch_tests {
         expected.push("mailbox".to_string());
         assert_eq!(listed, expected);
         assert!(UpperBranch::ORDER.contains(&SupervisionEvent::Verdict.branch()));
+    }
+}
+
+#[cfg(test)]
+mod reply_drain_tests {
+    use super::*;
+
+    /// The turns before which the loop would hand the thread back, when turn
+    /// `i` sends a reply exactly if `replies[i]` and a lane always holds
+    /// messages.
+    fn hand_backs(replies: &[bool]) -> Vec<usize> {
+        let mut drain = ReplyDrain::new();
+        let mut at = Vec::new();
+        for (i, replied) in replies.iter().enumerate() {
+            if drain.0 != 0 && drain.step() {
+                at.push(i);
+            }
+            if *replied {
+                drain.replied();
+            }
+        }
+        at
+    }
+
+    fn status_info() -> ActorStatusInfo {
+        ActorStatusInfo {
+            id: ActorId::from("status".to_string()),
+            name: None,
+            status: ActorStatus::Running,
+            mailbox_len: 0,
+            mailbox_capacity: 1,
+            priority_len: 0,
+            priority_capacity: 0,
+            child_count: 0,
+            timer_count: 0,
+            stream_count: 0,
+            incarnation: crate::types::Incarnation::mint(),
+            monitors: 0,
+            monitored_by: 0,
+            trap_exit: false,
+            links: 0,
+            pg_groups: 0,
+            group_monitors: 0,
+            aliases: 0,
+            requests_in_flight: 0,
+            suspended: false,
+            state: None,
+        }
+    }
+
+    /// What answering one status request leaves behind: whether the window
+    /// opened and whether the reply is marked for the hand-back.
+    fn answered(task: bool, same_thread: bool, requester_gone: bool) -> (bool, bool) {
+        let (reply, requester) = oneshot::channel();
+        let keep = (!requester_gone).then_some(requester);
+        let mut fp_skip = 0;
+        let mut drain = ReplyDrain::new();
+        answer_status(
+            crate::types::StatusRequest { reply, task },
+            status_info(),
+            same_thread,
+            &mut fp_skip,
+            &mut drain,
+        );
+        drop(keep);
+        (
+            fp_skip == STATUS_FAST_PATH_OFF_TURNS,
+            drain.0 & ReplyDrain::REPLIED != 0,
+        )
+    }
+}
+
+/// The size of what every actor carries, pinned: an actor holds no telemetry
+/// state of its own, so its parameter box and its run loop's future are the
+/// size they are without telemetry. The sizes of a future depend on the
+/// compiler and those of the standard library's types on the target, so they
+/// are pinned only where they were measured, on x86_64 Linux.
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code, unused_imports)
+)]
+mod footprint_tests {
+    use super::*;
+    use crate::error::ActorResult;
+
+    struct Counter {
+        n: u64,
+        spin_ns: u64,
+    }
+
+    enum Msg {
+        Add(u64),
+        Get,
+    }
+
+    impl Actor for Counter {
+        type Message = Msg;
+        type Response = u64;
+
+        async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<u64> {
+            if let Msg::Add(k) = msg {
+                self.n += k + self.spin_ns;
+            }
+            Ok(self.n)
+        }
+    }
+
+    fn size_of_output<T>(_: impl FnOnce() -> T) -> usize {
+        std::mem::size_of::<T>()
     }
 }

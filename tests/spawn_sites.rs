@@ -36,9 +36,33 @@ const ALLOWED: &[Site] = &[
     },
     Site {
         file: "actor/runtime.rs",
-        line: "let join = handle.spawn(MarkedRun::new(",
+        line: "let join = span.spawn(&handle, run);",
         count: 1,
         owner: "the actor's own task, joined by its watcher and observed by the registry",
+    },
+    Site {
+        file: "telemetry/span.rs",
+        line: "return rt.spawn(fut);",
+        count: 1,
+        owner: "the actor's own task (no span), joined by its watcher and observed by the registry",
+    },
+    Site {
+        file: "telemetry/span.rs",
+        line: "rt.spawn(SpanRun {",
+        count: 1,
+        owner: "the actor's own task (inside its span), joined by its watcher and observed by the registry",
+    },
+    Site {
+        file: "telemetry/span.rs",
+        line: "rt.spawn(fut)",
+        count: 1,
+        owner: "the actor's own task (build without spans), joined by its watcher and observed by the registry",
+    },
+    Site {
+        file: "telemetry/span.rs",
+        line: "None => rt.spawn(fut),",
+        count: 1,
+        owner: "the actor's own task (no span), joined by its watcher and observed by the registry",
     },
     Site {
         file: "actor/runtime.rs",
@@ -55,13 +79,7 @@ const ALLOWED: &[Site] = &[
     Site {
         file: "actor/supervision.rs",
         line: "let task = self.death_set.spawn(async move {",
-        count: 2,
-        owner: "a supervisor's death plane, joined by its run loop",
-    },
-    Site {
-        file: "actor/supervision.rs",
-        line: ".spawn(async move { (child_id, reason, incarnation) });",
-        count: 1,
+        count: 3,
         owner: "a supervisor's death plane, joined by its run loop",
     },
     Site {

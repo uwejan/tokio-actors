@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -56,7 +57,6 @@ impl Leftover {
             stop_lane.clone(),
             1,
             status_rx,
-            sys.name().into(),
             None,
             Some(Arc::new(AtomicBool::new(false))),
         );
@@ -88,7 +88,68 @@ fn phase_of(sys: &ActorSystem) -> SystemPhase {
     SystemPhase::from_u8(sys.phase.load(Ordering::Acquire))
 }
 
+/// Ends `rt` and returns once every task on it is dropped.
+fn end_runtime(rt: tokio::runtime::Runtime) {
+    std::thread::spawn(move || drop(rt))
+        .join()
+        .expect("the runtime ended cleanly");
+}
+
 // - A walk cut short after its sweep began ----------------------------------
+
+/// A shutdown whose walk runs on a runtime that ends once the sweep has
+/// begun still has the system kill the leftover at the deadline and abort it
+/// a kill grace later, because both were scheduled with the system when the
+/// sweep began.
+async fn a_walk_cut_short_after_the_sweep_began_still_ends_its_leftover() {
+    let sys = ActorSystem::create(unique("cut-sweep")).unwrap();
+    let id = ActorId::from("cut-sweep-leftover");
+    let leftover = Leftover::register(&sys, &id, Duration::from_millis(50));
+    let host = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    // The window is far longer than ending the runtime takes, so the walk
+    // cannot force the leftover itself before it is cut short.
+    drop(host.spawn({
+        let sys = sys.clone();
+        async move {
+            sys.shutdown_with(ShutdownPolicy {
+                timeout: Duration::from_secs(3),
+                per_actor_timeout: Duration::from_secs(1),
+            })
+            .await
+        }
+    }));
+    let deadline = {
+        let mut held = sys.sweep_deadline.subscribe();
+        let seen = timeout(BOUND, held.wait_for(|deadline| deadline.is_some()))
+            .await
+            .expect("the sweep began within the bound")
+            .expect("the system holds its sweep deadline");
+        (*seen).expect("the deadline is held")
+    };
+    end_runtime(host);
+    assert!(
+        Instant::now() < deadline,
+        "the walk was cut short before the deadline"
+    );
+    assert_eq!(leftover.lane.reason(), None, "nothing has been forced yet");
+
+    let ended = timeout(BOUND, leftover.task)
+        .await
+        .expect("the leftover's task was aborted within the bound");
+    assert!(ended.unwrap_err().is_cancelled(), "its end is the abort");
+    assert!(
+        matches!(leftover.lane.reason(), Some(StopReason::Kill)),
+        "the abort came after the deadline's Kill"
+    );
+    assert!(
+        Instant::now() >= deadline,
+        "neither stage ran before the deadline"
+    );
+}
 
 // - Cut-short shutdowns keep the sweep deadline -----------------------------
 
@@ -164,8 +225,12 @@ impl Actor for Veto {
     type Response = ();
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        // The verdict is read before the request is reported, so a caller
+        // that changes `veto` when it sees a report changes the verdict of
+        // the next request, never of the one reported.
+        let accept = !self.veto.load(Ordering::SeqCst);
         let _ = self.asked.send(());
-        !self.veto.load(Ordering::SeqCst)
+        accept
     }
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
@@ -242,7 +307,18 @@ async fn overlapping_calls_each_run_their_own_walk() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overlapping_calls_each_run_their_own_walk_multi_thread() {
-    overlapping_calls_each_run_their_own_walk().await;
+/// A waker that counts its wakes and panics in them while it is armed.
+#[derive(Default)]
+struct LoudWake {
+    armed: AtomicBool,
+    woken: std::sync::atomic::AtomicUsize,
+}
+
+impl std::task::Wake for LoudWake {
+    fn wake(self: Arc<Self>) {
+        self.woken.fetch_add(1, Ordering::SeqCst);
+        if self.armed.load(Ordering::SeqCst) {
+            panic!("a waker's wake panics");
+        }
+    }
 }

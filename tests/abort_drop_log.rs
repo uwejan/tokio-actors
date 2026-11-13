@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![cfg(feature = "tracing")]
 //! An actor whose own value (a field of the actor, not queued mail) panics
 //! when dropped is aborted by a `Kill`, on both runtime flavors. The drop is
@@ -31,33 +32,36 @@ const ABORT_DROP: &str = "a drop at the abort or the unwind";
 /// The text the value's drop panics with.
 const DROPPED: &str = "the actor's value panicked when dropped";
 
+/// The text a queued message's drop panics with.
+const QUEUED: &str = "a queued message panicked when dropped";
+
 /// Set right before the kill: from then on the value panics when dropped.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Panics when dropped once armed.
-struct Loud;
+/// Panics with its text when dropped once armed.
+struct Loud(&'static str);
 
 impl Drop for Loud {
     fn drop(&mut self) {
         if ARMED.load(Ordering::SeqCst) {
-            panic!("{DROPPED}");
+            panic!("{}", self.0);
         }
     }
 }
+
+/// A message that tells the handler to park, and may carry a value that
+/// panics when dropped.
+struct Mail(Arc<Notify>, #[allow(dead_code)] Option<Loud>);
 
 /// Its turn never yields once parked, and its field panics when dropped.
 struct Parked(#[allow(dead_code)] Loud);
 
 impl Actor for Parked {
-    type Message = Arc<Notify>;
+    type Message = Mail;
     type Response = ();
 
-    async fn handle(
-        &mut self,
-        entered: Arc<Notify>,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        entered.notify_one();
+    async fn handle(&mut self, mail: Mail, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        mail.0.notify_one();
         std::future::pending::<()>().await;
         Ok(())
     }
@@ -84,54 +88,82 @@ fn runtime(flavor: Flavor) -> tokio::runtime::Runtime {
 
 /// Kills a parked [`Parked`] actor whose value panics when dropped, and
 /// checks its end once the runtime has dropped the task: it read `Kill`, and
-/// exactly one warning that names the abort carries the panic text.
+/// one warning that names the abort carries the panic text, for each panic
+/// the abort's drops raise: the actor's value, and a queued message when the
+/// row has one. The rows are an ordinary actor, a sensitive actor and a
+/// sensitive actor with a queued message; a sensitive actor's warnings name
+/// the abort and carry no text.
 fn kill_a_parked_actor(flavor: Flavor, lines: &Mutex<Vec<String>>) {
-    let rt = runtime(flavor);
-    let reason = rt.block_on(async {
-        let actor = Parked(Loud)
-            .spawn()
-            .kill_grace(Duration::from_millis(50))
-            .await
-            .expect("the actor starts");
-        let entered = Arc::new(Notify::new());
-        actor.notify(entered.clone()).await.expect("queued");
-        timeout(BOUND, entered.notified())
-            .await
-            .expect("the turn parks");
-        ARMED.store(true, Ordering::SeqCst);
-        actor.stop(StopReason::Kill).await.expect("accepted");
-        timeout(BOUND, actor.wait_stopped())
-            .await
-            .expect("the actor ends")
-    });
-    // The task's drops finish when the runtime has dropped it.
-    drop(rt);
-    ARMED.store(false, Ordering::SeqCst);
-    assert_eq!(reason, StopReason::Kill);
-    let written: Vec<String> = lines
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|line| line.contains(ABORT_DROP))
-        .cloned()
-        .collect();
-    assert_eq!(written.len(), 1, "one warning names the abort: {written:?}");
-    assert!(
-        written[0].contains(DROPPED),
-        "the warning carries the panic text: {}",
-        written[0]
-    );
+    for (sensitive, queued) in [(false, false), (true, false), (true, true)] {
+        let name = format!("parked-{}-{}", u8::from(sensitive), u8::from(queued));
+        let rt = runtime(flavor);
+        let reason = rt.block_on(async {
+            let builder = Parked(Loud(DROPPED))
+                .spawn()
+                .named(name.clone())
+                .kill_grace(Duration::from_millis(50));
+            let builder = if sensitive {
+                builder.sensitive()
+            } else {
+                builder
+            };
+            let actor = builder.await.expect("the actor starts");
+            let entered = Arc::new(Notify::new());
+            actor
+                .notify(Mail(entered.clone(), None))
+                .await
+                .expect("queued");
+            timeout(BOUND, entered.notified())
+                .await
+                .expect("the turn parks");
+            if queued {
+                actor
+                    .notify(Mail(Arc::new(Notify::new()), Some(Loud(QUEUED))))
+                    .await
+                    .expect("queued behind the parked turn");
+            }
+            ARMED.store(true, Ordering::SeqCst);
+            actor.stop(StopReason::Kill).await.expect("accepted");
+            timeout(BOUND, actor.wait_stopped())
+                .await
+                .expect("the actor ends")
+        });
+        // The task's drops finish when the runtime has dropped it.
+        drop(rt);
+        ARMED.store(false, Ordering::SeqCst);
+        assert_eq!(reason, StopReason::Kill);
+        let token = format!("actor_id={name} ");
+        let written: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(ABORT_DROP) && line.contains(&token))
+            .cloned()
+            .collect();
+        assert_eq!(
+            written.len(),
+            1 + usize::from(queued),
+            "one warning names the abort for each panic: {written:?}"
+        );
+        for line in &written {
+            assert_eq!(
+                line.contains(DROPPED) || line.contains(QUEUED),
+                !sensitive,
+                "sensitive {sensitive}, queued {queued}: the warning carries the panic text only for an ordinary actor: {line}"
+            );
+        }
+    }
 }
 
 #[test]
-fn a_panicking_subscriber_at_the_drop_of_the_actor_s_value_does_not_abort_current_thread() {
+fn a_drop_panic_of_the_actor_s_value_at_an_abort_is_logged_once_multi_thread() {
     if !common::in_a_child_process(
-        "a_panicking_subscriber_at_the_drop_of_the_actor_s_value_does_not_abort_current_thread",
+        "a_drop_panic_of_the_actor_s_value_at_an_abort_is_logged_once_multi_thread",
     ) {
         return;
     }
-    let lines = subscriber::install(Some(ABORT_DROP), subscriber::Payload::TwoBombs);
-    kill_a_parked_actor(Flavor::CurrentThread, &lines);
+    let lines = subscriber::install(None, subscriber::Payload::Text);
+    kill_a_parked_actor(Flavor::MultiThread, &lines);
 }
 
 /// A child that does nothing.
@@ -156,7 +188,7 @@ impl Actor for ParkedParent {
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         for _ in 0..2 {
-            let capture = Loud;
+            let capture = Loud(DROPPED);
             ctx.spawn_child(move || {
                 let _ = &capture;
                 Leaf
@@ -183,16 +215,23 @@ const DISCARDED: &str = "this panic is discarded";
 /// Kills a parked [`ParkedParent`]: the abort drops its context, whose two
 /// factories both panic. The first panic is kept and the second discarded, and
 /// the warning that records the discarded one names the actor that was
-/// aborted.
+/// aborted, and carries the panic text unless the actor is sensitive.
 fn kill_a_parked_supervisor(flavor: Flavor, lines: &Mutex<Vec<String>>) {
+    for sensitive in [false, true] {
+        kill_a_parked_supervisor_row(flavor, lines, sensitive);
+    }
+}
+
+fn kill_a_parked_supervisor_row(flavor: Flavor, lines: &Mutex<Vec<String>>, sensitive: bool) {
     let rt = runtime(flavor);
     let (reason, id) = rt.block_on(async {
-        let actor = ParkedParent
-            .spawn()
-            .kill_grace(Duration::from_millis(50))
-            .supervisor()
-            .await
-            .expect("the actor starts");
+        let builder = ParkedParent.spawn().kill_grace(Duration::from_millis(50));
+        let builder = if sensitive {
+            builder.sensitive()
+        } else {
+            builder
+        };
+        let actor = builder.supervisor().await.expect("the actor starts");
         let entered = Arc::new(Notify::new());
         actor.notify(entered.clone()).await.expect("queued");
         timeout(BOUND, entered.notified())
@@ -209,16 +248,23 @@ fn kill_a_parked_supervisor(flavor: Flavor, lines: &Mutex<Vec<String>>) {
     ARMED.store(false, Ordering::SeqCst);
     assert_eq!(reason, StopReason::Kill);
     let lines = lines.lock().unwrap();
+    let token = format!("actor_id={id} ");
     let discarded: Vec<&String> = lines
         .iter()
-        .filter(|line| line.contains(DISCARDED))
+        .filter(|line| line.contains(DISCARDED) && line.contains(&token))
         .collect();
     assert_eq!(discarded.len(), 1, "one discarded panic: {discarded:?}");
-    assert!(
-        discarded[0].contains(&format!("actor_id={id} ")),
-        "the warning names the aborted actor {id}: {}",
+    assert_eq!(
+        discarded[0].contains(DROPPED),
+        !sensitive,
+        "the warning carries the panic text only for an ordinary actor: {}",
         discarded[0]
     );
+    if sensitive {
+        for line in lines.iter().filter(|line| line.contains(&token)) {
+            assert!(!line.contains(DROPPED), "{line}");
+        }
+    }
 }
 
 #[test]

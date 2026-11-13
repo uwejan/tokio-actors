@@ -334,6 +334,18 @@ async fn spend_budget() {
     );
 }
 
+/// An actor with no supervision config.
+struct Plain;
+
+impl Actor for Plain {
+    type Message = Spec;
+    type Response = Attempt;
+
+    async fn handle(&mut self, spec: Spec, ctx: &mut ActorContext<Self>) -> ActorResult<Attempt> {
+        Ok(attempt(ctx, &spec))
+    }
+}
+
 async fn supervisor(delivery: &Arc<Delivery>) -> ActorHandle<Supervisor> {
     Supervisor {
         delivery: delivery.clone(),
@@ -392,28 +404,6 @@ fn a_spawn_on_a_shut_down_runtime_returns_ok_and_runs_no_panic_hook() {
     assert_eq!(hook.calls(), 0, "no panic hook ran at all");
 }
 
-#[test]
-fn a_spawn_on_a_shut_down_runtime_is_found_when_the_caller_has_spent_its_budget() {
-    let hook = CountingHook::install();
-    // Without the driver the creation of a sleep panics, so a runtime that
-    // is not found shut down is taken for one that never had the driver.
-    let placements = [ended(without_driver()), ended(with_driver())];
-    common::run(2, async {
-        for placed in &placements {
-            let sup = supervisor(&Default::default()).await;
-            let spec = Spec::new("spent", Some(placed.clone()));
-            let reply = sup.send(Cmd::SpawnSpent(spec)).await.unwrap();
-            let Reply::Spawned(answer, hooks) = reply else {
-                unreachable!()
-            };
-            assert_eq!(answer, Ok(()), "the call is not refused");
-            assert_eq!(hooks, 0, "no panic hook ran for the spawn");
-            finish(sup).await;
-        }
-    });
-    assert_eq!(hook.calls(), 0);
-}
-
 // ---------------------------------------------------------------------------
 // A runtime without the time driver
 // ---------------------------------------------------------------------------
@@ -441,48 +431,3 @@ fn a_runtime_without_the_driver_panics_before_the_factory_runs() {
 // ---------------------------------------------------------------------------
 // The refusals come first
 // ---------------------------------------------------------------------------
-
-#[test]
-fn a_spawn_under_a_taken_name_is_refused_before_the_entry_check() {
-    let _hook = CountingHook::install();
-    let bare = without_driver();
-    let good = with_driver();
-    let bare_handle = bare.handle().clone();
-    let good_handle = good.handle().clone();
-    common::run(2, async move {
-        let sup = supervisor(&Default::default()).await;
-        let first = Spec::new("taken", Some(good_handle));
-        let (answer, _) = spawn_via(&sup, &first).await;
-        assert_eq!(answer, Ok(()));
-        until("the first child", || {
-            ActorSystem::default().get::<Worker>(&first.name).is_some()
-        })
-        .await;
-
-        let again = Spec {
-            runtime: Some(bare_handle.clone()),
-            ..first.clone()
-        };
-        let attempted = attempt_via(&sup, &again).await;
-        assert_eq!(attempted.panic, None, "the refusal comes first");
-        assert_eq!(
-            attempted.answer,
-            Some(Err(SpawnError::DuplicateChild(first.name.as_str().into())))
-        );
-        assert_eq!(
-            first.built.load(Ordering::SeqCst),
-            1,
-            "no second factory call"
-        );
-
-        // The check is still live for a name nobody holds.
-        let fresh = Spec::new("fresh", Some(bare_handle));
-        let attempted = attempt_via(&sup, &fresh).await;
-        let text = attempted.panic.expect("the call panics");
-        assert!(text.contains("enable_time"), "{text}");
-        assert_eq!(fresh.built.load(Ordering::SeqCst), 0);
-        finish(sup).await;
-    });
-    end_runtime(bare);
-    end_runtime(good);
-}

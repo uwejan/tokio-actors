@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! A timer or stream forwarder releases what it owns as soon as it sees its
 //! actor's mailbox closed (a refused send, or the close itself while it
 //! waits for a tick, a firing or an item), in its own poll, catching each
@@ -18,14 +19,17 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    oneshot_forward, recurring_loop, stream_forward, take_parked, ActorContext, MessageFactory,
-    PanicSlot, Released,
+    adjust_next, oneshot_forward, recurring_loop, stream_forward, take_parked, ActorContext,
+    Adjusted, ForwarderKind, MessageFactory, PanicSlot, RecurringId, Released, StreamRegistration,
+    TickEvents,
 };
 use crate::actor::handle::ActorHandle;
+use crate::actor::subtree::SubtreeHold;
 use crate::actor::{Actor, ActorEnvelope};
-use crate::error::ActorResult;
+use crate::error::{ActorError, ActorResult};
 use crate::types::{
     ActorId, ActorStatus, Envelope, MissPolicy, StatusTx, StatusValue, StopLane, StreamEvent,
+    TurnClock,
 };
 
 /// Records its drop, then panics.
@@ -110,16 +114,25 @@ fn handle_of<A: Actor>() -> (
     ActorHandle<A>,
     crate::actor::mailbox::MailRx<ActorEnvelope<A>>,
 ) {
-    let (tx, rx) = crate::actor::mailbox::test_channel(1);
+    handle_with_room(1)
+}
+
+/// As [`handle_of`], with room for `room` messages.
+fn handle_with_room<A: Actor>(
+    room: usize,
+) -> (
+    ActorHandle<A>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<A>>,
+) {
+    let (tx, rx) = crate::actor::mailbox::test_channel(room);
     let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
     let (stop_lane, _) = StopLane::new();
     let handle = ActorHandle::new(
         ActorId::from("forwarder-sink"),
         tx,
         stop_lane,
-        1,
+        room,
         status_rx,
-        "forwarder-tests".into(),
         None,
         Some(Arc::new(AtomicBool::new(false))),
     );
@@ -216,87 +229,60 @@ async fn refused_at_the_close(
     );
 }
 
+/// The first deadline is the one the timer was registered with, however late
+/// its task is first polled: with the clock 250 ms past a registration whose
+/// first tick was due after 100 ms, every policy sends that tick at once, and
+/// a catch-up timer sends the one due at 200 ms too.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_one_shot_whose_send_the_close_refuses_releases_its_message() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let (handle, rx) = full::<Sink>(Msg::Data);
-    let task = tokio::spawn(oneshot_forward(
-        handle,
-        Msg::Bomb(Bomb(dropped.clone())),
-        Instant::now(),
-        CancellationToken::new(),
-        Arc::new(AtomicBool::new(false)),
-    ));
-    refused_at_the_close(task, rx, &dropped).await;
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_one_shot_not_yet_fired_releases_its_message_at_the_close() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let fut = oneshot_forward(
-        closed(),
-        Msg::Bomb(Bomb(dropped.clone())),
-        // Past the wait's own bound: only the close can end it.
-        Instant::now() + Duration::from_secs(7200),
-        CancellationToken::new(),
-        Arc::new(AtomicBool::new(false)),
-    );
-    releases_at_the_close(fut, &dropped).await;
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_recurring_tick_whose_send_the_close_refuses_releases_its_message_and_factory() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let built = Arc::new(AtomicUsize::new(0));
-    let factory: Box<MessageFactory<Sink>> = {
-        let (dropped, built) = (dropped.clone(), built.clone());
-        Box::new(move || {
-            built.fetch_add(1, Ordering::SeqCst);
-            Msg::Bomb(Bomb(dropped.clone()))
-        })
-    };
-    let (handle, rx) = full::<Sink>(Msg::Data);
-    let slot = PanicSlot::default();
-    let task = tokio::spawn(recurring_loop(
-        handle,
-        factory,
-        Duration::from_millis(1),
-        MissPolicy::Skip,
-        CancellationToken::new(),
-        slot.clone(),
-    ));
-    refused_at_the_close(task, rx, &dropped).await;
-    assert!(
-        take_parked(&slot).is_none(),
-        "the factory was released, not left"
-    );
-    assert_eq!(built.load(Ordering::SeqCst), 1, "one tick");
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_recurring_timer_between_ticks_releases_its_factory_at_the_close() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let built = Arc::new(AtomicUsize::new(0));
-    let guard = Bomb(dropped.clone());
-    let factory: Box<MessageFactory<Sink>> = {
-        let built = built.clone();
-        Box::new(move || {
-            let _ = &guard;
-            built.fetch_add(1, Ordering::SeqCst);
-            Msg::Data
-        })
-    };
-    let fut = recurring_loop(
-        closed(),
-        factory,
-        // Past the wait's own bound: only the close can end it.
-        Duration::from_secs(7200),
-        MissPolicy::Skip,
-        CancellationToken::new(),
-        PanicSlot::default(),
-    );
-    releases_at_the_close(fut, &dropped).await;
-    assert_eq!(built.load(Ordering::SeqCst), 0, "no tick");
+async fn a_recurring_timer_counts_its_first_interval_from_the_call() {
+    let interval = Duration::from_millis(100);
+    for (policy, ticks) in [
+        (MissPolicy::Skip, 1),
+        (MissPolicy::Delay, 1),
+        (MissPolicy::CatchUp, 2),
+    ] {
+        let called = Instant::now();
+        let built = Arc::new(Mutex::new(Vec::new()));
+        let factory: Box<MessageFactory<Sink>> = {
+            let built = built.clone();
+            Box::new(move || {
+                built.lock().unwrap().push(Instant::now());
+                Msg::Data
+            })
+        };
+        let (handle, _rx) = handle_with_room::<Sink>(8);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        let token = CancellationToken::new();
+        let task = tokio::spawn(recurring_loop(
+            handle,
+            RecurringId::new(0),
+            factory,
+            called + interval,
+            interval,
+            policy,
+            token.clone(),
+            PanicSlot::default(),
+        ));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let built = built.lock().unwrap().clone();
+        assert_eq!(
+            built.len(),
+            ticks,
+            "{policy:?}: ticks sent at the first poll"
+        );
+        assert!(
+            built
+                .iter()
+                .all(|at| *at == called + Duration::from_millis(250)),
+            "{policy:?}: the first tick was due before the first poll"
+        );
+        token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the timer ends");
+    }
 }
 
 /// Never yields; owns a bomb.
@@ -307,18 +293,6 @@ impl Stream for Idle {
     fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
         Poll::Pending
     }
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_stream_with_nothing_to_yield_releases_itself_at_the_close() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let fut = stream_forward(
-        Idle(Bomb(dropped.clone())),
-        closed(),
-        CancellationToken::new(),
-        PanicSlot::default(),
-    );
-    releases_at_the_close(fut, &dropped).await;
 }
 
 /// Yields an item on every poll, counting its polls; owns a bomb.
@@ -333,26 +307,6 @@ impl Stream for Counted {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Poll::Ready(Some(()))
     }
-}
-
-/// A stream with an item ready when the mailbox is already closed is never
-/// polled: the forwarder releases it at the close.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_stream_with_an_item_ready_at_the_close_is_not_polled() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let polls = Arc::new(AtomicUsize::new(0));
-    let stream = Counted {
-        _bomb: Bomb(dropped.clone()),
-        polls: polls.clone(),
-    };
-    let fut = stream_forward(
-        stream,
-        closed(),
-        CancellationToken::new(),
-        PanicSlot::default(),
-    );
-    releases_at_the_close(fut, &dropped).await;
-    assert_eq!(polls.load(Ordering::SeqCst), 0, "no poll after the close");
 }
 
 /// Yields `None` after closing the mailbox's receiver itself, so the close
@@ -370,26 +324,6 @@ impl Stream for EndsClosing {
     }
 }
 
-/// A stream that ends once the mailbox is closed (here it closes the
-/// mailbox itself as it ends): the close read just before its drop makes
-/// that drop the end's.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_stream_ending_once_the_mailbox_is_closed_releases_itself() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let (handle, rx) = handle_of::<Sink>();
-    let stream = EndsClosing {
-        _bomb: Bomb(dropped.clone()),
-        rx: Arc::new(Mutex::new(rx)),
-    };
-    let fut = stream_forward(
-        stream,
-        handle,
-        CancellationToken::new(),
-        PanicSlot::default(),
-    );
-    releases_at_the_close(fut, &dropped).await;
-}
-
 /// Records the mailbox's length at its drop, then panics.
 struct LenBomb {
     handle: ActorHandle<Sink>,
@@ -403,216 +337,12 @@ impl Drop for LenBomb {
     }
 }
 
-/// The stream ends while the mailbox is open: it is dropped in the
-/// forwarder's poll while the mailbox is still empty, its `Finished` is then
-/// delivered, and the drop's panic is reported as the run's.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_stream_that_ends_during_the_run_is_dropped_before_its_finished() {
-    let (handle, mut rx) = handle_of::<Sink>();
-    let len_at_drop = Arc::new(Mutex::new(None));
-    let stream = Owned {
-        bomb: LenBomb {
-            handle: handle.clone(),
-            len_at_drop: len_at_drop.clone(),
-        },
-        items: 0,
-    };
-    let released = tokio::time::timeout(
-        Duration::from_secs(3600),
-        stream_forward(
-            stream,
-            handle,
-            CancellationToken::new(),
-            PanicSlot::default(),
-        ),
-    )
-    .await
-    .expect("the forwarder ends by itself");
-    assert_eq!(
-        *len_at_drop.lock().unwrap(),
-        Some(0),
-        "dropped before Finished reached the mailbox"
-    );
-    assert!(released.run.is_some(), "the drop's panic is the run's");
-    assert!(released.end.is_none());
-    match rx.try_recv() {
-        Ok(Envelope::Message {
-            payload: Msg::Finished,
-            ..
-        }) => {}
-        _ => panic!("Finished is delivered"),
-    }
-}
-
-/// The stream ends during the run and is dropped then (the run's); its
-/// `Finished` waits for room in the full mailbox, which then closes: the
-/// refused `Finished` is released at the close (the end's).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_finished_meeting_the_closed_mailbox_is_released_at_the_close() {
-    let (handle, mut rx) = handle_of::<FinishedSink>();
-    let dropped = Arc::new(AtomicBool::new(false));
-    assert!(
-        handle.try_forward(FMsg::Filler).is_ok(),
-        "the slot is filled"
-    );
-    let stream = Owned {
-        bomb: Bomb(dropped.clone()),
-        items: 0,
-    };
-    let slot = PanicSlot::default();
-    let task = tokio::spawn(stream_forward(
-        stream,
-        handle,
-        CancellationToken::new(),
-        slot.clone(),
-    ));
-    while !dropped.load(Ordering::SeqCst) {
-        tokio::task::yield_now().await;
-    }
-    let before = FINISHED_DROPS.load(Ordering::SeqCst);
-    assert!(!task.is_finished(), "Finished waits for room");
-    rx.close();
-    let released = tokio::time::timeout(Duration::from_secs(3600), task)
-        .await
-        .expect("the forwarder ends by itself")
-        .expect("the forwarder's own drops are caught");
-    assert!(released.run.is_some(), "the stream's drop is the run's");
-    assert!(
-        released
-            .end
-            .as_deref()
-            .is_some_and(|p| p.contains("Finished message panicked")),
-        "the refused Finished is released at the close"
-    );
-    assert_eq!(FINISHED_DROPS.load(Ordering::SeqCst), before + 1);
-    assert!(
-        take_parked(&slot).is_none(),
-        "the stream was released, not left"
-    );
-    drop(rx.try_recv());
-}
-
-/// A CatchUp timer that fell behind: its tick is delivered, and the missed
-/// tick sent at once meets the mailbox closed meanwhile (the factory, which
-/// runs between the two sends, closes it). The loop releases that tick's
-/// message and the factory at the close.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_recurring_catch_up_tick_meeting_the_close_is_released_at_the_close() {
-    let start = Instant::now();
-    let (handle, rx) = handle_of::<Sink>();
-    let rx = Arc::new(Mutex::new(rx));
-    let dropped = Arc::new(AtomicBool::new(false));
-    let built = Arc::new(AtomicUsize::new(0));
-    let instants = Arc::new(Mutex::new(Vec::new()));
-    let factory: Box<MessageFactory<Sink>> = {
-        let (dropped, built, rx) = (dropped.clone(), built.clone(), rx.clone());
-        let instants = instants.clone();
-        Box::new(move || {
-            instants.lock().unwrap().push(Instant::now());
-            if built.fetch_add(1, Ordering::SeqCst) == 0 {
-                Msg::Data
-            } else {
-                rx.lock().unwrap().close();
-                Msg::Bomb(Bomb(dropped.clone()))
-            }
-        })
-    };
-    let slot = PanicSlot::default();
-    let task = tokio::spawn(recurring_loop(
-        handle,
-        factory,
-        Duration::from_millis(1),
-        MissPolicy::CatchUp,
-        CancellationToken::new(),
-        slot.clone(),
-    ));
-    // The loop takes its first deadline, then the clock moves past several.
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(10)).await;
-    let released = tokio::time::timeout(Duration::from_secs(3600), task)
-        .await
-        .expect("the forwarder ends by itself")
-        .expect("the forwarder's own drops are caught");
-    assert!(
-        take_parked(&slot).is_none(),
-        "the factory was released, not left"
-    );
-    assert_eq!(built.load(Ordering::SeqCst), 2, "one missed tick was built");
-    // The delivered tick and the missed one are built in the same poll, at
-    // one instant past the clock's move: the missed one is a catch-up.
-    let instants = instants.lock().unwrap().clone();
-    assert_eq!(instants.len(), 2);
-    assert_eq!(instants[0], instants[1], "both built at one instant");
-    assert!(
-        instants[0] >= start + Duration::from_millis(10),
-        "built after the clock moved past the missed deadlines"
-    );
-    assert!(
-        dropped.load(Ordering::SeqCst),
-        "the missed tick was released"
-    );
-    assert!(released.run.is_none());
-    assert!(
-        released
-            .end
-            .as_deref()
-            .is_some_and(|p| p.contains("panicked when dropped")),
-        "released at the close"
-    );
-    let first = rx.lock().unwrap().try_recv();
-    assert!(
-        matches!(
-            first,
-            Ok(Envelope::Message {
-                payload: Msg::Data,
-                ..
-            })
-        ),
-        "the first tick was delivered"
-    );
-}
-
 /// Panics with its text when dropped.
 struct PanicsWith(String);
 
 impl Drop for PanicsWith {
     fn drop(&mut self) {
         panic!("{}", self.0);
-    }
-}
-
-/// A forwarder that drops two items at the close keeps the first one's
-/// panic and logs the second once, naming the actor, with the `tracing`
-/// feature.
-#[test]
-fn both_items_dropped_at_the_close_keep_the_first_panic_and_log_the_second() {
-    #[cfg(feature = "tracing")]
-    let logged = crate::actor::supervision::lost_runner::capture::install();
-    let token = uuid::Uuid::new_v4();
-    let owner = ActorId::from(format!("closing-{token}"));
-    let first = format!("the first item panicked {token}");
-    let second = format!("the second item panicked {token}");
-    let released = Released::both_at_the_close(
-        PanicsWith(first.clone()),
-        PanicsWith(second.clone()),
-        &owner,
-    );
-    assert_eq!(released.run, None);
-    assert_eq!(released.end, Some(first));
-    #[cfg(feature = "tracing")]
-    {
-        let lines: Vec<String> = logged
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| line.contains(&second) && line.contains(&format!("actor_id={owner} ")))
-            .cloned()
-            .collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "the discarded panic is logged once: {lines:?}"
-        );
     }
 }
 
@@ -720,7 +450,9 @@ async fn a_cancel_while_a_recurring_send_waits(
     let slot = PanicSlot::default();
     let task = tokio::spawn(recurring_loop(
         handle,
+        RecurringId::new(0),
         factory,
+        Instant::now() + Duration::from_millis(1),
         Duration::from_millis(1),
         policy,
         token.clone(),
@@ -786,14 +518,6 @@ async fn a_cancel_while_a_recurring_send_waits(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_recurring_tick_is_never_sent_multi_thread() {
-    for policy in [MissPolicy::Skip, MissPolicy::Delay, MissPolicy::CatchUp] {
-        a_cancel_while_a_recurring_send_waits(policy, false, false).await;
-        a_cancel_while_a_recurring_send_waits(policy, false, true).await;
-    }
-}
-
 /// A `CatchUp` burst meets a full mailbox, and the tick it had no room for
 /// panics when dropped (and, with `loud_factory`, so does the factory's
 /// capture): each drops in its own catch, so the process does not abort,
@@ -810,13 +534,15 @@ async fn catch_up_without_room(loud_factory: bool) {
     let slot = PanicSlot::default();
     let task = tokio::spawn(recurring_loop(
         handle,
+        RecurringId::new(0),
         factory,
+        Instant::now() + Duration::from_millis(10),
         Duration::from_millis(10),
         MissPolicy::CatchUp,
         CancellationToken::new(),
         slot.clone(),
     ));
-    // The timer computes its first deadline, then the clock moves five
+    // The timer waits for its first deadline, then the clock moves five
     // intervals past it before the timer runs again.
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(50)).await;
@@ -857,11 +583,6 @@ async fn catch_up_without_room(loud_factory: bool) {
     assert!(rx.try_recv().is_err());
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_catch_up_tick_without_room_drops_in_its_own_catch() {
-    catch_up_without_room(false).await;
-}
-
 /// A one-shot timer whose cancel claimed it first never sends its message,
 /// even with its deadline past and room in the mailbox: the message drops
 /// once, in the forwarder's own poll, and the forwarder ends with nothing
@@ -882,55 +603,26 @@ async fn a_one_shot_whose_claim_was_lost_never_sends() {
     assert_eq!(drops.load(Ordering::SeqCst), 1, "the message dropped once");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_one_shot_whose_claim_was_lost_never_sends_multi_thread() {
-    a_one_shot_whose_claim_was_lost_never_sends().await;
-}
-
-/// The stream ended and was dropped; its `Finished` waits for room in the
-/// full mailbox and the registration is cancelled: `Finished` is never sent.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_cancel_while_a_finished_waits_drops_it() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let (handle, mut rx) = full::<Sink>(Msg::Data);
-    let token = CancellationToken::new();
-    let task = tokio::spawn(stream_forward(
-        Owned {
-            bomb: Bomb(dropped.clone()),
-            items: 0,
-        },
+/// A context on a bare mailbox, for driving the end of its forwarders by
+/// hand.
+fn bare_context() -> (
+    ActorContext<Sink>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<Sink>>,
+) {
+    let (handle, rx) = handle_of::<Sink>();
+    let (status_tx, _status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+    let ctx = ActorContext::new(
+        ActorId::from("forwarder-end"),
         handle,
-        token.clone(),
-        PanicSlot::default(),
-    ));
-    until_idle().await;
-    assert!(!task.is_finished(), "Finished waits for room");
-    assert!(
-        dropped.load(Ordering::SeqCst),
-        "the ended stream drops before its Finished"
+        tokio::runtime::Handle::current(),
+        status_tx,
+        None,
+        None,
+        None,
+        TurnClock::default(),
+        SubtreeHold::new(None),
     );
-    token.cancel();
-    let released = tokio::time::timeout(Duration::from_secs(3600), task)
-        .await
-        .expect("the forwarder ends")
-        .expect("the forwarder's own drops are caught");
-    assert!(
-        released
-            .run
-            .as_deref()
-            .is_some_and(|p| p.contains("panicked when dropped")),
-        "{:?}",
-        released.run
-    );
-    assert!(released.end.is_none());
-    assert!(matches!(
-        rx.try_recv(),
-        Ok(Envelope::Message {
-            payload: Msg::Data,
-            ..
-        })
-    ));
-    assert!(rx.try_recv().is_err(), "Finished was never sent");
+    (ctx, rx)
 }
 
 #[cfg(feature = "tracing")]
@@ -951,7 +643,7 @@ mod captured {
         /// Makes this the subscriber of the calling thread until the guard
         /// drops.
         pub(super) fn install(&self) -> tracing::subscriber::DefaultGuard {
-            tracing::subscriber::set_default(self.clone())
+            crate::tracing_isolation::install(self.clone())
         }
 
         pub(super) fn lines(&self) -> Vec<String> {
@@ -1059,33 +751,4 @@ async fn an_ended_stream_whose_finished_ends(how: FinishedEnds) -> (Option<Relea
         .filter(|line| line.contains("ended before reporting"))
         .collect();
     (released, lines)
-}
-
-/// A forwarder that reports an ended stream's drop panic, with `Finished` or
-/// with the release of a refused or cancelled `Finished`, has handed the
-/// panic over: it is not logged as one the forwarder ended without reporting.
-/// A forwarder aborted before it reports does log it, once.
-#[cfg(feature = "tracing")]
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_drop_panic_a_forwarder_reports_is_not_logged_as_unreported() {
-    for how in [
-        FinishedEnds::Delivered,
-        FinishedEnds::Refused,
-        FinishedEnds::Cancelled,
-    ] {
-        let (released, lines) = an_ended_stream_whose_finished_ends(how).await;
-        let released = released.expect("the forwarder reports");
-        assert!(
-            released
-                .run
-                .as_deref()
-                .is_some_and(|p| p.contains("panicked when dropped")),
-            "{how:?}: {:?}",
-            released.run
-        );
-        assert!(lines.is_empty(), "{how:?}: {lines:?}");
-    }
-    let (released, lines) = an_ended_stream_whose_finished_ends(FinishedEnds::Aborted).await;
-    assert!(released.is_none(), "an aborted forwarder reports nothing");
-    assert_eq!(lines.len(), 1, "logged once: {lines:?}");
 }

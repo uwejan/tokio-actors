@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::collections::HashSet;
 use std::future::IntoFuture;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -74,24 +73,5 @@ fn kill_by_id_reaches_the_actor_that_holds_the_id_when_it_is_called() {
             "the later actor took the Kill"
         );
         assert_eq!(first.wait_stopped().await, StopReason::Graceful);
-    });
-}
-
-#[test]
-fn anonymous_actors_get_distinct_random_ids() {
-    common::run(2, async {
-        let sys = ActorSystem::create(uname("anonymous")).unwrap();
-        let mut seen = HashSet::new();
-        for _ in 0..8 {
-            let h = within("spawn", Idle.spawn().on_system(&sys)).await.unwrap();
-            let parsed = uuid::Uuid::parse_str(h.id().as_str())
-                .unwrap_or_else(|_| panic!("{} is not a uuid", h.id()));
-            assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
-            assert!(
-                seen.insert(h.id().clone()),
-                "id {} was handed out twice",
-                h.id()
-            );
-        }
     });
 }

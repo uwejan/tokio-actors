@@ -79,8 +79,12 @@ impl Actor for Root {
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
         self.requests.fetch_add(1, Ordering::SeqCst);
+        // The verdict is read before the request is reported, so a caller
+        // that changes `veto` when it sees a report changes the verdict of
+        // the next request, never of the one reported.
+        let accept = !self.veto.load(Ordering::SeqCst);
         let _ = self.asked.send(());
-        !self.veto.load(Ordering::SeqCst)
+        accept
     }
 
     async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {

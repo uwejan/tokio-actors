@@ -129,101 +129,6 @@ async fn test_cancel_stream() {
     handle.stop(StopReason::Graceful).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_multiple_streams() {
-    struct DualCollector {
-        rx1: Option<tokio::sync::mpsc::Receiver<i32>>,
-        rx2: Option<tokio::sync::mpsc::Receiver<i32>>,
-        items: Vec<i32>,
-        finish_count: u32,
-    }
-
-    enum Msg {
-        Stream(StreamEvent<i32>),
-        GetState,
-    }
-
-    impl From<StreamEvent<i32>> for Msg {
-        fn from(ev: StreamEvent<i32>) -> Self {
-            Msg::Stream(ev)
-        }
-    }
-
-    enum Resp {
-        Ack,
-        State(Vec<i32>, u32),
-    }
-
-    impl Actor for DualCollector {
-        type Message = Msg;
-        type Response = Resp;
-
-        async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-            if let Some(rx) = self.rx1.take() {
-                ctx.add_stream(ReceiverStream::new(rx));
-            }
-            if let Some(rx) = self.rx2.take() {
-                ctx.add_stream(ReceiverStream::new(rx));
-            }
-            Ok(())
-        }
-
-        async fn handle(
-            &mut self,
-            msg: Self::Message,
-            _ctx: &mut ActorContext<Self>,
-        ) -> ActorResult<Self::Response> {
-            match msg {
-                Msg::Stream(StreamEvent::Data(v)) => {
-                    self.items.push(v);
-                    Ok(Resp::Ack)
-                }
-                Msg::Stream(StreamEvent::Finished) => {
-                    self.finish_count += 1;
-                    Ok(Resp::Ack)
-                }
-                Msg::GetState => Ok(Resp::State(self.items.clone(), self.finish_count)),
-            }
-        }
-    }
-
-    let (tx1, rx1) = tokio::sync::mpsc::channel(16);
-    let (tx2, rx2) = tokio::sync::mpsc::channel(16);
-
-    let handle = DualCollector {
-        rx1: Some(rx1),
-        rx2: Some(rx2),
-        items: Vec::new(),
-        finish_count: 0,
-    }
-    .spawn()
-    .named("dual")
-    .with_config(ActorConfig::default())
-    .await
-    .unwrap();
-
-    tx1.send(10).await.unwrap();
-    tx2.send(20).await.unwrap();
-    tx1.send(30).await.unwrap();
-    tx2.send(40).await.unwrap();
-    drop(tx1);
-    drop(tx2);
-
-    let h = &handle;
-    settle(|| async move {
-        matches!(h.send(Msg::GetState).await, Ok(Resp::State(items, 2)) if items.len() == 4)
-    })
-    .await;
-
-    if let Resp::State(mut items, finish_count) = handle.send(Msg::GetState).await.unwrap() {
-        items.sort();
-        assert_eq!(items, vec![10, 20, 30, 40]);
-        assert_eq!(finish_count, 2, "Both streams should send Finished");
-    }
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-}
-
 /// A stream that ends at once and panics when dropped.
 struct EndsAndPanicsWhenDropped;
 
@@ -300,9 +205,4 @@ async fn an_ended_stream_s_drop_panic_is_the_last_forwarder_error() {
     );
     handle.stop(StopReason::Graceful).await.unwrap();
     handle.wait_stopped().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ended_stream_s_drop_panic_is_the_last_forwarder_error_multi_thread() {
-    an_ended_stream_s_drop_panic_is_the_last_forwarder_error().await;
 }

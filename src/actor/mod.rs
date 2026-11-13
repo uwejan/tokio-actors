@@ -1,23 +1,75 @@
 //! Core actor traits and identity types.
 
+/// Aliases: names for sending to one run of an actor that its owner can end.
+pub(crate) mod alias;
+#[cfg(test)]
+mod alias_tests;
 /// Actor execution context.
 pub mod context;
 /// Actor handle for external communication.
 pub mod handle;
+#[cfg(test)]
+mod idle_tests;
+#[cfg(test)]
+mod late_map_panic_tests;
+/// Links and the trap flag.
+pub(crate) mod link;
+#[cfg(test)]
+mod link_tests;
 /// The actor's normal mailbox.
 pub(crate) mod mailbox;
 #[cfg(doctest)]
 mod message_bounds;
+/// Peer monitors: the entries an actor holds and the tasks that watch for
+/// the end of the actors they name.
+pub(crate) mod monitor;
+#[cfg(test)]
+mod monitor_tests;
 /// Panic capture for actor callbacks.
 pub(crate) mod panic;
+/// Process groups: scopes, join, leave and members.
+pub(crate) mod pg;
+/// Group and scope monitors.
+pub(crate) mod pg_monitor;
+/// Requests in flight.
+pub(crate) mod request;
+#[cfg(test)]
+mod request_tests;
 /// Runtime configuration and spawning logic.
 pub mod runtime;
+#[cfg(test)]
+mod size_tests;
+#[cfg(test)]
+mod spawned_monitor_tests;
 /// The start bound of a spawn, owned by the system.
 mod start_bound;
 /// Subtree tokens: the end of an actor and of everything it spawned.
 pub(crate) mod subtree;
 /// Supervision configuration and child management.
 pub mod supervision;
+/// A typed reference to a supervisor, for managing its children from outside.
+pub mod supervisor_ref;
+#[cfg(test)]
+mod supervisor_ref_tests;
+#[allow(dead_code)]
+pub mod sys;
+#[allow(dead_code)]
+pub(crate) mod sys_debug;
+#[allow(dead_code)]
+pub(crate) mod sys_loop;
+#[allow(dead_code)]
+pub(crate) mod sys_serve;
+#[allow(dead_code)]
+pub(crate) mod sys_state;
+#[allow(dead_code)]
+pub(crate) mod sys_suspend;
+/// The key of an actor's own task, for the self-call check.
+pub(crate) mod task_key;
+/// The receive timeout, the idle hook and the message to handle next.
+pub(crate) mod turn;
+
+#[cfg(test)]
+mod sys_options_tests;
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -28,10 +80,13 @@ use tokio::sync::oneshot;
 
 use crate::error::{ActorResult, SpawnError};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, ChildEvent, Envelope, StopReason};
+use crate::telemetry::Birth;
+use crate::types::{ActorId, ChildEvent, Down, Envelope, MonitorId, StopReason};
 use context::ActorContext;
+use monitor::MapFn;
 use runtime::ActorConfig;
 use supervision::{SupervisionConfig, DEFAULT_KILL_GRACE};
+use sys::{DebugOptions, SysOptions};
 
 /// Primary trait implemented by all actors.
 ///
@@ -304,6 +359,66 @@ pub trait Actor: Sized + Send + 'static {
         async { Ok(()) }
     }
 
+    /// Runs when the actor has been idle for the length set with
+    /// [`idle_after`](ActorContext::idle_after), once per idle spell.
+    ///
+    /// A spell starts when the run loop is about to wait with the normal
+    /// mailbox and the priority lane empty, and ends when a message starts a
+    /// turn. A request on the system channel, such as a status read, neither
+    /// ends it nor restarts it. The hook runs on the actor's task, takes no
+    /// mailbox slot and leaves the status `Running`; an `Err` or a panic from
+    /// it ends the actor as one from `handle` does. The default does nothing.
+    ///
+    /// Erlang/OTP: the `hibernate_after` trigger without the hibernation. Here
+    /// a status read does not restart the spell, where a system message
+    /// restarts OTP's `hibernate_after` wait as well as its legacy time-out;
+    /// its documentation calls the legacy time-out's restart a flaw.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult,
+    /// };
+    ///
+    /// struct Cache {
+    ///     flushed: u32,
+    /// }
+    ///
+    /// impl Actor for Cache {
+    ///     type Message = ();
+    ///     type Response = u32;
+    ///
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         ctx.idle_after(Duration::from_secs(30));
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn on_idle(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         self.flushed += 1;
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+    ///         Ok(self.flushed)
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cache = Cache { flushed: 0 }.spawn().await?;
+    /// assert_eq!(cache.send(()).await?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn on_idle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Handles a message sent to the actor.
     ///
     /// This method is called sequentially for each message in the mailbox.
@@ -329,7 +444,7 @@ pub trait Actor: Sized + Send + 'static {
         ctx: &mut ActorContext<Self>,
     ) -> impl Future<Output = ActorResult<Self::Response>> + Send;
 
-    /// Phase 4a: Stop gate. Return `false` to reject graceful/parent-requested stops.
+    /// Phase 4a: Stop gate. Return `false` to reject graceful, shutdown and parent-requested stops.
     /// Forced stops (`Failure`, `ParentKilled`, `Cancelled`) bypass this hook entirely.
     ///
     /// If it panics, the actor's exit reason is that panic as a `Failure`,
@@ -402,15 +517,15 @@ pub trait Actor: Sized + Send + 'static {
     /// or a `Kill` raised meanwhile ends the actor with `Kill` and no
     /// `on_stopped`; the failure is recorded as its last error in every case,
     /// and the remaining deliveries still run unless that `Kill` ends them. A
-    /// child whose end comes after the supervisor has collected the deaths
-    /// still pending when its message loop ended, one stopped by the
-    /// supervisor's own teardown included, is
-    /// not reported here; with the `tracing` feature, such an end with an
-    /// unexpected reason is logged as a warning. A supervisor whose
+    /// child whose exit reason becomes final after the supervisor has
+    /// collected the deaths still pending when its message loop ended, one
+    /// stopped by the supervisor's own teardown included, is not reported
+    /// here; with the `tracing` feature, such an end with an
+    /// unexpected reason is logged as an error. A supervisor whose
     /// `pre_start` or `on_started` fails receives none: it never ran its
     /// message loop, as it never receives `on_stopped`; with the `tracing`
     /// feature, a child that ended with an unexpected reason during that
-    /// initialization is logged as a warning.
+    /// initialization is logged as an error.
     ///
     /// A `SupervisorStopping` error from a supervision call made here is an
     /// `Err` like any other: returned with `?`, it makes the supervisor's
@@ -427,9 +542,34 @@ pub trait Actor: Sized + Send + 'static {
     ) -> impl Future<Output = ActorResult<()>> + Send {
         async { Ok(()) }
     }
+
+    /// Whether this actor is sensitive. A sensitive actor refuses
+    /// [`inspect`](crate::actor::sys::Sys::inspect) and
+    /// [`replace_state`](crate::actor::sys::Sys::replace_state) even when it
+    /// was spawned with
+    /// [`allow_state_access`](crate::actor::SpawnBuilder::allow_state_access),
+    /// reports no [`state`](crate::types::ActorStatusInfo::state), and its
+    /// log lines print the kind of an error and never the text derived from
+    /// it. [`SpawnBuilder::sensitive`](crate::actor::SpawnBuilder::sensitive)
+    /// makes one spawn sensitive without this constant.
+    const SENSITIVE: bool = false;
+
+    /// The actor's own account of its state, for
+    /// [`ActorStatusInfo::state`](crate::types::ActorStatusInfo::state) and
+    /// for the report of a crash. The default is `None`.
+    ///
+    /// It is a query on `&self`, not a lifecycle hook. It runs on the actor's
+    /// task, between two turns, and a panic in it is caught and shown as a
+    /// placeholder; with `panic = "abort"` it ends the process. A sensitive
+    /// actor's `format_status` is never called.
+    /// Erlang/OTP's `format_status/1` returns a map; this returns text.
+    fn format_status(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Type alias tying the strongly typed envelope to a concrete actor.
+#[doc(hidden)]
 pub type ActorEnvelope<A> = Envelope<<A as Actor>::Message, <A as Actor>::Response>;
 
 // ---------------------------------------------------------------------------
@@ -522,6 +662,7 @@ pub struct SpawnBuilder<A: Actor> {
     config: ActorConfig,
     ack: SpawnAck,
     kill_grace: Duration,
+    sys: SysOptions,
 }
 
 impl<A: Actor> std::fmt::Debug for SpawnBuilder<A> {
@@ -546,9 +687,18 @@ impl<A: Actor> SpawnBuilder<A> {
         self
     }
 
-    /// Overrides the default [`ActorConfig`].
+    /// Overrides the default [`ActorConfig`]. A supervisor role chosen on
+    /// this builder with [`supervisor`](Self::supervisor) or
+    /// [`with_supervision`](Self::with_supervision) before this call stays,
+    /// unless `config` carries a supervision config of its own, which then
+    /// wins; a role chosen after this call replaces whatever `config`
+    /// carried.
     pub fn with_config(mut self, config: ActorConfig) -> Self {
+        let role = self.config.supervision.take();
         self.config = config;
+        if self.config.supervision.is_none() {
+            self.config.supervision = role;
+        }
         self
     }
 
@@ -675,8 +825,9 @@ impl<A: Actor> SpawnBuilder<A> {
     /// [`StopReason::Kill`], the kill step of
     /// [`ActorHandle::stop_within`](crate::actor::handle::ActorHandle::stop_within)
     /// and of system shutdown, its supervisor's stop of it, and the kill a
-    /// worker receives when its own supervisor is killed. An actor that is
-    /// itself a supervisor stops in order when its supervisor is killed,
+    /// worker that does not trap exit signals receives when its own supervisor
+    /// is killed. An actor that is itself a supervisor, or a worker that traps
+    /// exit signals, stops in order when its supervisor is killed,
     /// bounded by its own [`Shutdown`](crate::types::Shutdown), and the
     /// grace applies to the `Kill` raised once that window has passed;
     /// [`ActorHandle::stop_within`](crate::actor::handle::ActorHandle::stop_within)
@@ -685,8 +836,9 @@ impl<A: Actor> SpawnBuilder<A> {
     /// never aborts. A callback that never yields survives the abort as well
     /// and is reported unresponsive.
     ///
-    /// `kill_grace(Duration::ZERO)` gives Erlang/OTP's kill latency for a
-    /// callback that awaits; a grace beyond any practical bound keeps every turn
+    /// `kill_grace(Duration::ZERO)` gives a kill that cuts a callback at its
+    /// next await, the nearest the runtime offers to Erlang/OTP's immediate
+    /// kill; a grace beyond any practical bound keeps every turn
     /// whole, and makes every wait that runs on that grace, its parent's stop
     /// budget included, last for the grace, which in practice is as long as
     /// under `Shutdown::Infinity`, while `stop_within(StopReason::Kill, d)`
@@ -694,6 +846,285 @@ impl<A: Actor> SpawnBuilder<A> {
     pub fn kill_grace(mut self, grace: Duration) -> Self {
         self.kill_grace = grace;
         self
+    }
+
+    /// Starts the actor with the given debug options on: statistics, the log
+    /// and the trace, as the [`sys`] calls would turn them on. A supervised
+    /// child restarts with the same options, and each incarnation starts from
+    /// them, not from the toggles of the one before.
+    pub fn debug(mut self, options: DebugOptions) -> Self {
+        self.sys.debug = options;
+        self
+    }
+
+    /// Lets [`inspect`](sys::Sys::inspect) and
+    /// [`replace_state`](sys::Sys::replace_state) reach the actor's value.
+    /// State access is closed otherwise. A sensitive actor stays closed.
+    pub fn allow_state_access(mut self) -> Self {
+        self.sys.allow_state_access = true;
+        self
+    }
+
+    /// Makes this actor sensitive, as [`Actor::SENSITIVE`] does for every
+    /// spawn of its type.
+    pub fn sensitive(mut self) -> Self {
+        self.sys.sensitive = true;
+        self
+    }
+
+    /// Monitors the actor for `ctx`'s actor from its first moment, as Erlang/OTP's
+    /// `spawn_monitor` does: the notice is made as the spawn returns, so an
+    /// actor that ends at once is never missed. `.await` resolves to the
+    /// handle and the [`MonitorId`], and the notice reaches `ctx`'s actor
+    /// through `map`, as for [`ActorContext::monitor`].
+    ///
+    /// The monitor is made after the start is acknowledged, and a start that
+    /// fails has one outcome: the `.await` returns the [`SpawnError`], no
+    /// monitor exists and no notice follows. An actor that ends before the
+    /// monitor is made still sends its notice with its own reason, never
+    /// `NoProc`. A spawn made with
+    /// `.detached()` has no acknowledgment to wait for, so its
+    /// monitor is made as soon as the task is spawned, and a start that fails
+    /// afterwards is reported to `map` as any other end.
+    ///
+    /// Chain it after the other options (`named`, `on_system`, `with_config`,
+    /// `start_timeout`), as the last call before `.await`; add
+    /// `.linked()` on the result to link as well.
+    ///
+    /// A spawn from an actor that is stopping or has stopped is refused with
+    /// [`SpawnError::OwnerStopping`] before anything is spawned, because the
+    /// notices a stopping actor is owed were fixed when its stop began.
+    ///
+    /// Only the root builder has this form. A supervised child has none: after
+    /// [`ActorContext::spawn_child`] returns, `ctx.monitor(&child, map)` is
+    /// the same monitor, and a child whose first start fails still sends its
+    /// notice, because that start is not awaited.
+    ///
+    /// Erlang/OTP: `erlang:spawn_monitor/1`.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use tokio::sync::mpsc;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult, Down, DownReason, StopReason,
+    /// };
+    ///
+    /// struct Worker;
+    ///
+    /// impl Actor for Worker {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         // The worker's work is done as soon as it starts.
+    ///         ctx.stop(StopReason::Graceful).expect("the lane takes the request");
+    ///         Ok(())
+    ///     }
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// enum Msg {
+    ///     Start,
+    ///     Gone(Down),
+    /// }
+    ///
+    /// struct Parent(mpsc::UnboundedSender<Down>);
+    ///
+    /// impl Actor for Parent {
+    ///     type Message = Msg;
+    ///     type Response = ();
+    ///     async fn handle(&mut self, msg: Msg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         match msg {
+    ///             Msg::Start => {
+    ///                 Worker.spawn().monitored(ctx, Msg::Gone).await.expect("the worker starts");
+    ///             }
+    ///             Msg::Gone(down) => {
+    ///                 let _ = self.0.send(down);
+    ///             }
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let (tx, mut downs) = mpsc::unbounded_channel();
+    /// let parent = Parent(tx).spawn().await?;
+    /// parent.notify(Msg::Start).await?;
+    /// let down = downs.recv().await.expect("the monitor fires");
+    /// assert_eq!(down.reason, DownReason::Stopped(StopReason::Graceful));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn monitored<W, F>(self, ctx: &mut ActorContext<W>, map: F) -> MonitoredSpawn<'_, A, W>
+    where
+        W: Actor,
+        F: Fn(Down) -> W::Message + Send + Sync + 'static,
+    {
+        MonitoredSpawn {
+            inner: self,
+            ctx,
+            map: Box::new(map),
+            linked: false,
+        }
+    }
+
+    /// Links the actor to `ctx`'s actor from its first moment, as Erlang/OTP's
+    /// `spawn_link` does: the link is made as the spawn returns, so an actor
+    /// that ends at once is never missed, and one that has already ended by
+    /// then delivers its own end reason through the link rules, as if the
+    /// link had been there before it ran. `.await` resolves to the handle.
+    ///
+    /// The link is made after the start is acknowledged, and a start that
+    /// fails has one outcome: the `.await` returns the [`SpawnError`], no link
+    /// exists and no exit signal follows. A spawn made with
+    /// `.detached()` has no acknowledgment to wait for, so its
+    /// link is made as soon as the task is spawned.
+    ///
+    /// An actor that ended before `ctx`'s actor resumed from the start
+    /// acknowledgment has already sent its exit: [`ActorContext::unlink`]
+    /// answers `false` for it and the exit still arrives.
+    ///
+    /// Chain it after the other options (`named`, `on_system`, `with_config`,
+    /// `start_timeout`), as the last call before `.await`. A spawn from an
+    /// actor that is stopping or has stopped is refused with
+    /// [`SpawnError::OwnerStopping`] before anything is spawned.
+    ///
+    /// Only the root builder has this form. After
+    /// [`ActorContext::spawn_child`] returns, `ctx.link(&child)` is the same
+    /// link.
+    ///
+    /// Erlang/OTP: `erlang:spawn_link/1`.
+    pub fn linked<W: Actor>(self, ctx: &mut ActorContext<W>) -> LinkedSpawn<'_, A, W> {
+        LinkedSpawn { inner: self, ctx }
+    }
+}
+
+/// Whether an actor still takes new monitors and links: the notices a
+/// stopping actor is owed were fixed when its stop began.
+fn owner_takes_registrations<W: Actor>(ctx: &ActorContext<W>) -> bool {
+    !matches!(
+        ctx.status(),
+        crate::types::ActorStatus::Stopping | crate::types::ActorStatus::Stopped
+    )
+}
+
+/// A root spawn that monitors the new actor for the spawning actor.
+///
+/// Created by [`SpawnBuilder::monitored`]. Awaiting it spawns the actor and,
+/// once the start is acknowledged, monitors it. It resolves to the handle and
+/// the [`MonitorId`], or to the spawn's error with nothing monitored.
+pub struct MonitoredSpawn<'ctx, A: Actor, W: Actor> {
+    inner: SpawnBuilder<A>,
+    ctx: &'ctx mut ActorContext<W>,
+    map: Box<MapFn<W::Message>>,
+    linked: bool,
+}
+
+impl<A: Actor, W: Actor> std::fmt::Debug for MonitoredSpawn<'_, A, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonitoredSpawn")
+            .field("inner", &self.inner)
+            .field("linked", &self.linked)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: Actor, W: Actor> MonitoredSpawn<'_, A, W> {
+    /// Links the new actor as well as monitoring it, as Erlang/OTP's
+    /// `spawn_opt` with the `link` and `monitor` options does. The link is
+    /// made right after the monitor, on the same terms: an actor that has
+    /// already ended delivers its own end reason through the link rules, and
+    /// [`ActorContext::unlink`] answers `false` for it.
+    pub fn linked(mut self) -> Self {
+        self.linked = true;
+        self
+    }
+}
+
+impl<'ctx, A: Actor, W: Actor> IntoFuture for MonitoredSpawn<'ctx, A, W> {
+    type Output = Result<(handle::ActorHandle<A>, MonitorId), SpawnError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'ctx>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let Self {
+                inner,
+                ctx,
+                map,
+                linked,
+            } = self;
+            if !owner_takes_registrations(ctx) {
+                return Err(SpawnError::OwnerStopping);
+            }
+            let handle = inner.await?;
+            // The spawning actor's own task is the one awaiting, so its stop
+            // stage cannot begin between the check above and these calls.
+            let made = ctx.monitor_spawned(&handle, map);
+            let made = made.map_err(|_| ()).and_then(|id| {
+                if linked {
+                    ctx.link_spawned(&handle).map_err(|_| ())?;
+                }
+                Ok(id)
+            });
+            match made {
+                Ok(id) => Ok((handle, id)),
+                Err(()) => {
+                    debug_assert!(
+                        false,
+                        "an actor that took a spawn was refused a registration"
+                    );
+                    let _ = handle.stop(StopReason::Graceful).await;
+                    Err(SpawnError::OwnerStopping)
+                }
+            }
+        })
+    }
+}
+
+/// A root spawn that links the new actor to the spawning actor.
+///
+/// Created by [`SpawnBuilder::linked`]. Awaiting it spawns the actor and, once
+/// the start is acknowledged, links it. It resolves to the handle, or to the
+/// spawn's error with nothing linked.
+pub struct LinkedSpawn<'ctx, A: Actor, W: Actor> {
+    inner: SpawnBuilder<A>,
+    ctx: &'ctx mut ActorContext<W>,
+}
+
+impl<A: Actor, W: Actor> std::fmt::Debug for LinkedSpawn<'_, A, W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkedSpawn")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'ctx, A: Actor, W: Actor> IntoFuture for LinkedSpawn<'ctx, A, W> {
+    type Output = Result<handle::ActorHandle<A>, SpawnError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'ctx>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let Self { inner, ctx } = self;
+            if !owner_takes_registrations(ctx) {
+                return Err(SpawnError::OwnerStopping);
+            }
+            let handle = inner.await?;
+            // As for a monitored spawn, the owner's stop stage cannot begin
+            // here, so the link is not refused.
+            if ctx.link_spawned(&handle).is_err() {
+                debug_assert!(
+                    false,
+                    "an actor that took a spawn was refused a registration"
+                );
+                let _ = handle.stop(StopReason::Graceful).await;
+                return Err(SpawnError::OwnerStopping);
+            }
+            Ok(handle)
+        })
     }
 }
 
@@ -720,10 +1151,11 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                     name,
                     self.system,
                     self.kill_grace,
+                    self.sys,
                 ),
                 SpawnAck::Await => {
                     let (tx, rx) = oneshot::channel();
-                    let (handle, _join, _subtree) = runtime::spawn_actor(
+                    let (handle, _join, _subtree) = runtime::spawn_actor_in(
                         id_str,
                         self.actor,
                         self.config,
@@ -733,6 +1165,9 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                         true,
                         self.kill_grace,
                         None,
+                        None,
+                        Birth::root(),
+                        self.sys,
                     )?;
                     match rx.await {
                         Ok(Ok(())) => Ok(handle),
@@ -749,7 +1184,7 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                     crate::time_probe::require_timers_if_in_runtime("SpawnBuilder::start_timeout");
                     let requested = self.system.clone();
                     let (tx, rx) = oneshot::channel();
-                    let (handle, join, _subtree) = runtime::spawn_actor(
+                    let (handle, join, _subtree) = runtime::spawn_actor_in(
                         id_str.clone(),
                         self.actor,
                         self.config,
@@ -759,6 +1194,9 @@ impl<A: Actor> IntoFuture for SpawnBuilder<A> {
                         true,
                         self.kill_grace,
                         None,
+                        None,
+                        Birth::root(),
+                        self.sys,
                     )?;
                     let target = requested.unwrap_or_else(ActorSystem::default);
                     // Boxed, so only a timed spawn carries the bound's state.
@@ -822,6 +1260,7 @@ pub trait ActorExt: Actor + Sized {
             config: ActorConfig::default(),
             ack: SpawnAck::Await,
             kill_grace: DEFAULT_KILL_GRACE,
+            sys: SysOptions::default(),
         }
     }
 }

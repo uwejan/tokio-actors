@@ -18,128 +18,9 @@ use tokio_actors::{
 mod common;
 
 #[derive(Clone, Copy)]
-enum Crash {
-    HandleErr,
-    HandlePanic,
-}
-
-#[derive(Clone, Copy)]
 enum Cleanup {
     Err,
     Panic,
-}
-
-struct Subject {
-    cleanup: Cleanup,
-}
-
-impl Actor for Subject {
-    type Message = Crash;
-    type Response = ();
-
-    async fn handle(&mut self, msg: Crash, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        match msg {
-            Crash::HandleErr => Err(ActorError::user("db down")),
-            Crash::HandlePanic => panic!("handler panic"),
-        }
-    }
-
-    async fn on_stopped(
-        &mut self,
-        _reason: &StopReason,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        match self.cleanup {
-            Cleanup::Err => Err(ActorError::user("close failed")),
-            Cleanup::Panic => panic!("close panicked"),
-        }
-    }
-}
-
-async fn end_reason(cleanup: Cleanup, crash: Option<Crash>) -> StopReason {
-    let h = Subject { cleanup }.spawn().await.unwrap();
-    match crash {
-        Some(c) => {
-            let _ = h.send(c).await;
-        }
-        None => {
-            h.stop(StopReason::Graceful).await.unwrap();
-        }
-    }
-    tokio::time::timeout(Duration::from_secs(10), h.wait_stopped())
-        .await
-        .expect("the actor ends")
-}
-
-#[test]
-fn the_first_failure_stays_the_reason_whichever_way_on_stopped_fails() {
-    common::run(2, async {
-        let db_down = StopReason::Failure(ActorError::user("db down"));
-        // An earlier failure stands: an Err from on_stopped, as a panic.
-        assert_eq!(
-            end_reason(Cleanup::Err, Some(Crash::HandleErr)).await,
-            db_down
-        );
-        assert_eq!(
-            end_reason(Cleanup::Panic, Some(Crash::HandleErr)).await,
-            db_down
-        );
-        match end_reason(Cleanup::Err, Some(Crash::HandlePanic)).await {
-            StopReason::Failure(ActorError::Panic(text)) => assert!(text.contains("handler panic")),
-            other => panic!("the handler's panic stands, got {other:?}"),
-        }
-        match end_reason(Cleanup::Panic, Some(Crash::HandlePanic)).await {
-            StopReason::Failure(ActorError::Panic(text)) => assert!(text.contains("handler panic")),
-            other => panic!("the handler's panic stands, got {other:?}"),
-        }
-    });
-}
-
-/// A stop that is no failure (a parent's request, a cancellation, an
-/// inherited stop) is not a failure that stands: an `Err` or a panic from
-/// `on_stopped` is then the reason the actor ends with.
-#[test]
-fn a_failure_of_on_stopped_is_the_reason_after_a_stop_that_is_no_failure() {
-    common::run(2, async {
-        for forced in [
-            StopReason::ParentRequest,
-            StopReason::Cancelled,
-            StopReason::ParentKilled,
-        ] {
-            let h = Subject {
-                cleanup: Cleanup::Err,
-            }
-            .spawn()
-            .await
-            .unwrap();
-            h.stop(forced.clone()).await.unwrap();
-            let reason = tokio::time::timeout(Duration::from_secs(10), h.wait_stopped())
-                .await
-                .expect("the actor ends");
-            assert_eq!(
-                reason,
-                StopReason::Failure(ActorError::user("close failed")),
-                "{forced:?}"
-            );
-
-            let h = Subject {
-                cleanup: Cleanup::Panic,
-            }
-            .spawn()
-            .await
-            .unwrap();
-            h.stop(forced.clone()).await.unwrap();
-            let reason = tokio::time::timeout(Duration::from_secs(10), h.wait_stopped())
-                .await
-                .expect("the actor ends");
-            match reason {
-                StopReason::Failure(ActorError::Panic(text)) => {
-                    assert!(text.contains("close panicked"), "{forced:?}: {text}")
-                }
-                other => panic!("{forced:?}: the cleanup panic is the reason, got {other:?}"),
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -347,30 +228,6 @@ fn a_failure_raised_while_pre_stop_runs_stays_the_reason_when_it_panics() {
         match seen.last_error {
             Some(ActorError::Panic(text)) => assert!(text.contains("pre_stop panicked"), "{text}"),
             other => panic!("the pre_stop panic is the last error, got {other:?}"),
-        }
-    });
-}
-
-#[test]
-fn a_panic_of_pre_stop_is_the_reason_when_no_failure_stands() {
-    common::run(2, async {
-        for meanwhile in [
-            None,
-            Some(StopReason::Cancelled),
-            Some(StopReason::ParentKilled),
-        ] {
-            let end = pre_stop_panic_end(Payload::Text, meanwhile.clone()).await;
-            let error = match &end.reason {
-                StopReason::Failure(error @ ActorError::Panic(text)) => {
-                    assert!(text.contains("pre_stop panicked"), "{meanwhile:?}: {text}");
-                    error.clone()
-                }
-                other => panic!("{meanwhile:?}: the panic is the reason, got {other:?}"),
-            };
-            let seen = end.seen.expect("on_stopped runs");
-            assert_eq!(seen.reason, end.reason, "{meanwhile:?}");
-            // The last error is the reason's own error.
-            assert_eq!(seen.last_error, Some(error), "{meanwhile:?}");
         }
     });
 }

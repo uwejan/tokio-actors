@@ -26,9 +26,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::types::ActorId;
+use crate::types::{ActorId, Who};
 
 /// Opaque panic payload as produced by the unwind machinery.
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
@@ -91,8 +91,48 @@ impl<F> Drop for DropCaught<'_, F> {
 /// hook handles included, drop under `catch_unwind`, so that drop never
 /// unwinds. A future the crate built itself goes through [`catch_callback`],
 /// which holds it once.
+#[cfg(test)]
 pub(crate) fn catch_hook<B, F>(build: B) -> impl Future<Output = Result<F::Output, PanicPayload>>
 where
+    B: FnOnce() -> F,
+    F: Future,
+{
+    catch_hook_t((), build)
+}
+
+/// What a hook's polls run under: nothing, or a caller token. `()` is the
+/// hook that sets no token and stores none, so such a hook's future is no
+/// larger than before tokens existed.
+pub(crate) trait HookToken: Copy + Unpin {
+    /// Enters the token for one poll; `None` when there is none to set.
+    fn enter(self) -> Option<crate::telemetry::token::TokenGuard>;
+}
+
+impl HookToken for () {
+    #[inline(always)]
+    fn enter(self) -> Option<crate::telemetry::token::TokenGuard> {
+        None
+    }
+}
+
+impl HookToken for u64 {
+    #[inline(always)]
+    fn enter(self) -> Option<crate::telemetry::token::TokenGuard> {
+        (self != 0).then(|| crate::telemetry::token::enter(self))
+    }
+}
+
+/// [`catch_hook`] with the caller `token` of the hook: every poll of the
+/// hook, and the drop of its completed future, runs with the thread's token
+/// set to `token` when it is nonzero, and the token the thread held is put
+/// back when the poll ends, also on an unwind. `token` is a `u64`, or `()`
+/// for a hook that sets none ([`catch_hook`]).
+pub(crate) fn catch_hook_t<K, B, F>(
+    token: K,
+    build: B,
+) -> impl Future<Output = Result<F::Output, PanicPayload>>
+where
+    K: HookToken,
     B: FnOnce() -> F,
     F: Future,
 {
@@ -109,6 +149,7 @@ where
         }
         PollStep {
             running: &mut running,
+            token,
         }
         .await
     }
@@ -120,16 +161,20 @@ where
 /// produced is then dropped under a catch. `poll` carries `#[inline(always)]`
 /// so that the step is compiled into the block that awaits it and is not
 /// called from there.
-struct PollStep<'a, 'b, F> {
+struct PollStep<'a, 'b, F, K> {
     running: &'a mut Running<'b, F>,
+    /// The caller token the poll runs under; `()` or 0 sets none.
+    token: K,
 }
 
-impl<F: Future> Future for PollStep<'_, '_, F> {
+impl<F: Future, K: HookToken> Future for PollStep<'_, '_, F, K> {
     type Output = Result<F::Output, PanicPayload>;
 
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let slot = &mut self.get_mut().running.0;
+        let this = self.get_mut();
+        let _token = this.token.enter();
+        let slot = &mut this.running.0;
         let mut output = None;
         let polled = catch_unwind(AssertUnwindSafe(|| {
             let poll = slot
@@ -250,14 +295,24 @@ pub(crate) fn discard(payload: PanicPayload) {
 ///
 /// A waker the polling task itself replaces or drops in its own poll is not
 /// the business of this function: that panic unwinds into that poll.
-pub(crate) fn contain_waker_panic(
-    site: &'static str,
-    owner: Option<&ActorId>,
-    work: impl FnOnce(),
-) {
+#[cfg_attr(feature = "tracing", inline(always))]
+pub(crate) fn contain_waker_panic(site: &'static str, owner: Option<&Who>, work: impl FnOnce()) {
     if let Err(payload) = catch_sync(work) {
+        #[cfg(feature = "tracing")]
+        waker_panicked(site, payload, owner);
+        #[cfg(not(feature = "tracing"))]
         log_waker_panic(site, &payload_into_string(payload), owner);
     }
+}
+
+/// The log line of a waker's panic that [`contain_waker_panic`] caught, with
+/// the payload rendered as text. A separate cold function, so the code that
+/// wakes holds the wake and its catch and nothing of the log line.
+#[cfg(feature = "tracing")]
+#[cold]
+#[inline(never)]
+fn waker_panicked(site: &'static str, payload: PanicPayload, owner: Option<&Who>) {
+    log_waker_panic(site, &payload_into_string(payload), owner);
 }
 
 /// Sends `value` on a one-shot channel whose receiver is another task's future
@@ -300,9 +355,20 @@ impl<T> AnswerHold<T> {
         Self(answer)
     }
 
+    /// Whether the guard holds a sender.
+    #[inline]
+    pub(crate) fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Takes the sender out of the guard, which then holds nothing.
     pub(crate) fn take(&mut self) -> Option<oneshot::Sender<T>> {
         self.0.take()
+    }
+
+    /// Whether the receiver is gone, or the guard holds nothing.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.as_ref().is_none_or(oneshot::Sender::is_closed)
     }
 }
 
@@ -314,21 +380,111 @@ impl<T> Drop for AnswerHold<T> {
     }
 }
 
+/// A value whose drop frees a slot of a tokio channel and so wakes the sender
+/// parked behind it: a permit of the priority lane, or the pending `reserve`
+/// future that may hold one. The woken waker belongs to that sender's task.
+///
+/// The guard drops the value inside [`contain_waker_panic`] however the guard
+/// goes (an end of scope, a cancelled select, an aborted task, an unwind), so
+/// a panic of that waker never unwinds into the task that held the slot.
+/// [`into_inner`](Self::into_inner) hands the value back for a use that
+/// consumes it, after which the guard holds nothing.
+pub(crate) struct WakeHold<T> {
+    value: Option<T>,
+    site: &'static str,
+    owner: Option<ActorId>,
+}
+
+impl<T> WakeHold<T> {
+    /// Holds `value`, which `site` names in the log, with `owner` when it is
+    /// known, if its drop panics.
+    pub(crate) fn new(site: &'static str, owner: Option<&ActorId>, value: T) -> Self {
+        Self {
+            value: Some(value),
+            site,
+            owner: owner.cloned(),
+        }
+    }
+
+    /// The held value.
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        self.value.as_mut().expect("held until taken")
+    }
+
+    /// Takes the value out of the guard, which then holds nothing.
+    pub(crate) fn into_inner(mut self) -> T {
+        self.value.take().expect("held until taken")
+    }
+}
+
+impl<T> Drop for WakeHold<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            contain_waker_panic(
+                self.site,
+                self.owner.as_ref().map(ActorId::as_who),
+                move || drop(value),
+            );
+        }
+    }
+}
+
+/// Reserves a slot of a bounded tokio channel, waiting while it is full; `None`
+/// once the channel is closed. `seen` runs once, before any wait, with whether
+/// the channel was full.
+///
+/// The permit, and the pending `reserve` future while it waits, are held in a
+/// [`WakeHold`]: a future dropped with a slot the channel has already granted
+/// it gives the slot to the next parked sender, whose waker belongs to another
+/// task, so a cancelled wait, a timeout or an abort drops it inside the catch.
+/// The free-slot path allocates nothing.
+pub(crate) async fn reserve_held<'a, M>(
+    site: &'static str,
+    owner: Option<&ActorId>,
+    lane: &'a mpsc::Sender<M>,
+    seen: impl FnOnce(bool),
+) -> Option<WakeHold<mpsc::Permit<'a, M>>> {
+    match lane.try_reserve() {
+        Ok(permit) => {
+            seen(false);
+            return Some(WakeHold::new(site, owner, permit));
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => return None,
+        Err(mpsc::error::TrySendError::Full(())) => seen(true),
+    }
+    let mut wait = WakeHold::new(site, owner, Box::pin(lane.reserve()));
+    let permit = std::future::poll_fn(|cx| wait.get_mut().as_mut().poll(cx))
+        .await
+        .ok()?;
+    Some(WakeHold::new(site, owner, permit))
+}
+
+/// Reserves a slot of a bounded tokio channel without waiting, held in a
+/// [`WakeHold`] at once; a full or closed channel is refused and holds nothing.
+pub(crate) fn try_reserve_held<'a, M>(
+    site: &'static str,
+    owner: Option<&ActorId>,
+    lane: &'a mpsc::Sender<M>,
+) -> Result<WakeHold<mpsc::Permit<'a, M>>, mpsc::error::TrySendError<()>> {
+    lane.try_reserve()
+        .map(|permit| WakeHold::new(site, owner, permit))
+}
+
 /// Logs, with the `tracing` feature, a panic raised by the wake or the drop of
 /// a waker that [`contain_waker_panic`] contained, naming the actor when it is
 /// known.
-pub(crate) fn log_waker_panic(site: &'static str, payload: &str, owner: Option<&ActorId>) {
+pub(crate) fn log_waker_panic(site: &'static str, payload: &str, owner: Option<&Who>) {
     #[cfg(feature = "tracing")]
     match owner {
         Some(owner) => caught_log!(warn,
             actor_id = %owner,
             site,
-            panic = %payload,
+            panic = %crate::telemetry::LogFields::foreign().panic_text(payload),
             "a waker panicked when the crate woke or dropped it; the panic is contained"
         ),
         None => caught_log!(warn,
             site,
-            panic = %payload,
+            panic = %crate::telemetry::LogFields::foreign().panic_text(payload),
             "a waker panicked when the crate woke or dropped it; the panic is contained"
         ),
     }
@@ -364,6 +520,44 @@ pub(crate) fn contain_log(log: impl FnOnce()) {
     }
 }
 
+/// The environment variable that marks a child process of the unit-test
+/// binary.
+#[cfg(test)]
+const CHILD_PROCESS: &str = "TOKIO_ACTORS_UNIT_TEST_CHILD";
+
+/// Runs the unit test `name` of module `module` (`module_path!()` at the call)
+/// alone in a child process of this test binary, and asserts the child exited
+/// successfully. Returns `true` in the child, where the test runs its scenario
+/// and its assertions, and `false` in the parent once the child passed. A
+/// scenario whose failure ends the process (a panic raised while another
+/// unwinds) runs this way, so the abort fails one test instead of ending the
+/// binary.
+#[cfg(test)]
+pub(crate) fn in_a_child_process(module: &str, name: &str) -> bool {
+    if std::env::var_os(CHILD_PROCESS).is_some() {
+        return true;
+    }
+    let module = module.strip_prefix("tokio_actors::").unwrap_or(module);
+    let path = format!("{module}::{name}");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &path, "--test-threads", "1"])
+        .env(CHILD_PROCESS, "1")
+        .output()
+        .expect("the child process runs");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success(),
+        "the scenario failed or ended the process: {}\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(
+        stdout.contains("running 1 test") && stdout.contains("1 passed"),
+        "the child ran exactly the one test: {stdout}"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,45 +584,38 @@ mod tests {
         }
     }
 
-    /// The output the hook produced is dropped once, and under a catch: its
-    /// own drop panics too, and the result is still the panic of the
-    /// future's drop.
-    #[tokio::test]
-    async fn the_output_of_a_hook_whose_drop_panics_is_dropped_once_under_a_catch() {
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let out = catch_hook(|| ReadyHolding {
-            value: Some(CountedBomb(drops.clone())),
-            _held: DropBomb,
-        })
-        .await;
-        let payload = out.err().expect("the drop of the future panicked");
-        assert_eq!(payload_into_string(payload), HELD_PANIC);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    /// A future that is pending at its first poll, ready with `value` at its
+    /// second, and keeps `held` until it is dropped.
+    struct ReadyAfterOne<T, V> {
+        polled: bool,
+        value: Option<T>,
+        _held: V,
     }
 
-    /// The panic of the output's drop is dropped under a catch too: a payload
-    /// whose own drop panics does not unwind either.
-    #[test]
-    fn the_panic_of_the_output_of_a_hook_whose_drop_panics_is_dropped_under_a_catch() {
-        let mut hook = Box::pin(catch_hook(|| ReadyHolding {
-            value: Some(PayloadBomb),
-            _held: DropBomb,
-        }));
-        let mut polled = None;
-        assert!(
-            !unwinds(|| polled = Some(poll_once(&mut hook))),
-            "the drop of the output unwound out of the hook"
-        );
-        match polled {
-            Some(Poll::Ready(Err(payload))) => {
-                assert_eq!(payload_into_string(payload), HELD_PANIC)
+    impl<T: Unpin, V: Unpin> Future for ReadyAfterOne<T, V> {
+        type Output = T;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<T> {
+            let this = self.get_mut();
+            if this.polled {
+                return Poll::Ready(this.value.take().expect("polled once"));
             }
-            Some(Poll::Ready(Ok(output))) => {
-                // Dropping the output would panic with a payload that panics.
-                std::mem::forget(output);
-                panic!("the hook reported an output though the drop of its future panicked");
-            }
-            _ => panic!("the hook did not complete in one poll"),
+            this.polled = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    /// A future whose poll panics and that keeps `held` until it is dropped.
+    struct PollPanics<V> {
+        _held: V,
+    }
+
+    impl<V: Unpin> Future for PollPanics<V> {
+        type Output = u32;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<u32> {
+            panic!("a poll boom");
         }
     }
 
@@ -519,60 +706,6 @@ mod tests {
             std::future::ready(())
         }));
         unwinds(move || drop(awaiting))
-    }
-
-    /// The panic of such a drop is dropped under a catch too: a payload whose
-    /// own drop panics does not unwind either.
-    #[test]
-    fn the_panic_of_a_drop_while_suspended_is_dropped_under_a_catch() {
-        let awaiting = callback_suspended_with(PayloadBomb);
-        assert!(
-            !unwinds(move || drop(awaiting)),
-            "the drop of the panic's payload unwound"
-        );
-    }
-
-    /// The panic of such a drop is dropped under a catch too: a payload whose
-    /// own drop panics does not unwind either.
-    #[test]
-    fn the_panic_of_a_hook_s_drop_while_suspended_is_dropped_under_a_catch() {
-        let awaiting = hook_suspended_with(PayloadBomb);
-        assert!(
-            !unwinds(move || drop(awaiting)),
-            "the drop of the panic's payload unwound"
-        );
-    }
-
-    /// An awaiting future dropped before its first poll drops the call that
-    /// was to build the future under a catch: a drop that panics does not
-    /// unwind out of the drop of the awaiting future.
-    #[test]
-    fn a_hook_call_that_never_ran_is_dropped_under_a_catch() {
-        assert!(
-            !dropping_a_call_that_never_ran(DropBomb),
-            "the drop of what the call held unwound"
-        );
-    }
-
-    /// The call that was to build the future is dropped once, not leaked.
-    #[test]
-    fn a_hook_dropped_before_its_first_poll_drops_its_call_once() {
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        assert!(
-            !dropping_a_call_that_never_ran(CountedBomb(drops.clone())),
-            "the drop of what the call held unwound"
-        );
-        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    /// The panic of such a drop is dropped under a catch too: a payload whose
-    /// own drop panics does not unwind either.
-    #[test]
-    fn the_panic_of_a_call_that_never_ran_is_dropped_under_a_catch() {
-        assert!(
-            !dropping_a_call_that_never_ran(PayloadBomb),
-            "the drop of the panic's payload unwound"
-        );
     }
 
     /// The text a [`LoudWake`] panics with.
@@ -668,11 +801,12 @@ mod tests {
     fn a_held_answer_whose_waker_panics_is_logged_once() {
         let warnings = Warnings::default();
         let lines = warnings.lines.clone();
-        tracing::subscriber::with_default(warnings, || {
+        {
+            let _installed = crate::tracing_isolation::install(warnings);
             let (hold, _rx, loud) = held_answer_with_a_loud_receiver();
             drop(hold);
             assert_eq!(loud.woken(), 1, "the drop woke the receiver");
-        });
+        }
         let lines = lines.lock().unwrap();
         assert_eq!(lines.len(), 1, "one warning for the one contained panic");
         assert!(

@@ -49,10 +49,52 @@ fn unbounded_subtree() -> (SubtreeWatch, Arc<SubtreeHold>) {
         parent: root.token(),
         own: ms(10),
         infinity: true,
+        trap_extra: std::time::Duration::ZERO,
+        trap_infinity: false,
     }));
     let watch = root.watch();
     drop(root);
     (watch, kid)
+}
+
+/// An observer's wait whose waker panics, and the library's own wait on the
+/// same subtree, parked in either order. Returns how many times each was woken.
+fn library_wait_beside_a_panicking_observer(observer_parks_first: bool) -> (usize, usize) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("a paused current-thread runtime");
+    let _entered = runtime.enter();
+    let (watch, kid) = unbounded_subtree();
+    let observer = Arc::new(LoudWake::default());
+    let library = Arc::new(LoudWake::default());
+    let (observer_waker, library_waker) =
+        (Waker::from(observer.clone()), Waker::from(library.clone()));
+    let mut observer_wait = SubtreeWait::new(&watch.clone().for_observer());
+    let mut library_wait = SubtreeWait::new(&watch);
+    let mut observer_cx = Context::from_waker(&observer_waker);
+    let mut library_cx = Context::from_waker(&library_waker);
+    let mut observer_changed = Box::pin(observer_wait.changed());
+    let mut library_changed = Box::pin(library_wait.changed());
+    if observer_parks_first {
+        assert!(observer_changed
+            .as_mut()
+            .poll(&mut observer_cx)
+            .is_pending());
+        assert!(library_changed.as_mut().poll(&mut library_cx).is_pending());
+    } else {
+        assert!(library_changed.as_mut().poll(&mut library_cx).is_pending());
+        assert!(observer_changed
+            .as_mut()
+            .poll(&mut observer_cx)
+            .is_pending());
+    }
+    observer.arm(true);
+    let dropped = catch_unwind(AssertUnwindSafe(|| drop(kid)));
+    observer.arm(false);
+    assert!(dropped.is_ok(), "a waker's panic unwound out of the drop");
+    (observer.woken(), library.woken())
 }
 
 /// Observers share one list. When the waker of the first panics, the wake of

@@ -344,21 +344,31 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
     // `.raise(`, `try_raise(` and `.raise_kill(` calls each production text may
     // hold. Every count is an allowed site:
     //
+    // - context.rs: none. The actor's own stop (`ctx.stop`) refuses `Kill`
+    //   before it raises, and raises through `raise_noted`.
     // - handle.rs: the two non-Kill raises of `stop` and `stop_within`.
-    // - start_bound.rs: the cut of a start that timed out, which holds the
-    //   task's abort handle and requests the abort itself, so no registry
-    //   entry is involved and no deadline is declared.
-    // - supervision.rs: the child link guard, which holds the child's abort
-    //   handle and its own reaper entry.
-    // - slot.rs: `raise_first` (a `Kill` there belongs to the supervisor's
-    //   ladder), `raise_owing` (the supervisor holds the abort and record),
-    //   and the orderly stop of a slot.
-    // - system.rs: `.raise(` is the reaper entry (it holds the abort handle
-    //   itself) and the stop sent by id; `try_raise(` is the graceful stop by
-    //   name, the shared function and the step cell's own raise;
+    // - start_bound.rs, supervision.rs, slot.rs, link.rs, monitor.rs,
+    //   request.rs and pg_monitor.rs: none. The cut of a start that timed
+    //   out, the child link guard, `raise_first`, `raise_owing`, the orderly
+    //   stop of a slot and the failure of an actor whose trap map, monitor
+    //   map, request map or group monitor map panicked raise through
+    //   `raise_noted`, which queues the request's event and a `Kill`'s
+    //   `Raised` step; they hold the abort handle or the record themselves,
+    //   so no registry entry is involved and no deadline is declared. A
+    //   link's `Kill` on its owner goes through the declaring function
+    //   (`raise_caused`), which the scan does not count.
+    // - system.rs: `try_raise(` is the graceful stop by name, the shared
+    //   function, the step cell's own raise, the reaper entry (it holds the
+    //   abort handle itself) and the two raises of `raise_noted`;
     //   `.raise_kill(` is the reaper entry, the shared function and the
-    //   private by-id helper that calls the shared function.
+    //   private by-id helper that calls the shared function. The events of
+    //   each raise are pinned by `tests/telemetry_sites.rs`.
     let scanned: &[(&str, &str, [usize; 3])] = &[
+        (
+            "actor/alias.rs",
+            include_str!("../src/actor/alias.rs"),
+            [0, 0, 0],
+        ),
         (
             "actor/context.rs",
             include_str!("../src/actor/context.rs"),
@@ -368,6 +378,11 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
             "actor/handle.rs",
             include_str!("../src/actor/handle.rs"),
             [0, 2, 0],
+        ),
+        (
+            "actor/link.rs",
+            include_str!("../src/actor/link.rs"),
+            [0, 0, 0],
         ),
         (
             "actor/mailbox.rs",
@@ -380,8 +395,24 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
             [0, 0, 0],
         ),
         (
+            "actor/monitor.rs",
+            include_str!("../src/actor/monitor.rs"),
+            [0, 0, 0],
+        ),
+        (
             "actor/panic.rs",
             include_str!("../src/actor/panic.rs"),
+            [0, 0, 0],
+        ),
+        ("actor/pg.rs", include_str!("../src/actor/pg.rs"), [0, 0, 0]),
+        (
+            "actor/pg_monitor.rs",
+            include_str!("../src/actor/pg_monitor.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/request.rs",
+            include_str!("../src/actor/request.rs"),
             [0, 0, 0],
         ),
         (
@@ -392,7 +423,7 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         (
             "actor/start_bound.rs",
             include_str!("../src/actor/start_bound.rs"),
-            [1, 0, 0],
+            [0, 0, 0],
         ),
         (
             "actor/subtree.rs",
@@ -402,7 +433,7 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         (
             "actor/supervision.rs",
             include_str!("../src/actor/supervision.rs"),
-            [2, 0, 0],
+            [0, 0, 0],
         ),
         (
             "actor/supervision/rules.rs",
@@ -412,12 +443,28 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         (
             "actor/supervision/slot.rs",
             include_str!("../src/actor/supervision/slot.rs"),
-            [2, 1, 0],
+            [0, 0, 0],
         ),
+        (
+            "actor/supervisor_ref.rs",
+            include_str!("../src/actor/supervisor_ref.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/task_key.rs",
+            include_str!("../src/actor/task_key.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/turn.rs",
+            include_str!("../src/actor/turn.rs"),
+            [0, 0, 0],
+        ),
+        ("behavior.rs", include_str!("../src/behavior.rs"), [0, 0, 0]),
         ("error.rs", include_str!("../src/error.rs"), [0, 0, 0]),
         ("helper.rs", include_str!("../src/helper.rs"), [0, 0, 0]),
         ("lib.rs", include_str!("../src/lib.rs"), [0, 0, 0]),
-        ("system.rs", include_str!("../src/system.rs"), [2, 3, 3]),
+        ("system.rs", include_str!("../src/system.rs"), [0, 6, 3]),
         (
             "time_probe.rs",
             include_str!("../src/time_probe.rs"),
@@ -436,6 +483,116 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         (
             "types/turn_clock.rs",
             include_str!("../src/types/turn_clock.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/actor_ref.rs",
+            include_str!("../src/telemetry/actor_ref.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/identity.rs",
+            include_str!("../src/telemetry/identity.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/event.rs",
+            include_str!("../src/telemetry/event.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/handlers.rs",
+            include_str!("../src/telemetry/handlers.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/mod.rs",
+            include_str!("../src/telemetry/mod.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/mode.rs",
+            include_str!("../src/telemetry/mode.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/pump.rs",
+            include_str!("../src/telemetry/pump.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/sinks.rs",
+            include_str!("../src/telemetry/sinks.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/hot.rs",
+            include_str!("../src/telemetry/hot.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/record.rs",
+            include_str!("../src/telemetry/record.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/span.rs",
+            include_str!("../src/telemetry/span.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/token.rs",
+            include_str!("../src/telemetry/token.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/wait_graph.rs",
+            include_str!("../src/telemetry/wait_graph.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys.rs",
+            include_str!("../src/actor/sys.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys_debug.rs",
+            include_str!("../src/actor/sys_debug.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys_loop.rs",
+            include_str!("../src/actor/sys_loop.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys_serve.rs",
+            include_str!("../src/actor/sys_serve.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys_state.rs",
+            include_str!("../src/actor/sys_state.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "actor/sys_suspend.rs",
+            include_str!("../src/actor/sys_suspend.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/monitor.rs",
+            include_str!("../src/telemetry/monitor.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/reports.rs",
+            include_str!("../src/telemetry/reports.rs"),
+            [0, 0, 0],
+        ),
+        (
+            "telemetry/subscription.rs",
+            include_str!("../src/telemetry/subscription.rs"),
             [0, 0, 0],
         ),
     ];
@@ -495,8 +652,8 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
     let system = production_text(include_str!("../src/system.rs"));
     assert_eq!(
         system.matches("try_raise(StopReason::Kill)").count(),
-        2,
-        "system.rs raises a Kill outside the declaring function and the step cell"
+        3,
+        "system.rs raises a Kill outside the declaring function, the step cell and the reaper"
     );
 }
 

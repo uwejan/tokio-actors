@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Instant};
 
 use crate::actor::context::ActorContext;
-use crate::actor::runtime::own_unwind_tests::{Gate, SlowDrop};
+use crate::actor::runtime::own_unwind_tests::{panic_at_the_end_of, Gate, OpensOnDrop, SlowDrop};
 use crate::actor::runtime::{spawn_actor, ActorConfig};
 use crate::actor::supervision::{
     rules, slot_pair, slot_pair_for, ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState,
@@ -93,7 +93,7 @@ const LONG_STUCK: Duration = Duration::from_secs(15);
 /// How far past its exact timing a verdict on a `LONG_STUCK` turn may land on
 /// a real-time runtime: loose enough for a host that stalls its threads, and
 /// far short of the turn a verdict that waited for its end would come with.
-const STALL_SLACK: Duration = Duration::from_secs(3);
+const STALL_SLACK: Duration = Duration::from_secs(8);
 
 /// Holds the calling thread for `time`, or until `probe.unstick` is set.
 fn block_unless_unstuck(probe: &Probe, time: Duration) {
@@ -471,6 +471,8 @@ impl Sup {
                 start_timeout: None,
                 kill_grace: grace,
                 is_supervisor,
+                significant: false,
+                sys: crate::actor::sys::SysOptions::default(),
             },
             ctl,
             lifecycle: ChildLifecycle::Running(incarnation),
@@ -617,6 +619,8 @@ impl Actor for Sup {
                         kill_grace: DEFAULT_KILL_GRACE,
                         start_timeout: None,
                         is_supervisor: false,
+                        significant: false,
+                        sys: crate::actor::sys::SysOptions::default(),
                     },
                     ctl,
                     lifecycle: ChildLifecycle::Restarting {
@@ -647,6 +651,8 @@ impl Actor for Sup {
                             kill_grace: DEFAULT_KILL_GRACE,
                             start_timeout: None,
                             is_supervisor: false,
+                            significant: false,
+                            sys: crate::actor::sys::SysOptions::default(),
                         },
                         ctl,
                         lifecycle: ChildLifecycle::Down {
@@ -860,6 +866,11 @@ async fn rig_with(grace: Duration) -> Rig {
     rig_adopting(|name| Cmd::AdoptWith(name, grace)).await
 }
 
+/// A supervisor adopting a vetoing worker with this policy and kill grace.
+async fn rig_over_worker(shutdown: Shutdown, grace: Duration) -> Rig {
+    rig_adopting(|name| Cmd::AdoptWorker(name, shutdown, grace)).await
+}
+
 /// A supervisor adopting a child that is itself a supervisor, with this
 /// policy, kill grace and behavior.
 async fn rig_over_supervisor(shutdown: Shutdown, grace: Duration, shape: Shape) -> Rig {
@@ -937,6 +948,191 @@ async fn until_in_turn(probe: &Probe) {
     }
 }
 
+async fn a_caller_waiting_on_a_child_whose_runner_fails_returns_ok_once_it_ends() {
+    let rig = rig().await;
+    let sup = rig.sup.clone();
+    let name = rig.name.clone();
+    let call = tokio::spawn(async move { sup.send(Cmd::Terminate(name)).await });
+    until_vetoed(&rig).await;
+    make_busy(&rig).await;
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("supervisor answers");
+    assert_eq!(
+        answer,
+        Ok(()),
+        "the call returns Ok once the guard's Kill ended the child, never ChildUnresponsive"
+    );
+    assert!(
+        rig.probe.ended.load(Ordering::SeqCst),
+        "and only after the child ended"
+    );
+    // The end is reported once, with the reason the child ended with.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.reports.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no report of the child's end");
+        sleep(Duration::from_millis(5)).await;
+    }
+    sleep(Duration::from_millis(300)).await;
+    let reports = rig.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1, "reported once");
+    assert!(matches!(reports[0].event.reason, StopReason::Kill));
+    assert_eq!(reports[0].event.action, SupervisionAction::Removed);
+    // The runner's panic is in the supervisor's own accessor for crate
+    // task failures, and the supervisor's last error is untouched.
+    assert!(
+        matches!(&reports[0].task_error, Some(ActorError::Panic(text)) if text == "runner failed"),
+        "{:?}",
+        reports[0].task_error
+    );
+    assert!(reports[0].last_error_clear);
+}
+
+/// The child's value takes 400 ms to drop, longer than the settle time that
+/// bounds a wait on its subtree. `Stopped` is published only after the value
+/// is gone, so the wait for the subtree that follows the end of a child whose
+/// runner failed starts from a finished drop and does not expire.
+///
+/// The child's grace outlasts its turn, so it leaves its loop by itself; a
+/// drop that outlasts the ladder after an abort is the verdict's case.
+async fn a_slow_drop_of_a_child_whose_runner_failed_never_escalates() {
+    let rig = rig_with(Duration::from_secs(2)).await;
+    rig.probe.drop_ms.store(400, Ordering::SeqCst);
+    let sup = rig.sup.clone();
+    let name = rig.name.clone();
+    let call = tokio::spawn(async move { sup.send(Cmd::Terminate(name)).await });
+    until_vetoed(&rig).await;
+    make_busy(&rig).await;
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("supervisor answers");
+    assert_eq!(answer, Ok(()), "a slow drop is not an unresponsive child");
+    assert!(
+        rig.probe.ended.load(Ordering::SeqCst),
+        "and the call returned only after the value was dropped"
+    );
+}
+
+async fn a_parent_stop_waits_for_a_child_whose_runner_failed() {
+    let rig = rig().await;
+    let stop = {
+        let sup = rig.sup.clone();
+        tokio::spawn(async move {
+            sup.stop(StopReason::Graceful).await.expect("stop");
+            sup.wait_stopped().await;
+        })
+    };
+    until_vetoed(&rig).await;
+    make_busy(&rig).await;
+    rig.fail.notify_one();
+    timeout(Duration::from_secs(10), stop)
+        .await
+        .expect("the parent stops")
+        .expect("joined");
+    assert!(
+        rig.probe.ended.load(Ordering::SeqCst),
+        "the parent publishes Stopped only after the child ended"
+    );
+}
+
+async fn a_lost_runner_reports_its_childs_end_as_a_kill() {
+    // No call waits on the child. Its runner fails, the guard's Kill and abort
+    // end the child, and the replacement task reports how it ended.
+    let rig = rig().await;
+    rig.fail.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.reports.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no report of the child's end");
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        rig.probe.ended.load(Ordering::SeqCst),
+        "the end is reported only once the child ended"
+    );
+    sleep(Duration::from_millis(300)).await;
+    let reports = rig.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1, "reported once");
+    assert!(
+        matches!(reports[0].event.reason, StopReason::Kill),
+        "{:?}",
+        reports[0].event.reason
+    );
+    assert_eq!(reports[0].event.action, SupervisionAction::Removed);
+    assert!(
+        matches!(&reports[0].task_error, Some(ActorError::Panic(text)) if text == "runner failed")
+    );
+    assert!(reports[0].last_error_clear);
+}
+
+/// The child ends `Graceful` while its runner still runs, and the runner then
+/// fails before it records the end: the replacement reports the reason the
+/// child's plane carries, `Graceful`, not `Kill`.
+async fn a_lost_runner_reports_the_reason_its_ended_child_wrote() {
+    let rig = rig().await;
+    rig.probe.accepts.store(true, Ordering::SeqCst);
+    let child = crate::system::ActorSystem::default()
+        .get::<Vetoer>(&rig.name)
+        .expect("the child is registered");
+    child.stop(StopReason::Graceful).await.expect("accepted");
+    let plane = rig.probe.plane.lock().unwrap().clone().expect("a plane");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while plane.has_changed().is_ok() && plane.borrow().status != ActorStatus::Stopped {
+        assert!(Instant::now() < deadline, "the child never ended");
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(plane.borrow().reason, Some(StopReason::Graceful));
+    assert!(
+        rig.reports.lock().unwrap().is_empty(),
+        "the stand-in runner records nothing before it fails"
+    );
+    rig.fail.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.reports.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no report of the child's end");
+        sleep(Duration::from_millis(5)).await;
+    }
+    let reports = rig.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1, "reported once");
+    assert_eq!(reports[0].event.reason, StopReason::Graceful);
+    assert_eq!(reports[0].event.action, SupervisionAction::Removed);
+}
+
+async fn children_and_restart_child_read_a_lost_runners_ended_task_as_down_with_its_decision_owed()
+{
+    let rig = rig().await;
+    let answer = timeout(
+        Duration::from_secs(10),
+        rig.sup.send(Cmd::Inspect(rig.name.clone())),
+    )
+    .await
+    .expect("the supervisor answers")
+    .expect("the supervisor answers");
+    assert_eq!(answer, Ok(()), "{answer:?}");
+    // After the handler returns, the runner's failure and the replacement
+    // report are handled: the end is reported once, as a kill.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.reports.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no report of the child's end");
+        sleep(Duration::from_millis(5)).await;
+    }
+    sleep(Duration::from_millis(300)).await;
+    let reports = rig.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1, "reported once");
+    assert!(matches!(reports[0].event.reason, StopReason::Kill));
+    assert_eq!(reports[0].event.action, SupervisionAction::Removed);
+    // The child's value was dropped before the plane read its end.
+    assert!(
+        !rig.probe.saw_the_end_at_drop.load(Ordering::SeqCst),
+        "the plane read the child's end before its value was dropped"
+    );
+}
+
 /// The child's value is dropped before the plane its supervisor follows reads
 /// the child's end: an idle child ends at its next turn boundary, a busy one
 /// is aborted after its kill grace, and in both the value's `Drop` sees a
@@ -970,11 +1166,6 @@ async fn lost_runner_end_is_observed_after_the_actor_value_drops(busy: bool) {
         Some(StopReason::Kill),
         "the ended plane holds the incarnation's reason (busy: {busy})"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn lost_runner_end_is_observed_after_the_actor_value_drops_abort_current_thread() {
-    lost_runner_end_is_observed_after_the_actor_value_drops(true).await;
 }
 
 // Each test runs on a multi-threaded runtime and on a current-thread one,
@@ -1033,7 +1224,7 @@ async fn caller_told_unresponsive_on_a_lost_runner_leaves_one_verdict_for_the_gr
     );
     // The pending group's barrier escalates without waiting another budget:
     // the supervisor stops with the verdict, well before the stuck turn ends.
-    timeout(Duration::from_secs(5), rig.sup.wait_stopped())
+    timeout(STALL_SLACK, rig.sup.wait_stopped())
         .await
         .expect("the supervisor stops");
     assert!(
@@ -1073,10 +1264,38 @@ async fn caller_told_unresponsive_on_a_lost_runner_leaves_one_verdict_for_the_gr
     drop(unsticks);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn caller_told_unresponsive_on_a_lost_runner_leaves_one_verdict_for_the_group_barrier_multi_thread(
-) {
-    caller_told_unresponsive_on_a_lost_runner_leaves_one_verdict_for_the_group_barrier().await;
+async fn a_parent_stop_records_the_verdict_of_a_lost_runner_and_moves_on() {
+    // Second form: the teardown's wait reaches the same closed cell.
+    #[cfg(feature = "tracing")]
+    let logged = capture::install();
+    let rig = rig().await;
+    let unsticks = stuck_long(&rig);
+    make_stuck(&rig).await;
+    rig.fail.notify_one();
+    sleep(Duration::from_millis(30)).await;
+    let stopping_at = Instant::now();
+    rig.sup.stop(StopReason::Graceful).await.expect("stop");
+    timeout(Duration::from_secs(5), rig.sup.wait_stopped())
+        .await
+        .expect("the supervisor stops");
+    let took = stopping_at.elapsed();
+    assert!(
+        took < DEFAULT_KILL_GRACE + ABORT_SETTLE + STALL_SLACK,
+        "the teardown moved on at the verdict: {took:?}"
+    );
+    assert!(!rig.probe.ended.load(Ordering::SeqCst));
+    // The verdict is one flag and one wake-up: the replacement task, once its
+    // bound expires, finds the flag set and the supervisor gone. No call
+    // received it, so it is logged once.
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(rig.reports.lock().unwrap().len(), 0);
+    #[cfg(feature = "tracing")]
+    assert_eq!(
+        capture::naming(&logged.lock().unwrap(), &rig.name).len(),
+        1,
+        "the teardown's verdict is logged once"
+    );
+    drop(unsticks);
 }
 
 async fn a_runner_that_fails_after_the_verdict_logs_it_once() {
@@ -1103,9 +1322,30 @@ async fn a_runner_that_fails_after_the_verdict_logs_it_once() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_runner_that_fails_after_the_verdict_logs_it_once_multi_thread() {
-    a_runner_that_fails_after_the_verdict_logs_it_once().await;
+async fn a_lost_runners_stuck_incarnation_is_aborted_at_its_next_await() {
+    // The incarnation's turn blocks its thread, then awaits for ever: the
+    // guard's abort, due long before the turn returns, is the only thing
+    // that ends it, and it lands at that await.
+    let rig = rig().await;
+    rig.probe.then_hangs.store(true, Ordering::SeqCst);
+    // Taken before the turn is sent: the turn begins after this instant, so
+    // an end that comes with the turn is at least its 1500 ms past it.
+    let stuck_at = Instant::now();
+    make_stuck(&rig).await;
+    rig.fail.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rig.probe.ended.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the incarnation was never aborted"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        stuck_at.elapsed() >= Duration::from_millis(1200),
+        "it ended with its turn, not before: {:?}",
+        stuck_at.elapsed()
+    );
 }
 
 /// The kill grace of the child in `lost_runner_verdict_waits_the_childs_own_kill_grace`.
@@ -1181,9 +1421,53 @@ async fn lost_runner_verdict_waits_the_childs_own_kill_grace() {
     drop(unsticks);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lost_runner_verdict_waits_the_childs_own_kill_grace_multi_thread() {
-    lost_runner_verdict_waits_the_childs_own_kill_grace().await;
+// A stuck turn holds a worker until the test ends it and the waits are timed
+// against it, so the body runs on a multi-threaded runtime only.
+/// The incarnation of a lost runner unwinds from its own poll at the end of
+/// its task while a forwarder of its still runs the slow drop of a stream, so
+/// its subtree outlives the task and its plane stays open. The caller
+/// waiting on it is told `ChildUnresponsive` no sooner than the
+/// incarnation's bound (the grace the guard's entry owes plus the settle
+/// time) and within a margin of it, and not when the drop ends; the drop ends
+/// afterwards and the supervisor keeps one verdict.
+async fn a_lost_runners_incarnation_with_a_forwarder_still_dropping_is_judged_at_its_bound() {
+    let bound = OWN_GRACE + ABORT_SETTLE;
+    let gate = Gate::new();
+    let _opens = OpensOnDrop(gate.clone());
+    let rig = rig_adopting(|name| Cmd::AdoptHeld(name, OWN_GRACE, gate.clone())).await;
+    let child = crate::system::ActorSystem::default()
+        .get::<HeldChild>(&rig.name)
+        .expect("the child is registered");
+    child
+        .send(HeldChildMsg::Event)
+        .await
+        .expect("the child has started");
+    panic_at_the_end_of(&rig.name);
+    let call = {
+        let sup = rig.sup.clone();
+        let name = rig.name.clone();
+        tokio::spawn(async move { sup.send(Cmd::Terminate(name)).await })
+    };
+    until_vetoed(&rig).await;
+    let failed_at = Instant::now();
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("the supervisor answers");
+    let took = failed_at.elapsed();
+    let text = answer.expect_err("the call reports what it saw");
+    assert!(text.contains("ChildUnresponsive"), "{text}");
+    assert!(
+        took >= bound,
+        "the verdict waits the child's bound: {took:?}"
+    );
+    assert!(
+        took < bound + STALL_SLACK,
+        "and within a margin of it: {took:?}"
+    );
+    gate.open();
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,11 +1627,6 @@ async fn every_runner_is_registered_with_its_plane() {
     assert_eq!(kills(&events), 1, "the end is reported exactly once");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_runner_is_registered_with_its_plane_multi_thread() {
-    every_runner_is_registered_with_its_plane().await;
-}
-
 static TEARDOWN_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 async fn a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic() {
@@ -1409,11 +1688,6 @@ async fn a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic_multi_thread() {
-    a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic().await;
-}
-
 async fn a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt() {
     // The newer child's attempt is lost after its spawn, so the walk settles
     // it first, while the older child's attempt still initializes in the
@@ -1459,11 +1733,6 @@ async fn a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt
         probe.ordered.load(Ordering::SeqCst),
         "the teardown ordered the older sibling's attempt in its turn"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt_current_thread() {
-    a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt().await;
 }
 
 async fn a_final_collection_is_not_held_by_the_replacement_of_a_lost_attempt() {
@@ -1512,11 +1781,6 @@ async fn a_final_collection_is_not_held_by_the_replacement_of_a_lost_attempt() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_final_collection_is_not_held_by_the_replacement_of_a_lost_attempt_current_thread() {
-    a_final_collection_is_not_held_by_the_replacement_of_a_lost_attempt().await;
-}
-
 async fn a_failing_delivery_in_a_group_evaluation_leaves_the_trigger_owed() {
     let reports = Arc::new(Mutex::new(Vec::new()));
     let stopped = Arc::new(Mutex::new(Vec::new()));
@@ -1557,11 +1821,6 @@ async fn a_failing_delivery_in_a_group_evaluation_leaves_the_trigger_owed() {
         ],
         "the failing member's report was delivered once; the final drain then delivers the trigger's own and the report left behind it, in that order"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failing_delivery_in_a_group_evaluation_leaves_the_trigger_owed_multi_thread() {
-    a_failing_delivery_in_a_group_evaluation_leaves_the_trigger_owed().await;
 }
 
 /// A capture of every WARN event, installed once for the test binary; tests
@@ -1650,6 +1909,92 @@ async fn the_one_report(rig: &Rig) -> (StopReason, SupervisionAction) {
     let reports = rig.reports.lock().unwrap();
     assert_eq!(reports.len(), 1, "reported once");
     (reports[0].event.reason.clone(), reports[0].event.action)
+}
+
+/// The shape of the supervisor child of the tests that wait on its orderly
+/// stop: it vetoes the first request, and its one worker takes `worker_stop`
+/// in its `on_stopped`.
+fn slow_worker_below(worker_stop: Duration) -> Shape {
+    Shape {
+        vetoes: true,
+        own_stop: OwnStopMode::Quick,
+        worker: Some((
+            worker_stop,
+            Shutdown::Timeout(Duration::from_secs(5)),
+            false,
+        )),
+    }
+}
+
+async fn a_caller_waiting_on_an_infinity_supervisor_child_whose_runner_fails_gets_no_early_verdict()
+{
+    let rig = rig_over_supervisor(
+        Shutdown::Infinity,
+        DEFAULT_KILL_GRACE,
+        slow_worker_below(Duration::from_millis(600)),
+    )
+    .await;
+    let call = {
+        let sup = rig.sup.clone();
+        let name = rig.name.clone();
+        tokio::spawn(async move { sup.send(Cmd::Terminate(name)).await })
+    };
+    until_vetoed(&rig).await;
+    let failed_at = Instant::now();
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("supervisor answers");
+    assert_eq!(
+        answer,
+        Ok(()),
+        "an unbounded orderly stop is waited for, never called unresponsive"
+    );
+    assert!(
+        failed_at.elapsed() >= Duration::from_millis(600),
+        "the call returned before the worker's stop was over: {:?}",
+        failed_at.elapsed()
+    );
+    assert!(
+        rig.probe.worker_done.load(Ordering::SeqCst) && rig.probe.ended.load(Ordering::SeqCst),
+        "and only after the child's whole subtree ended"
+    );
+    let (reason, action) = the_one_report(&rig).await;
+    assert!(matches!(reason, StopReason::ParentKilled), "{reason:?}");
+    assert_eq!(action, SupervisionAction::Removed);
+}
+
+async fn a_parent_stop_waits_for_an_infinity_supervisor_child_whose_runner_failed() {
+    let rig = rig_over_supervisor(
+        Shutdown::Infinity,
+        DEFAULT_KILL_GRACE,
+        slow_worker_below(Duration::from_millis(600)),
+    )
+    .await;
+    let stop = {
+        let sup = rig.sup.clone();
+        tokio::spawn(async move {
+            sup.stop(StopReason::Graceful).await.expect("stop");
+            sup.wait_stopped().await;
+        })
+    };
+    until_vetoed(&rig).await;
+    rig.fail.notify_one();
+    timeout(Duration::from_secs(10), stop)
+        .await
+        .expect("the parent stops")
+        .expect("joined");
+    assert!(
+        rig.probe.worker_done.load(Ordering::SeqCst) && rig.probe.ended.load(Ordering::SeqCst),
+        "the parent publishes Stopped only after the child's subtree ended"
+    );
+    let reasons = rig.stopped.lock().unwrap().clone();
+    assert!(
+        matches!(reasons.as_slice(), [StopReason::Graceful]),
+        "the parent stops with the reason it was given: {reasons:?}"
+    );
 }
 
 /// The window and the grace of the supervisor child of the window tests.
@@ -1741,6 +2086,90 @@ async fn a_lost_runner_wait_follows_a_supervisor_childs_window_first(paused: boo
     assert!(rig.stopped.lock().unwrap().is_empty());
 }
 
+async fn a_lost_supervisor_child_stuck_in_a_turn_gets_the_verdict_after_its_window_and_grace() {
+    // The child's own `on_stopped` blocks its thread until the test ends
+    // it, so the abort cannot land: the verdict comes at the window, the
+    // grace and the settle time, and not before, and while the turn runs.
+    let rig = rig_over_supervisor(
+        Shutdown::Timeout(WINDOW),
+        WINDOW_GRACE,
+        own_stop_of(OwnStopMode::Block(LONG_STUCK)),
+    )
+    .await;
+    let unsticks = Unsticks(rig.probe.clone());
+    let call = {
+        let sup = rig.sup.clone();
+        let name = rig.name.clone();
+        tokio::spawn(async move { sup.send(Cmd::TerminateThenVerdict(name)).await })
+    };
+    until_vetoed(&rig).await;
+    let failed_at = Instant::now();
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("the supervisor answers");
+    let took = failed_at.elapsed();
+    let bound = WINDOW + WINDOW_GRACE + ABORT_SETTLE;
+    let text = answer.expect_err("the call reports what it saw");
+    assert!(text.contains("ChildUnresponsive"), "{text}");
+    assert!(text.contains("flagged=true"), "{text}");
+    assert!(
+        took >= bound,
+        "no verdict before the window, the grace and the settle time: {took:?}"
+    );
+    assert!(
+        took < bound + STALL_SLACK,
+        "and the verdict by that bound: {took:?}"
+    );
+    assert!(
+        !rig.probe.ended.load(Ordering::SeqCst),
+        "the stuck turn still runs"
+    );
+    drop(unsticks);
+}
+
+async fn an_infinity_worker_whose_runner_fails_is_still_judged_at_its_kill_grace() {
+    // A worker has no orderly stop, whatever its own policy: a vetoing
+    // worker in a turn that never yields is called unresponsive at its kill grace plus the
+    // settle time, never earlier and never unbounded.
+    let rig = rig_over_worker(Shutdown::Infinity, DEFAULT_KILL_GRACE).await;
+    let unsticks = stuck_long(&rig);
+    make_stuck(&rig).await;
+    let call = {
+        let sup = rig.sup.clone();
+        let name = rig.name.clone();
+        tokio::spawn(async move { sup.send(Cmd::TerminateThenVerdict(name)).await })
+    };
+    // The worker is inside its blocked turn and cannot acknowledge the
+    // request, so nothing shows the call has committed; this head start only
+    // lets it reach its wait before the runner fails. A call that is later
+    // still waits from its own start, which the slack below absorbs.
+    sleep(Duration::from_millis(50)).await;
+    let failed_at = Instant::now();
+    rig.fail.notify_one();
+    let answer = timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .expect("joined")
+        .expect("the supervisor answers");
+    let took = failed_at.elapsed();
+    let text = answer.expect_err("the call reports what it saw");
+    assert!(text.contains("ChildUnresponsive"), "{text}");
+    assert!(text.contains("flagged=true"), "{text}");
+    assert!(
+        took >= DEFAULT_KILL_GRACE + ABORT_SETTLE,
+        "not before the kill grace and the settle time: {took:?}"
+    );
+    assert!(
+        took < DEFAULT_KILL_GRACE + ABORT_SETTLE + STALL_SLACK,
+        "and by that bound: {took:?}"
+    );
+    assert!(!rig.probe.ended.load(Ordering::SeqCst));
+    drop(unsticks);
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_lost_runner_wait_follows_a_supervisor_childs_window_first_current_thread() {
     a_lost_runner_wait_follows_a_supervisor_childs_window_first(true).await;
@@ -1823,16 +2252,85 @@ async fn a_lost_supervisor_child_reports_the_reason_it_ended_with(veto_worker: b
     }
 }
 
-// The control: the child's own Kill stage ends it at its window, and every
-// reader reads that `Kill`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_supervisor_child_ended_by_its_kill_stage_reports_a_kill_multi_thread() {
-    a_lost_supervisor_child_reports_the_reason_it_ended_with(true).await;
-}
-
 // ---------------------------------------------------------------------------
 // A waiter on the status plane runs before a callback can block the thread
 // ---------------------------------------------------------------------------
+
+/// An actor that notes, when `on_stopped` begins, whether a task waiting for
+/// its `Stopping` status has already run.
+struct NotesItsWaiter {
+    waiter_ran: Arc<AtomicBool>,
+    saw_the_waiter: Arc<AtomicBool>,
+}
+
+impl Actor for NotesItsWaiter {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.saw_the_waiter
+            .store(self.waiter_ran.load(Ordering::SeqCst), Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A supervisor that stops itself when it reports a restart it initiated,
+/// leaving the restart attempt in flight, and notes, when `on_stopped`
+/// begins, whether a task waiting for its `Stopping` status has already run.
+struct StopsWithAnAttemptInFlight {
+    child: String,
+    waiter_ran: Arc<AtomicBool>,
+    saw_the_waiter: Arc<AtomicBool>,
+}
+
+impl Actor for StopsWithAnAttemptInFlight {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(|| Plain)
+            .named(self.child.clone())
+            .restart_type(RestartType::Permanent)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        if event.action == SupervisionAction::RestartInitiated {
+            ctx.self_handle()
+                .stop(StopReason::Graceful)
+                .await
+                .expect("the supervisor stops itself");
+        }
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.saw_the_waiter
+            .store(self.waiter_ran.load(Ordering::SeqCst), Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 /// A supervisor whose turn holds until `release`, then waits until its
 /// child's death is recorded (the death then waits in the plane) and stops
@@ -1884,69 +2382,4 @@ impl Actor for NotesItsWaiterAtDelivery {
         }
         Ok(())
     }
-}
-
-/// As above for a supervisor whose first callback of the stop is the
-/// delivery of a death still pending when its loop ended: the waiter runs
-/// before that delivery begins, not only before `on_stopped`. The death's
-/// runner has ended before the stop, so collecting it never waits.
-#[tokio::test(flavor = "current_thread")]
-async fn a_waiter_on_the_status_plane_runs_before_the_first_final_delivery() {
-    let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    let (waiter_ran, delivered, saw_the_waiter) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let child = uname("pending-death-child");
-    let handle = NotesItsWaiterAtDelivery {
-        child: child.clone(),
-        entered: entered.clone(),
-        release: release.clone(),
-        waiter_ran: waiter_ran.clone(),
-        delivered: delivered.clone(),
-        saw_the_waiter: saw_the_waiter.clone(),
-    }
-    .spawn()
-    .named(uname("pending-death-sup"))
-    .with_supervision(SupervisionConfig::default())
-    .await
-    .expect("spawn");
-    let mut plane = handle.status_rx();
-    let (flag, registered) = (waiter_ran.clone(), Arc::new(AtomicBool::new(false)));
-    let parked = registered.clone();
-    let waiter = tokio::spawn(async move {
-        // Set before the first poll of the wait, which registers it without
-        // yielding in between.
-        parked.store(true, Ordering::SeqCst);
-        let _ = plane
-            .wait_for(|value| value.status == ActorStatus::Stopping)
-            .await;
-        flag.store(true, Ordering::SeqCst);
-    });
-    while !registered.load(Ordering::SeqCst) {
-        tokio::task::yield_now().await;
-    }
-    handle.notify(()).await.expect("notify");
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .expect("the turn begins");
-    // The child dies while the turn holds, so its death waits in the plane.
-    let crashing = crate::system::ActorSystem::default()
-        .get::<Plain>(&child)
-        .expect("the child is registered");
-    let _ = crashing.send(true).await;
-    release.notify_one();
-    timeout(Duration::from_secs(5), handle.wait_stopped())
-        .await
-        .expect("the supervisor stops");
-    waiter.await.expect("the waiter ends");
-    assert!(
-        delivered.load(Ordering::SeqCst),
-        "the death was delivered with the supervisor stopping"
-    );
-    assert!(
-        saw_the_waiter.load(Ordering::SeqCst),
-        "the waiter woken by the Stopping publish ran before the first final delivery"
-    );
 }

@@ -47,8 +47,8 @@ use crate::actor::runtime::saturating_deadline;
 use crate::actor::supervision::ABORT_SETTLE;
 use crate::actor::{closed_ack_error, Actor};
 use crate::error::{ActorError, SpawnError};
-use crate::helper::HelperKind;
-use crate::system::{wait_final_reason, ActorSystem};
+use crate::helper::{HelperKind, HelperOwner};
+use crate::system::{raise_noted, wait_final_reason, ActorSystem};
 use crate::types::{ActorId, StopLane, StopReason};
 
 /// The state of the gate before anyone decided.
@@ -189,10 +189,15 @@ impl Bound {
 /// [`StopLane::try_raise`]), so the raise always returns and the abort always
 /// follows. That holds from the guard's drop too, which runs while the
 /// helper's own panic unwinds, where a second panic would end the process.
-fn cut_start(lane: &StopLane, abort: &AbortHandle) {
+pub(super) fn cut_start(lane: &StopLane, abort: &AbortHandle) {
     // The bound holds the task's abort handle and requests the abort below
     // itself, so no registry entry is involved and no deadline is declared.
-    lane.raise(StopReason::Kill);
+    raise_noted(
+        None,
+        lane,
+        StopReason::Kill,
+        crate::telemetry::StopOrigin::Requested,
+    );
     lane.abort_record().abort(abort);
 }
 
@@ -341,7 +346,7 @@ pub(super) async fn bounded_start<A: Actor>(
         id: id.clone(),
     };
     let rt = Handle::current();
-    let owner = id.clone();
+    let owner = HelperOwner::new(id.clone(), Some(lane.abort_record().clone()));
     drop(
         system.spawn_helper(&rt, HelperKind::StartBound, Some(owner), {
             let gate = gate.clone();
@@ -518,6 +523,22 @@ mod hooks {
                 .changed
                 .wait_timeout_while(state, HOLD_BOUND, |state| !state.1)
                 .unwrap();
+        }
+
+        /// Waits until a thread is held here.
+        pub(super) fn wait_arrived(&self) {
+            let state = self.state.lock().unwrap();
+            let (_state, waited) = self
+                .changed
+                .wait_timeout_while(state, HOLD_BOUND, |state| !state.0)
+                .unwrap();
+            assert!(!waited.timed_out(), "nothing reached the hold");
+        }
+
+        /// Lets the held thread go on.
+        pub(super) fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
         }
     }
 

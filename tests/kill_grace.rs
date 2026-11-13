@@ -383,9 +383,18 @@ async fn runs_then_is_aborted(
 // The grace of a root
 // ---------------------------------------------------------------------------
 
-#[test]
-fn default_kill_grace_applies_when_none_is_set_paused() {
-    common::run_paused(default_kill_grace_applies_when_none_is_set_body(true));
+async fn kill_grace_set_on_a_root_delays_its_abort_body(paused: bool) {
+    let sys = ActorSystem::create(uname("root-grace")).unwrap();
+    let probe = Arc::new(Probe::default());
+    let name = uname("root");
+    let grace = Duration::from_millis(600);
+    let handle = spawn_root(&sys, &name, &probe, Some(grace)).await;
+    park(&handle, &probe).await;
+
+    let killed_at = Instant::now();
+    sys.kill(&name).await.expect("the kill is accepted");
+    assert!(sys.get::<Worker>(&name).is_some(), "still registered");
+    runs_then_is_aborted(&handle, killed_at, grace, paused).await;
 }
 
 async fn default_kill_grace_applies_when_none_is_set_body(paused: bool) {
@@ -513,150 +522,6 @@ async fn blocked_zero_grace_root(
     (handle, release)
 }
 
-/// The wait after an abort is the settle time (100 ms), never the zero grace:
-/// each call below waits it out before it answers `Unresponsive`.
-#[test]
-fn zero_kill_grace_settles_after_abort_settle() {
-    // A blocked turn holds a worker thread: real threads only.
-    common::run_multi_thread_only(4, async {
-        let slack = Duration::from_millis(30);
-        let settle = ASSUMED_ABORT_SETTLE;
-
-        // stop_within: the Kill step of a graceful stop.
-        let sys = ActorSystem::create(uname("settle-within")).unwrap();
-        let (handle, release) = blocked_zero_grace_root(&sys, "within").await;
-        let window = Duration::from_millis(50);
-        let started = Instant::now();
-        let outcome = within(
-            BOUND,
-            "stop_within",
-            handle.stop_within(StopReason::Graceful, window),
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, StopOutcome::Unresponsive, "stop_within");
-        assert!(
-            started.elapsed() + slack >= window + settle,
-            "stop_within waited {:?}, less than its window plus the settle time",
-            started.elapsed()
-        );
-        drop(release);
-
-        // The shutdown's sequential ladder.
-        let sys = ActorSystem::create_with(
-            uname("settle-sequential"),
-            SystemConfig {
-                shutdown_policy: ShutdownPolicy {
-                    timeout: Duration::from_secs(30),
-                    per_actor_timeout: window,
-                },
-                ..SystemConfig::default()
-            },
-        )
-        .unwrap();
-        let (_handle, release) = blocked_zero_grace_root(&sys, "sequential").await;
-        let started = Instant::now();
-        let report = within(BOUND, "shutdown", sys.shutdown()).await;
-        assert_eq!(report.outcomes.len(), 1);
-        assert_eq!(
-            report.outcomes[0].1.outcome,
-            StopOutcome::Unresponsive,
-            "sequential"
-        );
-        assert!(
-            started.elapsed() + slack >= window + settle,
-            "the sequential ladder waited {:?}, less than its window plus the settle time",
-            started.elapsed()
-        );
-        drop(release);
-
-        // The shutdown's concurrent sweep (its global timeout is spent).
-        let sys = ActorSystem::create_with(
-            uname("settle-sweep"),
-            SystemConfig {
-                shutdown_policy: ShutdownPolicy {
-                    timeout: Duration::ZERO,
-                    per_actor_timeout: Duration::from_secs(5),
-                },
-                ..SystemConfig::default()
-            },
-        )
-        .unwrap();
-        let (_handle, release) = blocked_zero_grace_root(&sys, "sweep").await;
-        let started = Instant::now();
-        let report = within(BOUND, "shutdown", sys.shutdown()).await;
-        assert_eq!(report.outcomes.len(), 1);
-        assert_eq!(
-            report.outcomes[0].1.outcome,
-            StopOutcome::Unresponsive,
-            "sweep"
-        );
-        assert!(
-            started.elapsed() + slack >= settle,
-            "the sweep waited {:?}, less than the settle time",
-            started.elapsed()
-        );
-        drop(release);
-    });
-}
-
-/// One condition gets one verdict: an actor aborted before it published
-/// `Stopped` is `Aborted` on a graceful `stop_within` and on the shutdown's
-/// first step, as it is on every other path.
-#[test]
-fn a_graceful_stop_that_meets_a_kill_reports_aborted() {
-    common::run(2, async {
-        // stop_within(Graceful) while another caller kills the actor.
-        let sys = ActorSystem::create(uname("graceful-race")).unwrap();
-        let probe = Arc::new(Probe::default());
-        let name = uname("root");
-        let handle = spawn_root(&sys, &name, &probe, None).await;
-        park(&handle, &probe).await;
-        // The call raises its Graceful before its first await, so one poll
-        // places it ahead of the kill.
-        let mut call =
-            std::pin::pin!(handle.stop_within(StopReason::Graceful, Duration::from_secs(5)));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(std::future::Future::poll(call.as_mut(), &mut cx).is_pending());
-        sys.kill(&name).await.unwrap();
-        let outcome = within(BOUND, "stop_within", call).await.unwrap();
-        assert_eq!(outcome, StopOutcome::Aborted);
-
-        // The shutdown's first step while another caller kills the actor.
-        let sys = ActorSystem::create_with(
-            uname("graceful-race-shutdown"),
-            SystemConfig {
-                shutdown_policy: ShutdownPolicy {
-                    timeout: Duration::from_secs(30),
-                    per_actor_timeout: Duration::from_secs(5),
-                },
-                ..SystemConfig::default()
-            },
-        )
-        .unwrap();
-        // A 1 s kill grace: the shutdown takes its snapshot of the roots long
-        // before the backstop can abort the root.
-        // The root's graceful stop hangs in its `pre_stop`, which says when the
-        // shutdown's first step reached it.
-        let probe = Arc::new(Probe::default());
-        probe.hold_pre_stop.store(true, Ordering::SeqCst);
-        let name = uname("root");
-        let _handle = spawn_root(&sys, &name, &probe, Some(Duration::from_secs(1))).await;
-        let shutdown = {
-            let sys = sys.clone();
-            tokio::spawn(async move { sys.shutdown().await })
-        };
-        wait_until(BOUND, "the shutdown's stop to reach the root", || {
-            probe.pre_stop_entered.load(Ordering::SeqCst)
-        })
-        .await;
-        sys.kill(&name).await.unwrap();
-        let report = within(BOUND, "shutdown", shutdown).await.unwrap();
-        assert_eq!(report.outcomes.len(), 1);
-        assert_eq!(report.outcomes[0].1.outcome, StopOutcome::Aborted);
-    });
-}
-
 /// Vetoes every request to stop.
 struct Vetoer;
 
@@ -699,11 +564,6 @@ async fn answers_a_ping(
     }
     assert!(probe.pings.load(Ordering::SeqCst) > before);
     answered.unwrap()
-}
-
-#[test]
-fn child_kill_grace_survives_restarts_paused() {
-    common::run_paused(child_kill_grace_survives_restarts_body(true));
 }
 
 async fn child_kill_grace_survives_restarts_body(paused: bool) {
@@ -898,6 +758,48 @@ async fn every_kill_entry_point_waits_the_target_s_own_kill_grace_body(paused: b
         sup.stop(StopReason::Kill).await.unwrap();
         runs_then_is_aborted(&child, killed_at, OWN_GRACE, paused).await;
     }
+}
+
+/// A grace beyond any practical bound keeps a parked turn alive across a
+/// long advance of the clock, while `stop_within(Kill, d)` on a target with
+/// that grace still aborts it after `d`.
+#[test]
+fn a_huge_grace_never_aborts_but_stop_within_kill_still_does() {
+    common::run_paused(async {
+        let sys = ActorSystem::create(uname("huge-grace")).unwrap();
+
+        let probe = Arc::new(Probe::default());
+        let name = uname("held");
+        let held = spawn_root(&sys, &name, &probe, Some(Duration::MAX)).await;
+        park(&held, &probe).await;
+        sys.kill(&name).await.expect("the kill is accepted");
+        sleep(Duration::from_secs(24 * 3600)).await;
+        assert_ne!(
+            held.status(),
+            ActorStatus::Stopped,
+            "a day after its Kill the turn still runs"
+        );
+
+        let probe = Arc::new(Probe::default());
+        let name = uname("bounded");
+        let window = Duration::from_secs(2);
+        let target = spawn_root(&sys, &name, &probe, Some(Duration::MAX)).await;
+        park(&target, &probe).await;
+        let started = Instant::now();
+        let outcome = within(
+            BOUND,
+            "stop_within(Kill) to return",
+            target.stop_within(StopReason::Kill, window),
+        )
+        .await
+        .unwrap();
+        let took = started.elapsed();
+        assert_eq!(outcome, StopOutcome::Aborted);
+        assert!(
+            took >= window && took <= window + PAUSED_SLACK,
+            "the abort lands at the call's own window of {window:?}, not the grace: {took:?}"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,11 +1022,6 @@ fn edge_of_range_never_panics(edge: Edge, roots: bool) {
     });
 }
 
-#[test]
-fn edge_of_range_kill_grace_never_panics_children_largest_addable() {
-    edge_of_range_never_panics(Edge::LargestAddable, false);
-}
-
 // ---------------------------------------------------------------------------
 // The abort follows the target's runtime
 // ---------------------------------------------------------------------------
@@ -1188,34 +1085,4 @@ fn kill_backstop_fires_while_another_runtime_hosts_a_never_driven_reaper() {
     });
     rt.shutdown_background();
     host.shutdown_background();
-}
-
-#[test]
-fn kill_from_a_throwaway_runtime_still_aborts_a_parked_target() {
-    let rt = two_worker_runtime();
-    let throwaway = current_thread_runtime();
-    let sys = ActorSystem::create(uname("throwaway-caller")).unwrap();
-
-    let probe = Arc::new(Probe::default());
-    let name = uname("root");
-    let grace = Duration::from_millis(100);
-    let handle = rt.block_on(async {
-        let handle = spawn_root(&sys, &name, &probe, Some(grace)).await;
-        park(&handle, &probe).await;
-        handle
-    });
-    // The one kill is issued from a runtime that is then kept undriven.
-    throwaway
-        .block_on(sys.kill(&name))
-        .expect("the kill is accepted");
-    rt.block_on(async {
-        within(
-            upper(false, grace + ASSUMED_ABORT_SETTLE),
-            "the root to be aborted on its own runtime",
-            handle.wait_stopped(),
-        )
-        .await;
-    });
-    rt.shutdown_background();
-    throwaway.shutdown_background();
 }

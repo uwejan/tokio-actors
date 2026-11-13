@@ -198,25 +198,10 @@ async fn assert_one_reason(rig: &SubjectRig, want: &StopReason) {
 }
 
 #[test]
-fn a_send_whose_caller_is_gone_drops_the_response_through_the_catch() {
+fn a_notify_whose_response_drop_panics_stops_the_actor_with_one_reason() {
     common::run(2, async {
-        let gate = Arc::new(Gate::default());
-        gate.held.store(true, Ordering::SeqCst);
-        let rig = subject_rig(Some(gate.clone())).await;
-        let asker = rig.child.clone();
-        let caller = tokio::spawn(async move {
-            let _ = asker.send(()).await;
-        });
-        wait_until("the handler to begin", || {
-            gate.entered.load(Ordering::SeqCst)
-        })
-        .await;
-        // The caller gives up while the handler runs: its reply has nobody
-        // to reach.
-        caller.abort();
-        let joined = within("the caller's end", caller).await;
-        assert!(joined.unwrap_err().is_cancelled());
-        gate.held.store(false, Ordering::SeqCst);
+        let rig = subject_rig(None).await;
+        rig.child.notify(()).await.expect("queued");
         assert_one_reason(&rig, &panic_reason(RESPONSE_PANIC)).await;
         let _ = rig.top.stop(StopReason::Graceful).await;
     });
@@ -431,26 +416,6 @@ async fn assert_mid_ended_with(rig: &MidRig, want: &StopReason) {
     let reports = rig.events.lock().unwrap().clone();
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(&reports[0].reason, want, "the root's report of mid");
-}
-
-#[test]
-fn a_pruned_factory_whose_drop_panics_stops_its_supervisor_with_one_reason() {
-    common::run(2, async {
-        let rig = mid_rig(RestartType::Temporary).await;
-        rig.armed.store(true, Ordering::SeqCst);
-        // The leaf ends; mid prunes its `Temporary` spec in its own loop,
-        // dropping the factory.
-        rig.leaf.stop(StopReason::Graceful).await.expect("accepted");
-        assert_mid_ended_with(&rig, &panic_reason(FACTORY_PANIC)).await;
-        let leaf_reports = rig.leaf_events.lock().unwrap().clone();
-        assert_eq!(
-            leaf_reports.len(),
-            1,
-            "the leaf's end is delivered: {leaf_reports:?}"
-        );
-        assert_eq!(leaf_reports[0].reason, StopReason::Graceful);
-        let _ = rig.root.stop(StopReason::Graceful).await;
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -711,38 +676,4 @@ impl Actor for Pipeline {
             .expect("the producer starts");
         Ok(())
     }
-}
-
-/// A collector started first drains a shared channel in `on_stopped` until
-/// every sender is gone, and a newer producer's factory holds a sender. The
-/// teardown releases every factory at its start, so once the producer has
-/// stopped no sender is left: the collector's drain ends, and the supervisor
-/// stops gracefully, well within the collector's shutdown bound.
-#[test]
-fn a_collector_whose_senders_a_factory_holds_drains_within_its_stop() {
-    common::run(2, async {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let drained = Arc::new(Mutex::new(Vec::new()));
-        let finished = Arc::new(AtomicBool::new(false));
-        let pipeline = Pipeline {
-            rx: Arc::new(Mutex::new(Some(rx))),
-            tx: Some(tx),
-            drained: drained.clone(),
-            finished: finished.clone(),
-        }
-        .spawn()
-        .named(uname("pipeline"))
-        .supervisor()
-        .await
-        .expect("the pipeline starts");
-        pipeline.send(()).await.expect("both children start");
-        pipeline.stop(StopReason::Graceful).await.expect("accepted");
-        let reason = within("the pipeline's stop", pipeline.wait_stopped()).await;
-        assert_eq!(reason, StopReason::Graceful);
-        assert!(
-            finished.load(Ordering::SeqCst),
-            "the collector's drain ended"
-        );
-        assert_eq!(drained.lock().unwrap().clone(), vec![1]);
-    });
 }

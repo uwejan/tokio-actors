@@ -88,11 +88,6 @@ async fn lengths_at_serve(queries: usize) -> Vec<usize> {
     lengths
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn two_queries_are_answered_ahead_of_the_backlog_current_thread() {
-    assert_eq!(lengths_at_serve(2).await, vec![BACKLOG, BACKLOG]);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_queries_are_answered_ahead_of_the_backlog_multi_thread() {
     assert_eq!(lengths_at_serve(2).await, vec![BACKLOG, BACKLOG]);

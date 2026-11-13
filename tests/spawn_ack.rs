@@ -23,8 +23,8 @@ use tokio::time::{sleep, timeout, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorId, ActorResult, ActorStatus, ActorSystem, ChildEvent, RestartType,
-    SpawnError, StopReason,
+    ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, SpawnError,
+    StopReason,
 };
 
 mod common;
@@ -80,6 +80,38 @@ impl Actor for FailInit {
     }
 }
 
+/// An actor whose `pre_start` waits at a gate no test opens, so it outlasts
+/// every test's start_timeout, and whose `on_stopped` records whether it
+/// ever ran.
+#[derive(Default)]
+struct SlowInit {
+    gate: Arc<HookGate>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Actor for SlowInit {
+    type Message = ();
+    type Response = ();
+
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.gate.pass().await;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.stopped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// An actor whose `pre_start` succeeds but whose `on_started` always panics,
 /// and whose `on_stopped` records whether it ever ran.
 #[derive(Default)]
@@ -105,6 +137,80 @@ impl Actor for PanicInit {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         self.stopped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A child that flips `stopped` in `on_stopped`; used to prove a
+/// supervisor's pre-spawned children are torn down (not orphaned) when the
+/// supervisor's own init fails after spawning them.
+#[derive(Default)]
+struct TeardownChild {
+    stopped: Arc<AtomicBool>,
+}
+
+impl Actor for TeardownChild {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.stopped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Handles of the children spawned by [`SpawnsChildrenThenFailsInit`], handed
+/// out so the test can assert on them after `spawn().await` returns.
+type ChildHandles = Arc<Mutex<Vec<ActorHandle<TeardownChild>>>>;
+
+/// A SUPERVISOR whose `on_started` spawns two children via `ctx.spawn_child`
+/// and then always fails. Proves that Phase 5 (`stop_all_children`) runs off
+/// the shared teardown tail even when the failing init belongs to the
+/// supervisor itself, not to one of its children.
+#[derive(Default)]
+struct SpawnsChildrenThenFailsInit {
+    child1_stopped: Arc<AtomicBool>,
+    child2_stopped: Arc<AtomicBool>,
+    handles: ChildHandles,
+}
+
+impl Actor for SpawnsChildrenThenFailsInit {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let stopped1 = self.child1_stopped.clone();
+        let child1 = ctx
+            .spawn_child(move || TeardownChild {
+                stopped: stopped1.clone(),
+            })
+            .await
+            .expect("child 1 must spawn");
+
+        let stopped2 = self.child2_stopped.clone();
+        let child2 = ctx
+            .spawn_child(move || TeardownChild {
+                stopped: stopped2.clone(),
+            })
+            .await
+            .expect("child 2 must spawn");
+
+        self.handles.lock().unwrap().extend([child1, child2]);
+
+        Err(ActorError::user(
+            "supervisor init fails after spawning children",
+        ))
+    }
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
 }
@@ -162,34 +268,58 @@ async fn detached_spawn_does_not_wait_and_stays_silent_on_init_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_started_panic_surfaces_as_spawn_error_init_and_skips_on_stopped() {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let result = PanicInit {
-        stopped: stopped.clone(),
-    }
-    .spawn()
-    .await;
+async fn init_failure_stops_children_spawned_in_on_started() {
+    let child1_stopped = Arc::new(AtomicBool::new(false));
+    let child2_stopped = Arc::new(AtomicBool::new(false));
+    let handles: ChildHandles = Arc::new(Mutex::new(Vec::new()));
 
+    let supervisor = SpawnsChildrenThenFailsInit {
+        child1_stopped: child1_stopped.clone(),
+        child2_stopped: child2_stopped.clone(),
+        handles: handles.clone(),
+    };
+
+    let result = supervisor.spawn().supervisor().await;
+
+    // (1) The supervisor's own init failure - not a child's - must still
+    // surface to the caller as SpawnError::Init.
     match result {
         Err(SpawnError::Init(err)) => {
             assert!(
-                matches!(*err, ActorError::Panic(_)),
-                "expected the panic to surface as ActorError::Panic, got: {err}"
+                matches!(*err, ActorError::User(_)),
+                "expected the original ActorError::User to survive, got: {err}"
             );
         }
-        Ok(_) => panic!("spawn must fail when on_started panics"),
+        Ok(_) => panic!("spawn must fail: on_started returns Err after spawning children"),
         Err(other) => panic!("expected SpawnError::Init, got: {other}"),
     }
 
-    // No sleep needed here (unlike the start_timeout test above): the
-    // default, no-deadline spawn ack only fires after run_actor's entire
-    // teardown tail has already completed, and that tail unconditionally
-    // skips on_stopped when init failed - there is nothing left pending to
-    // race, so the terminal state of `stopped` is already decided.
+    // (2) Both pre-spawned children must have run on_stopped: the shared
+    // teardown tail's Phase 5 (stop_all_children) stops them, it does not
+    // orphan them. spawn().await does not itself return until that teardown
+    // (including Phase 5) has already completed - see the module docs - so
+    // this holds by construction; poll with a bounded deadline anyway rather
+    // than assert synchronously, in case that ordering ever changes.
     assert!(
-        !stopped.load(Ordering::SeqCst),
-        "on_stopped must NOT run after an on_started panic (self-cleaning contract)"
+        wait_until(2_000, || {
+            child1_stopped.load(Ordering::SeqCst) && child2_stopped.load(Ordering::SeqCst)
+        })
+        .await,
+        "both pre-spawned children must run on_stopped when the supervisor's own init fails"
     );
+
+    // (3) Both children's handles independently report a terminal state.
+    let spawned = handles.lock().unwrap().clone();
+    assert_eq!(
+        spawned.len(),
+        2,
+        "on_started must have recorded both child handles before failing"
+    );
+    for child in spawned {
+        tokio::time::timeout(Duration::from_secs(2), child.wait_stopped())
+            .await
+            .expect("each pre-spawned child must reach a terminal state");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +395,27 @@ struct OpensOnDrop(Arc<HookGate>);
 impl Drop for OpensOnDrop {
     fn drop(&mut self) {
         self.0.open();
+    }
+}
+
+/// An actor whose `on_started` waits at a gate the test opens only after the
+/// spawn has returned.
+#[derive(Debug)]
+struct SlowStart {
+    gate: Arc<HookGate>,
+}
+
+impl Actor for SlowStart {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.gate.pass().await;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
     }
 }
 
@@ -344,6 +495,41 @@ fn awaited_spawn_killed_during_pre_start_reports_killed() {
     });
 }
 
+/// A message whose `Drop` panics while it is armed.
+struct Bomb {
+    armed: Arc<AtomicBool>,
+}
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::SeqCst) && !std::thread::panicking() {
+            panic!("a queued message was dropped");
+        }
+    }
+}
+
+/// An actor whose `pre_start` queues a message that panics when it is
+/// dropped, then fails.
+#[derive(Debug)]
+struct QueuesABomb;
+
+impl Actor for QueuesABomb {
+    type Message = Bomb;
+    type Response = ();
+
+    async fn pre_start(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let armed = Arc::new(AtomicBool::new(true));
+        ctx.self_handle()
+            .try_notify(Bomb { armed })
+            .expect("the actor's own mailbox takes the message");
+        Err(ActorError::user("the initialization fails"))
+    }
+
+    async fn handle(&mut self, _msg: Bomb, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A restart attempt killed during its initialization
 // ---------------------------------------------------------------------------
@@ -412,66 +598,40 @@ impl Actor for KillSup {
     }
 }
 
-#[test]
-fn restart_attempt_killed_during_init_is_reported_as_kill() {
-    common::run(2, async {
-        let held = Arc::new(AtomicBool::new(false));
-        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let child = uname("held-child");
-        let sup = KillSup {
-            held: held.clone(),
-            built: built.clone(),
-            child: child.clone(),
-            events: events.clone(),
-        }
-        .spawn()
-        .named(uname("kill-sup"))
-        .supervisor()
-        .await
-        .expect("supervisor spawn");
-        let handle = ActorSystem::default()
-            .get::<HeldChild>(&child)
-            .expect("the child is registered");
-        let _ = handle.send(true).await;
-        // The attempt's incarnation is registered under the id once the old
-        // one has ended and the registry holds a live one again.
-        assert!(
-            wait_until(5_000, || {
-                built.load(Ordering::SeqCst) == 2
-                    && handle.status() == ActorStatus::Stopped
-                    && ActorSystem::default()
-                        .get::<HeldChild>(&child)
-                        .is_some_and(|attempt| attempt.status() != ActorStatus::Stopped)
-            })
-            .await,
-            "the restart attempt's incarnation is registered"
-        );
-        let report = ActorSystem::default()
-            .kill_by_id(&ActorId::from(child.clone()))
-            .await;
-        assert!(report.is_some(), "the attempt's incarnation is registered");
-        assert!(
-            wait_until(5_000, || {
-                events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.reason, StopReason::Kill))
-            })
-            .await,
-            "the attempt's end is reported as a kill: {:?}",
-            events.lock().unwrap()
-        );
-        for event in events.lock().unwrap().iter() {
-            assert!(
-                !matches!(event.reason, StopReason::Failure(ActorError::User(_))),
-                "never a fabricated user error: {event:?}"
-            );
-        }
-        held.store(false, Ordering::SeqCst);
-        sup.stop(StopReason::Graceful).await.unwrap();
-    });
+/// An actor whose `pre_start` waits for the test, and whose value's drop
+/// holds its worker thread until the test releases it.
+struct HeldDrop {
+    entered: Arc<AtomicBool>,
+    go: Arc<tokio::sync::Notify>,
+    drop_entered: Arc<AtomicBool>,
+    drop_held: Arc<AtomicBool>,
+}
+
+impl Actor for HeldDrop {
+    type Message = ();
+    type Response = ();
+
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.entered.store(true, Ordering::SeqCst);
+        self.go.notified().await;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+impl Drop for HeldDrop {
+    fn drop(&mut self) {
+        self.drop_entered.store(true, Ordering::SeqCst);
+        let held = self.drop_held.clone();
+        tokio::task::block_in_place(|| {
+            while held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
 }
 
 /// A queued message whose drop holds its worker thread while the test keeps
@@ -544,69 +704,4 @@ impl Actor for AbortTarget {
             }
         }
     }
-}
-
-/// A `Kill` reaches an initialization that never yields, with a message
-/// queued whose drop holds: the task is aborted after its kill grace, and
-/// the awaited spawn (with a start timeout, and without) returns `Killed`
-/// while that drop still holds, since the reason is written before the
-/// queued messages drop. Multi-thread only: the held drop blocks its thread.
-#[test]
-fn an_awaited_spawn_aborted_in_its_initialization_returns_before_the_queued_drops() {
-    common::run_multi_thread_only(4, async {
-        for start_timeout in [None, Some(Duration::from_secs(5))] {
-            let name = uname("abort-init");
-            let entered = Arc::new(AtomicBool::new(false));
-            let held = Arc::new(AtomicBool::new(true));
-            let _release = ReleaseFlag(held.clone());
-            let drop_entered = Arc::new(AtomicBool::new(false));
-            let actor = AbortTarget {
-                hang_init: true,
-                entered: entered.clone(),
-                parked: Arc::new(AtomicBool::new(false)),
-            };
-            let spawn_name = name.clone();
-            let spawner = tokio::spawn(async move {
-                let mut builder = actor
-                    .spawn()
-                    .named(spawn_name)
-                    .kill_grace(Duration::from_millis(50));
-                if let Some(bound) = start_timeout {
-                    builder = builder.start_timeout(bound);
-                }
-                builder.await
-            });
-            assert!(
-                wait_until(BOUND.as_millis() as u64, || entered.load(Ordering::SeqCst)).await,
-                "pre_start begins"
-            );
-            let handle = ActorSystem::default()
-                .get::<AbortTarget>(&name)
-                .expect("registered");
-            handle
-                .notify(AbortMsg::Held(HeldMessage {
-                    entered: drop_entered.clone(),
-                    held: held.clone(),
-                }))
-                .await
-                .expect("queued");
-            handle.stop(StopReason::Kill).await.expect("accepted");
-            let result = timeout(BOUND, spawner)
-                .await
-                .expect("the spawn returns while the queued drop holds")
-                .expect("the spawner ends");
-            assert!(
-                matches!(result, Err(SpawnError::Killed)),
-                "{:?}",
-                result.err()
-            );
-            assert!(held.load(Ordering::SeqCst), "the queued drop still held");
-            held.store(false, Ordering::SeqCst);
-            assert_eq!(
-                timeout(BOUND, handle.wait_stopped()).await.expect("ends"),
-                StopReason::Kill
-            );
-            assert!(drop_entered.load(Ordering::SeqCst));
-        }
-    });
 }

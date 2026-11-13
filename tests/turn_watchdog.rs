@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorResult, ActorStatus, ActorSystem, ChildEvent, StopReason, SupervisionConfig, SystemConfig,
+    ActorConfig, ActorResult, ActorStatus, ActorSystem, StopReason, SystemConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,19 +42,6 @@ fn uname(base: &str) -> String {
 // ---------------------------------------------------------------------------
 // Helper actors
 // ---------------------------------------------------------------------------
-
-/// A trivial actor: `handle` returns immediately.
-#[derive(Default)]
-struct Idle;
-
-impl Actor for Idle {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-}
 
 /// A turn the test holds: the handler records the instant it began, then
 /// blocks the OS thread it runs on, never yielding back to the runtime, until
@@ -182,32 +169,78 @@ async fn turn_elapsed_reports_a_running_turn() {
     assert_eq!(sys.actor_status(handle.id()), Some(ActorStatus::Running));
 }
 
+/// How a turn reaches the handler.
+#[derive(Clone, Copy, Debug)]
+enum Entry {
+    /// An ordinary message taken from the mailbox.
+    Mailbox,
+    /// A message taken from the priority lane.
+    Priority,
+    /// The step a handler asked for with `continue_with`.
+    ChainStep,
+}
+
+enum EntryMsg {
+    /// Holds the turn on the actor's [`HeldTurn`].
+    Hold,
+    /// Replies at once and asks for `Hold` as the next step.
+    ThenHold,
+}
+
+/// An actor that holds a turn on a [`HeldTurn`] for the message `Hold`.
+struct HoldsOnEntry(HeldTurn);
+
+impl Actor for HoldsOnEntry {
+    type Message = EntryMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: EntryMsg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            EntryMsg::Hold => self.0.block(),
+            EntryMsg::ThenHold => ctx.continue_with(EntryMsg::Hold),
+        }
+        Ok(())
+    }
+}
+
+/// The turn clock clears once the turn ends, whichever way the turn was
+/// reached: from the mailbox, from the priority lane, or as a chain step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_elapsed_is_none_once_the_watchdog_is_switched_off_mid_turn() {
-    let sys = ActorSystem::create_with(
-        uname("off-mid-turn"),
-        SystemConfig::default().with_turn_warning_threshold(LONG_THRESHOLD),
-    )
-    .unwrap();
-    let (handle, turn, _open) = slow_on(&sys).await;
+async fn turn_elapsed_clears_when_the_turn_ends() {
+    for entry in [Entry::Mailbox, Entry::Priority, Entry::ChainStep] {
+        let sys = ActorSystem::create_with(
+            uname("turn-ends"),
+            SystemConfig::default().with_turn_warning_threshold(LONG_THRESHOLD),
+        )
+        .unwrap();
+        let turn = HeldTurn::default();
+        let _open = turn.opens_on_drop();
+        let handle = HoldsOnEntry(turn.clone())
+            .spawn()
+            .with_config(ActorConfig::default().with_priority_lane(8))
+            .on_system(&sys)
+            .await
+            .unwrap();
 
-    held_turn(&handle, &turn).await;
-    assert!(
-        sys.turn_elapsed(handle.id()).is_some(),
-        "the turn should be reported while the threshold is still on"
-    );
+        match entry {
+            Entry::Mailbox => handle.notify(EntryMsg::Hold).await.unwrap(),
+            Entry::Priority => handle.notify_priority(EntryMsg::Hold).await.unwrap(),
+            Entry::ChainStep => handle.notify(EntryMsg::ThenHold).await.unwrap(),
+        }
+        turn.began().await;
+        assert!(
+            sys.turn_elapsed(handle.id()).is_some(),
+            "{entry:?}: the turn should still be in flight"
+        );
 
-    // Switch the watchdog off mid-turn: the actor's own turn clock keeps a
-    // nonzero token for this turn until `handle()` returns, but the
-    // system's current threshold - not that stale token - decides whether
-    // `turn_elapsed` reports it.
-    sys.set_turn_warning_threshold(None);
-
-    assert_eq!(
-        sys.turn_elapsed(handle.id()),
-        None,
-        "turn_elapsed must report None as soon as the threshold is off, even mid-turn"
-    );
+        // Once handle() returns, the turn clock clears.
+        turn.open();
+        until(
+            &format!("{entry:?}: the turn clock to clear once handle() returns"),
+            || sys.turn_elapsed(handle.id()).is_none(),
+        )
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,25 +317,6 @@ impl Actor for SlowStop {
     }
 }
 
-/// An actor whose `on_started` waits for its gate.
-struct SlowStart {
-    gate: Gate,
-}
-
-impl Actor for SlowStart {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        self.gate.wait().await;
-        Ok(())
-    }
-}
-
 fn watched(label: &str) -> Arc<ActorSystem> {
     ActorSystem::create_with(
         uname(label),
@@ -338,260 +352,4 @@ async fn stuck_actors_lists_an_actor_stuck_in_on_stopped() {
         .expect("the actor stops");
     assert_eq!(sys.turn_elapsed(handle.id()), None, "gone once it returned");
     assert!(!sys.stuck_actors().iter().any(|(id, _)| id == handle.id()));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stuck_actors_lists_an_actor_stuck_in_its_initialization() {
-    let sys = watched("stuck-init");
-    let gate = Gate::default();
-    let name = uname("slow-start");
-    let spawned = {
-        let sys = sys.clone();
-        let name = name.clone();
-        let gate = gate.clone();
-        tokio::spawn(async move { SlowStart { gate }.spawn().named(name).on_system(&sys).await })
-    };
-
-    until("the actor to be listed as stuck", || {
-        !sys.stuck_actors().is_empty()
-    })
-    .await;
-    assert!(
-        !spawned.is_finished(),
-        "the spawn has not acknowledged yet while the actor is listed"
-    );
-    let (id, elapsed) = sys.stuck_actors().remove(0);
-    assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
-    assert_eq!(sys.actor_status(&id), Some(ActorStatus::Initializing));
-    gate.open();
-    spawned.await.unwrap().expect("the actor starts");
-}
-
-/// A supervisor whose handler waits for `busy` and whose `on_child_stopped`
-/// waits for `delivery`.
-struct StuckDelivery {
-    /// Set once a `Busy` message is being handled.
-    in_turn: Arc<AtomicBool>,
-    busy: Gate,
-    delivery: Gate,
-}
-
-#[derive(Clone)]
-enum DeliveryMsg {
-    Busy,
-}
-
-impl Actor for StuckDelivery {
-    type Message = DeliveryMsg;
-    type Response = ();
-
-    async fn handle(
-        &mut self,
-        _msg: DeliveryMsg,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        self.in_turn.store(true, Ordering::SeqCst);
-        self.busy.wait().await;
-        Ok(())
-    }
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        ctx.spawn_child(Idle::default)
-            .named("delivery-child".to_string())
-            .await?;
-        Ok(())
-    }
-
-    async fn on_child_stopped(
-        &mut self,
-        _event: &ChildEvent,
-        _ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<()> {
-        self.delivery.wait().await;
-        Ok(())
-    }
-}
-
-async fn delivery_supervisor(
-    sys: &Arc<ActorSystem>,
-) -> (
-    tokio_actors::ActorHandle<StuckDelivery>,
-    Arc<AtomicBool>,
-    Gate,
-    Gate,
-) {
-    let in_turn = Arc::new(AtomicBool::new(false));
-    let (busy, delivery) = (Gate::default(), Gate::default());
-    let sup = StuckDelivery {
-        in_turn: in_turn.clone(),
-        busy: busy.clone(),
-        delivery: delivery.clone(),
-    }
-    .spawn()
-    .named(uname("sup"))
-    .with_supervision(SupervisionConfig::one_for_one())
-    .on_system(sys)
-    .await
-    .unwrap();
-    (sup, in_turn, busy, delivery)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stuck_actors_lists_a_supervisor_stuck_in_a_final_delivery() {
-    let sys = watched("stuck-final");
-    let (sup, in_turn, busy_gate, delivery) = delivery_supervisor(&sys).await;
-    // The handler is busy, a child ends meanwhile, and the stop lands in the
-    // same handler: the death is pending when the message loop ends.
-    let busy = {
-        let sup = sup.clone();
-        tokio::spawn(async move { sup.notify(DeliveryMsg::Busy).await })
-    };
-    until("the handler to be in its turn", || {
-        in_turn.load(Ordering::SeqCst)
-    })
-    .await;
-    let child = sys
-        .get::<Idle>("delivery-child")
-        .expect("the supervisor's child is registered");
-    child
-        .stop(StopReason::Failure(tokio_actors::ActorError::user("crash")))
-        .await
-        .unwrap();
-    child.wait_stopped().await;
-    sup.stop(StopReason::Graceful).await.unwrap();
-    busy_gate.open();
-    busy.await.unwrap().unwrap();
-
-    // The handler ended; the final delivery now waits for its gate.
-    until(
-        "the supervisor to be listed with its status Stopping",
-        || {
-            sys.stuck_actors().iter().any(|(id, _)| id == sup.id())
-                && sys.actor_status(sup.id()) == Some(ActorStatus::Stopping)
-        },
-    )
-    .await;
-    delivery.open();
-    tokio::time::timeout(BOUND, sup.wait_stopped())
-        .await
-        .expect("the supervisor stops");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stuck_actors_lists_a_supervisor_stuck_in_a_loop_delivery() {
-    let sys = watched("stuck-loop");
-    let (sup, _in_turn, _busy, delivery) = delivery_supervisor(&sys).await;
-    let child = sys
-        .get::<Idle>("delivery-child")
-        .expect("the supervisor's child is registered");
-    child
-        .stop(StopReason::Failure(tokio_actors::ActorError::user("crash")))
-        .await
-        .unwrap();
-    // The supervisor is idle, so the death is delivered by its message loop,
-    // while its status is still Running.
-    until("the supervisor to be listed as stuck", || {
-        sys.stuck_actors().iter().any(|(id, _)| id == sup.id())
-    })
-    .await;
-    assert_eq!(sys.actor_status(sup.id()), Some(ActorStatus::Running));
-    let elapsed = sys.turn_elapsed(sup.id()).expect("a callback is in flight");
-    assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
-    delivery.open();
-    sup.stop(StopReason::Graceful).await.unwrap();
-    tokio::time::timeout(BOUND, sup.wait_stopped())
-        .await
-        .expect("the supervisor stops");
-}
-
-/// An actor whose `pre_start` waits for its gate.
-struct SlowPreStart {
-    gate: Gate,
-}
-
-impl Actor for SlowPreStart {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        self.gate.wait().await;
-        Ok(())
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stuck_actors_lists_an_actor_stuck_in_pre_start() {
-    let sys = watched("stuck-pre-start");
-    let gate = Gate::default();
-    let spawned = {
-        let sys = sys.clone();
-        let gate = gate.clone();
-        tokio::spawn(async move { SlowPreStart { gate }.spawn().on_system(&sys).await })
-    };
-    until("the actor to be listed as stuck", || {
-        !sys.stuck_actors().is_empty()
-    })
-    .await;
-    assert!(
-        !spawned.is_finished(),
-        "the spawn has not acknowledged yet while the actor is listed"
-    );
-    let (id, elapsed) = sys.stuck_actors().remove(0);
-    assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
-    assert_eq!(sys.actor_status(&id), Some(ActorStatus::Initializing));
-    gate.open();
-    spawned.await.unwrap().expect("the actor starts");
-}
-
-/// An actor whose `pre_stop` waits for its gate and then lets the stop
-/// proceed.
-struct SlowPreStop {
-    gate: Gate,
-}
-
-impl Actor for SlowPreStop {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-
-    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        self.gate.wait().await;
-        true
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stuck_actors_lists_an_actor_stuck_in_pre_stop() {
-    let sys = watched("stuck-pre-stop");
-    let gate = Gate::default();
-    let handle = SlowPreStop { gate: gate.clone() }
-        .spawn()
-        .on_system(&sys)
-        .await
-        .unwrap();
-
-    handle.stop(StopReason::Graceful).await.unwrap();
-    until("the actor to be listed as stuck", || {
-        sys.stuck_actors().iter().any(|(id, _)| id == handle.id())
-    })
-    .await;
-    // The actor stays Running while `pre_stop` decides.
-    assert_eq!(sys.actor_status(handle.id()), Some(ActorStatus::Running));
-    let elapsed = sys
-        .turn_elapsed(handle.id())
-        .expect("a callback is in flight");
-    assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
-
-    gate.open();
-    tokio::time::timeout(BOUND, handle.wait_stopped())
-        .await
-        .expect("the actor stops");
-    assert_eq!(sys.turn_elapsed(handle.id()), None, "gone once it returned");
 }

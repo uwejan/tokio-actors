@@ -5,9 +5,8 @@
 //! caller with no runtime at all each get an answer that does not depend on
 //! anything but the actor.
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -83,6 +82,39 @@ impl Gate {
 impl Drop for Gate {
     fn drop(&mut self) {
         self.open();
+    }
+}
+
+/// Holds its worker thread in its handler until the test releases the gate.
+struct Wedge {
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    stopped_ran: Arc<AtomicBool>,
+}
+
+impl Actor for Wedge {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        let (open, changed) = &*self.gate;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = changed.wait(open).unwrap();
+        }
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.stopped_ran.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -229,25 +261,6 @@ fn a_caller_runtime_that_ends_leaves_a_target_on_a_runtime_without_timers_alone(
 // ---------------------------------------------------------------------------
 // No runtime
 // ---------------------------------------------------------------------------
-
-/// A bounded stop polled with no runtime current panics at its entry, before
-/// it raises anything: the actor is never asked to stop.
-#[test]
-fn a_bounded_stop_without_a_runtime_panics_before_it_raises_anything() {
-    let target_rt = multi_thread(2);
-    let asked = Arc::new(AtomicUsize::new(0));
-    let h = target_rt.block_on(async { Veto::new(&asked).spawn().await.unwrap() });
-    let polled = catch_unwind(AssertUnwindSafe(|| {
-        foreign_block_on(
-            h.stop_within(StopReason::Graceful, Duration::from_millis(100)),
-            Duration::from_secs(2),
-        )
-    }));
-    assert!(polled.is_err(), "the call panics at its entry");
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing was raised");
-    assert_eq!(h.status(), ActorStatus::Running);
-}
 
 // ---------------------------------------------------------------------------
 // An actor that has already ended

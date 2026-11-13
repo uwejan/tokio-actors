@@ -16,7 +16,7 @@ fn idle_forwarder(done: Arc<AtomicU64>) -> Forwarder<std::future::Pending<Releas
         counted: false,
         future: Some(Box::pin(std::future::pending::<Released>())),
         slot: PanicSlot::default(),
-        owner: ActorId::from("forwarder-count"),
+        owner: crate::actor::runtime::Owner::new(ActorId::from("forwarder-count"), false),
         _status: status_tx,
         _subtree: SubtreeHold::new(None),
     }

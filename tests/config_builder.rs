@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult,

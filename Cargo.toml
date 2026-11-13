@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.85"
 description = "An OTP-style actor runtime for Rust: supervision, lifecycle and crash semantics traced to Erlang/OTP, with the known departures listed in the README"

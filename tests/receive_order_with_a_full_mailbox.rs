@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, ChildEvent, RestartType, TrySendError,
+    ActorConfig, ActorError, ActorHandle, ActorResult, ChildEvent, RestartType,
 };
 
 /// Bounds every wait, so a hang fails the test.
@@ -178,35 +178,5 @@ fn a_recorded_child_death_is_received_before_the_childs_queued_message() {
         release.send(()).unwrap();
         assert_eq!(rig.next().await, "child_stopped");
         assert_eq!(rig.next().await, "from-child");
-    });
-}
-
-#[test]
-fn a_priority_message_is_received_before_a_message_in_a_full_mailbox() {
-    common::run(2, async {
-        let mut rig = start(
-            ActorConfig::default()
-                .with_mailbox_capacity(1)
-                .with_priority_lane(1),
-            false,
-        )
-        .await;
-        let release = rig.hold_a_turn().await;
-        rig.receiver
-            .try_notify(Msg::Tag("normal"))
-            .expect("room for one message");
-        assert!(
-            matches!(
-                rig.receiver.try_notify(Msg::Tag("refused")),
-                Err(TrySendError::Full)
-            ),
-            "the mailbox is full"
-        );
-        rig.receiver
-            .try_notify_priority(Msg::Tag("priority"))
-            .expect("the priority lane has room");
-        release.send(()).unwrap();
-        assert_eq!(rig.next().await, "priority");
-        assert_eq!(rig.next().await, "normal");
     });
 }

@@ -40,7 +40,7 @@ use std::sync::{Mutex, MutexGuard};
 use tokio::task::coop::cooperative;
 
 use crate::actor::subtree::AbortRecord;
-use crate::types::{ActorStatus, StatusValue};
+use crate::types::{ActorStatus, StatusValue, StopReason};
 
 /// Every sender of the plane is gone: the plane is closed and holds its
 /// final value.
@@ -61,6 +61,15 @@ const CLOSED: u64 = 1;
 /// so one load gives a version and the closed bit that belong together.
 const VERSION_STEP: u64 = 2;
 
+fn mirror_of(value: &StatusValue) -> u8 {
+    encode(value.status)
+        | if value.reason.is_some() {
+            REASON_WRITTEN
+        } else {
+            0
+        }
+}
+
 fn encode(status: ActorStatus) -> u8 {
     match status {
         ActorStatus::Initializing => 0,
@@ -70,8 +79,12 @@ fn encode(status: ActorStatus) -> u8 {
     }
 }
 
+/// Set in the status byte while the value carries a reason, so a reader asks
+/// whether the plane is terminal without its lock.
+const REASON_WRITTEN: u8 = 0x80;
+
 fn decode(byte: u8) -> ActorStatus {
-    match byte {
+    match byte & !REASON_WRITTEN {
         0 => ActorStatus::Initializing,
         1 => ActorStatus::Running,
         2 => ActorStatus::Stopping,
@@ -103,6 +116,11 @@ impl StatusCell {
             senders: AtomicU32::new(0),
             mirror: AtomicU8::new(encode(ActorStatus::Initializing)),
         }
+    }
+
+    /// Whether the plane's status reads `Stopped`: one relaxed load.
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.mirror.load(Ordering::Relaxed) == encode(ActorStatus::Stopped)
     }
 
     fn lock(&self) -> CellGuard<'_> {
@@ -187,6 +205,13 @@ impl AbortRecord {
         (tx, rx)
     }
 
+    /// Whether the incarnation's final reason is written in its status plane.
+    /// Every writer of the reason writes the final one, once, so a reason
+    /// read here never changes. Takes the plane's leaf lock.
+    pub(crate) fn has_final_reason(&self) -> bool {
+        self.status_cell().lock().reason.is_some()
+    }
+
     /// Wakes every waiter on the block's signals. Never called with the
     /// status cell's lock held. A waiter's waker belongs to the waiter's task,
     /// so a panic of its wake is contained in the call (see
@@ -208,6 +233,13 @@ pub(crate) struct StatusTx {
 impl fmt::Debug for StatusTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StatusTx").finish_non_exhaustive()
+    }
+}
+
+impl StatusTx {
+    /// The abort record of the incarnation whose plane this is.
+    pub(crate) fn abort_record(&self) -> &AbortRecord {
+        &self.record
     }
 }
 
@@ -237,6 +269,11 @@ impl Drop for StatusTx {
 }
 
 impl StatusTx {
+    /// The incarnation's block this sender writes.
+    pub(crate) fn record(&self) -> &AbortRecord {
+        &self.record
+    }
+
     /// The plane's value. See [`StatusRef`] for what holding it means.
     pub(crate) fn borrow(&self) -> StatusRef<'_> {
         StatusRef(self.record.status_cell().lock())
@@ -245,6 +282,13 @@ impl StatusTx {
     /// The plane's current status, without the lock.
     pub(crate) fn status(&self) -> ActorStatus {
         decode(self.record.status_cell().mirror.load(Ordering::Acquire))
+    }
+
+    /// Whether the plane carries a reason, without the lock. A reason is
+    /// never taken back, so `true` is final; `false` may be stale by a write
+    /// that is being made.
+    pub(crate) fn reason_written(&self) -> bool {
+        self.record.status_cell().mirror.load(Ordering::Acquire) & REASON_WRITTEN != 0
     }
 
     /// A receiver that has seen the current version.
@@ -266,7 +310,7 @@ impl StatusTx {
             let modified = modify(&mut guard);
             // The byte first, the version after: a reader that consumed
             // the new version finds the byte of that value or a later one.
-            cell.mirror.store(encode(guard.status), Ordering::Release);
+            cell.mirror.store(mirror_of(&guard), Ordering::Release);
             if modified {
                 cell.state.fetch_add(VERSION_STEP, Ordering::Release);
             }
@@ -313,7 +357,7 @@ impl StatusTx {
             let cell = record.status_cell();
             let mut guard = cell.lock();
             *guard = init;
-            cell.mirror.store(encode(guard.status), Ordering::Release);
+            cell.mirror.store(mirror_of(&guard), Ordering::Release);
         }
         record.status_channel()
     }
@@ -345,10 +389,27 @@ impl Clone for StatusRx {
 }
 
 impl StatusRx {
+    /// The incarnation's block this receiver reads, for the counters and the
+    /// public name that live beside the plane.
+    pub(crate) fn record(&self) -> &crate::actor::subtree::AbortRecord {
+        &self.record
+    }
+
     /// The plane's value. It never marks a version seen. See [`StatusRef`]
     /// for what holding it means.
     pub(crate) fn borrow(&self) -> StatusRef<'_> {
         StatusRef(self.record.status_cell().lock())
+    }
+
+    /// The reason a reader takes from a plane it found terminal: the one
+    /// written, else the cause a `Kill` on the stop lane carries (the plane
+    /// closed before the reason was written, as an aborted task's does), else
+    /// `Kill`. The plane's lock is released before the lane is read.
+    pub(crate) fn reason_or_kill(&self) -> StopReason {
+        let written = self.borrow().reason.clone();
+        written
+            .or_else(|| self.record.kill_cause())
+            .unwrap_or(StopReason::Kill)
     }
 
     /// The plane's current status, without the lock.
@@ -506,29 +567,210 @@ pub(crate) mod probe {
             hook();
         }
     }
+
+    /// Installs `hook` to run in the window of the next wait on this thread.
+    pub(crate) fn set_after_unchanged_read(hook: impl FnOnce() + 'static) {
+        AFTER_UNCHANGED_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    pub(crate) struct CountWake(std::sync::atomic::AtomicUsize);
+
+    impl CountWake {
+        pub(crate) fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for CountWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-
+    use super::probe::CountWake;
     use super::*;
+
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
 
     fn plane(status: ActorStatus) -> (StatusTx, StatusRx) {
         StatusTx::channel(StatusValue::new(status))
     }
 
+    fn poll_once<F: Future>(fut: &mut Pin<Box<F>>, wake: &Arc<CountWake>) -> Poll<F::Output> {
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        fut.as_mut().poll(&mut cx)
+    }
+
+    /// A waker that, when it runs, records whether the plane's lock was
+    /// free for the thread that woke it.
+    struct LockProbe {
+        record: AbortRecord,
+        free: std::sync::atomic::AtomicUsize,
+        locked: std::sync::atomic::AtomicUsize,
+        /// The version and the closed bit at each wake.
+        states: Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl LockProbe {
+        fn new(record: AbortRecord) -> Arc<Self> {
+            Arc::new(Self {
+                record,
+                free: Default::default(),
+                locked: Default::default(),
+                states: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn note(&self) {
+            let counter = match self.record.status_cell().value.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => &self.free,
+                Err(std::sync::TryLockError::WouldBlock) => &self.locked,
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            self.states
+                .lock()
+                .unwrap()
+                .push(self.record.status_cell().load());
+        }
+
+        /// The last wake found the version `version` or later and the
+        /// plane closed as `closed`.
+        fn last_wake_saw(&self) -> (u64, bool) {
+            *self.states.lock().unwrap().last().expect("a wake ran")
+        }
+
+        fn free(&self) -> usize {
+            self.free.load(Ordering::SeqCst)
+        }
+
+        fn locked(&self) -> usize {
+            self.locked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for LockProbe {
+        fn wake(self: Arc<Self>) {
+            self.note();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.note();
+        }
+    }
+
+    /// A waker that counts its wakes and panics in them while it is armed.
+    #[derive(Default)]
+    struct LoudWake {
+        armed: std::sync::atomic::AtomicBool,
+        woken: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LoudWake {
+        fn arm(&self, armed: bool) {
+            self.armed.store(armed, Ordering::SeqCst);
+        }
+
+        fn woken(&self) -> usize {
+            self.woken.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for LoudWake {
+        fn wake(self: Arc<Self>) {
+            self.woken.fetch_add(1, Ordering::SeqCst);
+            if self.armed.load(Ordering::SeqCst) {
+                panic!("a waker's wake panics");
+            }
+        }
+    }
+
+    fn is_send<T: Send>(_: &T) {}
+
+    fn assert_thread_safe<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    struct Idle;
+
+    impl crate::Actor for Idle {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::ActorContext<Self>,
+        ) -> crate::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Parks a `changed` and a `wait_for` on the plane, runs `write`, and
+    /// finds both woken (with the lock free for the waker) and both ready.
+    fn parked_waiters_are_woken_by(write: impl FnOnce(&StatusTx)) {
+        let (tx, rx) = plane(ActorStatus::Initializing);
+        let probe = LockProbe::new(tx.record.clone());
+        let counted = Arc::new(CountWake::default());
+        let mut changed_rx = rx.clone();
+        let mut wait_rx = rx.clone();
+        let mut changed = Box::pin(changed_rx.changed());
+        let mut wait = Box::pin(
+            wait_rx.wait_for(|v| v.status != ActorStatus::Initializing || v.reason.is_some()),
+        );
+        let waker = Waker::from(probe.clone());
+        assert!(changed
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        assert!(poll_once(&mut wait, &counted).is_pending());
+        write(&tx);
+        assert!(probe.free() >= 1, "the parked changed was woken");
+        assert_eq!(probe.locked(), 0, "no wake ran with the plane's lock held");
+        assert_eq!(
+            probe.last_wake_saw(),
+            (1, false),
+            "the version was moved before the waiters were woken"
+        );
+        assert!(counted.count() >= 1, "the parked wait_for was woken");
+        assert_eq!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert_eq!(poll_once(&mut wait, &counted), Poll::Ready(Ok(())));
+    }
+}
+
+#[cfg(test)]
+mod cause_read_tests {
+    use super::*;
+    use crate::types::StopLane;
+
+    fn held() -> StopReason {
+        StopReason::Shutdown("held".into())
+    }
+
+    /// A plane that closed with no reason written reads the cause the stop
+    /// lane carries, else `Kill`; a written reason always wins.
     #[test]
-    fn a_poisoned_lock_is_ignored() {
-        let (tx, rx) = plane(ActorStatus::Running);
-        let held = tx.clone();
-        let panicked = std::thread::spawn(move || {
-            let _guard = held.record.status_cell().value.lock().unwrap();
-            panic!("a panic while the plane is locked");
-        })
-        .join();
-        assert!(panicked.is_err());
-        assert_eq!(rx.borrow().status, ActorStatus::Running);
-        tx.send_modify(|v| v.status = ActorStatus::Stopped);
-        assert_eq!(rx.status(), ActorStatus::Stopped);
+    fn reason_or_kill_reads_the_cause_for_a_closed_plane() {
+        let (lane, _rx) = StopLane::new();
+        let record = lane.abort_record().clone();
+        let (tx, rx) = record.status_channel();
+        assert_eq!(rx.reason_or_kill(), StopReason::Kill);
+        lane.try_raise_kill_caused(held());
+        assert_eq!(rx.reason_or_kill(), held());
+        StatusValue::write_reason(&tx, StopReason::Graceful, true);
+        assert_eq!(rx.reason_or_kill(), StopReason::Graceful);
     }
 }

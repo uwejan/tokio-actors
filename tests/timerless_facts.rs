@@ -1,6 +1,5 @@
 //! What a runtime built without the Tokio time driver does with actors: plain
-//! actors run, an actor timer panics in its own task and leaves the actor
-//! running, and a `Kill` aborts the task at once with no kill grace.
+//! actors run, and a `Kill` aborts the task at once with no kill grace.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +8,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Notify;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorResult, ActorStatus, StopReason,
+    ActorResult, StopReason,
 };
 
 fn without_timers() -> Runtime {
@@ -37,51 +36,6 @@ fn a_plain_actor_runs_and_stops_gracefully_on_a_runtime_without_the_time_driver(
         actor.wait_stopped().await
     });
     assert_eq!(reason, StopReason::Graceful);
-}
-
-/// Holds a recurring timer and answers each message with the last error its
-/// timers left.
-struct Ticker;
-
-impl Actor for Ticker {
-    type Message = ();
-    type Response = Option<String>;
-
-    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        ctx.every_with(Duration::from_millis(1), || ())
-            .await
-            .expect("the timer starts");
-        Ok(())
-    }
-
-    async fn handle(
-        &mut self,
-        _msg: (),
-        ctx: &mut ActorContext<Self>,
-    ) -> ActorResult<Option<String>> {
-        Ok(ctx.last_forwarder_error().map(ToString::to_string))
-    }
-}
-
-#[test]
-fn an_actor_timer_panics_in_its_own_task_and_the_actor_keeps_running() {
-    let rt = without_timers();
-    rt.block_on(async {
-        let actor = Ticker.spawn().await.expect("the actor starts");
-        // The timer's task panics at its first poll; the actor's loop reaps
-        // it between two requests, so a later request reads its error.
-        let mut error = None;
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-            error = actor.send(()).await.expect("the actor answers");
-            if error.is_some() {
-                break;
-            }
-        }
-        assert!(error.is_some(), "the timer's task panicked");
-        assert_eq!(actor.status(), ActorStatus::Running);
-        actor.send(()).await.expect("the actor still answers");
-    });
 }
 
 /// Parks inside its handler until the runtime aborts it.

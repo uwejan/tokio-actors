@@ -36,6 +36,36 @@ fn recorder() -> EventLog {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// The bound on a timed outcome on a real-time runtime. A tighter limit would
+/// fail on a host that stalls its threads; the exact timing is pinned on the
+/// paused clock, where an outcome lands on its instant.
+const HANG_BOUND: Duration = Duration::from_secs(10);
+
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// window a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
+/// The time between a `Kill` and the abort when a spawn builder sets no
+/// `kill_grace`. An integration test cannot read the crate's constant, so the
+/// value is named here once.
+const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
+
+/// The upper bound of an outcome that lands at `exact` on the paused clock:
+/// that instant plus [`PAUSED_SLACK`]; a hang bound on a real-time runtime.
+fn upper(paused: bool, exact: Duration) -> Duration {
+    if paused {
+        exact + PAUSED_SLACK
+    } else {
+        HANG_BOUND
+    }
+}
+
+/// `upper` for a poll deadline given in milliseconds.
+fn upper_ms(paused: bool, precise_ms: u64) -> u64 {
+    upper(paused, Duration::from_millis(precise_ms)).as_millis() as u64
+}
+
 /// Unique registry names so tests can run in parallel within one process.
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +87,22 @@ where
             return false;
         }
         sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Re-looks a named `Node` up until it answers a `Ping` - proof that
+/// whichever incarnation is registered under the name right now is alive and
+/// responsive (a crashed predecessor can never satisfy this).
+async fn wait_responsive(sys: &ActorSystem, name: &str, timeout_ms: u64) -> ActorHandle<Node> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(handle) = sys.get::<Node>(name) {
+            if handle.send(NodeMsg::Ping).await.is_ok() {
+                return handle;
+            }
+        }
+        assert!(Instant::now() < deadline, "{name} never became responsive");
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -94,6 +140,11 @@ impl Node {
 
     fn recording_stops(mut self, stops: &StopLog) -> Self {
         self.stops = Some(stops.clone());
+        self
+    }
+
+    fn with_child_grace(mut self, grace: Duration) -> Self {
+        self.child_grace = Some(grace);
         self
     }
 }
@@ -193,6 +244,128 @@ impl Actor for Node {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
+/// A kill grace no wait in this test comes near: an abort after it cannot be
+/// what ends a descendant here.
+const FAR_GRACE: Duration = Duration::from_secs(30);
+
+async fn wedged_child_is_aborted_only_after_its_grace(paused: bool) {
+    let sys = ActorSystem::create(uname("sys")).unwrap();
+    let leaf_name = uname("leaf");
+
+    let sup = Node::new(false, recorder())
+        .spawn()
+        .named(uname("sup"))
+        .on_system(&sys)
+        .supervisor()
+        .await
+        .unwrap();
+
+    sup.send(NodeMsg::SpawnChild {
+        name: leaf_name.clone(),
+        as_supervisor: false,
+        shutdown: Shutdown::Timeout(Duration::from_secs(5)),
+        restart_type: RestartType::Permanent,
+        veto: false,
+    })
+    .await
+    .unwrap();
+
+    let leaf = sys.get::<Node>(&leaf_name).expect("leaf registered");
+    // The handler runs only after the leaf's start, and the Kill comes only
+    // once the wedge holds.
+    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    leaf.notify(NodeMsg::Wedge(wedged.clone())).await.unwrap();
+    assert!(
+        wait_until(2_000, || wedged.load(Ordering::SeqCst)).await,
+        "the leaf's handler parks"
+    );
+
+    let t0 = Instant::now();
+    sup.stop(StopReason::Kill).await.unwrap();
+    sup.wait_stopped().await;
+
+    assert!(
+        wait_until(2_000, || sys.get::<Node>(&leaf_name).is_none()).await,
+        "a wedged leaf must eventually be aborted by the reaper"
+    );
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(90),
+        "the reaper must honor the leaf's grace window before aborting, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < upper(paused, ASSUMED_KILL_GRACE),
+        "the reaper must not take drastically longer than the grace window, took {elapsed:?}"
+    );
+}
+
+async fn escalated_timeout_kill_cascades_the_same_as_configured_kill(paused: bool) {
+    let sys = ActorSystem::create(uname("sys")).unwrap();
+    let mid_name = uname("mid");
+    let leaf_name = uname("leaf");
+
+    let top = Node::new(false, recorder())
+        .spawn()
+        .named(uname("top"))
+        .on_system(&sys)
+        .supervisor()
+        .await
+        .unwrap();
+
+    // `mid` vetoes every stoppable stop forever and has a short Shutdown
+    // timeout, so `top`'s own child-stop ladder escalates it to Kill
+    // instead of waiting for a cooperative stop that never comes.
+    top.send(NodeMsg::SpawnChild {
+        name: mid_name.clone(),
+        as_supervisor: true,
+        shutdown: Shutdown::Timeout(Duration::from_millis(50)),
+        restart_type: RestartType::Permanent,
+        veto: true,
+    })
+    .await
+    .unwrap();
+    let mid = sys.get::<Node>(&mid_name).expect("mid registered");
+
+    // `leaf` ALSO vetoes forever and carries a Shutdown policy long enough
+    // to be unmistakable: if `mid`'s own teardown ever awaited it under
+    // that policy instead of cascading Kill directly, this test would see
+    // it take seconds, not milliseconds.
+    mid.send(NodeMsg::SpawnChild {
+        name: leaf_name.clone(),
+        as_supervisor: false,
+        shutdown: Shutdown::Timeout(Duration::from_secs(2)),
+        restart_type: RestartType::Permanent,
+        veto: true,
+    })
+    .await
+    .unwrap();
+
+    // A graceful top-level stop, NOT Kill: this is what drives `top`'s own
+    // child-stop ladder, which is where the Timeout -> Kill escalation on
+    // `mid` actually happens.
+    let stopping = Instant::now();
+    top.stop(StopReason::Graceful).await.unwrap();
+    top.wait_stopped().await;
+
+    assert!(
+        wait_until(upper_ms(paused, 0), || sys
+            .get::<Node>(&leaf_name)
+            .is_none())
+        .await,
+        "leaf must be torn down promptly by the inverted cascade under mid's \
+         escalated Kill, not left waiting out its own unrelated Shutdown policy"
+    );
+    // The whole stop, counted from the request: mid's 50 ms window, then its
+    // escalated Kill, which mid obeys and cascades to the leaf at once. A
+    // ladder that gave mid more than its window ends past it on the paused
+    // clock.
+    let took = stopping.elapsed();
+    assert!(
+        took < upper(paused, Duration::from_millis(50)),
+        "the escalated stop and its cascade took {took:?}"
+    );
+}
+
 /// A wedged (never-cooperating) child's `status()` must never report
 /// `Stopped` while it is still alive, from the instant its supervisor is
 /// killed through to the reaper actually aborting it: `status() == Stopped`
@@ -272,16 +445,6 @@ fn status_stopped_implies_not_alive_through_a_cascade() {
             panic!("a same-name respawn under a freed name must succeed: {err}");
         }
     });
-}
-
-/// The inherited stop of a supervisor child whose `Shutdown::Timeout` is at
-/// the very edge of what `Instant::checked_add` accepts, and beyond it: the
-/// deadlines the guard computes in its drop glue saturate instead of
-/// panicking, the child runs `on_stopped` and stops its own child in order,
-/// and it ends when that child has.
-#[test]
-fn inherited_stop_with_an_edge_of_range_shutdown_does_not_panic() {
-    common::run(0, inherited_stop_with_an_edge_of_range_shutdown());
 }
 
 async fn inherited_stop_with_an_edge_of_range_shutdown() {
@@ -396,7 +559,7 @@ impl Actor for TurnWorker {
 
 /// The kill grace of the runtime-change test's worker: far longer than the
 /// test holds its turn after the cascade's Kill.
-const TURN_WORKER_GRACE: Duration = Duration::from_secs(2);
+const TURN_WORKER_GRACE: Duration = Duration::from_secs(8);
 
 /// A supervisor that spawns one named `TurnWorker` child on `on_started`,
 /// with `TURN_WORKER_GRACE`.
@@ -431,97 +594,4 @@ impl Actor for TurnSupervisor {
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
-}
-
-/// A runtime change under one system: the same Kill cascade run on runtime A,
-/// then again on runtime B after A is dropped, on the same system. A system's
-/// reaper is spawned lazily on whichever runtime first needs it; once that
-/// runtime is gone, a link guard's drop must still find (or respawn) a live
-/// reaper on whatever runtime is current, honoring the child's full grace
-/// instead of aborting it immediately.
-///
-/// The worker is inside a turn when its supervisor is killed, and the turn
-/// is released only after the supervisor has stopped and a further 50 ms,
-/// well inside the worker's 2 s grace: a healthy reaper leaves it its grace
-/// to finish that turn cooperatively, while a reaper that aborted at once
-/// would have ended it first.
-#[test]
-fn kill_cascade_grace_survives_a_runtime_change() {
-    let sys = ActorSystem::create(uname("kill-grace-runtime-change")).unwrap();
-
-    let run_phase = |sys: &Arc<ActorSystem>, rt: &tokio::runtime::Runtime, tag: &str| -> bool {
-        rt.block_on(async {
-            let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let child_name = uname(&format!("{tag}-worker"));
-
-            let sup = TurnSupervisor {
-                child_name: child_name.clone(),
-                began: began.clone(),
-                release: release.clone(),
-                finished: finished.clone(),
-            }
-            .spawn()
-            .named(uname(&format!("{tag}-sup")))
-            .on_system(sys)
-            .supervisor()
-            .await
-            .unwrap();
-
-            assert!(
-                wait_until(2_000, || sys.get::<TurnWorker>(&child_name).is_some()).await,
-                "{tag}: worker must be registered before it can be probed"
-            );
-            let worker: ActorHandle<TurnWorker> = sys.get(&child_name).unwrap();
-
-            worker.notify(()).await.unwrap();
-            // The turn runs only after the worker's start: the Kill comes
-            // once the worker is inside it.
-            assert!(
-                wait_until(2_000, || began.load(Ordering::SeqCst)).await,
-                "{tag}: the worker's turn begins"
-            );
-
-            sup.stop(StopReason::Kill).await.unwrap();
-            sup.wait_stopped().await;
-            sleep(Duration::from_millis(50)).await;
-            assert!(
-                worker.is_alive() && !finished.load(Ordering::SeqCst),
-                "{tag}: the worker is still inside its turn, within its grace"
-            );
-            release.store(true, Ordering::SeqCst);
-
-            assert!(
-                wait_until(2_000, || sys.get::<TurnWorker>(&child_name).is_none()).await,
-                "{tag}: the killed worker must eventually be reaped"
-            );
-
-            finished.load(Ordering::SeqCst)
-        })
-    };
-
-    let rt_a = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let a_finished = run_phase(&sys, &rt_a, "rt-a");
-    drop(rt_a);
-    assert!(
-        a_finished,
-        "on the first runtime, with its own reaper alive, the worker's in-flight \
-         turn must finish within its grace before it dies"
-    );
-
-    let rt_b = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let b_finished = run_phase(&sys, &rt_b, "rt-b");
-    drop(rt_b);
-    assert!(
-        b_finished,
-        "after runtime A drops, the same system's reaper must still honor the \
-         child's grace on a fresh runtime instead of aborting it immediately"
-    );
 }

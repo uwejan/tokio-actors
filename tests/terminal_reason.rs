@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! One terminal reason for every party that waits on an actor's end.
 //!
 //! The runtime status plane carries the reason an actor ended with, written
@@ -36,6 +37,9 @@ const HANG_BOUND: Duration = Duration::from_secs(60);
 /// releases it: past every bound a test awaits.
 const GATE_CAP: Duration = Duration::from_secs(15);
 
+/// How long a test watches for a late duplicate or a late change.
+const QUIET: Duration = Duration::from_millis(300);
+
 /// The time between a `Kill` and the abort of an actor whose builder sets no
 /// kill grace. An integration test cannot read the crate's constant, so the
 /// value is named here once.
@@ -60,6 +64,14 @@ async fn within<T>(bound: Duration, what: &str, fut: impl Future<Output = T>) ->
 /// request before its first await has sent it when this returns.
 fn poll_once<F: Future + ?Sized>(fut: Pin<&mut F>) -> Poll<F::Output> {
     fut.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// The value of a future that must be ready at its first poll.
+fn ready_now<F: Future>(fut: F, what: &str) -> F::Output {
+    match poll_once(pin!(fut)) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("not ready at once: {what}"),
+    }
 }
 
 /// A hold the test opens and closes. A waiter does not depend on the
@@ -810,6 +822,67 @@ fn terminal_reason_is_one_value_on_every_plane() {
 // A final collection over an actor whose drop blocks
 // ---------------------------------------------------------------------------
 
+/// A child whose `handle` fails and whose value's `Drop` blocks its thread.
+struct Blocker {
+    entered: Arc<AtomicBool>,
+    returned: Arc<AtomicBool>,
+}
+
+impl Actor for Blocker {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Err(ActorError::user("the child fails"))
+    }
+}
+
+impl Drop for Blocker {
+    fn drop(&mut self) {
+        self.entered.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        self.returned.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A supervisor whose handler waits for a signal the test owns, and whose
+/// child is a [`Blocker`].
+struct BusySup {
+    entered: Arc<AtomicBool>,
+    returned: Arc<AtomicBool>,
+    /// Set when the handler began to wait.
+    handling: Arc<AtomicBool>,
+    child: String,
+}
+
+impl Actor for BusySup {
+    type Message = tokio::sync::oneshot::Receiver<()>;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let (entered, returned) = (self.entered.clone(), self.returned.clone());
+        ctx.spawn_child(move || Blocker {
+            entered: entered.clone(),
+            returned: returned.clone(),
+        })
+        .named(self.child.clone())
+        .restart_type(RestartType::Temporary)
+        .shutdown(Shutdown::Timeout(Duration::from_millis(100)))
+        .await?;
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        msg: tokio::sync::oneshot::Receiver<()>,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.handling.store(true, Ordering::SeqCst);
+        let _ = msg.await;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // wait_stopped, and the callers of stop_within
 // ---------------------------------------------------------------------------
@@ -855,103 +928,6 @@ fn dropped_reason(result: Result<(), AskError>) -> StopReason {
 // A status query that was queued when its actor stopped
 // ---------------------------------------------------------------------------
 
-#[test]
-fn status_query_queued_at_a_stop_fails_with_the_stop_reason() {
-    common::run(2, async {
-        // Sent while `on_stopped` runs: the reason is `Graceful`.
-        let knobs = Knobs::default();
-        knobs.hold_on_stopped.hold();
-        let h = patient_root(&knobs).await;
-        h.stop(StopReason::Graceful).await.unwrap();
-        wait_until(BOUND, "on_stopped to begin", || {
-            knobs.on_stopped_runs.load(Ordering::SeqCst) == 1
-        })
-        .await;
-        let mut query = pin!(h.get_status());
-        assert!(poll_once(query.as_mut()).is_pending());
-        knobs.hold_on_stopped.release();
-        let result = within(BOUND, "the query", query).await;
-        assert_eq!(dropped_reason(result.map(|_| ())), StopReason::Graceful);
-
-        // A `Kill` raised while `on_stopped` runs: the reason is `Kill`.
-        let knobs = Knobs::default();
-        knobs.hold_on_stopped.hold();
-        let h = patient_root(&knobs).await;
-        h.stop(StopReason::Graceful).await.unwrap();
-        wait_until(BOUND, "on_stopped to begin", || {
-            knobs.on_stopped_runs.load(Ordering::SeqCst) == 1
-        })
-        .await;
-        let mut query = pin!(h.get_status());
-        assert!(poll_once(query.as_mut()).is_pending());
-        h.stop(StopReason::Kill).await.unwrap();
-        knobs.hold_on_stopped.release();
-        let result = within(BOUND, "the query", query).await;
-        assert_eq!(dropped_reason(result.map(|_| ())), StopReason::Kill);
-
-        // A supervisor whose child takes its window: the query fails only
-        // after it.
-        let knobs = Knobs::held();
-        knobs.hold_pre_stop.hold();
-        let t = tree(
-            RestartType::Temporary,
-            Shutdown::Timeout(BOUND),
-            None,
-            knobs,
-        )
-        .await;
-        t.top.notify(HOLD).await.unwrap();
-        wait_until(BOUND, "the supervisor's turn to begin", || {
-            t.knobs.in_turn.load(Ordering::SeqCst)
-        })
-        .await;
-        let mut query = pin!(t.top.get_status());
-        assert!(poll_once(query.as_mut()).is_pending());
-        t.top.stop(StopReason::Graceful).await.unwrap();
-        t.knobs.release();
-        wait_until(BOUND, "the child's stop to begin", || {
-            t.knobs.pre_stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
-        assert!(
-            poll_once(query.as_mut()).is_pending(),
-            "the query is not answered while the child's stop runs"
-        );
-        t.knobs.hold_pre_stop.release();
-        let result = within(BOUND, "the query", query).await;
-        assert_eq!(dropped_reason(result.map(|_| ())), StopReason::Graceful);
-
-        // The handle was taken from the registry while `pre_start` fails: the
-        // reason is its failure.
-        let knobs = Knobs::default();
-        knobs.hold_init.hold();
-        let name = uname("init-query");
-        let spawn_name = name.clone();
-        let spawn_knobs = knobs.clone();
-        let spawning = tokio::spawn(async move {
-            let mut subject = Subject::new(&spawn_knobs);
-            subject.fail_init = true;
-            subject.spawn().named(spawn_name).await
-        });
-        let mut found = None;
-        wait_until(BOUND, "the actor to be registered", || {
-            found = ActorSystem::default().get::<Subject>(&name);
-            found.is_some()
-        })
-        .await;
-        let h = found.unwrap();
-        let mut query = pin!(h.get_status());
-        assert!(poll_once(query.as_mut()).is_pending());
-        knobs.hold_init.release();
-        let result = within(BOUND, "the query", query).await;
-        assert_eq!(
-            dropped_reason(result.map(|_| ())),
-            StopReason::Failure(ActorError::user("the initialization fails"))
-        );
-        let _ = spawning.await;
-    });
-}
-
 // ---------------------------------------------------------------------------
 // kill_by_id, and the shutdown report
 // ---------------------------------------------------------------------------
@@ -986,127 +962,162 @@ fn kill_by_id_reports_unresponsive_for_a_never_yielding_turn() {
     });
 }
 
-#[test]
-fn kill_by_id_of_an_actor_held_in_its_stop_reports_the_kill_it_ended_with() {
-    common::run(2, async {
-        // The actor is inside `on_stopped`, past its loop: a `Kill` raised
-        // now is read after the hook and is the reason it ends with.
-        let knobs = Knobs::default();
-        knobs.hold_on_stopped.hold();
-        let h = patient_root(&knobs).await;
-        h.stop(StopReason::Graceful).await.unwrap();
-        wait_until(BOUND, "on_stopped to begin", || {
-            knobs.on_stopped_runs.load(Ordering::SeqCst) == 1
-        })
-        .await;
-        // The first poll raises the `Kill`; the call then waits for the end.
-        let system = ActorSystem::default();
-        let mut call = pin!(system.kill_by_id(h.id()));
-        assert!(poll_once(call.as_mut()).is_pending());
-        knobs.hold_on_stopped.release();
-        let report = within(BOUND, "kill_by_id", call)
-            .await
-            .expect("the id is registered");
-        assert_eq!(report.outcome, StopOutcome::Killed, "{report:?}");
-        assert_eq!(report.reason, Some(StopReason::Kill), "{report:?}");
-        assert_eq!(h.wait_stopped().await, StopReason::Kill);
-    });
-}
-
-#[test]
-fn shutdown_report_carries_each_roots_reason() {
-    common::run(2, async {
-        let sys = ActorSystem::create(uname("shutdown-report")).unwrap();
-        // A root whose `on_stopped` fails reads `Graceful` with the failure;
-        // a root that stops cleanly reads `Graceful` with `Graceful`.
-        let failing = Knobs::default();
-        failing.on_stopped_fails.store(true, Ordering::SeqCst);
-        let a = Subject::new(&failing)
-            .spawn()
-            .named(uname("failing"))
-            .on_system(&sys)
-            .await
-            .unwrap();
-        let b = Subject::new(&Knobs::default())
-            .spawn()
-            .named(uname("clean"))
-            .on_system(&sys)
-            .await
-            .unwrap();
-        let report = within(BOUND, "the shutdown", sys.shutdown()).await;
-        let find = |id: &ActorId| {
-            report
-                .outcomes
-                .iter()
-                .find(|(root, _)| root == id)
-                .map(|(_, stop)| stop.clone())
-                .expect("the root is reported")
-        };
-        let a = find(a.id());
-        assert_eq!(a.outcome, StopOutcome::Graceful);
-        assert_eq!(
-            a.reason,
-            Some(StopReason::Failure(ActorError::user("on_stopped fails")))
-        );
-        let b = find(b.id());
-        assert_eq!(b.outcome, StopOutcome::Graceful);
-        assert_eq!(b.reason, Some(StopReason::ParentRequest));
-        assert!(report.swept.is_empty());
-    });
-}
-
 // ---------------------------------------------------------------------------
 // A task dropped before its first poll
 // ---------------------------------------------------------------------------
 
+/// What the value of a never-polled actor sees when it is dropped.
+#[derive(Default)]
+struct DropView {
+    /// Whether the actor's lifecycle ever ran.
+    started: AtomicBool,
+    /// Set when the value was dropped.
+    dropped: AtomicBool,
+    /// Whether the actor's status already read `Stopped` inside the drop.
+    ended_at_drop: AtomicBool,
+    /// Whether the actor's name was still registered inside the drop.
+    registered_at_drop: AtomicBool,
+    /// The actor's own handle and system, for the drop to look through.
+    lookup: Mutex<Option<(ActorHandle<Unpolled>, Arc<ActorSystem>)>>,
+}
+
+struct Unpolled {
+    view: Arc<DropView>,
+}
+
+impl Actor for Unpolled {
+    type Message = ();
+    type Response = ();
+
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.view.started.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Unpolled {
+    fn drop(&mut self) {
+        if let Some((handle, system)) = self.view.lookup.lock().unwrap().as_ref() {
+            self.view.ended_at_drop.store(
+                handle.status() == tokio_actors::ActorStatus::Stopped,
+                Ordering::SeqCst,
+            );
+            self.view.registered_at_drop.store(
+                system.get_by_id::<Unpolled>(handle.id()).is_some(),
+                Ordering::SeqCst,
+            );
+        }
+        self.view.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Spawns `count` actors on `runtime` and drops the runtime. The actors'
+/// values are dropped by the runtime's shutdown, most of them before their
+/// task ran once; for every one the plane must stay open until its value is
+/// dropped and close only after its name is free. Returns how many never
+/// started.
+fn drop_the_runtime_before_the_first_poll(runtime: tokio::runtime::Runtime, count: usize) -> usize {
+    let system = ActorSystem::create(uname("unpolled-system")).unwrap();
+    let mut spawned = Vec::new();
+    for _ in 0..count {
+        let view = Arc::new(DropView::default());
+        let handle = runtime.block_on(async {
+            Unpolled { view: view.clone() }
+                .spawn()
+                .named(uname("unpolled"))
+                .on_system(&system)
+                .detached()
+                .await
+                .expect("the spawn is accepted")
+        });
+        *view.lookup.lock().unwrap() = Some((handle.clone(), system.clone()));
+        spawned.push((view, handle));
+    }
+    drop(runtime);
+    let mut unstarted = 0;
+    for (view, handle) in &spawned {
+        assert!(
+            view.dropped.load(Ordering::SeqCst),
+            "the runtime's shutdown drops the actor's value"
+        );
+        let never_polled = !view.started.load(Ordering::SeqCst);
+        if never_polled {
+            unstarted += 1;
+        }
+        assert!(
+            !view.ended_at_drop.load(Ordering::SeqCst),
+            "the plane read the actor's end before its value was dropped"
+        );
+        assert!(
+            !never_polled || view.registered_at_drop.load(Ordering::SeqCst),
+            "the name of a never-polled actor is still registered while its value drops"
+        );
+        assert_eq!(
+            handle.status(),
+            tokio_actors::ActorStatus::Stopped,
+            "the plane ends once the runtime is gone"
+        );
+        assert!(
+            system.get_by_id::<Unpolled>(handle.id()).is_none(),
+            "the name is free when the plane ends"
+        );
+        view.lookup.lock().unwrap().take();
+    }
+    unstarted
+}
+
+/// A queued message whose drop signals that it began and then waits for
+/// its release.
+struct HeldMailDrop {
+    began: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drop for HeldMailDrop {
+    fn drop(&mut self) {
+        let _ = self.began.send(());
+        let _ = self.release.recv_timeout(BOUND);
+    }
+}
+
+enum NeverPolledMsg {
+    Request,
+    Held(#[allow(dead_code)] HeldMailDrop),
+}
+
+struct NeverPolled;
+
+impl Actor for NeverPolled {
+    type Message = NeverPolledMsg;
+    type Response = ();
+
+    async fn handle(
+        &mut self,
+        _msg: NeverPolledMsg,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+/// Releases a held drop when it goes, a failed assertion included.
+struct Release(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A request answered while the actor value's drop blocks
 // ---------------------------------------------------------------------------
-
-/// The reason is final at the lane seal, before the queued messages drop:
-/// a request dropped with them is answered with that reason while the
-/// actor value's `Drop` still blocks, and the end follows once it returns.
-/// Multi-thread only: the held `Drop` blocks the thread it runs on, and on a
-/// current-thread runtime that is the only thread, so the request's caller
-/// could not run until the drop returned and the order could not be seen.
-#[test]
-fn a_request_queued_at_a_stop_is_answered_while_the_actors_blocked_drop_runs() {
-    common::run_multi_thread_only(4, async {
-        let knobs = Knobs::held();
-        knobs.hold_drop.hold();
-        // Every gate is released when the test ends, a failed assertion
-        // included, so the blocked drop never outlives it.
-        let _release = knobs.release_on_drop();
-        let h = patient_root(&knobs).await;
-        h.notify(Msg::Hold).await.unwrap();
-        wait_until(BOUND, "the turn to begin", || {
-            knobs.in_turn.load(Ordering::SeqCst)
-        })
-        .await;
-        let asker = h.clone();
-        let ask = tokio::spawn(async move { asker.send(Msg::Ping).await });
-        until_queued(&h, 1).await;
-        h.stop(StopReason::Graceful).await.unwrap();
-        knobs.release();
-        wait_until(BOUND, "the value's drop to begin", || {
-            knobs.drop_entered.load(Ordering::SeqCst)
-        })
-        .await;
-        // The teardown is inside a blocked `Drop`, past the seal: the
-        // request is already answered with the final reason.
-        let result = within(BOUND, "the request's answer", ask).await.unwrap();
-        assert_eq!(dropped_reason(result), StopReason::Graceful);
-        assert!(
-            knobs.hold_drop.is_held() && h.status() != tokio_actors::ActorStatus::Stopped,
-            "answered while the value's drop still blocks"
-        );
-        knobs.hold_drop.release();
-        assert_eq!(
-            within(BOUND, "the end", h.wait_stopped()).await,
-            StopReason::Graceful
-        );
-    });
-}
 
 // ---------------------------------------------------------------------------
 // A discarded panic in the drop of queued mail
@@ -1174,60 +1185,47 @@ mod warnings {
     }
 }
 
+/// Ends an actor with queued mail whose drop panics, after `how`: a graceful
+/// stop, a `Kill` or a failing turn. The mail drops after the reason is final,
+/// so the reason stands (`Graceful`, `Kill` or the turn's failure) and the
+/// panic is logged once. Returns the actor's id text and its reason.
+#[cfg(feature = "tracing")]
+async fn end_with_a_panicking_mail_drop(how: u8) -> (String, StopReason) {
+    let knobs = Knobs::held();
+    let name = uname("warned");
+    let h = Subject::new(&knobs)
+        .spawn()
+        .named(&name)
+        .kill_grace(Duration::from_secs(5))
+        .await
+        .expect("the actor spawns");
+    h.notify(if how == 2 {
+        Msg::HoldThenFail
+    } else {
+        Msg::Hold
+    })
+    .await
+    .unwrap();
+    wait_until(BOUND, "the turn to begin", || {
+        knobs.in_turn.load(Ordering::SeqCst)
+    })
+    .await;
+    let armed = Arc::new(AtomicBool::new(true));
+    h.notify(Msg::Mail(Bomb::armed(&armed))).await.unwrap();
+    match how {
+        0 => h.stop(StopReason::Graceful).await.unwrap(),
+        1 => h.stop(StopReason::Kill).await.unwrap(),
+        _ => {}
+    }
+    knobs.release();
+    let reason = within(BOUND, "the end", h.wait_stopped()).await;
+    armed.store(false, Ordering::SeqCst);
+    (h.id().to_string(), reason)
+}
+
 // ---------------------------------------------------------------------------
 // An aborted target whose queued mail panics in its drop
 // ---------------------------------------------------------------------------
-
-/// A target held in a turn is killed and, past its grace, aborted while a
-/// message whose drop panics waits in its queue. The abort drops the queue
-/// through the caught drop: the task ends as an abort, the plane, the stop
-/// report and the supervisor's report all read `Kill`, and with the `tracing`
-/// feature the panic is logged once with the actor's id.
-#[test]
-fn an_aborted_actor_whose_queued_mail_panics_reads_kill_everywhere() {
-    #[cfg(feature = "tracing")]
-    let lines = warnings::install();
-    common::run(2, async {
-        let t = tree(
-            RestartType::Temporary,
-            Shutdown::Timeout(BOUND),
-            None,
-            Knobs::default(),
-        )
-        .await;
-        let h = t.handle();
-        h.notify(Msg::Park).await.unwrap();
-        wait_until(BOUND, "the turn to begin", || {
-            t.knobs.in_turn.load(Ordering::SeqCst)
-        })
-        .await;
-        let armed = Arc::new(AtomicBool::new(true));
-        h.notify(Msg::Mail(Bomb::armed(&armed))).await.unwrap();
-        let report = ActorSystem::default()
-            .kill_by_id(&t.id())
-            .await
-            .expect("registered");
-        assert_eq!(report.reason, Some(StopReason::Kill), "{report:?}");
-        assert_eq!(
-            one_reason(&t, &h, "abort with panicking queued mail").await,
-            StopReason::Kill
-        );
-        #[cfg(feature = "tracing")]
-        {
-            let token = format!("actor_id={} ", t.id());
-            let naming: Vec<String> = lines
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|line| line.contains(&token) && line.contains("at the abort"))
-                .cloned()
-                .collect();
-            assert_eq!(naming.len(), 1, "one warning for the abort: {naming:?}");
-        }
-        armed.store(false, Ordering::SeqCst);
-        t.finish().await;
-    });
-}
 
 // ---------------------------------------------------------------------------
 // A runtime dropped during an unwind that is not the actor's

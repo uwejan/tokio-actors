@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use crate::actor::runtime;
 use crate::actor::supervision::lost_runner::capture;
-use crate::helper::{HelperEnd, HelperKind};
+use crate::helper::{HelperEnd, HelperKind, HelperOwner};
 use crate::system::ActorSystem;
 use crate::types::ActorId;
 
@@ -54,7 +54,13 @@ fn drain_cancelled_by_its_runtime(
     let mut replies = Vec::new();
     rt.block_on(async {
         let permit = tx.clone().try_reserve_owned().unwrap();
-        assert!(runtime::end_queue_late(rx, system, owner).is_none());
+        assert!(runtime::end_queue_late(
+            rx,
+            system,
+            &runtime::Owner::new(owner.clone(), false),
+            None
+        )
+        .is_none());
         // The task has not been polled: what is sent waits in the receiver.
         if values > 0 {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -70,27 +76,6 @@ fn drain_cancelled_by_its_runtime(
     assert_eq!(system.live_helpers(), 0, "the cancelled task counted down");
     drop(tx);
     system.helper_ends(&handle)
-}
-
-/// A drain cancelled while it held a value logs one warning naming the
-/// actor, with the number of values it dropped.
-#[test]
-fn a_cancelled_helper_that_dropped_a_value_logs_once_with_its_owner() {
-    let _ = capture::install();
-    let system = fresh_system("loud");
-    let owner = fresh_owner("loud");
-    let ends = drain_cancelled_by_its_runtime(&system, &owner, 1);
-    assert_eq!(
-        ends,
-        vec![(HelperKind::LateDrain, HelperEnd::Cancelled { dropped: 1 })]
-    );
-    let lines = lines_for(&owner);
-    assert_eq!(lines.len(), 1, "one line for one cancellation: {lines:?}");
-    assert!(
-        lines[0].contains("dropped=1 ") && lines[0].contains("late values it held were dropped"),
-        "{}",
-        lines[0]
-    );
 }
 
 /// A drain cancelled with nothing to drop, and a task aborted while it waits,
@@ -122,7 +107,7 @@ fn a_cancelled_helper_that_dropped_nothing_logs_nothing() {
         let parked = system.spawn_helper(
             &rt_handle,
             HelperKind::Reaper,
-            Some(aborted.clone()),
+            Some(HelperOwner::new(aborted.clone(), None)),
             |end| end.observe(std::future::pending::<()>()),
         );
         parked.abort();

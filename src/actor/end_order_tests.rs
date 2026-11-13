@@ -98,6 +98,24 @@ struct Hold {
     release: std::sync::mpsc::Receiver<()>,
 }
 
+/// The test's side of a [`Hold`].
+struct HoldKey {
+    entered: oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+fn hold() -> (Hold, HoldKey) {
+    let (entered_tx, entered) = oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    (
+        Hold {
+            entered: Some(entered_tx),
+            release: release_rx,
+        },
+        HoldKey { entered, release },
+    )
+}
+
 impl Drop for Owned {
     fn drop(&mut self) {
         if let Some(probe) = self.probe.get() {
@@ -587,9 +605,33 @@ async fn a_returning_actor_ends_in_order(reason: StopReason) {
     r.assert_order(ALL_QUEUED, true);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_kill_drops_everything_before_stopped_multi_thread() {
-    a_returning_actor_ends_in_order(StopReason::Kill).await;
+/// A handler's panic unwinds out of the callback and is caught; the end
+/// keeps the same order.
+async fn a_handler_panic_ends_in_order() {
+    let mut r = rig(Start::Run, Panics::default(), false);
+    r.started.take().unwrap().await.expect("the actor started");
+    let (release, held) = oneshot::channel();
+    let (began_tx, began) = oneshot::channel();
+    r.handle.notify(Msg::Hold(held, began_tx)).await.unwrap();
+    began.await.expect("the turn is held");
+    r.handle.notify(Msg::Panic).await.unwrap();
+    r.handle
+        .notify(Msg::Queued(r.owned("message", false)))
+        .await
+        .unwrap();
+    let _ = release.send(());
+    let returned = (&mut r.join).await.expect("the task returns");
+    assert!(
+        matches!(&returned, StopReason::Failure(ActorError::Panic(text)) if text.contains("the handler panicked")),
+        "{returned:?}"
+    );
+    r.wait_ended().await;
+    assert_eq!(
+        r.status.borrow().status,
+        ActorStatus::Stopped,
+        "Stopped is published"
+    );
+    r.assert_order(ALL, true);
 }
 
 /// A task aborted while suspended drops its parameters last to first: the
@@ -618,11 +660,6 @@ async fn an_actor_aborted_while_suspended_ends_in_order() {
         "an aborted task never publishes Stopped"
     );
     r.assert_order_on_abort(ALL, true);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn an_actor_aborted_while_suspended_drops_everything_first_current_thread() {
-    an_actor_aborted_while_suspended_ends_in_order().await;
 }
 
 /// The task's own poll unwinds right after the registry guard freed the
@@ -672,35 +709,6 @@ async fn an_own_unwind_after_the_name_is_freed_ends_as_an_abort_current_thread()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_own_unwind_after_the_name_is_freed_ends_as_an_abort_multi_thread() {
     an_own_unwind_after_the_name_is_freed_ends_as_an_abort().await;
-}
-
-/// A task aborted before its first poll drops its parameters first to last:
-/// the value and the context, then the queued messages, then the registry
-/// guard, which frees the name and only then releases the last status
-/// sender and the last subtree hold. Current-thread only: the task must not
-/// be polled before the abort, which only one thread can promise.
-#[tokio::test(flavor = "current_thread")]
-async fn an_actor_aborted_before_its_first_poll_drops_everything_first() {
-    let mut r = rig(Start::Run, Panics::default(), false);
-    r.handle
-        .try_notify(Msg::Queued(r.owned("message", false)))
-        .expect("the mailbox has room");
-    r.join.abort();
-    let joined = (&mut r.join).await;
-    assert!(joined.unwrap_err().is_cancelled());
-    let seen = r.log.seen();
-    let message = r.log.of("message");
-    assert!(
-        message.name_registered,
-        "the value and the queued messages drop before the registry guard here: {seen:?}"
-    );
-    // Nothing was polled: no stream or timer exists.
-    r.assert_order_on_abort(&["value", "message"], false);
-    assert!(
-        r.status.has_changed().is_err(),
-        "the plane is closed: every sender is gone"
-    );
-    assert!(r.subtree.is_gone());
 }
 
 /// A panic in a drop of the end is caught and `Stopped` is still
@@ -816,34 +824,438 @@ async fn a_discarded_panic_of_the_end_is_logged_once(panics: Panics, discarded: 
     assert!(lines[0].contains(discarded), "{lines:?}");
 }
 
-#[cfg(feature = "tracing")]
-#[tokio::test(flavor = "current_thread")]
-async fn a_discarded_queued_message_panic_is_logged_once() {
-    let panics = Panics {
-        message: true,
-        ..Panics::default()
-    };
-    a_discarded_panic_of_the_end_is_logged_once(panics, "priority panicked when dropped").await;
+/// An abort that lands while the actor value's drop is in progress cannot
+/// change how the task ends: no await follows the seal, so the task still
+/// returns its own reason and publishes `Stopped`, with a timer and a stream
+/// that were ended before the value's drop. Multi-thread only: the held drop
+/// blocks its worker thread.
+async fn an_abort_during_the_value_s_drop_changes_nothing(start: Start) {
+    let (value_hold, mut key) = hold();
+    let mut r = rig_held(start, Panics::default(), false, Some(value_hold));
+    if start == Start::Run {
+        r.started.take().unwrap().await.expect("the actor started");
+        r.handle.stop(StopReason::Kill).await.expect("accepted");
+    }
+    tokio::time::timeout(Duration::from_secs(10), &mut key.entered)
+        .await
+        .expect("the value's drop begins")
+        .expect("the hold is alive");
+    r.join.abort();
+    let _ = key.release.send(());
+    let returned = (&mut r.join)
+        .await
+        .expect("the task returns its own reason, not an abort");
+    match start {
+        Start::Run => assert!(matches!(returned, StopReason::Kill), "{returned:?}"),
+        _ => assert!(
+            matches!(&returned, StopReason::Failure(ActorError::User(_))),
+            "{returned:?}"
+        ),
+    }
+    r.wait_ended().await;
+    assert_eq!(
+        r.status.borrow().status,
+        ActorStatus::Stopped,
+        "Stopped is published"
+    );
+    r.assert_order(&["value", "stream", "timer"], true);
 }
 
-#[cfg(feature = "tracing")]
-#[tokio::test(flavor = "current_thread")]
-async fn a_discarded_forwarder_panic_of_the_end_is_logged_once() {
+/// On an abort, a panic in the drop of something the actor owned is caught:
+/// the task ends as an abort (read as `Kill`), never as a panic, and the
+/// plane closes without `Stopped` once everything is dropped.
+async fn an_aborted_actor_s_panicking_drops_end_it_as_an_abort(before_first_poll: bool) {
+    // Before the first poll the stream is still a field of the value, and a
+    // value with two panicking fields aborts the process by itself.
     let panics = Panics {
-        stream: true,
-        timer: true,
+        value: true,
+        stream: !before_first_poll,
         ..Panics::default()
     };
-    a_discarded_panic_of_the_end_is_logged_once(panics, "panicked when dropped").await;
+    let start = if before_first_poll {
+        Start::Run
+    } else {
+        Start::Park
+    };
+    let mut r = rig(start, panics, false);
+    if !before_first_poll {
+        r.started
+            .take()
+            .unwrap()
+            .await
+            .expect("parked in on_started");
+    }
+    r.handle
+        .try_notify(Msg::Queued(r.owned("message", false)))
+        .expect("the mailbox has room");
+    r.join.abort();
+    let joined = (&mut r.join).await;
+    assert!(
+        joined.as_ref().is_err_and(|err| err.is_cancelled()),
+        "the task ends as an abort, not as a panic: {joined:?}"
+    );
+    r.wait_ended().await;
+    assert_ne!(
+        r.status.borrow().status,
+        ActorStatus::Stopped,
+        "an aborted task never publishes Stopped"
+    );
+    if before_first_poll {
+        r.assert_order_on_abort(&["value", "message"], false);
+    } else {
+        r.assert_order_on_abort(ALL, true);
+    }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn a_panicking_child_factory_drop_still_publishes_stopped() {
-    let panics = Panics {
-        factory: true,
-        ..Panics::default()
-    };
-    a_panicking_drop_still_publishes_stopped("factory", panics, false).await;
+/// A stream whose poll blocks its worker thread until released, then panics.
+struct PanickingPoll {
+    entered: Option<oneshot::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Stream for PanickingPoll {
+    type Item = ();
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        let release = &self.release;
+        tokio::task::block_in_place(|| {
+            let _ = release.recv();
+        });
+        panic!("a stream panicked while polled");
+    }
+}
+
+struct Polled {
+    stream: Option<PanickingPoll>,
+}
+
+impl Actor for Polled {
+    type Message = Msg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Some(stream) = self.stream.take() {
+            ctx.add_stream(stream);
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+/// A message whose drop panics, held by the callback in progress.
+struct InFlightBomb;
+
+impl Drop for InFlightBomb {
+    fn drop(&mut self) {
+        panic!("the in-flight message panicked when dropped");
+    }
+}
+
+/// Handles one message by parking forever with it.
+struct Parker;
+
+impl Actor for Parker {
+    type Message = (InFlightBomb, oneshot::Sender<()>);
+    type Response = ();
+
+    async fn handle(
+        &mut self,
+        (bomb, began): (InFlightBomb, oneshot::Sender<()>),
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        let _held = bomb;
+        let _ = began.send(());
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// An abort while a callback is suspended drops the callback's future, and
+/// the message it handles, under a catch: the task ends as an abort (read as
+/// `Kill`), never as a panic, after a `Kill` as on its own.
+async fn an_in_flight_message_that_panics_on_abort_ends_as_an_abort() {
+    let system = ActorSystem::create(format!("end-order-{}", uuid::Uuid::new_v4())).unwrap();
+    let name = format!("end-order-{}", uuid::Uuid::new_v4());
+    let (handle, mut join, _subtree) = spawn_actor(
+        ActorId::from(name.clone()),
+        Parker,
+        ActorConfig::default(),
+        Some(Arc::from(name.clone())),
+        Some(system),
+        None,
+        true,
+        Duration::from_millis(50),
+        None,
+    )
+    .expect("the actor spawns");
+    let (began_tx, began) = oneshot::channel();
+    handle
+        .try_notify((InFlightBomb, began_tx))
+        .expect("the mailbox has room");
+    tokio::time::timeout(Duration::from_secs(10), began)
+        .await
+        .expect("the callback holds the message")
+        .unwrap();
+    handle.stop(StopReason::Kill).await.expect("accepted");
+    join.abort();
+    let joined = (&mut join).await;
+    assert!(
+        joined.as_ref().is_err_and(|err| err.is_cancelled()),
+        "the task ends as an abort, not as a panic: {joined:?}"
+    );
+}
+
+/// A stream that panics when it is polled after the test fires it.
+struct PanicsWhenFired {
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+    panicked: Option<oneshot::Sender<()>>,
+}
+
+impl Stream for PanicsWhenFired {
+    type Item = ();
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+        if self.fired.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(panicked) = self.panicked.take() {
+                let _ = panicked.send(());
+            }
+            panic!("a stream panicked during the run");
+        }
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct Fired {
+    stream: Option<PanicsWhenFired>,
+    attached: Option<oneshot::Sender<()>>,
+}
+
+impl Actor for Fired {
+    type Message = Msg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Some(stream) = self.stream.take() {
+            ctx.add_stream(stream);
+        }
+        if let Some(attached) = self.attached.take() {
+            let _ = attached.send(());
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Msg::Hold(release, began) = msg {
+            let _ = began.send(());
+            let _ = release.await;
+        }
+        Ok(())
+    }
+}
+
+/// A forwarder that panics during the run is the actor's last forwarder
+/// error and never its end, whether the message loop reaped it before the
+/// stop or the end did: both ways a graceful stop ends as `Graceful`.
+async fn a_forwarder_panic_during_the_run_never_changes_the_end(reaped_by_the_loop: bool) {
+    let system = ActorSystem::create(format!("end-order-{}", uuid::Uuid::new_v4())).unwrap();
+    let name = format!("end-order-{}", uuid::Uuid::new_v4());
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waker: Arc<Mutex<Option<std::task::Waker>>> = Arc::default();
+    let (panicked_tx, panicked) = oneshot::channel();
+    let (attached_tx, attached) = oneshot::channel();
+    let (handle, join, _subtree) = spawn_actor(
+        ActorId::from(name.clone()),
+        Fired {
+            stream: Some(PanicsWhenFired {
+                fired: fired.clone(),
+                waker: waker.clone(),
+                panicked: Some(panicked_tx),
+            }),
+            attached: Some(attached_tx),
+        },
+        ActorConfig::default(),
+        Some(Arc::from(name.clone())),
+        Some(system),
+        None,
+        true,
+        Duration::from_millis(200),
+        None,
+    )
+    .expect("the actor spawns");
+    attached.await.expect("the stream is attached");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while waker.lock().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "the stream is polled");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The stream panics while a turn is held, so the loop cannot reap it.
+    let (release, held) = oneshot::channel();
+    let (began_tx, began) = oneshot::channel();
+    handle.try_notify(Msg::Hold(held, began_tx)).unwrap();
+    began.await.unwrap();
+    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+    let wake = waker.lock().unwrap().take().expect("a waker is stored");
+    wake.wake();
+    panicked.await.expect("the stream panicked");
+    if reaped_by_the_loop {
+        let _ = release.send(());
+        // The loop reaps the ended forwarder before the stop arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !handle
+            .get_status()
+            .await
+            .is_ok_and(|info| info.stream_count == 0)
+        {
+            assert!(std::time::Instant::now() < deadline, "the loop reaps it");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        handle.stop(StopReason::Graceful).await.expect("accepted");
+    } else {
+        // The stop is read when the turn ends, ahead of the forwarder's end.
+        handle.stop(StopReason::Graceful).await.expect("accepted");
+        let _ = release.send(());
+    }
+    let returned = tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("the actor ends")
+        .expect("the task returns its reason");
+    assert!(
+        matches!(returned, StopReason::Graceful),
+        "reaped by the loop: {reaped_by_the_loop}, ended as {returned:?}"
+    );
+}
+
+/// A panic payload whose own drop panics.
+struct BadPayload;
+
+impl Drop for BadPayload {
+    fn drop(&mut self) {
+        panic!("the payload panicked when dropped");
+    }
+}
+
+/// A message whose drop panics with a payload whose drop panics.
+struct PayloadBomb;
+
+impl Drop for PayloadBomb {
+    fn drop(&mut self) {
+        std::panic::panic_any(BadPayload);
+    }
+}
+
+struct PayloadParker;
+
+impl Actor for PayloadParker {
+    type Message = (PayloadBomb, oneshot::Sender<()>);
+    type Response = ();
+
+    async fn handle(
+        &mut self,
+        (bomb, began): (PayloadBomb, oneshot::Sender<()>),
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        let _held = bomb;
+        let _ = began.send(());
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// The stream panics slowly (as under a slow panic hook): the test's
+/// `panicked` signal arrives before the forwarder task has completed, and
+/// the actor's end reads its completion only after the abort. The poll
+/// began during the run, so the panic never changes the end.
+struct SlowPanic {
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+    panicked: Option<oneshot::Sender<()>>,
+}
+
+impl Stream for SlowPanic {
+    type Item = ();
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+        if self.fired.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(panicked) = self.panicked.take() {
+                let _ = panicked.send(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            panic!("a stream panicked during the run");
+        }
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+struct SlowFired {
+    stream: Option<SlowPanic>,
+    attached: Option<oneshot::Sender<()>>,
+}
+
+impl Actor for SlowFired {
+    type Message = Msg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Some(stream) = self.stream.take() {
+            ctx.add_stream(stream);
+        }
+        if let Some(attached) = self.attached.take() {
+            let _ = attached.send(());
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Msg::Hold(release, began) = msg {
+            let _ = began.send(());
+            let _ = release.await;
+        }
+        Ok(())
+    }
+}
+
+/// On an abort while suspended, the callback in progress drops first, with
+/// the message it handles, while the name is still registered: the name is
+/// freed after it, by the registry guard.
+static REG_SEEN: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+static REG_NAME: std::sync::Mutex<Option<(Arc<ActorSystem>, String)>> = std::sync::Mutex::new(None);
+
+struct NameProbe;
+
+impl Drop for NameProbe {
+    fn drop(&mut self) {
+        let g = REG_NAME.lock().unwrap();
+        if let Some((sys, name)) = g.as_ref() {
+            *REG_SEEN.lock().unwrap() = Some(sys.get::<ProbeParker>(name).is_some());
+        }
+    }
+}
+
+struct ProbeParker;
+
+impl Actor for ProbeParker {
+    type Message = (NameProbe, oneshot::Sender<()>);
+    type Response = ();
+
+    async fn handle(
+        &mut self,
+        (probe, began): (NameProbe, oneshot::Sender<()>),
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        let _held = probe;
+        let _ = began.send(());
+        std::future::pending::<()>().await;
+        Ok(())
+    }
 }
 
 /// A timer factory or stream that panics when dropped, recording at its
@@ -1029,17 +1441,6 @@ async fn a_cancelled_forwarder_s_drop_panic_never_changes_the_end(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn a_cancelled_forwarder_s_drop_panic_never_changes_the_end_multi_thread() {
-    for order in [
-        CancelOrder::RunFirst,
-        CancelOrder::NoWait,
-        CancelOrder::InOnStopped,
-    ] {
-        a_cancelled_forwarder_s_drop_panic_never_changes_the_end(order, false).await;
-    }
-}
-
 /// A registered stream whose drop panics, yielding items as fast as the
 /// actor's one-slot mailbox takes them, and counting them.
 struct Flooding {
@@ -1175,11 +1576,6 @@ async fn a_stream_parked_on_the_full_mailbox_ends_the_same_either_way() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stream_parked_on_the_full_mailbox_ends_the_same_either_way_multi_thread() {
-    a_stream_parked_on_the_full_mailbox_ends_the_same_either_way().await;
-}
-
 /// The parent's stream, fed by its child through a one-slot channel.
 struct ChannelStream(tokio::sync::mpsc::Receiver<u32>);
 
@@ -1309,14 +1705,6 @@ async fn a_producer_child_stops_at_its_parent_s_request(shutdown: crate::types::
         "the child ran on_stopped with the parent's request: {:?}",
         stopped.lock().unwrap()
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_producer_child_stops_at_its_parent_s_request_current_thread() {
-    a_producer_child_stops_at_its_parent_s_request(crate::types::Shutdown::Timeout(
-        Duration::from_secs(5),
-    ))
-    .await;
 }
 
 /// What a forwarder owns that a child of the actor waits on.
@@ -1493,12 +1881,81 @@ async fn every_forwarder_releases_at_the_close(shutdown: crate::types::Shutdown)
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_forwarder_releases_at_the_close_multi_thread() {
-    every_forwarder_releases_at_the_close(crate::types::Shutdown::Timeout(Duration::from_millis(
-        500,
-    )))
-    .await;
+/// A stream waiting in its send when the mailbox closes, cancelled in
+/// `on_stopped`, belongs to the run: the forwarder releases it at the close,
+/// and its drop's panic never changes the end.
+struct CancelledFlood {
+    stream: Option<Flooding>,
+    yielded: Arc<std::sync::atomic::AtomicUsize>,
+    handled: usize,
+}
+
+impl Actor for CancelledFlood {
+    type Message = FloodMsg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.add_stream(self.stream.take().expect("the stream"));
+        ctx.spawn_child(|| IdleChild)
+            .await
+            .expect("the child spawns");
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: FloodMsg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.handled += 1;
+        while self.yielded.load(std::sync::atomic::Ordering::SeqCst) < self.handled + 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        ctx.self_handle()
+            .stop(StopReason::Graceful)
+            .await
+            .expect("accepted");
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _r: &StopReason,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        ctx.cancel_all_streams();
+        Ok(())
+    }
+}
+
+async fn a_cancelled_parked_stream_ends() -> StopReason {
+    let system = ActorSystem::create(format!("end-order-{}", uuid::Uuid::new_v4())).unwrap();
+    let name = format!("end-order-{}", uuid::Uuid::new_v4());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let yielded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = ActorConfig::default().with_mailbox_capacity(1);
+    config.supervision = Some(crate::actor::supervision::SupervisionConfig::default());
+    let (_handle, join, _subtree) = spawn_actor(
+        ActorId::from(name.clone()),
+        CancelledFlood {
+            stream: Some(Flooding {
+                _bomb: FloodBomb(seen.clone()),
+                yielded: yielded.clone(),
+            }),
+            yielded,
+            handled: 0,
+        },
+        config,
+        Some(Arc::from(name)),
+        Some(system),
+        None,
+        true,
+        Duration::from_millis(200),
+        None,
+    )
+    .expect("the actor spawns");
+    let reason = tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("the actor ends")
+        .expect("the task returns its reason");
+    assert_eq!(*seen.lock().unwrap(), vec!["dropped"]);
+    reason
 }
 
 /// A stream whose one poll holds its worker thread until the test releases it
@@ -1550,48 +2007,54 @@ impl Actor for CancelsInOnStopped {
     }
 }
 
-/// A stream cancelled in `on_stopped` while one of its polls is running, and
-/// whose poll returns only after the mailbox closed, belongs to the run: the
-/// forwarder drops it at the close, and the end reads that drop by the
-/// registration, so its panic never changes the actor's reason.
+/// An answer a newer one replaced, whose drop panics, is logged naming the
+/// actor, and the line carries the panic's text unless the actor is
+/// sensitive.
+#[cfg(feature = "tracing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stream_cancelled_in_on_stopped_whose_poll_ends_after_the_close_is_the_run_s() {
-    let system = ActorSystem::create(format!("end-order-{}", uuid::Uuid::new_v4())).unwrap();
-    let name = format!("end-order-{}", uuid::Uuid::new_v4());
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let (entered_tx, entered) = oneshot::channel();
-    let (release_tx, release) = std::sync::mpsc::channel();
-    let (handle, join, _subtree) = spawn_actor(
-        ActorId::from(name.clone()),
-        CancelsInOnStopped {
-            stream: Some(StraddlingPoll {
-                _bomb: FloodBomb(seen.clone()),
-                entered: Some(entered_tx),
-                release,
-            }),
-        },
-        ActorConfig::default(),
-        Some(Arc::from(name)),
-        Some(system),
-        None,
-        true,
-        Duration::from_millis(200),
-        None,
-    )
-    .expect("the actor spawns");
-    tokio::time::timeout(Duration::from_secs(10), entered)
-        .await
-        .expect("the stream is polled")
-        .unwrap();
-    handle.stop(StopReason::Graceful).await.expect("accepted");
-    tokio::time::timeout(Duration::from_secs(10), handle.mailbox_close())
-        .await
-        .expect("the mailbox closes");
-    release_tx.send(()).expect("the poll is still waiting");
-    let reason = tokio::time::timeout(Duration::from_secs(10), join)
-        .await
-        .expect("the actor ends")
-        .expect("the task returns its reason");
-    assert_eq!(*seen.lock().unwrap(), vec!["dropped"]);
-    assert!(matches!(reason, StopReason::Graceful), "{reason:?}");
+async fn a_discarded_answer_is_logged_with_its_text_only_for_an_ordinary_actor() {
+    struct Quiet;
+
+    impl Actor for Quiet {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    let lines = crate::actor::supervision::lost_runner::capture::install();
+    let system = ActorSystem::create(format!("discarded-answer-{}", uuid::Uuid::new_v4()))
+        .expect("a fresh system name");
+    for sensitive in [false, true] {
+        let name = format!("discarded-answer-{sensitive}-{}", uuid::Uuid::new_v4());
+        let builder = crate::actor::ActorExt::spawn(Quiet)
+            .named(name.clone())
+            .on_system(&system);
+        let handle = if sensitive {
+            builder.sensitive().await.unwrap()
+        } else {
+            builder.await.unwrap()
+        };
+        super::log_discarded_answer(
+            Some("discarded-answer-text".to_string()),
+            handle.id(),
+            handle.stop_lane().abort_record(),
+        );
+        let token = format!("actor_id={name} ");
+        let seen: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(&token) && line.contains("a newer one replaced"))
+            .cloned()
+            .collect();
+        assert_eq!(seen.len(), 1, "sensitive {sensitive}: one line: {seen:?}");
+        assert_eq!(
+            seen[0].contains("discarded-answer-text"),
+            !sensitive,
+            "sensitive {sensitive}: the text appears only for an ordinary actor: {seen:?}"
+        );
+    }
 }

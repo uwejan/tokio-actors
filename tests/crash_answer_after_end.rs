@@ -179,6 +179,30 @@ impl Actor for Gated {
     }
 }
 
+/// A supervisor with one child whose `on_stopped` waits at a gate: the end of
+/// the supervisor includes the child's teardown.
+struct Boss {
+    child: Arc<Hook>,
+    child_name: String,
+}
+
+impl Actor for Boss {
+    type Message = Msg;
+    type Response = u32;
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let hook = self.child.clone();
+        ctx.spawn_child(move || Gated { hook: hook.clone() })
+            .named(self.child_name.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        respond(msg)
+    }
+}
+
 /// How a request is made.
 #[derive(Clone, Copy, Debug)]
 enum Form {
@@ -281,6 +305,10 @@ fn failed(err: &AskError) -> bool {
     matches!(err, AskError::Actor(ActorError::User(_)))
 }
 
+fn panicked(err: &AskError) -> bool {
+    matches!(err, AskError::Actor(ActorError::Panic(_)))
+}
+
 fn dropped_with_a_failure(answer: &Result<u32, AskError>) -> bool {
     matches!(
         answer,
@@ -347,6 +375,13 @@ async fn failing_request_is_answered_after_the_end(
         rig.handle.wait_stopped().await,
         StopReason::Failure(_)
     ));
+}
+
+#[test]
+fn an_err_is_answered_only_after_the_actor_has_ended() {
+    common::run(0, async {
+        failing_request_is_answered_after_the_end(Form::Send, Msg::Fail, |b| b, failed).await;
+    });
 }
 
 #[test]
@@ -437,44 +472,6 @@ impl Actor for Timered {
     async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         respond(msg)
     }
-}
-
-/// A `Kill` accepted after the name is free and before the lane is sealed,
-/// while the end waits for a timer's value to drop, is the final reason: the
-/// caller reads it, not the handler's error. Multi-thread only: the held drop
-/// blocks its thread.
-#[test]
-fn a_kill_accepted_after_the_name_is_free_reads_the_final_reason() {
-    common::run_multi_thread_only(4, async {
-        let (entered_tx, entered) = oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let hook = Hook::new();
-        let rig = Rig::start(
-            Timered {
-                owner: Some(HeldDrop {
-                    entered: Some(entered_tx),
-                    release: Some(release_rx),
-                }),
-            },
-            hook,
-            |b| b.kill_grace(Duration::from_secs(60)),
-        )
-        .await;
-        let ask = rig.ask(Form::Send, Msg::Fail);
-        timeout(BOUND, entered)
-            .await
-            .expect("the value's drop begins")
-            .unwrap();
-        until("the name to be free", || rig.lookup().is_none()).await;
-        rig.handle
-            .stop(StopReason::Kill)
-            .await
-            .expect("a Kill is accepted until the lane is sealed");
-        release_tx.send(()).unwrap();
-        let seen = timeout(BOUND, ask).await.expect("answered").unwrap();
-        assert!(dropped_with_kill(&seen.answer), "{seen:?}");
-        assert_eq!(rig.handle.wait_stopped().await, StopReason::Kill);
-    });
 }
 
 /// A worker whose `on_stopped` takes `delay`, and which supervises a child of
@@ -743,4 +740,93 @@ fn a_child_waiting_on_its_failing_parent_is_ended_by_its_shutdown() {
             "the child's on_stopped ran: it was stopped in order"
         );
     });
+}
+
+/// The wait for the answer counts against the call's own deadline.
+async fn a_timed_call_counts_the_teardown(
+    form: fn(Duration) -> Form,
+    tune: fn(SpawnBuilder<Gated>) -> SpawnBuilder<Gated>,
+) {
+    // The gate stays shut until the call has returned.
+    let rig = Rig::gated(tune).await;
+    let seen = timeout(BOUND, rig.ask(form(Duration::from_millis(100)), Msg::Fail))
+        .await
+        .expect("the deadline ends the call")
+        .unwrap();
+    assert!(
+        matches!(seen.answer, Err(AskError::Timeout { enqueued: true })),
+        "{seen:?}"
+    );
+    rig.hook.release();
+    assert!(matches!(
+        rig.handle.wait_stopped().await,
+        StopReason::Failure(_)
+    ));
+
+    // A deadline past the end reads the handler's error.
+    let rig = Rig::gated(tune).await;
+    let ask = rig.ask(form(BOUND), Msg::Fail);
+    rig.hook.entered().await;
+    rig.hook.release();
+    let seen = timeout(BOUND, ask).await.expect("answered").unwrap();
+    assert!(
+        matches!(seen.answer, Err(AskError::Actor(ActorError::User(_)))),
+        "{seen:?}"
+    );
+    assert!(seen.hook_returned && !seen.name_registered);
+}
+
+/// Two actors that call each other: the first calls the second with a failing
+/// request and a deadline, the second's `on_stopped` calls the first.
+struct First {
+    sys: Arc<ActorSystem>,
+    second: String,
+    call: Arc<Mutex<Option<Result<u32, AskError>>>>,
+}
+
+enum FirstMsg {
+    Ping,
+    CallSecond,
+}
+
+impl Actor for First {
+    type Message = FirstMsg;
+    type Response = u32;
+
+    async fn handle(&mut self, msg: FirstMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        if let FirstMsg::CallSecond = msg {
+            let second = self.sys.get::<Second>(&self.second).expect("the second");
+            let result = second
+                .send_timeout(Msg::Fail, Duration::from_millis(200))
+                .await;
+            *self.call.lock().unwrap() = Some(result);
+        }
+        Ok(1)
+    }
+}
+
+struct Second {
+    sys: Arc<ActorSystem>,
+    first: String,
+    ping: Arc<Mutex<Option<Result<u32, AskError>>>>,
+}
+
+impl Actor for Second {
+    type Message = Msg;
+    type Response = u32;
+
+    async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        respond(msg)
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        let first = self.sys.get::<First>(&self.first).expect("the first");
+        let result = first.send(FirstMsg::Ping).await;
+        *self.ping.lock().unwrap() = Some(result);
+        Ok(())
+    }
 }

@@ -20,8 +20,8 @@ use tokio::time::Instant;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, AskError, ChildEvent,
-    RestartType, StopReason, TrySendError,
+    ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatusInfo, ActorSystem, AskError,
+    ChildEvent, RestartType, StopReason, TrySendError,
 };
 
 // ---------------------------------------------------------------------------
@@ -413,6 +413,84 @@ async fn child_death_is_observed_before_a_queued_priority_message() {
 
     let log = wait_for_len(&log, 2, 2_000).await;
     assert_eq!(log, vec!["child_stopped", "priority-msg"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_the_priority_lane_separately() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let handle = Gate::new(log.clone())
+        .spawn()
+        .named(uname("status-separate"))
+        .with_config(
+            ActorConfig::default()
+                .with_mailbox_capacity(8)
+                .with_priority_lane(4),
+        )
+        .await
+        .unwrap();
+
+    let baseline: ActorStatusInfo = handle.get_status().await.unwrap();
+    assert_eq!(baseline.mailbox_len, 0);
+    assert_eq!(baseline.mailbox_capacity, 8);
+    assert_eq!(baseline.priority_len, 0);
+    assert_eq!(baseline.priority_capacity, 4);
+
+    let release = open_gate(&handle).await;
+
+    handle.notify(GateMsg::Tag("n1".into())).await.unwrap();
+    handle.notify(GateMsg::Tag("n2".into())).await.unwrap();
+    handle
+        .notify_priority(GateMsg::Tag("p1".into()))
+        .await
+        .unwrap();
+    handle
+        .notify_priority(GateMsg::Tag("p2".into()))
+        .await
+        .unwrap();
+    handle
+        .notify_priority(GateMsg::Tag("p3".into()))
+        .await
+        .unwrap();
+
+    // `get_status` cannot answer while the actor is parked mid-handler (the
+    // Isolated Turn Principle: the system channel is only serviced between
+    // turns), so the backlog is observed through the handle's own instant,
+    // capacity-based counters instead - the same ones `get_status` itself
+    // reads once the actor is free to answer.
+    assert_eq!(
+        handle.mailbox_len(),
+        2,
+        "priority traffic must not change the mailbox counters"
+    );
+    assert_eq!(handle.mailbox_capacity(), 8);
+    assert_eq!(handle.priority_len(), 3);
+    assert_eq!(handle.priority_capacity(), 4);
+
+    // A status query is served at the next turn boundary, ahead of the queued
+    // messages of both lanes, so it reads the same backlog. The query is
+    // polled once before the gate opens so it is already waiting.
+    let status = handle.get_status();
+    tokio::pin!(status);
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(status.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    release.send(()).unwrap();
+    let during: ActorStatusInfo = status.await.unwrap();
+    assert_eq!(during.mailbox_len, 2, "status mailbox_len");
+    assert_eq!(during.mailbox_capacity, 8, "status mailbox_capacity");
+    assert_eq!(during.priority_len, 3, "status priority_len");
+    assert_eq!(during.priority_capacity, 4, "status priority_capacity");
+    let _ = wait_for_len(&log, 5, 2_000).await;
+
+    let after: ActorStatusInfo = handle.get_status().await.unwrap();
+    assert_eq!(after.mailbox_len, 0);
+    assert_eq!(after.priority_len, 0);
+    assert_eq!(after.mailbox_capacity, 8);
+    assert_eq!(after.priority_capacity, 4);
 }
 
 // ---------------------------------------------------------------------------

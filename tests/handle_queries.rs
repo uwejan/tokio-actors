@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult, ActorSystem,
@@ -88,4 +89,31 @@ async fn handle_inequality_across_systems() {
         actor_a, actor_b,
         "identical ActorId in different systems must NOT compare equal"
     );
+}
+
+#[tokio::test]
+async fn handle_can_be_used_in_hashset() {
+    use std::collections::HashSet;
+
+    let actor1 = TestActor::default()
+        .spawn()
+        .named("hq-hash-1")
+        .await
+        .unwrap();
+    let actor2 = TestActor::default()
+        .spawn()
+        .named("hq-hash-2")
+        .await
+        .unwrap();
+    let actor1_clone = actor1.clone();
+
+    #[allow(clippy::mutable_key_type)]
+    let mut set = HashSet::new();
+    set.insert(actor1.clone());
+    set.insert(actor2.clone());
+    set.insert(actor1_clone);
+
+    assert_eq!(set.len(), 2, "HashSet should deduplicate by actor ID");
+    assert!(set.contains(&actor1));
+    assert!(set.contains(&actor2));
 }

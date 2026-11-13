@@ -114,9 +114,14 @@ fn spawn_park() -> Spawned {
 }
 
 fn spawn_park_in(system: Option<Arc<ActorSystem>>) -> Spawned {
+    spawn_park_with(system, false)
+}
+
+/// [`spawn_park_in`], with the actor sensitive when `sensitive` says so.
+fn spawn_park_with(system: Option<Arc<ActorSystem>>, sensitive: bool) -> Spawned {
     let (entered_tx, entered_rx) = oneshot::channel();
     let id = format!("late-slot-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let (handle, join, _subtree) = runtime::spawn_actor(
+    let (handle, join, _subtree) = runtime::spawn_actor_in(
         id.into(),
         Park {
             entered: Mutex::new(Some(entered_tx)),
@@ -128,9 +133,22 @@ fn spawn_park_in(system: Option<Arc<ActorSystem>>) -> Spawned {
         true,
         Duration::ZERO,
         None,
+        None,
+        crate::telemetry::Birth::root(),
+        crate::actor::sys::SysOptions {
+            sensitive,
+            ..Default::default()
+        },
     )
     .unwrap();
     (handle, join, entered_rx)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Lane {
+    System,
+    Mailbox,
+    Priority,
 }
 
 /// Keeps the actor's loop busy until the returned sender fires, so that the
@@ -144,6 +162,22 @@ async fn hold_loop(
     handle.notify(Msg::Hold(release_rx)).await.unwrap();
     entered.await.unwrap();
     release_tx
+}
+
+/// Opens the actor's system channel with two status requests, then reserves a
+/// slot on it through a sender of its own, which the permit keeps alive. The
+/// actor's loop must be busy, or it takes the first request before the second
+/// arrives and the channel never opens.
+async fn reserve_system(
+    handle: &ActorHandle<Park>,
+) -> tokio::sync::mpsc::OwnedPermit<SystemMessage> {
+    let record = handle.stop_lane().abort_record().clone();
+    for _ in 0..2 {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        record.submit_status(reply_tx).await.unwrap();
+    }
+    let tx = record.system_tx_for_test().expect("the channel is open");
+    tx.reserve_owned().await.unwrap()
 }
 
 /// Ends the actor and returns once its task is gone (all its drops done).
@@ -164,31 +198,71 @@ async fn end(
     );
 }
 
-/// A late value whose drop panics is contained: the stop reason stays what it
-/// was, and a value pushed through a second slot after it is still dropped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn panicking_late_drop_does_not_stop_the_drain() {
-    let (handle, mut join, _entered) = spawn_park();
-    let first = handle.tx.reserve().await.unwrap();
-    let second = handle.tx.reserve().await.unwrap();
-    end(&handle, false, &mut join).await;
-    first.send(Envelope::Message {
-        payload: Msg::Bomb(Bomb),
-        responder: None,
-    });
-    let (reply_tx, reply_rx) = oneshot::channel();
-    second.send(Envelope::Message {
-        payload: Msg::Ping,
-        responder: Some(reply_tx),
-    });
-    assert!(
-        timeout(BOUND, reply_rx).await.is_ok(),
-        "the drain must survive a panicking drop"
-    );
-    assert!(matches!(
-        timeout(BOUND, handle.wait_stopped()).await,
-        Ok(StopReason::Graceful)
-    ));
+/// Reserves a slot on `lane`, ends the actor, then pushes a value through the
+/// slot; true when the crate dropped that value.
+async fn late_value_dropped(lane: Lane, abort: bool) -> bool {
+    let (handle, mut join, entered) = spawn_park();
+    let mut release = None;
+    if abort {
+        handle.notify(Msg::Park).await.unwrap();
+        // The handler is parked, so the stop below ends the task by abort.
+        entered.await.unwrap();
+    } else if matches!(lane, Lane::System) {
+        release = Some(hold_loop(&handle, entered).await);
+    }
+    // The reply side closes only when the late value is dropped; the handle
+    // is still alive, so nothing else drops it.
+    match lane {
+        Lane::System => {
+            let permit = reserve_system(&handle).await;
+            if let Some(release) = release.take() {
+                let _ = release.send(());
+            }
+            end(&handle, abort, &mut join).await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            // The sender the permit returns stays alive until the check
+            // ends: the value must be dropped by the crate, not by the
+            // last sender.
+            let _sender = permit.send(SystemMessage::GetStatus(StatusRequest {
+                reply: reply_tx,
+                task: false,
+            }));
+            timeout(BOUND, reply_rx).await.is_ok()
+        }
+        Lane::Mailbox => {
+            let permit = handle.tx.reserve().await.unwrap();
+            end(&handle, abort, &mut join).await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            permit.send(Envelope::Message {
+                payload: Msg::Ping,
+                responder: Some(reply_tx),
+            });
+            timeout(BOUND, reply_rx).await.is_ok()
+        }
+        Lane::Priority => {
+            let permit = handle
+                .priority_tx
+                .as_ref()
+                .unwrap()
+                .reserve()
+                .await
+                .unwrap();
+            end(&handle, abort, &mut join).await;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            permit.send(Envelope::Message {
+                payload: Msg::Ping,
+                responder: Some(reply_tx),
+            });
+            timeout(BOUND, reply_rx).await.is_ok()
+        }
+    }
+}
+
+fn runtime_without_time() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap()
 }
 
 fn fresh_system(tag: &str) -> Arc<ActorSystem> {
@@ -204,6 +278,21 @@ async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     })
     .await;
     assert!(waited.is_ok(), "{what}");
+}
+
+/// A mailbox request: the message and the side its reply comes back on.
+fn request() -> (
+    Envelope<Msg, ()>,
+    oneshot::Receiver<crate::error::ActorResult<()>>,
+) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    (
+        Envelope::Message {
+            payload: Msg::Ping,
+            responder: Some(reply_tx),
+        },
+        reply_rx,
+    )
 }
 
 fn runtime_of(multi: bool) -> tokio::runtime::Runtime {
@@ -236,6 +325,16 @@ fn reply_closed<T>(mut reply_rx: oneshot::Receiver<T>) -> bool {
     }
 }
 
+/// The ends the helper slot of the current runtime recorded for `kind`.
+fn ends_of(system: &ActorSystem, kind: HelperKind) -> Vec<HelperEnd> {
+    system
+        .helper_ends(&tokio::runtime::Handle::current())
+        .into_iter()
+        .filter(|(k, _)| *k == kind)
+        .map(|(_, end)| end)
+        .collect()
+}
+
 /// A late value whose drop blocks delays only its own queue's task: an
 /// unrelated actor's late value is dropped while the first one is still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -252,8 +351,20 @@ async fn a_blocking_late_drop_delays_only_its_own_queue() {
     let (second_tx, second_rx) = tokio::sync::mpsc::channel::<oneshot::Sender<()>>(2);
     let first_permit = first_tx.clone().try_reserve_owned().unwrap();
     let second_permit = second_tx.clone().try_reserve_owned().unwrap();
-    assert!(runtime::end_queue_late(first_rx, &system, &id).is_none());
-    assert!(runtime::end_queue_late(second_rx, &system, &id).is_none());
+    assert!(runtime::end_queue_late(
+        first_rx,
+        &system,
+        &runtime::Owner::new(id.clone(), false),
+        None
+    )
+    .is_none());
+    assert!(runtime::end_queue_late(
+        second_rx,
+        &system,
+        &runtime::Owner::new(id.clone(), false),
+        None
+    )
+    .is_none());
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let _first_sender = first_permit.send(Slow(release_rx));
     let (probe_tx, probe_rx) = oneshot::channel();
@@ -268,58 +379,69 @@ async fn a_blocking_late_drop_delays_only_its_own_queue() {
     until("the first task ends", || system.live_helpers() == 0).await;
 }
 
-/// A task dropped before it took the value waiting in its receiver drops that
-/// value, and the slot records the cancellation once, with the count of
-/// values dropped.
-#[test]
-fn a_cancelled_drain_records_the_values_it_dropped() {
-    let rt = runtime_of(false);
-    let system = fresh_system("cancel");
-    let (tx, rx) = tokio::sync::mpsc::channel::<oneshot::Sender<()>>(2);
-    let (reply_tx, reply_rx) = oneshot::channel();
-    rt.block_on(async {
-        let id = ActorId::from("cancel".to_string());
-        let permit = tx.clone().try_reserve_owned().unwrap();
-        assert!(runtime::end_queue_late(rx, &system, &id).is_none());
-        // The task has not been polled: the value waits in the receiver.
-        let _sender = permit.send(reply_tx);
-        assert_eq!(system.live_helpers(), 1);
-    });
-    let handle = rt.handle().clone();
-    drop(rt);
-    assert_eq!(system.live_helpers(), 0, "the cancelled task counted down");
-    assert_eq!(
-        system.helper_ends(&handle),
-        vec![(HelperKind::LateDrain, HelperEnd::Cancelled { dropped: 1 })],
-        "one record, with the value it dropped"
-    );
-    assert!(reply_closed(reply_rx), "the held value was dropped");
-    drop(tx);
-}
-
 /// A late value whose drop panics is reported once, naming the actor it was
-/// meant for, and the task's end is recorded as finished.
+/// meant for, on the mailbox's push and on a lane's drain, and the log line
+/// carries the panic's text unless the actor is sensitive.
 #[cfg(feature = "tracing")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_panicking_late_drop_is_logged_with_the_owner() {
     let lines = crate::actor::supervision::lost_runner::capture::install();
     let system = fresh_system("bomb");
-    let (handle, mut join, _entered) = spawn_park_in(Some(system.clone()));
-    let permit = handle.tx.clone().reserve_owned().await.unwrap();
-    end(&handle, false, &mut join).await;
-    let _sender = permit.send(Envelope::Message {
-        payload: Msg::Bomb(Bomb),
-        responder: None,
-    });
-    let token = format!("actor_id={} ", handle.id());
-    until("the panic is logged with the owner's id", || {
-        lines
+    for (lane, sensitive) in [
+        (Lane::Mailbox, false),
+        (Lane::Mailbox, true),
+        (Lane::Priority, false),
+        (Lane::Priority, true),
+    ] {
+        let (handle, mut join, _entered) = spawn_park_with(Some(system.clone()), sensitive);
+        // The sender the mailbox's permit returns stays alive until the
+        // check ends: the value is dropped by the crate, not by the last
+        // sender.
+        let _sender = match lane {
+            Lane::Priority => {
+                let reserved = handle
+                    .priority_tx
+                    .as_ref()
+                    .unwrap()
+                    .reserve()
+                    .await
+                    .unwrap();
+                end(&handle, false, &mut join).await;
+                reserved.send(Envelope::Message {
+                    payload: Msg::Bomb(Bomb),
+                    responder: None,
+                });
+                None
+            }
+            _ => {
+                let reserved = handle.tx.clone().reserve_owned().await.unwrap();
+                end(&handle, false, &mut join).await;
+                Some(reserved.send(Envelope::Message {
+                    payload: Msg::Bomb(Bomb),
+                    responder: None,
+                }))
+            }
+        };
+        let token = format!("actor_id={} ", handle.id());
+        until("the panic is logged with the owner's id", || {
+            lines.lock().unwrap().iter().any(|line| {
+                line.contains(&token) && line.contains("arrived after its queue closed")
+            })
+        })
+        .await;
+        let seen: Vec<String> = lines
             .lock()
             .unwrap()
             .iter()
-            .any(|line| line.contains(&token) && line.contains("arrived after its queue closed"))
-    })
-    .await;
+            .filter(|line| line.contains(&token))
+            .cloned()
+            .collect();
+        assert_eq!(
+            seen.iter().any(|line| line.contains("late value drop")),
+            !sensitive,
+            "{lane:?}, sensitive {sensitive}: the text appears only for an ordinary actor: {seen:?}"
+        );
+    }
 }
 
 struct Gate {
@@ -361,7 +483,10 @@ async fn a_blocked_lane_sender_that_gives_back_a_freed_slot_leaves_no_task() {
     // The last receive hands its permit to the waiting sender, and the lane
     // ends before that sender runs.
     drop(rx.try_recv().unwrap());
-    assert!(runtime::end_queue_late(rx, &system, &id).is_none());
+    assert!(
+        runtime::end_queue_late(rx, &system, &runtime::Owner::new(id.clone(), false), None)
+            .is_none()
+    );
     assert_eq!(system.live_helpers(), 1, "the lane's task is waiting");
     drop(waiting);
     drop(tx);
@@ -438,27 +563,45 @@ async fn one_deadline_spans_wait_and_reply(priority: bool) {
     );
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn send_priority_timeout_has_one_deadline_for_the_wait_and_the_reply() {
-    one_deadline_spans_wait_and_reply(true).await;
-}
-
-/// Without a priority lane, `send_priority_timeout` waits for room in the
-/// mailbox for at most its bound.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn send_priority_timeout_without_a_lane_stops_waiting_at_its_bound() {
-    const WITHIN: Duration = Duration::from_millis(50);
-    let (handle, _join, entered) = spawn_one_slot(false);
-    assert!(handle.priority_tx.is_none());
-    let _release = hold_loop(&handle, entered).await;
-    handle.notify(Msg::Ping).await.unwrap();
-    let started = tokio::time::Instant::now();
-    let reply = timeout(BOUND, handle.send_priority_timeout(Msg::Ping, WITHIN)).await;
-    assert!(
-        matches!(reply, Ok(Err(AskError::Timeout { enqueued: false }))),
-        "{reply:?}"
-    );
-    assert!(started.elapsed() < WITHIN * 2, "{:?}", started.elapsed());
+/// Many senders each hold a slot reserved before the actor ends and push
+/// while it ends: every value is dropped, none waits.
+async fn concurrent_pushers(repeats: usize) {
+    const PUSHERS: usize = 16;
+    let system = fresh_system("pushers");
+    for attempt in 0..repeats {
+        let (handle, mut join, _entered) = spawn_park_in(Some(system.clone()));
+        let mut permits = Vec::new();
+        for _ in 0..PUSHERS {
+            permits.push(handle.tx.clone().reserve_owned().await.unwrap());
+        }
+        let ender = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.stop(StopReason::Graceful).await })
+        };
+        let mut pushers = Vec::new();
+        let mut replies = Vec::new();
+        for permit in permits {
+            let (envelope, reply_rx) = request();
+            replies.push(reply_rx);
+            pushers.push(tokio::spawn(async move {
+                if attempt % 2 == 0 {
+                    tokio::task::yield_now().await;
+                }
+                permit.send(envelope)
+            }));
+        }
+        let _ = ender.await;
+        assert!(timeout(BOUND, &mut join).await.is_ok());
+        let mut senders = Vec::new();
+        for pusher in pushers {
+            senders.push(pusher.await.unwrap());
+        }
+        for reply_rx in replies {
+            let settled = timeout(BOUND, reply_rx).await;
+            assert!(settled.is_ok(), "attempt {attempt}: a value must not wait");
+        }
+        drop((handle, senders));
+    }
 }
 
 /// Requests made through the handle while the actor ends: each is answered by
@@ -525,6 +668,15 @@ fn host_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// How the actor's end is caused while a request holds its slot.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    /// The actor's runtime shuts down; the task's drop glue writes `Kill`.
+    RuntimeShutdown,
+    /// The actor stops gracefully and is `Stopped` before the push.
+    GracefulStop,
+}
+
 /// The four forms of a request that waits for a reply.
 #[derive(Clone, Copy, Debug)]
 enum Form {
@@ -566,6 +718,43 @@ impl Form {
 /// A deadline far beyond what a test waits: an answer within `BOUND` came
 /// long before it.
 const FAR: Duration = Duration::from_secs(600);
+
+/// Spawns an idle actor on its own runtime, ends it by `end` between the
+/// reservation and the push of a request made through `form`, and returns
+/// that request's outcome, awaited on another runtime.
+fn request_across_the_end(
+    form: Form,
+    end: End,
+) -> Result<Result<(), AskError>, tokio::time::error::Elapsed> {
+    let actor_rt = host_runtime();
+    let caller_rt = host_runtime();
+    let system = fresh_system("hook");
+    let (handle, _join) = {
+        let _guard = actor_rt.enter();
+        let (handle, join, _entered) = spawn_park_in(Some(system));
+        (handle, join)
+    };
+    // The loop runs: a status reply is only produced from inside it.
+    actor_rt.block_on(handle.get_status()).unwrap();
+    let ender = handle.clone();
+    BEFORE_PUSH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Another thread: this one is inside the caller's runtime.
+            std::thread::spawn(move || {
+                if let End::GracefulStop = end {
+                    actor_rt.block_on(async {
+                        ender.stop(StopReason::Graceful).await.unwrap();
+                        ender.wait_stopped().await;
+                    });
+                }
+                drop(actor_rt);
+            })
+            .join()
+            .unwrap();
+        }));
+    });
+    caller_rt.block_on(async { timeout(BOUND, form.call(&handle, Msg::Ping, FAR)).await })
+}
 
 /// The system lane holds no sender across its wait, so it needs no check: a
 /// status request pushed after the actor's runtime shut down is freed with
@@ -627,7 +816,10 @@ fn a_queue_with_a_slot_out_and_no_runtime_ends_in_place() {
     let (tx, rx) = tokio::sync::mpsc::channel::<oneshot::Sender<()>>(2);
     let permit = tx.clone().try_reserve_owned().unwrap();
     let id = ActorId::from("no-runtime".to_string());
-    assert!(runtime::end_queue_late(rx, &system, &id).is_none());
+    assert!(
+        runtime::end_queue_late(rx, &system, &runtime::Owner::new(id.clone(), false), None)
+            .is_none()
+    );
     assert_eq!(system.live_helpers(), 0);
     let (reply_tx, reply_rx) = oneshot::channel();
     let _sender = permit.send(reply_tx);
@@ -666,7 +858,13 @@ mod stress {
             for _ in 0..N {
                 permits.push(tx.clone().try_reserve_owned().unwrap());
             }
-            assert!(runtime::end_queue_late(rx, &system, &id).is_none());
+            assert!(runtime::end_queue_late(
+                rx,
+                &system,
+                &runtime::Owner::new(id.clone(), false),
+                None
+            )
+            .is_none());
             let mut replies = Vec::new();
             let mut threads = Vec::new();
             let keep = Arc::new(Mutex::new(Vec::new()));
@@ -710,9 +908,28 @@ mod stress {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn queues_ended_with_slots_out_settle_multi_thread() {
-        real_queues().await;
+    static NEXT: Mutex<Vec<(mpsc::Sender<Reply>, mpsc::OwnedPermit<Reply>)>> =
+        Mutex::new(Vec::new());
+    static SYSTEM: Mutex<Option<Arc<ActorSystem>>> = Mutex::new(None);
+
+    /// A value whose drop ends another queue with a slot out, from inside the
+    /// task that drops it.
+    struct EndsAnother;
+    impl Drop for EndsAnother {
+        fn drop(&mut self) {
+            let system = SYSTEM.lock().unwrap().clone().unwrap();
+            let id = ActorId::from("reentrant".to_string());
+            let (tx, rx) = mpsc::channel::<Reply>(2);
+            let permit = tx.clone().try_reserve_owned().unwrap();
+            assert!(runtime::end_queue_late(
+                rx,
+                &system,
+                &runtime::Owner::new(id.clone(), false),
+                None
+            )
+            .is_none());
+            NEXT.lock().unwrap().push((tx, permit));
+        }
     }
 }
 
@@ -787,57 +1004,194 @@ fn request_between_the_queue_ends(form: Form) {
     }
 }
 
-#[test]
-fn a_priority_request_reads_the_lane_it_pushed_to() {
-    request_between_the_queue_ends(Form::SendPriority);
-}
+mod held_teardown {
+    use super::*;
+    use crate::types::{RestartType, Shutdown};
+    use std::sync::atomic::AtomicBool;
 
-#[test]
-fn a_mailbox_request_reads_the_mailbox_it_pushed_to() {
-    request_between_the_queue_ends(Form::Send);
-}
+    /// A child whose `on_stopped` returns only once its gate opens.
+    struct SlowChild {
+        gate: Arc<AtomicBool>,
+    }
 
-/// The receiver closes the mailbox while it still holds the queue (the actor
-/// is tearing down its children), and a request made just then pushes into it.
-/// The request reads the closed mailbox after its push and is answered with
-/// the reason the actor's status plane carries, without waiting for the
-/// receiver to drop the queue.
-#[test]
-fn a_mailbox_request_pushed_after_the_close_is_answered_while_the_queue_is_still_held() {
-    use crate::types::{ActorStatus, StatusTx, StatusValue, StopLane};
-    let (tx, rx) = crate::actor::mailbox::test_channel(2);
-    let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
-    let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-    StatusValue::write_reason(&status_tx, StopReason::Graceful, true);
-    let (stop_lane, _stop_rx) = StopLane::new();
-    let handle = ActorHandle::<Park>::new(
-        ActorId::from("closed-mailbox-request".to_string()),
-        tx,
-        stop_lane,
-        2,
-        status_rx,
-        "closed-mailbox-request".into(),
-        None,
-        None,
-    );
-    let closing = rx.clone();
-    BEFORE_PUSH.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move || closing.borrow_mut().close()));
-    });
-    let mut call = Box::pin(Form::Send.call(&handle, Msg::Ping, FAR));
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    let outcome = std::future::Future::poll(call.as_mut(), &mut cx);
-    assert!(
-        matches!(
-            outcome,
-            std::task::Poll::Ready(Err(AskError::ResponseDropped {
-                reason: StopReason::Graceful
-            }))
-        ),
-        "the request waited for its own reply to be dropped: {outcome:?}"
-    );
-    drop(call);
-    assert_eq!(rx.borrow().len(), 1, "the request is still in the queue");
+    impl Actor for SlowChild {
+        type Message = ();
+        type Response = ();
+        async fn handle(&mut self, _m: (), _c: &mut ActorContext<Self>) -> ActorResult<()> {
+            Ok(())
+        }
+        async fn on_stopped(
+            &mut self,
+            _r: &StopReason,
+            _c: &mut ActorContext<Self>,
+        ) -> ActorResult<()> {
+            while !self.gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok(())
+        }
+    }
+
+    struct Sup {
+        gate: Arc<AtomicBool>,
+        started: bool,
+    }
+
+    impl Actor for Sup {
+        type Message = ();
+        type Response = ();
+        async fn handle(&mut self, _m: (), ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+            if !self.started {
+                self.started = true;
+                let gate = self.gate.clone();
+                ctx.spawn_child(move || SlowChild { gate: gate.clone() })
+                    .named("slow-child".to_string())
+                    .restart_type(RestartType::Temporary)
+                    .shutdown(Shutdown::Timeout(Duration::from_secs(8)))
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A supervisor whose child is held at its `on_stopped`, and the runtimes
+    /// around it. The hook installed for the next request stops the supervisor
+    /// between that request's reservation and its push, and returns once both
+    /// of its queues are closed: the request then finds a closed queue while
+    /// the teardown is held and the reason is still open.
+    struct Held {
+        actor_rt: tokio::runtime::Runtime,
+        caller_rt: tokio::runtime::Runtime,
+        handle: ActorHandle<Sup>,
+        gate: Arc<AtomicBool>,
+    }
+
+    fn held() -> Held {
+        let actor_rt = host_runtime();
+        let caller_rt = host_runtime();
+        let gate = Arc::new(AtomicBool::new(false));
+        let (handle, _join) = {
+            let _guard = actor_rt.enter();
+            let (handle, join, _subtree) = runtime::spawn_actor(
+                format!("held-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst)).into(),
+                Sup {
+                    gate: gate.clone(),
+                    started: false,
+                },
+                ActorConfig::default().with_priority_lane(4).supervisor(),
+                None,
+                Some(fresh_system("held")),
+                None,
+                true,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+            (handle, join)
+        };
+        actor_rt.block_on(handle.send(())).unwrap();
+        let ender = handle.clone();
+        let rt_handle = actor_rt.handle().clone();
+        BEFORE_PUSH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    rt_handle.block_on(async {
+                        ender.stop(StopReason::Graceful).await.unwrap();
+                        let waited = timeout(BOUND, async {
+                            while !(ender.tx.is_closed()
+                                && ender
+                                    .priority_tx
+                                    .as_ref()
+                                    .is_none_or(|lane| lane.is_closed()))
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await;
+                        assert!(waited.is_ok(), "the supervisor's queues never closed");
+                    });
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        Held {
+            actor_rt,
+            caller_rt,
+            handle,
+            gate,
+        }
+    }
+
+    impl Held {
+        /// Opens the gate and waits for the supervisor to be stopped.
+        fn finish(&self) {
+            self.gate.store(true, Ordering::SeqCst);
+            let stopped = self
+                .actor_rt
+                .block_on(async { timeout(BOUND, self.handle.wait_stopped()).await });
+            assert!(stopped.is_ok(), "the supervisor never stopped");
+        }
+    }
+
+    /// The request waits for the reason to be final: it is not answered
+    /// while the child holds the teardown, and it is answered with the reason
+    /// the supervisor ends with once the child lets go.
+    fn waits_for_the_reason(form: Form, kill_meanwhile: bool) {
+        let held = held();
+        let outcome = held.caller_rt.block_on(async {
+            let mut call = Box::pin(form.call(&held.handle, (), FAR));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let first = std::future::Future::poll(call.as_mut(), &mut cx);
+            assert!(
+                first.is_pending(),
+                "{form:?}: answered before the reason was final"
+            );
+            assert!(held.handle.status_rx.borrow().reason.is_none());
+            if kill_meanwhile {
+                held.handle.stop(StopReason::Kill).await.ok();
+            }
+            held.gate.store(true, Ordering::SeqCst);
+            timeout(BOUND, call).await.expect("never answered")
+        });
+        held.finish();
+        let want = if kill_meanwhile {
+            StopReason::Kill
+        } else {
+            StopReason::Graceful
+        };
+        match outcome {
+            Err(AskError::ResponseDropped { reason }) => {
+                assert_eq!(reason, want, "{form:?}");
+            }
+            other => panic!("{form:?}: {other:?}"),
+        }
+    }
+
+    /// A timed request that finds its queue closed while the reason is still
+    /// open ends at its own deadline with `Timeout { enqueued: true }`, not
+    /// later. The wait is bounded by the deadline, not by the child. The
+    /// elapsed bounds only detect a failure.
+    fn times_out_at_its_deadline(form: Form) {
+        const DEADLINE: Duration = Duration::from_millis(400);
+        let held = held();
+        let (outcome, elapsed) = held.caller_rt.block_on(async {
+            let started = std::time::Instant::now();
+            let outcome = timeout(BOUND, form.call(&held.handle, (), DEADLINE)).await;
+            (outcome, started.elapsed())
+        });
+        // Opened before the assertions, so a failure leaves nothing parked.
+        held.finish();
+        assert!(
+            matches!(outcome, Ok(Err(AskError::Timeout { enqueued: true }))),
+            "{form:?}: {outcome:?}"
+        );
+        assert!(elapsed >= DEADLINE, "{form:?}: answered at {elapsed:?}");
+        assert!(
+            elapsed < DEADLINE + Duration::from_secs(2),
+            "{form:?}: answered at {elapsed:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -942,11 +1296,6 @@ mod settlement {
             }
         }
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn handled_iff_ok_graceful() {
-        handled_iff_ok(300, StopReason::Graceful, true).await;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -959,6 +1308,8 @@ mod crash_answer {
 
     use tokio::sync::{Notify, Semaphore};
 
+    use crate::actor::runtime::{end_hooks, fast_path_turns, UNCAUGHT_PANIC};
+    use crate::actor::ActorExt;
     use crate::error::ActorError;
 
     /// What a test holds and watches of an actor's `on_stopped`.
@@ -992,71 +1343,185 @@ mod crash_answer {
         }
     }
 
-    /// Each form of request that finds its queue closed after its push waits
-    /// for the actor's final reason, then reads the answer the actor sent it
-    /// meanwhile: the answer to a request whose handler failed is sent at the
-    /// lane's seal, before the reason is written.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_request_across_the_close_reads_the_answer_sent_before_the_reason() {
-        use crate::types::{ActorStatus, StatusTx, StatusValue, StopLane};
-        for form in Form::ALL {
-            let (tx, rx) = crate::actor::mailbox::test_channel(2);
-            let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
-            let (priority_tx, priority_rx) = tokio::sync::mpsc::channel(2);
-            let priority_rx = std::rc::Rc::new(std::cell::RefCell::new(priority_rx));
-            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-            let (stop_lane, _stop_rx) = StopLane::new();
-            let handle = ActorHandle::<Park>::new(
-                ActorId::from("crash-answer-across-the-close".to_string()),
-                tx,
-                stop_lane,
-                2,
-                status_rx,
-                "crash-answer-across-the-close".into(),
-                Some(priority_tx),
-                None,
-            );
-            let (closing, closing_lane) = (rx.clone(), priority_rx.clone());
-            BEFORE_PUSH.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    closing.borrow_mut().close();
-                    closing_lane.borrow_mut().close();
-                }));
-            });
-            let mut call = Box::pin(form.call(&handle, Msg::Ping, FAR));
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(
-                std::future::Future::poll(call.as_mut(), &mut cx).is_pending(),
-                "{form:?}: the call waits for the reason"
-            );
+    enum Turn {
+        /// Holds the turn until a test releases it.
+        Block,
+        /// Records how many fast path turns the thread has taken.
+        Mark,
+        /// Records the same, then fails.
+        Fail,
+    }
 
-            // The actor takes the request, answers it with the handler's error
-            // at its seal, and writes the reason.
-            let taken = if form.priority() {
-                priority_rx.borrow_mut().try_recv().ok()
-            } else {
-                rx.borrow_mut().try_recv().ok()
-            };
-            let Some(Envelope::Message {
-                responder: Some(reply),
-                ..
-            }) = taken
-            else {
-                panic!("{form:?}: the request was queued");
-            };
-            reply
-                .send(Err(ActorError::User("the handler failed".to_string())))
-                .unwrap();
-            StatusValue::write_reason(
-                &status_tx,
-                StopReason::Failure(ActorError::User("the handler failed".to_string())),
-                false,
-            );
-            let outcome = std::future::Future::poll(call.as_mut(), &mut cx);
-            assert!(
-                matches!(outcome, std::task::Poll::Ready(Err(AskError::Actor(_)))),
-                "{form:?}: {outcome:?}"
-            );
+    struct Crasher {
+        stopped: Arc<Stopped>,
+        in_turn: Arc<Notify>,
+        release: Arc<Notify>,
+        marks: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Crasher {
+        fn new(stopped: Arc<Stopped>) -> Crasher {
+            Crasher {
+                stopped,
+                in_turn: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                marks: Arc::new(Mutex::new(Vec::new())),
+            }
         }
+    }
+
+    impl Actor for Crasher {
+        type Message = Turn;
+        type Response = u32;
+
+        async fn handle(&mut self, turn: Turn, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+            match turn {
+                Turn::Block => {
+                    self.in_turn.notify_one();
+                    self.release.notified().await;
+                    Ok(0)
+                }
+                Turn::Mark => {
+                    self.marks.lock().unwrap().push(fast_path_turns::read());
+                    Ok(1)
+                }
+                Turn::Fail => {
+                    self.marks.lock().unwrap().push(fast_path_turns::read());
+                    Err(ActorError::User("the handler failed".to_string()))
+                }
+            }
+        }
+
+        async fn on_stopped(
+            &mut self,
+            _reason: &StopReason,
+            _ctx: &mut ActorContext<Self>,
+        ) -> ActorResult<()> {
+            self.stopped.entered.notify_one();
+            self.stopped.gate.acquire().await.unwrap().forget();
+            self.stopped.returned.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn unique_name(tag: &str) -> String {
+        format!("{tag}-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// A failing request taken from a backlog at a turn boundary, by the fast
+    /// path, is answered after the actor has ended like any other: while
+    /// `on_stopped` is held the caller is not answered, and when it is
+    /// answered `on_stopped` has returned and the name is free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failing_request_taken_from_a_backlog_is_answered_after_the_end() {
+        let stopped = Stopped::held();
+        let crasher = Crasher::new(stopped.clone());
+        let (in_turn, release, marks) = (
+            crasher.in_turn.clone(),
+            crasher.release.clone(),
+            crasher.marks.clone(),
+        );
+        let system = fresh_system("backlog");
+        let name = unique_name("backlog");
+        let handle = crasher
+            .spawn()
+            .named(name.clone())
+            .on_system(&system)
+            .await
+            .unwrap();
+
+        handle.notify(Turn::Block).await.unwrap();
+        timeout(BOUND, in_turn.notified())
+            .await
+            .expect("the first turn begins");
+        handle.notify(Turn::Mark).await.unwrap();
+        let mut asker = {
+            let (handle, system, name, stopped) = (
+                handle.clone(),
+                system.clone(),
+                name.clone(),
+                stopped.clone(),
+            );
+            tokio::spawn(async move {
+                let answer = handle.send(Turn::Fail).await;
+                (
+                    answer,
+                    stopped.returned.load(Ordering::SeqCst),
+                    system.get::<Crasher>(&name).is_some(),
+                )
+            })
+        };
+        // The request is queued behind the mark while the first turn holds.
+        tokio::task::yield_now().await;
+        release.notify_one();
+        stopped.entered().await;
+
+        let marks = marks.lock().unwrap().clone();
+        assert_eq!(marks.len(), 2, "the mark and the failing turn ran");
+        assert_eq!(
+            marks[1],
+            marks[0] + 1,
+            "the failing turn was taken by the fast path"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), &mut asker)
+                .await
+                .is_err(),
+            "the failing request was answered before the actor ended"
+        );
+        stopped.gate.add_permits(1);
+        let (answer, returned, registered) =
+            timeout(BOUND, asker).await.expect("answered").unwrap();
+        assert!(matches!(answer, Err(AskError::Actor(_))), "{answer:?}");
+        assert!(returned, "answered before on_stopped returned");
+        assert!(!registered, "answered with the name registered");
+    }
+
+    /// What the hooks at the two points of the end saw of a request's reply
+    /// channel and of the status plane.
+    #[derive(Default)]
+    struct Observed {
+        /// At the point just before the name is freed: the channel was empty.
+        unanswered_before_the_name_is_freed: Option<bool>,
+        /// At the point just after the answer is sent: the channel held the
+        /// handler's error, the plane carried no reason yet, and the actor read
+        /// as stopping.
+        answered: Option<bool>,
+        reason_not_yet_written: Option<bool>,
+        stopping: Option<bool>,
+    }
+
+    /// The task's own poll unwinds right after the name is freed, past a held
+    /// answer: the caller reads the final reason the unwind writes, the
+    /// uncaught panic, with the name free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_that_unwinds_after_the_handler_failed_leaves_its_caller_the_final_reason() {
+        let system = fresh_system("unwind");
+        let name = unique_name("unwind");
+        let handle = Crasher::new(Stopped::open())
+            .spawn()
+            .named(name.clone())
+            .on_system(&system)
+            .await
+            .unwrap();
+        end_hooks::attach(end_hooks::NAME_FREED, ActorId::from(name.clone()), || {
+            panic!("the crate's own code panics once the name is freed")
+        });
+        let answer = timeout(BOUND, handle.send(Turn::Fail))
+            .await
+            .expect("the caller is released");
+        assert!(
+            matches!(
+                &answer,
+                Err(AskError::ResponseDropped {
+                    reason: StopReason::Failure(ActorError::Panic(text))
+                }) if text == UNCAUGHT_PANIC
+            ),
+            "{answer:?}"
+        );
+        assert!(
+            system.get::<Crasher>(&name).is_none(),
+            "the name was not free when the call returned"
+        );
     }
 }

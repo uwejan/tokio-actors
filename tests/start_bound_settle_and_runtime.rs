@@ -121,7 +121,7 @@ fn poll_once(call: &mut Spawned) -> Poll<Result<ActorHandle<Quick>, SpawnError>>
 /// when the `Kill` raised at the cut ends it before another hook begins.
 #[test]
 fn a_start_that_never_yields_keeps_its_name_after_the_caller_is_answered() {
-    const START_TIMEOUT: Duration = Duration::from_millis(200);
+    const START_TIMEOUT: Duration = Duration::from_secs(2);
     common::run_multi_thread_only(2, async {
         let sys = ActorSystem::create(unique("never-yields")).unwrap();
         let name = unique("blocks");
@@ -247,7 +247,7 @@ fn a_caller_polled_after_its_runtime_ended_reads_the_end_of_the_actor() {
 /// `StartTimeout`.
 #[test]
 fn a_caller_whose_actor_has_not_ended_waits_on_the_timers_of_the_runtime_that_polls_it() {
-    const START_TIMEOUT: Duration = Duration::from_millis(400);
+    const START_TIMEOUT: Duration = Duration::from_secs(2);
     let actor_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

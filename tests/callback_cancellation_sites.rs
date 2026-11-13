@@ -34,8 +34,8 @@ const ABORT_SITES: &[(&str, usize, &str)] = &[
     ),
     (
         "system.rs",
-        4,
-        "the abort by id after a Kill's grace, the forced stop's abort, and the reaper entry that owes an abort and fires it (or drops it) after a Kill",
+        3,
+        "the abort by id after a Kill's grace, the forced stop's abort, and the reaper entry's one abort, which its fire and its drop both go through after a Kill",
     ),
 ];
 

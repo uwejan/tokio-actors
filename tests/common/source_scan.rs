@@ -467,7 +467,8 @@ pub fn test_only_files(sources: &BTreeMap<String, String>) -> (BTreeSet<String>,
 }
 
 /// Every Rust file under `dir`, by its path relative to `dir`, with `/`
-/// separators, and its text.
+/// separators, and its text with `\n` line ends, whatever line ends the
+/// checkout has.
 pub fn rust_sources(dir: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -480,11 +481,129 @@ pub fn rust_sources(dir: &Path) -> BTreeMap<String, String> {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                out.insert(relative, fs::read_to_string(&path).unwrap());
+                let text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+                out.insert(relative, text);
             }
         }
     }
     let mut out = BTreeMap::new();
     walk(dir, dir, &mut out);
+    out
+}
+
+/// One function found by [`fn_bodies`]: the header of the `impl` block that
+/// holds it (if any), its name, and the lines of its body.
+pub type FnBody = (Option<String>, String, Vec<String>);
+
+/// What an open brace belongs to.
+enum Block {
+    /// An `impl` block, with its header text.
+    Impl(String),
+    /// A function body: the index of its entry in the output.
+    Fn(usize),
+    /// Any other block: a module, a closure, a `match`, a literal.
+    Other,
+}
+
+/// The name of the function a block header declares, if it declares one: the
+/// identifier after the last `fn` word of the header.
+fn declared_fn(header: &str) -> Option<String> {
+    let bytes: Vec<char> = header.chars().collect();
+    let mut found = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        let starts_word = i == 0 || !is_ident(bytes[i - 1]);
+        if starts_word && bytes[i] == 'f' && bytes[i + 1] == 'n' && bytes[i + 2] == ' ' {
+            let name: String = bytes[i + 3..]
+                .iter()
+                .skip_while(|c| **c == ' ')
+                .take_while(|c| is_ident(**c))
+                .collect();
+            if !name.is_empty() {
+                found = Some(name);
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The header of an `impl` block, if the block header opens one: the text
+/// from `impl` on, attributes and visibility words before it cut.
+fn declared_impl(header: &str) -> Option<String> {
+    let mut text = header.trim();
+    while text.starts_with("#[") {
+        text = &text[attr_end(text)?..];
+        text = text.trim_start();
+    }
+    let text = text.strip_prefix("unsafe ").unwrap_or(text);
+    let rest = text.strip_prefix("impl")?;
+    match rest.chars().next() {
+        Some(c) if is_ident(c) => None,
+        _ => Some(text.to_string()),
+    }
+}
+
+/// Every function in `lines` (as [`library_code`] returns them), with the
+/// header of its `impl` block and its body. The body holds the lines between
+/// the function's braces, nested blocks and closures included, and a nested
+/// function appears both inside its parent's body and as an entry of its own.
+/// Braces are counted over the lines, so the lines must have their literals
+/// emptied.
+pub fn fn_bodies(lines: &[String]) -> Vec<FnBody> {
+    let mut out: Vec<FnBody> = Vec::new();
+    let mut stack: Vec<Block> = Vec::new();
+    let mut header = String::new();
+    for line in lines {
+        // The text of this line that belongs to each open function body.
+        let mut piece = String::new();
+        let flush = |piece: &mut String, stack: &[Block], out: &mut Vec<FnBody>| {
+            if piece.is_empty() {
+                return;
+            }
+            for block in stack {
+                if let Block::Fn(index) = block {
+                    out[*index].2.push(piece.clone());
+                }
+            }
+            piece.clear();
+        };
+        for c in line.chars() {
+            match c {
+                '{' => {
+                    flush(&mut piece, &stack, &mut out);
+                    let block = if let Some(name) = declared_fn(&header) {
+                        let owner = stack.iter().rev().find_map(|b| match b {
+                            Block::Impl(h) => Some(h.clone()),
+                            _ => None,
+                        });
+                        out.push((owner, name, Vec::new()));
+                        Block::Fn(out.len() - 1)
+                    } else if let Some(h) = declared_impl(&header) {
+                        Block::Impl(h)
+                    } else {
+                        Block::Other
+                    };
+                    stack.push(block);
+                    header.clear();
+                }
+                '}' => {
+                    flush(&mut piece, &stack, &mut out);
+                    stack.pop();
+                    header.clear();
+                }
+                ';' => {
+                    piece.push(c);
+                    header.clear();
+                }
+                _ => {
+                    piece.push(c);
+                    header.push(c);
+                }
+            }
+        }
+        flush(&mut piece, &stack, &mut out);
+        header.push(' ');
+    }
     out
 }

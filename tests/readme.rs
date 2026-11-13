@@ -38,7 +38,7 @@ mod common;
 
 const README: &str = include_str!("../README.md");
 const SOURCE: &str = include_str!("readme.rs");
-const README_RUST_BLOCKS: usize = 21;
+const README_RUST_BLOCKS: usize = 22;
 const MIRROR_MARKER: &str = "// ----- the mirrored blocks and their stubs follow -----";
 
 /// README lines paired with the spelling the mirror uses for them.
@@ -855,6 +855,10 @@ async fn crash_semantics_block(worker: &ActorHandle<Crashy>, job: Job) {
             // but the match must stay exhaustive since both share `AskError`.
             eprintln!("timed out (enqueued: {enqueued})");
         }
+        Err(AskError::CallingSelf) => {
+            // Called from the actor's own task, so nothing could answer.
+            eprintln!("the actor called itself");
+        }
     }
 }
 
@@ -1524,6 +1528,113 @@ fn core_concepts_turn_watchdog() {
         held.stop(StopReason::Graceful).await?;
         held.wait_stopped().await;
         assert_eq!(sys.turn_elapsed(&ids[0]), None);
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Core Concepts: Telemetry
+// ---------------------------------------------------------------------------
+
+/// README: "### Telemetry". The handler and the subscription are each shown
+/// the end of an actor spawned after them, and the snapshot lists the
+/// subscriber. Handlers, subscriptions, the snapshot and the monitor are
+/// tested in `tests/telemetry_handlers.rs`, `tests/telemetry_subscription.rs`,
+/// `tests/telemetry_snapshot.rs` and `tests/system_monitor.rs`.
+#[test]
+fn core_concepts_telemetry() {
+    run_block(async {
+        use tokio_actors::telemetry::{Filter, KindSet, Scope, TelemetryEvent};
+
+        // setup: the system, and the channel the subscriber below reports on.
+        let sys = ActorSystem::create("telemetry-example")?;
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+
+        // A handler is a plain closure. It must not block: hand slow work to a channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TelemetryEvent<'static>>(1024);
+        sys.attach_telemetry("export", KindSet::cold(), move |event| {
+            let _ = tx.try_send(event.to_static());
+        });
+        // A task of yours reads `rx` and does the slow work there.
+
+        // setup: the actor that subscribes, and its message.
+        enum Msg {
+            Event(tokio_actors::telemetry::Delivery),
+        }
+        struct Watcher(mpsc::UnboundedSender<tokio_actors::telemetry::Delivery>);
+
+        impl Actor for Watcher {
+            type Message = Msg;
+            type Response = ();
+
+            async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+                // A subscription, made inside a callback: the selected events arrive as this actor's own messages.
+                let id = ctx.subscribe(Filter::new(Scope::System), Msg::Event);
+                Ok(())
+            }
+
+            async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+                let Msg::Event(delivery) = msg;
+                let _ = self.0.send(delivery);
+                Ok(())
+            }
+        }
+        let watcher = Watcher(seen_tx).spawn().on_system(&sys).await?;
+
+        // setup: an actor that starts and ends after the handler and the subscription exist.
+        let subject = MyActor.spawn().on_system(&sys).await?;
+        let subject_id = subject.id().clone();
+        subject.stop(StopReason::Graceful).await?;
+        subject.wait_stopped().await;
+        let is_its_end = |event: &TelemetryEvent<'_>| matches!(event, TelemetryEvent::ActorEnded { actor, .. } if actor.id() == &subject_id);
+
+        // The handler's channel carries the end of that actor.
+        let by_handler = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match rx.recv().await {
+                    Some(event) if is_its_end(&event) => break true,
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(by_handler, Ok(true), "the handler was not shown the end");
+
+        // And the subscriber handled it as one of its own messages.
+        let by_subscription = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match seen.recv().await {
+                    Some(delivery) if is_its_end(&delivery.event) => break true,
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            by_subscription,
+            Ok(true),
+            "the subscriber was not sent the end"
+        );
+
+        // A record of every registered actor that has not ended, read without asking any of them.
+        for record in sys.snapshot() {
+            println!(
+                "{}: {:?}, mailbox {} of {}",
+                record.actor.id(),
+                record.status,
+                record.mailbox_len,
+                record.mailbox_capacity
+            );
+        }
+        let listed = format!("{}: Running, mailbox ", watcher.id());
+        let out = take_output();
+        assert!(out.iter().any(|line| line.starts_with(&listed)), "{out:?}");
+
+        assert!(sys.detach_telemetry("export"));
+        watcher.stop(StopReason::Graceful).await?;
+        watcher.wait_stopped().await;
         Ok(())
     });
 }

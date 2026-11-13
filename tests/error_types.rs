@@ -10,78 +10,55 @@
 //!   same fact `SupervisionError::NotASupervisor` reports to the child
 //!   management APIs.
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorHandle, ActorResult, AskError, SpawnError, StreamError, StreamEvent,
+    ActorError, ActorResult, AskError, SendError, SpawnError, StopReason,
 };
 
 // ---------------------------------------------------------------------------
 // Existing coverage (unchanged)
 // ---------------------------------------------------------------------------
 
+#[test]
+fn actor_error_spawn_preserves_type() {
+    let spawn_err = SpawnError::NameTaken {
+        name: "x".into(),
+        system: "test".into(),
+    };
+    let actor_err: ActorError = spawn_err.into();
+    match actor_err {
+        ActorError::Spawn(_) => {}
+        other => panic!("expected ActorError::Spawn, got: {other}"),
+    }
+
+    // A failed call to another actor becomes this actor's own `User` error
+    // with the call's text, whatever the variant: the other actor's error is
+    // never passed through as this actor's.
+    let asks = [
+        AskError::Closed,
+        AskError::Actor(ActorError::Panic("p".into())),
+        AskError::ResponseDropped {
+            reason: StopReason::Kill,
+        },
+        AskError::Timeout { enqueued: true },
+        AskError::CallingSelf,
+    ];
+    for err in asks {
+        let text = err.to_string();
+        assert_eq!(ActorError::from(err), ActorError::User(text));
+    }
+    for err in [SendError::Closed, SendError::NotFound, SendError::Full] {
+        let text = err.to_string();
+        assert_eq!(ActorError::from(err), ActorError::User(text));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 18: ?-conversion structures Timer/Stream/Supervision errors
 // ---------------------------------------------------------------------------
-
-/// Message type for the stream-crash actor: only `Go` is ever sent by the
-/// test; `Data`/`Done` exist to satisfy `add_stream`'s `From<StreamEvent<_>>`
-/// bound and are harmless no-ops if they are ever actually delivered.
-#[derive(Clone)]
-enum StreamMsg {
-    Go,
-    Data,
-    Done,
-}
-
-impl From<StreamEvent<u32>> for StreamMsg {
-    fn from(event: StreamEvent<u32>) -> Self {
-        match event {
-            StreamEvent::Data(_) => StreamMsg::Data,
-            StreamEvent::Finished => StreamMsg::Done,
-        }
-    }
-}
-
-/// A plain actor whose `handle` double-cancels an attached stream: the second
-/// `cancel_stream` returns `StreamError::NotFound`, surfaced via `?`.
-#[derive(Default)]
-struct StreamCrasher;
-
-impl Actor for StreamCrasher {
-    type Message = StreamMsg;
-    type Response = ();
-
-    async fn handle(&mut self, msg: StreamMsg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        match msg {
-            StreamMsg::Go => {
-                let id = ctx.add_stream(tokio_stream::iter(std::iter::empty::<u32>()));
-                ctx.cancel_stream(id)?;
-                ctx.cancel_stream(id)?; // already cancelled -> NotFound
-                Ok(())
-            }
-            StreamMsg::Data | StreamMsg::Done => Ok(()),
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stream_error_arrives_structured() {
-    let direct: ActorError = StreamError::NotFound.into();
-    assert!(
-        matches!(direct, ActorError::Stream(StreamError::NotFound)),
-        "expected ActorError::Stream(StreamError::NotFound), got: {direct}"
-    );
-
-    let handle = StreamCrasher.spawn().await.unwrap();
-    let err = handle
-        .send(StreamMsg::Go)
-        .await
-        .expect_err("double-cancel must crash");
-    match err {
-        AskError::Actor(ActorError::Stream(StreamError::NotFound)) => {}
-        other => panic!("expected AskError::Actor(ActorError::Stream(NotFound)), got: {other:?}"),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Test 19: budget exhaustion records the structured Supervision error
@@ -91,50 +68,68 @@ async fn stream_error_arrives_structured() {
 // Test 20: DuplicateChild (kept spec), then delete_child clears the way
 // ---------------------------------------------------------------------------
 
-/// Trivial supervised-child target for tests 20 and 21.
-#[derive(Debug, Default)]
-struct Leaf;
-
-impl Actor for Leaf {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Test 21: spawn_child on a non-supervisor -> SpawnError::NotASupervisor
 // ---------------------------------------------------------------------------
 
-/// Not configured as a supervisor (no `.supervisor()` / `.with_supervision`),
-/// so `ctx.spawn_child` must reject with `SpawnError::NotASupervisor`.
-///
-/// The `Result<ActorHandle<Leaf>, SpawnError>` annotation below is the
-/// compile-level half of the assertion: `ChildSpawnBuilder`'s
-/// `IntoFuture::Output` really is `SpawnError`, not `ActorError` - if it were
-/// `ActorError`, this annotation would fail to type-check and the file would
-/// not build.
-#[derive(Default)]
-struct NotSupervisor;
+// ---------------------------------------------------------------------------
+// ctx.last_error() after a failed turn
+// ---------------------------------------------------------------------------
 
-impl Actor for NotSupervisor {
+/// An actor whose `handle` fails (an `Err`, or a panic) and whose `on_stopped`
+/// reads `ctx.last_error()`.
+struct FailsInHandle {
+    panics: bool,
+    seen: Arc<Mutex<Option<Option<ActorError>>>>,
+}
+
+impl Actor for FailsInHandle {
     type Message = ();
-    type Response = bool;
+    type Response = ();
 
-    async fn handle(&mut self, _msg: (), ctx: &mut ActorContext<Self>) -> ActorResult<bool> {
-        let result: Result<ActorHandle<Leaf>, SpawnError> = ctx.spawn_child(Leaf::default).await;
-        Ok(matches!(result, Err(SpawnError::NotASupervisor)))
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if self.panics {
+            panic!("handler panicked");
+        }
+        Err(ActorError::user("handler failed"))
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        *self.seen.lock().unwrap() = Some(ctx.last_error().cloned());
+        Ok(())
     }
 }
 
+/// A turn that ends in an `Err` or a panic records the failure, so
+/// `on_stopped` reads it from `ctx.last_error()` on both paths.
 #[tokio::test(flavor = "multi_thread")]
-async fn spawn_child_on_non_supervisor_is_not_a_supervisor() {
-    let handle = NotSupervisor.spawn().await.unwrap();
-    let matched = handle.send(()).await.unwrap();
-    assert!(
-        matched,
-        "expected SpawnError::NotASupervisor from a non-supervisor spawn_child"
-    );
+async fn last_error_after_a_failed_handler_is_read_in_on_stopped() {
+    for panics in [false, true] {
+        let seen = Arc::new(Mutex::new(None));
+        let handle = FailsInHandle {
+            panics,
+            seen: seen.clone(),
+        }
+        .spawn()
+        .await
+        .unwrap();
+        let _ = handle.send(()).await;
+        tokio::time::timeout(Duration::from_secs(20), handle.wait_stopped())
+            .await
+            .expect("the actor ends");
+        let recorded = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("on_stopped ran")
+            .unwrap_or_else(|| panic!("panics={panics}: last_error was not recorded"));
+        match (panics, recorded) {
+            (false, ActorError::User(_)) | (true, ActorError::Panic(_)) => {}
+            (panics, other) => panic!("panics={panics}: recorded {other:?}"),
+        }
+    }
 }

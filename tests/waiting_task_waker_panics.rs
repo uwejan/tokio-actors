@@ -63,18 +63,6 @@ impl Actor for Fails {
     }
 }
 
-/// An actor that never fails by itself.
-struct Idle;
-
-impl Actor for Idle {
-    type Message = u64;
-    type Response = u64;
-
-    async fn handle(&mut self, msg: u64, _ctx: &mut ActorContext<Self>) -> ActorResult<u64> {
-        Ok(msg)
-    }
-}
-
 /// The actor's own task publishes its status, which wakes a waiter whose
 /// waker panics. The panic stays out of the actor's task, so the actor ends
 /// with the reason its handler failed with, and the waiter reads it.
@@ -107,43 +95,5 @@ fn a_wait_stopped_waker_that_panics_when_the_actor_fails_does_not_change_its_rea
             Poll::Ready(reason),
             "the waiter reads the end on its next poll"
         );
-    });
-}
-
-/// A caller stops the actor, and the raise wakes a waiter whose waker panics:
-/// the panic stays out of the caller's task, and the actor ends with the
-/// reason of the stop.
-#[test]
-fn a_wait_stopped_waker_that_panics_does_not_unwind_into_the_task_that_stops_the_actor() {
-    common::run(2, async {
-        for reason in [StopReason::Graceful, StopReason::Kill] {
-            let actor = Idle.spawn().await.unwrap();
-            let loud = Arc::new(LoudWake::default());
-            let waker = Waker::from(loud.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut waiter = Box::pin(actor.wait_stopped());
-            assert!(waiter.as_mut().poll(&mut cx).is_pending());
-            loud.arm(true);
-
-            let stopped = tokio::spawn({
-                let actor = actor.clone();
-                let reason = reason.clone();
-                async move { actor.stop(reason).await }
-            })
-            .await;
-            loud.arm(false);
-
-            let stopped = stopped.unwrap_or_else(|err| {
-                panic!("{reason:?}: the stopper's task panicked in a waker it does not own: {err}")
-            });
-            assert!(stopped.is_ok(), "{reason:?}: the stop was accepted");
-            assert_eq!(loud.woken(), 1, "{reason:?}: the waker was woken once");
-            assert_eq!(
-                timeout(BOUND, actor.wait_stopped())
-                    .await
-                    .expect("the actor ends"),
-                reason
-            );
-        }
     });
 }

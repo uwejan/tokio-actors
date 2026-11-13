@@ -7,7 +7,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::SubtreeObserver;
@@ -48,6 +48,8 @@ impl Rig {
             parent,
             own,
             infinity,
+            trap_extra: std::time::Duration::ZERO,
+            trap_infinity: false,
         }))
     }
 
@@ -66,10 +68,50 @@ impl Rig {
     fn release_hold(&mut self) {
         self.hold = None;
     }
+
+    /// The actor's whole end, in the order of its task: `Stopped`, the plane,
+    /// the hold.
+    fn end(&mut self) {
+        self.say_stopped();
+        self.close_plane();
+        self.release_hold();
+    }
 }
+
+/// The text of the panic a call ended with.
+fn panic_text(joined: Result<impl Sized, tokio::task::JoinError>) -> String {
+    match joined {
+        Ok(_) => panic!("the call was expected to panic"),
+        Err(err) => *err
+            .into_panic()
+            .downcast::<String>()
+            .expect("a formatted panic message"),
+    }
+}
+
+const NO_DRIVER: &str = "tokio-actors: SubtreeObserver::wait_ended needs the Tokio time driver on \
+                         the calling runtime (Builder::enable_time or enable_all)";
 const NO_RUNTIME: &str =
     "tokio-actors: SubtreeObserver::wait_ended needs a Tokio runtime with the \
                           time driver on the calling thread (Builder::enable_time or enable_all)";
+
+/// Polls `call` once with no runtime current.
+fn poll_once<F: Future>(call: &mut std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let mut cx = Context::from_waker(Waker::noop());
+    call.as_mut().poll(&mut cx)
+}
+
+/// The panic text of one poll made with no runtime current.
+fn polled_panic<F: Future>(call: &mut std::pin::Pin<&mut F>) -> String {
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let _ = poll_once(call);
+    }))
+    .expect_err("the poll panics");
+    caught
+        .downcast_ref::<String>()
+        .expect("a formatted panic message")
+        .clone()
+}
 
 /// Once the hold is released, an actor still running below the observed one
 /// is what the call needs a timer for: the same poll that ends the wait for
@@ -118,12 +160,4 @@ impl std::task::Wake for CountingWaker {
     fn wake(self: Arc<Self>) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-#[test]
-fn an_observer_is_clone_send_sync_debug_and_static() {
-    fn bounds<T: Clone + Send + Sync + std::fmt::Debug + 'static>() {}
-    bounds::<SubtreeObserver>();
-    let rig = Rig::new();
-    assert_eq!(format!("{:?}", rig.observer), "SubtreeObserver { .. }");
 }

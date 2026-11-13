@@ -12,7 +12,10 @@ pub type ActorResult<T> = Result<T, ActorError>;
 /// `User` is reserved for actor-authored errors (see [`ActorError::user`]).
 /// `Timer`, `Stream`, and `Supervision` carry their source error
 /// structurally - matchable as `ActorError::Timer(TimerError::NotFound)` and
-/// so on via `?` - instead of collapsing it into a display string.
+/// so on via `?` - instead of collapsing it into a display string. A failed
+/// call to another actor converts with `?` too: an [`AskError`] or a
+/// [`SendError`] becomes [`User`](ActorError::User) with the error's text, so
+/// this actor's exit reads as its own failure and not as the other actor's.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ActorError {
     /// A custom error message from the actor.
@@ -33,12 +36,55 @@ pub enum ActorError {
     /// A supervision operation failed.
     #[error(transparent)]
     Supervision(#[from] SupervisionError),
+    /// The actor was linked to an actor that was not running when the link
+    /// was made, so it ends with this error unless it traps exits. The
+    /// payload names the actor the link was made to. Erlang/OTP: the exit
+    /// reason `noproc`.
+    #[error("noproc: {0}")]
+    NoProc(ActorId),
+    /// A supervisor with
+    /// [`strict_start`](crate::actor::supervision::SupervisionConfig::with_strict_start)
+    /// failed to start because one of the children it spawned while starting
+    /// ended its own initialization with an error. It names the child and
+    /// carries the child's own error. Erlang/OTP: the supervisor's
+    /// start returns `{error, {shutdown, {failed_to_start_child, Id, Reason}}}`.
+    #[error("child `{child}` failed to start: {error}")]
+    ChildStart {
+        /// The id of the child that failed to start.
+        child: ActorId,
+        /// The error the child's initialization ended with.
+        error: Box<ActorError>,
+    },
 }
 
 impl ActorError {
     /// Creates a new user-defined error.
     pub fn user(message: impl Into<String>) -> Self {
         Self::User(message.into())
+    }
+}
+
+/// `?` on a call to another actor inside a callback: the error becomes
+/// [`ActorError::User`] with the error's text, whatever its variant, so the
+/// callback fails this actor with that text. The other actor's own error
+/// (`AskError::Actor`) is not passed through: this actor's exit names a
+/// failure of its own, never the other actor's panic or failed start. The exit
+/// is a [`Failure`](StopReason::Failure), so a `Transient` child that fails
+/// this way is restarted, an end of the other actor with
+/// [`Shutdown`](StopReason::Shutdown) included.
+impl From<AskError> for ActorError {
+    fn from(err: AskError) -> Self {
+        Self::User(err.to_string())
+    }
+}
+
+/// `?` on a `notify` to another actor inside a callback: the error becomes
+/// [`ActorError::User`] with the error's text, so the callback fails this
+/// actor with that text, and a `Transient` child that fails this way is
+/// restarted.
+impl From<SendError> for ActorError {
+    fn from(err: SendError) -> Self {
+        Self::User(err.to_string())
     }
 }
 
@@ -53,6 +99,12 @@ pub enum SendError {
     /// No actor is registered under the given name or ID.
     #[error("no actor registered under this name")]
     NotFound,
+    /// A waiting send was made from the actor's own task to its own full
+    /// mailbox or priority lane: only that task makes room, so the wait could
+    /// never end. The message was not sent. Returned only to the actor's own
+    /// task; a send with room goes through as from any other task.
+    #[error("the actor's own mailbox is full, so its own send could never complete")]
+    Full,
 }
 
 /// Failures encountered while sending without awaiting capacity.
@@ -66,9 +118,29 @@ pub enum TrySendError {
     Closed,
 }
 
+/// Why [`ActorContext::stop`](crate::actor::context::ActorContext::stop)
+/// did not stop the actor.
+///
+/// Both variants say that nothing was written to the actor's stop lane.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum StopError {
+    /// The stop lane takes no request any more because it is sealed or the
+    /// actor's task has ended. A callback of a live actor does not meet it:
+    /// until its teardown seals the lane, a request is accepted, and from
+    /// `on_stopped` it changes nothing.
+    #[error("the actor's stop lane is closed")]
+    Closed,
+    /// The reason was [`StopReason::Kill`]. An actor
+    /// does not kill itself through its context: a `Kill` is raised through
+    /// a handle or the system, which declare its deadline and arm its
+    /// backstop.
+    #[error("an actor cannot kill itself through its context")]
+    KillRefused,
+}
+
 /// Errors reported when awaiting a response from an actor.
 ///
-/// The four variants encode four distinct facts:
+/// The variants encode distinct facts:
 /// - [`Closed`](AskError::Closed): the request was never enqueued - it was
 ///   definitely NOT processed. Safe to retry unconditionally.
 /// - [`ResponseDropped`](AskError::ResponseDropped): the actor stopped after
@@ -105,6 +177,9 @@ pub enum TrySendError {
 ///   handler is never cancelled by the deadline: it keeps running, and a
 ///   reply that arrives afterward lands in a dropped `oneshot` and is
 ///   silently discarded.
+/// - [`CallingSelf`](AskError::CallingSelf): the call was made from the
+///   target actor's own task, so the request was not sent: nothing could
+///   answer it.
 #[derive(Debug, Error, Clone)]
 pub enum AskError {
     /// The actor's mailbox was closed before the request could be enqueued.
@@ -135,6 +210,12 @@ pub enum AskError {
         /// deadline elapsed.
         enqueued: bool,
     },
+    /// The actor called itself: the request was made from the actor's own
+    /// task, so the actor, busy running the callback that made it, could
+    /// never have answered. The request was not sent. Erlang/OTP refuses the
+    /// same call with `calling_self`.
+    #[error("the actor called itself, so the request could never be answered")]
+    CallingSelf,
 }
 
 /// Failures encountered when spawning a child actor.
@@ -227,6 +308,11 @@ pub enum SpawnError {
     /// reports the same case to the starter as `{error, killed}`.
     #[error("actor was killed before its spawn was answered")]
     Killed,
+    /// The actor that asked for a monitored or linked spawn is stopping or has
+    /// stopped. Nothing was spawned: a stopping actor takes no new monitor or
+    /// link, because the notices it is owed were fixed when its stop began.
+    #[error("the spawning actor is stopping")]
+    OwnerStopping,
     /// [`ActorContext::spawn_child`](crate::actor::context::ActorContext::spawn_child)
     /// was called on an actor with no supervision config. This is the
     /// spawn-time surface of the fact; [`SupervisionError::NotASupervisor`]
@@ -241,15 +327,24 @@ pub enum SpawnError {
     /// A previous actor under this id, or an actor it spawned, did not end in
     /// time, so no new actor was started beside it. The wait is bounded by the
     /// longest chain of stop budgets in the subtree (a worker's kill grace, a
-    /// supervisor child's `Shutdown` window plus its kill grace), each followed
-    /// by a short settle time, plus one more settle time, and unbounded only
-    /// while a supervisor child under `Shutdown::Infinity` runs in it or a
-    /// budget is too large to represent. Past that bound, the wait gives no
-    /// verdict on an actor before the abort the system owes it has had the
-    /// settle time to end it: an abort that is late holds the wait, for at most
-    /// the bound once more plus one more settle time.
+    /// supervisor child's `Shutdown` window plus its kill grace, and for a
+    /// worker that has called `trap_exit` its own `Shutdown` window as well),
+    /// each followed by a short settle time, plus one more settle time, and
+    /// unbounded only while a supervisor child under `Shutdown::Infinity` runs
+    /// in it, or a worker under `Infinity` that traps exit signals, or a budget
+    /// is too large to represent. Past that bound, the wait gives no verdict on
+    /// an actor before the abort the system owes it has had the settle time to
+    /// end it: an abort that is late holds the wait, for at most the bound once
+    /// more plus one more settle time.
     #[error("a previous actor under `{0}`, or one it spawned, did not end in time")]
     ChildUnresponsive(ActorId),
+    /// The supervision setup combines options that Erlang/OTP refuses: a
+    /// non-`Never` [`AutoShutdown`](crate::actor::supervision::AutoShutdown)
+    /// with `SimpleOneForOne`, a significant child under `AutoShutdown::Never`,
+    /// or a significant `Permanent` child. The text names the combination.
+    /// Nothing was started and no factory ran.
+    #[error("invalid supervision setup: {0}")]
+    InvalidSupervision(&'static str),
 }
 
 /// Errors emitted by the timer subsystem.
@@ -270,6 +365,228 @@ pub enum StreamError {
     /// The specified stream ID was not found (already finished or cancelled).
     #[error("stream id not found")]
     NotFound,
+}
+
+/// Errors emitted by the monitor subsystem.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::{
+///     actor::{context::ActorContext, Actor, ActorExt},
+///     ActorResult, MonitorError, StopReason,
+/// };
+///
+/// struct Probe(tokio::sync::mpsc::UnboundedSender<Result<(), MonitorError>>);
+///
+/// impl Actor for Probe {
+///     type Message = ();
+///     type Response = ();
+///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+///         Ok(())
+///     }
+///     async fn on_stopped(
+///         &mut self,
+///         _: &StopReason,
+///         ctx: &mut ActorContext<Self>,
+///     ) -> ActorResult<()> {
+///         // The actor is stopping, so it takes no new monitor.
+///         let me = ctx.self_handle();
+///         let _ = self.0.send(ctx.monitor(&me, |_| ()).map(|_| ()));
+///         Ok(())
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+/// let probe = Probe(tx).spawn().await?;
+/// probe.stop(StopReason::Graceful).await?;
+/// assert_eq!(rx.recv().await, Some(Err(MonitorError::Stopping)));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MonitorError {
+    /// The actor is stopping or has stopped, so a new monitor is refused:
+    /// the notices it still owes were fixed when its stop began, and one made
+    /// now would have no turn to be delivered in.
+    #[error("the actor is stopping, so it takes no new monitor")]
+    Stopping,
+}
+
+/// Why [`ActorContext::request`](crate::actor::context::ActorContext::request)
+/// made no request.
+///
+/// Nothing was sent in either case.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::{
+///     actor::{context::ActorContext, Actor, ActorExt},
+///     ActorHandle, ActorResult, RequestError,
+/// };
+///
+/// struct Echo;
+///
+/// impl Actor for Echo {
+///     type Message = u32;
+///     type Response = u32;
+///     async fn handle(&mut self, msg: u32, _: &mut ActorContext<Self>) -> ActorResult<u32> {
+///         Ok(msg)
+///     }
+/// }
+///
+/// struct Asker(ActorHandle<Echo>);
+///
+/// impl Actor for Asker {
+///     type Message = ();
+///     type Response = Result<(), RequestError>;
+///     async fn handle(
+///         &mut self,
+///         _: (),
+///         ctx: &mut ActorContext<Self>,
+///     ) -> ActorResult<Result<(), RequestError>> {
+///         // At most one request may be in flight, so the second is refused.
+///         ctx.set_request_cap(1);
+///         ctx.request(&self.0, 1, |_| ()).expect("the first fits");
+///         Ok(ctx.request(&self.0, 2, |_| ()).map(|_| ()))
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let echo = Echo.spawn().await?;
+/// let asker = Asker(echo).spawn().await?;
+/// assert_eq!(asker.send(()).await?, Err(RequestError::InFlightLimit));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// The actor is stopping or has stopped, so a new request is refused: a
+    /// reply still pending when the stop began is dropped, and one made now
+    /// would have no turn to be delivered in.
+    #[error("the actor is stopping, so it makes no new request")]
+    Stopping,
+    /// The actor already has as many requests in flight as its cap allows:
+    /// the capacity of its mailbox, or the value
+    /// [`set_request_cap`](crate::actor::context::ActorContext::set_request_cap)
+    /// gave. A request leaves the count when its reply reaches `handle` or it
+    /// is cancelled.
+    #[error("the actor has as many requests in flight as its cap allows")]
+    InFlightLimit,
+}
+
+/// Errors emitted by the link subsystem.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::{
+///     actor::{context::ActorContext, Actor, ActorExt},
+///     ActorResult, LinkError, StopReason,
+/// };
+///
+/// struct Probe(tokio::sync::mpsc::UnboundedSender<Result<(), LinkError>>);
+///
+/// impl Actor for Probe {
+///     type Message = ();
+///     type Response = ();
+///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+///         Ok(())
+///     }
+///     async fn on_stopped(
+///         &mut self,
+///         _: &StopReason,
+///         ctx: &mut ActorContext<Self>,
+///     ) -> ActorResult<()> {
+///         // The actor is stopping, so it takes no new link.
+///         let other = ctx.actor_id().clone();
+///         let _ = self.0.send(ctx.link(&other));
+///         Ok(())
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+/// let probe = Probe(tx).spawn().await?;
+/// probe.stop(StopReason::Graceful).await?;
+/// assert_eq!(rx.recv().await, Some(Err(LinkError::Stopping)));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LinkError {
+    /// The actor is stopping or has stopped, so a new link is refused: the
+    /// exits it still owes were fixed when its stop began, and one made now
+    /// would have no turn to be delivered in.
+    #[error("the actor is stopping, so it takes no new link")]
+    Stopping,
+}
+
+/// Errors an exit signal sent with
+/// [`ActorContext::exit`](crate::actor::context::ActorContext::exit) or
+/// [`exit_priority`](crate::actor::context::ActorContext::exit_priority)
+/// returns.
+///
+/// Erlang/OTP: `exit/2` always delivers the signal; here the signals that
+/// wait for a trapping actor are bounded by its mailbox capacity (64 for one
+/// that traps without having called `trap_exit`, as a supervisor does).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ExitError {
+    /// The target traps exit signals, and as many signals already wait for
+    /// it as its bound allows: the signal was not sent.
+    #[error("the target's exit queue is full")]
+    Full,
+}
+
+/// Errors a send through an [`Alias`](crate::Alias) returns.
+///
+/// Erlang/OTP: a message sent through an alias that is not active is dropped
+/// without a word; here the send says so.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::AliasError;
+///
+/// assert_eq!(AliasError::Inactive.to_string(), "the alias has ended");
+/// ```
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AliasError {
+    /// The alias has ended: its owner called `unalias`, or it is a reply alias
+    /// that took its message. The message was dropped.
+    #[error("the alias has ended")]
+    Inactive,
+    /// The actor's mailbox is closed: the actor is stopping or has stopped, and
+    /// every alias of it ends with it.
+    #[error("mailbox closed")]
+    Closed,
+    /// The queue the message needs is full, and the call does not wait: a
+    /// `try_` send, or a waiting send made from the actor's own task, which
+    /// is the only task that makes room.
+    #[error("mailbox full")]
+    Full,
+}
+
+/// Errors a process group operation returns.
+///
+/// Erlang/OTP: `pg:join/3` answers `ok` for any pid and removes a dead one a
+/// moment later, and `pg:leave/3` answers `not_joined`; this crate refuses a
+/// join that cannot succeed, with one outcome for each condition.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PgError {
+    /// The handle belongs to an actor of another system than the scope's. A
+    /// scope belongs to one system, and only actors of that system can be its
+    /// members.
+    #[error("the actor belongs to another system than the scope")]
+    ForeignSystem,
+    /// The run the handle names has ended, or ended while the join was made,
+    /// so it was not added: a member that has ended is never listed.
+    #[error("the actor has ended, so it cannot join a group")]
+    NoProc,
+    /// The actor is not a member of the group, so there is nothing to leave.
+    #[error("the actor is not a member of the group")]
+    NotJoined,
 }
 
 /// Errors emitted by the supervision subsystem.
@@ -304,18 +621,88 @@ pub enum SupervisionError {
     /// spawned did not end in time. The supervisor stops waiting instead of
     /// hanging. A wait for the child's subtree is bounded by the longest chain
     /// of stop budgets in the subtree (a worker's kill grace, a supervisor
-    /// child's `Shutdown` window plus its kill grace), each followed by a short
-    /// settle time, plus one more settle time, and unbounded only while a
-    /// supervisor child under `Shutdown::Infinity` runs in it or a budget is
-    /// too large to represent. Past that bound, the wait gives no verdict on an
-    /// actor before the abort the system owes it has had the settle time to end
-    /// it: an abort that is late holds the wait, for at most the bound once
-    /// more plus one more settle time. A child that has ended itself is named
-    /// when an actor it spawned is the one that did not end.
+    /// child's `Shutdown` window plus its kill grace, and for a worker that has
+    /// called `trap_exit` its own `Shutdown` window as well), each followed by
+    /// a short settle time, plus one more settle time, and unbounded only while
+    /// a supervisor child under `Shutdown::Infinity` runs in it, or a worker
+    /// under `Infinity` that traps exit signals, or a budget is too large to
+    /// represent. Past that bound, the wait gives no verdict on an actor before
+    /// the abort the system owes it has had the settle time to end it: an abort
+    /// that is late holds the wait, for at most the bound once more plus one
+    /// more settle time. A child that has ended itself is named when an actor
+    /// it spawned is the one that did not end.
     #[error("child `{0}` or an actor it spawned did not end in time")]
     ChildUnresponsive(ActorId),
     /// Returned by a supervision call made inside `on_child_stopped` while
     /// the supervisor itself is stopping.
     #[error("the supervisor is stopping")]
     SupervisorStopping,
+}
+
+/// Errors of a call made through a
+/// [`SupervisorRef`](crate::actor::supervisor_ref::SupervisorRef).
+///
+/// - [`CallingSelf`](Self::CallingSelf): the call was made from the
+///   supervisor's own task, so nothing was sent: the supervisor serves a
+///   request only between its callbacks and could never answer it.
+/// - [`Gone`](Self::Gone): the supervisor ended before it answered.
+/// - [`Timeout`](Self::Timeout) and [`NoTimeDriver`](Self::NoTimeDriver): the
+///   reference was given a bound with
+///   [`timeout`](crate::actor::supervisor_ref::SupervisorRef::timeout); the
+///   call was not answered within it, or the calling runtime has no time
+///   driver to keep it.
+/// - [`Supervision`](Self::Supervision) and [`Spawn`](Self::Spawn): the
+///   supervisor answered with the error the same call has on its context.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::{
+///     actor::{context::ActorContext, Actor, ActorExt},
+///     ActorResult, StopReason, SupervisorRef, SupervisorRefError,
+/// };
+///
+/// struct Boss;
+/// impl Actor for Boss {
+///     type Message = ();
+///     type Response = ();
+///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+///         Ok(())
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let boss = Boss.spawn().named("sref-error-doc").supervisor().await?;
+/// let sup = SupervisorRef::of(&boss);
+/// boss.stop(StopReason::Graceful).await?;
+/// boss.wait_stopped().await;
+/// assert_eq!(sup.count_children().await, Err(SupervisorRefError::Gone));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SupervisorRefError {
+    /// The call was made from the supervisor's own task; nothing was sent.
+    #[error("the call was made from the supervisor's own task")]
+    CallingSelf,
+    /// The supervisor ended before it answered.
+    #[error("the supervisor ended")]
+    Gone,
+    /// The call was not answered within the bound set with
+    /// [`timeout`](crate::actor::supervisor_ref::SupervisorRef::timeout). A
+    /// request that was already queued is still served.
+    #[error("the call was not answered within its bound")]
+    Timeout,
+    /// The reference has a bound and the calling runtime has no time driver to
+    /// keep it; nothing was sent. Not returned with `panic = "abort"` on a
+    /// runtime that lacks the driver, where the check cannot tell and the
+    /// call ends the process; with no runtime current it is still returned.
+    #[error("the runtime has no time driver")]
+    NoTimeDriver,
+    /// The child management call failed.
+    #[error(transparent)]
+    Supervision(#[from] SupervisionError),
+    /// The child could not be started.
+    #[error(transparent)]
+    Spawn(#[from] SpawnError),
 }

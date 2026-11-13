@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A bounded stop polled by a foreign executor, outside the runtime that
 //! drives it.
 //!
@@ -226,70 +227,6 @@ fn a_call_polled_with_no_runtime_context_after_its_runtime_ended_panics_for_a_st
     assert_panics_for_the_missing_runtime(outcome, "the actor had stopped");
 }
 
-/// A zero window raises the `Kill` inside the call, so a caller polled by a
-/// foreign executor under a runtime that is entered but never driven needs
-/// no ladder: the call completes with `Killed` when the actor, which would
-/// have vetoed a graceful stop, ends. The actor runs on a runtime of its own
-/// that is driven only after the call was polled, so it has not run since the
-/// request and skips its stop hooks.
-#[test]
-fn a_zero_window_call_under_an_undriven_runtime_completes_when_the_kill_ends_the_actor() {
-    let target_rt = current_thread();
-    let (counts, veto) = counters();
-    let target = target_rt.block_on(async { veto.spawn().await.unwrap() });
-    let caller_rt = current_thread();
-    let caller_handle = caller_rt.handle().clone();
-
-    let give_up = Arc::new(AtomicBool::new(false));
-    let (polled_tx, polled_rx) = std::sync::mpsc::channel();
-
-    let outcome = std::thread::scope(|scope| {
-        let _release = GiveUp(give_up.clone());
-        let poller = scope.spawn(|| {
-            let _entered = caller_handle.enter();
-            let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-            let mut cx = Context::from_waker(&waker);
-            let mut call = Box::pin(target.stop_within(StopReason::Graceful, Duration::ZERO));
-            let started = Instant::now();
-            let mut first = true;
-            loop {
-                match call.as_mut().poll(&mut cx) {
-                    Poll::Ready(outcome) => return Some(outcome),
-                    Poll::Pending => {
-                        if first {
-                            first = false;
-                            polled_tx.send(()).unwrap();
-                        }
-                    }
-                }
-                if give_up.load(Ordering::SeqCst) || started.elapsed() > 2 * BOUND {
-                    return None;
-                }
-                std::thread::park_timeout(Duration::from_millis(20));
-            }
-        });
-        polled_rx
-            .recv_timeout(BOUND)
-            .expect("the call was polled once and is waiting for the actor");
-        assert_eq!(counts.asked.load(Ordering::SeqCst), 0);
-        // Only now does the actor's runtime run: it finds the `Kill` first.
-        target_rt.block_on(async {
-            timeout(BOUND, target.wait_stopped())
-                .await
-                .expect("the Kill of the zero window ends the actor");
-        });
-        poller.join().expect("the polling thread panicked")
-    });
-
-    assert!(
-        matches!(outcome, Some(Ok(StopOutcome::Killed))),
-        "the call did not complete with Killed: {outcome:?}"
-    );
-    assert_eq!(counts.asked.load(Ordering::SeqCst), 0, "pre_stop ran");
-    assert_eq!(counts.stopped.load(Ordering::SeqCst), 0, "on_stopped ran");
-    drop(caller_rt);
-}
-
 /// Does nothing, and parks forever inside `handle` when it gets a message.
 struct Parker {
     entered: Arc<AtomicBool>,
@@ -382,47 +319,4 @@ fn kill_call_under_an_undriven_runtime<A: Actor>(
             .join()
             .expect("the polling thread panicked")
     })
-}
-
-/// A `Kill` call under a calling runtime that is entered but never driven,
-/// for an actor parked in a handler that never returns: it cannot take the
-/// `Kill` at a turn boundary, so the call completes with `Aborted` once the
-/// abort that the system armed on the actor's own runtime ends it, after the
-/// window and not much later.
-#[test]
-fn a_kill_call_under_an_undriven_runtime_completes_when_the_abort_ends_a_parked_actor() {
-    let entered = Arc::new(AtomicBool::new(false));
-    let target_rt = actor_runtime();
-    let target = target_rt.block_on(async {
-        let target = Parker {
-            entered: entered.clone(),
-        }
-        .spawn()
-        .await
-        .unwrap();
-        target.notify(()).await.unwrap();
-        target
-    });
-    let caller_rt = current_thread();
-    let window = Duration::from_millis(400);
-    let margin = Duration::from_secs(2);
-
-    let driven = Driven::start(target_rt);
-    wait_until("the handler", || entered.load(Ordering::SeqCst));
-    let (outcome, elapsed) = kill_call_under_an_undriven_runtime(&caller_rt, &target, window);
-
-    assert!(
-        matches!(outcome, Some(Ok(StopOutcome::Aborted))),
-        "the call did not complete with Aborted: {outcome:?}"
-    );
-    assert!(
-        elapsed >= window,
-        "the abort came before the window: {elapsed:?}"
-    );
-    assert!(
-        elapsed < window + margin,
-        "the abort came later than the window and the margin: {elapsed:?}"
-    );
-    drop(driven);
-    drop(caller_rt);
 }

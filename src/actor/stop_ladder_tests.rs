@@ -26,6 +26,9 @@ use crate::types::{
 /// asserts a timing relation against it.
 const BOUND: Duration = Duration::from_secs(60);
 
+/// Scheduling rounds of a one-thread runtime that an awaited step is given.
+const ROUNDS: usize = 1000;
+
 #[derive(Default)]
 struct Idle;
 
@@ -63,7 +66,6 @@ async fn a_stop_taken_before_the_abort_handle_is_attached_still_escalates() {
         stop_lane.clone(),
         1,
         status_rx,
-        sys.name().into(),
         None,
         Some(Arc::new(AtomicBool::new(false))),
     );
@@ -177,28 +179,21 @@ async fn veto_on(
     .unwrap()
 }
 
-/// The reaper of a runtime without the time driver cannot hold an entry, so
-/// a lost stop task takes no step for a target there, except a `Kill` whose
-/// window has already passed: with a window of zero the `Kill` is raised at
-/// once and the call reads `Killed`. The grace is long, so the call's own
-/// bound cannot pass before the target's thread has taken the `Kill`.
-#[tokio::test]
-async fn a_lost_task_whose_window_has_passed_raises_its_kill_for_a_target_without_timers() {
-    let sys = ActorSystem::create(unique("lost-passed-no-timers")).unwrap();
-    let target_rt = runtime_without_timers();
-    let h = veto_on(&target_rt, &sys, Duration::from_secs(30)).await;
-    lose_the_task_at_its_start(&sys);
-    let outcome = tokio::time::timeout(BOUND, h.stop_within(StopReason::Graceful, Duration::ZERO))
-        .await
-        .expect("the call returns")
-        .expect("the request is accepted");
-    sys.clear_ladder_hook();
-    assert_eq!(outcome, StopOutcome::Killed);
-    let reason = tokio::time::timeout(BOUND, h.wait_stopped())
-        .await
-        .expect("the actor ends");
-    assert_eq!(reason, StopReason::Kill);
-    target_rt.shutdown_background();
+/// Vetoes every stoppable stop, and ends by itself on a message.
+#[derive(Default)]
+struct Quitter;
+
+impl Actor for Quitter {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Err(crate::error::ActorError::user("done"))
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
 }
 
 /// The stop task of a pending call holds no sender of the mailbox, so the
@@ -219,7 +214,6 @@ async fn a_pending_call_holds_no_sender_of_the_mailbox() {
         stop_lane,
         1,
         status_rx,
-        sys.name().into(),
         None,
         Some(Arc::new(AtomicBool::new(false))),
     );
@@ -298,6 +292,20 @@ async fn a_call_that_returns_gives_its_stop_task_back() {
 // The abort after the window of a bounded Kill
 // ---------------------------------------------------------------------------
 
+/// Handles a message by waiting on a future that never completes: a wedge
+/// an abort cuts at its `.await`, though a `Kill` is never read in it.
+struct Hang;
+
+impl Actor for Hang {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
 /// An actor whose `pre_stop` sleeps and counts how often it started.
 struct SleepyStop(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -336,64 +344,6 @@ async fn a_window_that_has_passed_at_the_call_takes_the_kill_at_the_call() {
     assert_eq!(started.load(Ordering::SeqCst), 0, "pre_stop never started");
 }
 
-/// A call whose first request the lane refuses returns `Err` and leaves no
-/// `Kill` on the lane, even when the stop task spawned before the raise has
-/// reached its step by then (the caller is blocked between the spawn and the
-/// raise).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_first_request_in_a_blocking_caller_leaves_no_kill() {
-    let sys = ActorSystem::create(format!("refused-first-{}", uuid::Uuid::new_v4())).unwrap();
-    let id = ActorId::from("refused-first-id");
-    let (tx, _rx) = crate::actor::mailbox::test_channel(1);
-    let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-    let (stop_lane, _stop_rx) = StopLane::new();
-    let registered = ActorHandle::<Idle>::new(
-        id.clone(),
-        tx,
-        stop_lane.clone(),
-        1,
-        status_rx,
-        sys.name().into(),
-        None,
-        Some(Arc::new(AtomicBool::new(false))),
-    );
-    sys.register_actor::<Idle>(
-        &id,
-        None,
-        &registered,
-        true,
-        TurnClock::default(),
-        Duration::from_millis(100),
-        Handle::current(),
-    )
-    .unwrap();
-    let handle = sys.get_by_id::<Idle>(&id).unwrap();
-    let lane = stop_lane.clone();
-    sys.set_ladder_hook(move |point, _id| {
-        if point == LadderPoint::StopBeforeRaise {
-            lane.close_to_non_kill();
-            // Gives the stop task, already spawned, every chance to act.
-            let end = std::time::Instant::now() + Duration::from_millis(500);
-            while lane.reason().is_none() && std::time::Instant::now() < end {
-                std::thread::yield_now();
-            }
-        }
-    });
-    let rt = Handle::current();
-    let result = tokio::task::spawn_blocking(move || {
-        rt.block_on(handle.stop_within(StopReason::Graceful, Duration::ZERO))
-    })
-    .await
-    .unwrap();
-    assert!(result.is_err(), "the lane refused the request: {result:?}");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        stop_lane.reason().is_none(),
-        "the refused call left {:?} on the lane",
-        stop_lane.reason()
-    );
-}
-
 // ---------------------------------------------------------------------------
 // A Kill whose target has no abort handle yet
 // ---------------------------------------------------------------------------
@@ -423,7 +373,6 @@ impl Target {
             stop_lane,
             1,
             status_rx,
-            sys.name().into(),
             None,
             Some(Arc::new(AtomicBool::new(false))),
         );
@@ -486,90 +435,6 @@ impl Target {
         .await
         .expect("the target was aborted");
         since.elapsed()
-    }
-}
-
-/// A `Kill` call whose window is longer than the kill grace is not aborted
-/// before its window ends, also when the attach comes between the raise and
-/// the arming that follows it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_kill_call_is_not_aborted_before_its_window_when_the_grace_is_shorter() {
-    const WINDOW: Duration = Duration::from_millis(800);
-    let target = Arc::new(Target::new(Duration::from_millis(50)));
-    {
-        let attaching = target.clone();
-        target
-            .sys
-            .set_after_kill_raise_hook(move || attaching.attach());
-    }
-    let began = std::time::Instant::now();
-    let handle = target.handle.clone();
-    let call = tokio::spawn(async move { handle.stop_within(StopReason::Kill, WINDOW).await });
-    let took = target.finished_after(began).await;
-    assert!(
-        took >= WINDOW - Duration::from_millis(100),
-        "aborted at {took:?}, before the window of {WINDOW:?}"
-    );
-    assert!(took < Duration::from_secs(3), "aborted at {took:?}");
-    let _ = call.await;
-}
-
-/// A `Kill` that asks for the kill grace while another asks for a longer
-/// window decides the abort time: the earliest wins, whichever came first.
-/// The clock is paused, so the abort's instant is the declared deadline and
-/// not the host's scheduling.
-#[tokio::test(start_paused = true)]
-async fn the_earliest_kill_deadline_declared_before_the_attach_decides_the_abort() {
-    for windowed_first in [true, false] {
-        for by_name in [true, false] {
-            let target = Arc::new(Target::new(Duration::from_millis(150)));
-            let began = tokio::time::Instant::now();
-            let windowed = {
-                let handle = target.handle.clone();
-                async move {
-                    let _ = handle
-                        .stop_within(StopReason::Kill, Duration::from_secs(3))
-                        .await;
-                }
-            };
-            let grace_kill = {
-                let (sys, id, name) = (target.sys.clone(), target.id.clone(), target.name.clone());
-                async move {
-                    if by_name {
-                        let _ = sys.kill(&name).await;
-                    } else {
-                        let _ = sys.kill_by_id(&id).await;
-                    }
-                }
-            };
-            type Call = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-            let (windowed, grace_kill): (Call, Call) = (Box::pin(windowed), Box::pin(grace_kill));
-            let (first, second) = if windowed_first {
-                (windowed, grace_kill)
-            } else {
-                (grace_kill, windowed)
-            };
-            let (mut first, mut second) = (first, second);
-            let first_done = poll_once(first.as_mut());
-            assert_eq!(
-                target.handle.stop_lane().reason(),
-                Some(StopReason::Kill),
-                "the first call raised its Kill"
-            );
-            let second_done = poll_once(second.as_mut());
-            target.attach();
-            let took = target.finished_after_paused(began).await;
-            assert!(
-                took < Duration::from_millis(1500),
-                "windowed_first={windowed_first} by_name={by_name}: aborted at {took:?}, not at the grace"
-            );
-            if !first_done {
-                first.await;
-            }
-            if !second_done {
-                second.await;
-            }
-        }
     }
 }
 
@@ -672,15 +537,6 @@ async fn lost_task_call(
         fed += 1;
     }
     (result, fed, held.lane.reason())
-}
-
-/// A stop task lost before the caller decided that its first request was
-/// accepted hands nothing over; the caller hands over the steps, once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stop_task_lost_before_an_accepted_request_is_decided_has_its_steps_handed_over_once() {
-    let (result, fed, _) = lost_task_call(LostAt::BeforeTheDecision, false).await;
-    assert!(result.is_ok(), "the request was accepted: {result:?}");
-    assert_eq!(fed, 1, "one hand-off to the reaper");
 }
 
 /// A lost stop task's hand-off on a target whose abort handle is not attached

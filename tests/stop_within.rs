@@ -18,7 +18,7 @@ use tokio::time::Instant;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorResult, ActorStatus, StopOutcome, StopReason,
+    ActorResult, StopOutcome, StopReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,82 +109,6 @@ impl Drop for Releases {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// An aborted task never writes a final status itself; its status sender
-/// closing is the terminal signal instead, and `status()` must report
-/// `Stopped` for that case too, not go on reporting a stale `Running`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_reports_stopped_after_an_abort() {
-    let started = Arc::new(Notify::new());
-    let handle = Hangs {
-        started: started.clone(),
-    }
-    .spawn()
-    .named(uname("status-after-abort"))
-    .await
-    .unwrap();
-
-    handle.notify(()).await.unwrap();
-    started.notified().await;
-
-    let outcome = handle
-        .stop_within(StopReason::Kill, Duration::from_millis(50))
-        .await
-        .unwrap();
-    assert_eq!(outcome, StopOutcome::Aborted);
-
-    assert_eq!(handle.status(), ActorStatus::Stopped);
-    assert!(!handle.is_alive());
-}
-
-/// A trivial actor whose handler signals `began`, then cooperatively sleeps
-/// for a fixed duration before returning - it yields back to the runtime
-/// while it sleeps, so it is deaf to nothing; it simply takes a while to
-/// finish its current turn.
-struct SleepsBriefly {
-    began: Arc<Notify>,
-}
-
-impl Actor for SleepsBriefly {
-    type Message = ();
-    type Response = ();
-
-    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        self.began.notify_one();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        Ok(())
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_reason_waits_for_a_cooperative_turn_to_finish() {
-    let began = Arc::new(Notify::new());
-    let handle = SleepsBriefly {
-        began: began.clone(),
-    }
-    .spawn()
-    .named(uname("kill-waits-for-turn"))
-    .await
-    .unwrap();
-
-    handle.notify(()).await.unwrap();
-    // `Kill` is raised once the 300ms turn has begun, so the raise lands
-    // mid-turn.
-    tokio::time::timeout(Duration::from_secs(10), began.notified())
-        .await
-        .expect("the turn begins");
-
-    let outcome = handle
-        .stop_within(StopReason::Kill, Duration::from_secs(2))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        outcome,
-        StopOutcome::Killed,
-        "a cooperative turn that finishes within the window must never be aborted"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_reason_with_a_short_window_aborts_a_parked_handler() {

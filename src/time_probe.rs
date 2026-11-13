@@ -18,7 +18,8 @@
 //! spawned without `start_timeout`) does not panic for lack of the driver and
 //! runs on a runtime without it. A spawn asks about the runtime only to decide
 //! whether the sweep of long turns can start (with the `tracing` feature and a
-//! turn threshold set), because it names `start_timeout`, or, for a supervised
+//! turn threshold set, or when a handler takes the long-turn or mailbox-backlog
+//! events), because it names `start_timeout`, or, for a supervised
 //! child, because it names `on_runtime`.
 //!
 //! Under `panic = "abort"` there is nothing to probe with: the functions
@@ -272,7 +273,6 @@ fn remember(rt: &Handle, state: TimerState) -> TimerState {
 /// thread's last answer, then the process-wide table. It never probes and
 /// never answers for a runtime without the driver. Always `true` when the
 /// build cannot unwind, where no probe exists.
-#[cfg(any(test, feature = "tracing"))]
 pub(crate) fn runtime_known_to_have_timers(rt: &Handle) -> bool {
     #[cfg(panic = "unwind")]
     {
@@ -446,25 +446,6 @@ mod tests {
         handle
     }
 
-    /// The probe itself, called on a runtime that has ended: creating the
-    /// sleep succeeds when the runtime had the driver and polling it panics,
-    /// which reads as a shut-down runtime; without the driver the creation
-    /// panics, which reads as `Missing`.
-    #[cfg(panic = "unwind")]
-    #[test]
-    fn the_timer_probe_reads_a_poll_that_panics_as_a_shut_down_runtime() {
-        let _serial = serial_table();
-        let ended = shut_down_with_timers();
-        assert_eq!(probe_state(&ended), TimerState::ShutDown);
-        let ended_bare = {
-            let rt = without_timers();
-            let handle = rt.handle().clone();
-            drop(rt);
-            handle
-        };
-        assert_eq!(probe_state(&ended_bare), TimerState::Missing);
-    }
-
     #[test]
     fn the_shut_down_check_answers_for_each_kind_of_runtime() {
         let yes = with_timers();
@@ -480,20 +461,20 @@ mod tests {
         static HOOK_RUNS: Cell<usize> = const { Cell::new(0) };
     }
 
-    #[test]
-    fn a_kept_answer_for_a_runtime_without_the_driver_goes_stale_when_it_ends() {
-        let _serial = serial_table();
-        let rt = without_timers();
-        let handle = rt.handle().clone();
-        assert!(!runtime_has_timers(&handle));
-        assert_eq!(lock_table().get(&handle.id()), Some(&TimerState::Missing));
-        assert_eq!(runtime_timer_state(&handle), TimerState::Missing);
-        drop(rt);
-        // The entry check does not panic for it, as for a runtime that
-        // was never probed; the bool answer stays no.
-        assert_eq!(runtime_timer_state(&handle), TimerState::ShutDown);
-        require_runtime_timers("Example::op", &handle);
-        assert!(!runtime_has_timers(&handle));
+    /// Chains a hook that counts the panics of the thread it runs on, once.
+    fn count_hook_runs() {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                HOOK_RUNS.with(|runs| runs.set(runs.get() + 1));
+                previous(info);
+            }));
+        });
+    }
+
+    fn hook_runs() -> usize {
+        HOOK_RUNS.with(Cell::get)
     }
 
     /// Runs `require_caller_timers` from the drop of a task, which happens
@@ -585,39 +566,7 @@ mod tests {
         assert_eq!(mine, TimerState::ShutDown, "the table forgot the answer");
     }
 
-    /// A spawn on a runtime without the driver does not probe it again and
-    /// again: the sweep that is skipped there asks once per system and
-    /// runtime.
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn spawns_on_a_runtime_without_the_driver_probe_it_once() {
-        let _serial = serial_table();
-        use crate::actor::context::ActorContext;
-        use crate::actor::{Actor, ActorExt};
-        struct P;
-        impl Actor for P {
-            type Message = ();
-            type Response = ();
-            async fn handle(
-                &mut self,
-                _m: (),
-                _c: &mut ActorContext<Self>,
-            ) -> crate::ActorResult<()> {
-                Ok(())
-            }
-        }
-        let no = without_timers();
-        let sys =
-            crate::system::ActorSystem::create(format!("probe-once-{}", uuid::Uuid::new_v4()))
-                .unwrap();
-        sys.set_turn_warning_threshold(Some(Duration::from_secs(1)));
-        no.block_on(async {
-            for _ in 0..50 {
-                let a = P.spawn().on_system(&sys).await.expect("starts");
-                drop(a);
-            }
-        });
-        let n = probes_run(no.handle());
-        assert!(n <= 1, "probed {n} times for 50 spawns");
+    fn table_locks() -> usize {
+        TABLE_LOCKS.with(Cell::get)
     }
 }

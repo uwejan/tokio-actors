@@ -1,22 +1,24 @@
 //! Supervision configuration, restart budgets, and child registry.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::actor::runtime::saturating_deadline;
+use crate::actor::subtree::AbortRecord;
 use crate::error::ActorError;
-use crate::system::{ActorSystem, ReaperEntry, ReaperFeed};
+use crate::system::{raise_noted, ActorSystem, ReaperEntry, ReaperFeed};
+use crate::telemetry::AttemptOutcome;
 use crate::types::{
-    ActorId, ChildEvent, ChildInfo, ChildStoppedInternal, RestartStrategy, RestartType, Shutdown,
-    StopLane, StopReason, SupervisionAction,
+    ActorId, ChildCounts, ChildEvent, ChildInfo, ChildStoppedInternal, RestartStrategy,
+    RestartType, Shutdown, StopLane, StopReason, SupervisionAction,
 };
 
 pub(crate) mod rules;
@@ -32,9 +34,13 @@ pub(crate) use slot::joined_reason;
 pub(crate) use slot::slot_pair;
 pub(crate) use slot::{
     await_cell, await_predecessor, await_subtree, cancelled_before_factory, join_error_panic,
-    run_attempt, run_ladder, slot_pair_for, Attempt, CellOutcome, CellWatch, OwnStop, Predecessor,
-    SlotCtl, SlotIo, Verdicts,
+    run_attempt, run_ladder, slot_pair_for, Attempt, AttemptTicket, CellOutcome, CellWatch,
+    OwnStop, Predecessor, SlotCtl, SlotIo, Verdicts,
 };
+
+/// The acknowledgment of one child's initialization, with the child's id and
+/// the incarnation that owes it.
+pub(crate) type StrictAck = (ActorId, u64, oneshot::Receiver<Result<(), ActorError>>);
 
 /// Type-erased restart function stored per child.
 ///
@@ -89,6 +95,11 @@ pub(crate) enum RestartOutcome {
         /// The executor half of the attempt's slot, handed to the runner of
         /// the adopted incarnation.
         io: SlotIo,
+        /// The reason the incarnation ended with, when it ended before the
+        /// attempt handed it over and the attempt had already taken the end
+        /// from `new_join`, which is then spent: the runner takes the end
+        /// from here and runs the ladder's last step without waiting.
+        ended: Option<StopReason>,
     },
     /// The attempt never produced a live child (or the live child it did
     /// produce is already known fully gone by the time this is reported).
@@ -147,7 +158,10 @@ pub(crate) type DeathOutcome = (ActorId, StopReason, u64);
 /// every live child's runner task in one step.
 ///
 /// What a firing guard does is the child's [`InheritedStop`]. A worker is
-/// raised `Kill` and its task aborted once its kill grace has passed. A
+/// raised `Kill` and its task aborted once its kill grace has passed, unless
+/// the worker traps exit signals when the guard fires: it then gets the stop
+/// of a supervisor child, with its own `Shutdown` as the window (the flag is
+/// read at the drop, so a toggle just before the supervisor's end counts). A
 /// child that is itself a supervisor is raised
 /// [`ParentKilled`](StopReason::ParentKilled) and stops its own children in
 /// order, bounded by its own `Shutdown` window: the reaper raises `Kill` when
@@ -234,18 +248,42 @@ impl Drop for ChildLinkGuard {
         // no spawning that itself needs to be awaited). Every deadline
         // saturates, since a window and a grace are the user's and an
         // overflowing `Instant` sum would panic in drop glue.
-        // A supervisor child is raised its orderly stop first; a `Kill` the
-        // lane holds by then (raised before, or racing this raise) keeps the
-        // abort it is owed, whatever the child's `Shutdown`.
-        if matches!(self.inherited, rules::InheritedStop::Orderly { .. }) {
-            self.stop_lane.raise(StopReason::ParentKilled);
+        // A supervisor child, and a worker that traps exit signals at this
+        // moment, is raised its orderly stop first; a `Kill` the lane holds by
+        // then (raised before, or racing this raise) keeps the abort it is
+        // owed, whatever the child's `Shutdown`. The flag is read once, here.
+        // What a worker does instead when it traps exit signals at that
+        // moment is the orderly stop bounded by its own `Shutdown`, read from
+        // the child's record (see [`rules::inherited_stop_if_trapping`]); a
+        // supervisor child has that stop in `inherited` already.
+        let record = self.stop_lane.abort_record();
+        let trapping = record.trap();
+        let if_trapping = match self.inherited {
+            rules::InheritedStop::Kill { grace } if trapping => {
+                rules::inherited_stop_if_trapping(false, record.worker_shutdown(), grace)
+            }
+            _ => None,
+        };
+        let inherited = rules::guard_stop(self.inherited, if_trapping, trapping);
+        if matches!(inherited, rules::InheritedStop::Orderly { .. }) {
+            raise_noted(
+                Some(&self.system),
+                &self.stop_lane,
+                StopReason::ParentKilled,
+                crate::telemetry::StopOrigin::Requested,
+            );
         }
         let kill_stored = matches!(self.stop_lane.reason(), Some(StopReason::Kill));
-        let entry = match rules::fired_stop(self.inherited, kill_stored) {
+        let entry = match rules::fired_stop(inherited, kill_stored) {
             rules::InheritedStop::Kill { grace } => {
                 // The entry below holds the child's abort handle, so no
                 // registry entry is involved and no deadline is declared.
-                self.stop_lane.raise(StopReason::Kill);
+                raise_noted(
+                    Some(&self.system),
+                    &self.stop_lane,
+                    StopReason::Kill,
+                    crate::telemetry::StopOrigin::Requested,
+                );
                 ReaperEntry::new(
                     saturating_deadline(Instant::now(), grace),
                     self.abort.clone(),
@@ -379,6 +417,39 @@ impl ChildLifecycle {
 // SupervisionConfig
 // ---------------------------------------------------------------------------
 
+/// When a supervisor shuts itself down because of its significant children.
+///
+/// Erlang/OTP: the supervisor flag `auto_shutdown`. A child is significant
+/// when it is spawned with
+/// [`significant(true)`](crate::actor::context::ChildSpawnBuilder::significant).
+/// The check runs only for a child's end that the supervisor did not order:
+/// a child that ends and is not restarted, a `Transient` child after a normal
+/// exit or a `Temporary` child after any exit. An end the supervisor ordered
+/// (`stop_child`, `terminate_child`, `restart_child`, or the stop of a group
+/// restart) never triggers it. A child whose restart is under way has not
+/// terminated.
+///
+/// # Examples
+/// ```rust
+/// use tokio_actors::{AutoShutdown, SupervisionConfig};
+///
+/// let config = SupervisionConfig::one_for_one().with_auto_shutdown(AutoShutdown::AnySignificant);
+/// assert_eq!(config.auto_shutdown, AutoShutdown::AnySignificant);
+/// assert_eq!(SupervisionConfig::default().auto_shutdown, AutoShutdown::Never);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoShutdown {
+    /// The supervisor never shuts itself down because of a child. The default.
+    #[default]
+    Never,
+    /// The supervisor shuts down when any significant child ends without a
+    /// restart.
+    AnySignificant,
+    /// The supervisor shuts down when the last significant child that was
+    /// still active ends without a restart.
+    AllSignificant,
+}
+
 /// Configuration for an actor acting as a supervisor.
 ///
 /// Maps to OTP supervisor child specs: strategy, intensity (max_restarts),
@@ -405,6 +476,14 @@ pub struct SupervisionConfig {
     /// child's clean exit) does not charge it. OTP rejects a zero period; this
     /// crate accepts it.
     pub restart_window: Duration,
+    /// When the supervisor shuts itself down because of its significant
+    /// children. Default: [`AutoShutdown::Never`]. Not combinable with
+    /// `SimpleOneForOne`, which Erlang/OTP refuses too: the supervisor's spawn
+    /// answers [`SpawnError::InvalidSupervision`](crate::SpawnError::InvalidSupervision).
+    pub auto_shutdown: AutoShutdown,
+    /// Whether the supervisor's start waits for the children it spawned while
+    /// starting. Default: `false`. See [`with_strict_start`](Self::with_strict_start).
+    pub strict_start: bool,
 }
 
 impl Default for SupervisionConfig {
@@ -413,6 +492,8 @@ impl Default for SupervisionConfig {
             strategy: RestartStrategy::OneForOne,
             max_restarts: 3,
             restart_window: Duration::from_secs(5),
+            auto_shutdown: AutoShutdown::Never,
+            strict_start: false,
         }
     }
 }
@@ -453,6 +534,63 @@ impl SupervisionConfig {
         self.restart_window = window;
         self
     }
+
+    /// Sets when the supervisor shuts itself down because of its significant
+    /// children (see [`AutoShutdown`]). Default: [`AutoShutdown::Never`].
+    ///
+    /// A non-`Never` mode needs at least one child spawned with
+    /// [`significant(true)`](crate::actor::context::ChildSpawnBuilder::significant)
+    /// to have any effect. The supervisor ends with
+    /// [`StopReason::ParentRequest`] after it
+    /// delivers the significant child's end to
+    /// [`on_child_stopped`](crate::actor::Actor::on_child_stopped) as
+    /// [`SupervisionAction::AutoShutdown`], so a `Transient` supervisor above it
+    /// does not restart it. The supervisor's spawn is refused with
+    /// [`SpawnError::InvalidSupervision`](crate::SpawnError::InvalidSupervision)
+    /// for a non-`Never` mode under `SimpleOneForOne`, and a spawn of a
+    /// significant child is refused under `Never` and for a `Permanent` child.
+    pub fn with_auto_shutdown(mut self, mode: AutoShutdown) -> Self {
+        self.auto_shutdown = mode;
+        self
+    }
+
+    /// Makes the supervisor's own start wait for the children it spawned
+    /// while starting (in `pre_start` and `on_started`).
+    ///
+    /// By default [`spawn_child`](crate::actor::context::ActorContext::spawn_child)
+    /// returns once the child is registered, and a child whose initialization
+    /// fails ends with `Failure` and is supervised like any crash. With strict
+    /// start, after `on_started` returns and before the supervisor answers its
+    /// own spawn, the supervisor waits for the initialization of each child
+    /// spawned meanwhile, in the order they were spawned. The children still
+    /// initialize concurrently. The first child that fails ends the
+    /// supervisor's start with
+    /// [`ActorError::ChildStart`]: the spawn
+    /// answers [`SpawnError::Init`](crate::SpawnError::Init) carrying it, the
+    /// children already started are stopped in reverse start order under their
+    /// own [`Shutdown`], and the supervisor gets neither
+    /// `on_child_stopped` nor `on_stopped`.
+    ///
+    /// The wait has no bound of its own, as Erlang/OTP's start has none; a
+    /// `start_timeout` on the supervisor's spawn bounds it. A child that calls
+    /// its supervisor during its own initialization (for example with a request
+    /// to the supervisor's handle) waits for a supervisor that waits for it,
+    /// until that bound, as in Erlang/OTP. Only children spawned
+    /// while the supervisor starts are awaited; children it spawns later are
+    /// not. The supervisor ends `Failure(ChildStart)` where Erlang/OTP exits
+    /// with `{shutdown, ..}`.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use tokio_actors::SupervisionConfig;
+    ///
+    /// assert!(SupervisionConfig::one_for_one().with_strict_start().strict_start);
+    /// assert!(!SupervisionConfig::one_for_one().strict_start);
+    /// ```
+    pub fn with_strict_start(mut self) -> Self {
+        self.strict_start = true;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +616,11 @@ impl RestartBudget {
         }
     }
 
-    /// Checks if a restart is allowed. If yes, records it and returns `true`.
-    /// If the budget is exhausted, returns `false`.
-    pub(crate) fn check_and_record(&mut self) -> bool {
+    /// Checks if a restart is allowed. If yes, records it. Returns the charge
+    /// as it stands after the call: whether the restart was accepted, how
+    /// many restarts the window holds (on a refusal, the maximum), and the
+    /// budget's limits.
+    pub(crate) fn check_and_record(&mut self) -> BudgetCharge {
         let now = Instant::now();
         // checked_sub, never `now - self.restart_window`: a paused or
         // simulated clock (tokio::time::pause) can sit close to its own
@@ -501,13 +641,30 @@ impl RestartBudget {
             }
         }
 
-        if self.timestamps.len() >= self.max_restarts as usize {
-            return false;
+        let accepted = self.timestamps.len() < self.max_restarts as usize;
+        if accepted {
+            self.timestamps.push_back(now);
         }
-
-        self.timestamps.push_back(now);
-        true
+        BudgetCharge {
+            accepted,
+            used: u32::try_from(self.timestamps.len()).unwrap_or(u32::MAX),
+            max: self.max_restarts,
+            window: self.restart_window,
+        }
     }
+}
+
+/// The outcome of one charge against a [`RestartBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetCharge {
+    /// Whether the restart was within the budget (and was recorded).
+    pub(crate) accepted: bool,
+    /// The restarts the window holds after the charge.
+    pub(crate) used: u32,
+    /// The most restarts the window allows.
+    pub(crate) max: u32,
+    /// The window the restarts are counted in.
+    pub(crate) window: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,12 +698,19 @@ pub(crate) struct ChildSpec {
     /// decides what the child inherits when its supervisor is stopped, never
     /// a grace.
     ///
-    /// Stored here for parity with `start_timeout` above; every reader is a
-    /// captured copy taken at `spawn_child` time (the initial guard, and the
-    /// restart closure's own copy - see `spawn_child_internal` in
-    /// `context.rs`).
-    #[allow(dead_code)]
+    /// Also read by `which_children` and `count_children` of a
+    /// `SupervisorRef`; the stop and restart paths read the captured copies
+    /// taken at `spawn_child` time (the initial guard, and the restart
+    /// closure's own copy - see `spawn_child_internal` in `context.rs`).
     pub is_supervisor: bool,
+    /// Whether the child is significant: its end, when the supervisor does
+    /// not restart it, can shut the supervisor down under its
+    /// [`AutoShutdown`] mode. An invariant of the spec.
+    pub significant: bool,
+    /// What the spawn passed on for the `sys` bundle. An invariant of the
+    /// spec, kept across every restart: each incarnation is spawned with it.
+    #[allow(dead_code)]
+    pub sys: crate::actor::sys::SysOptions,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,83 +777,164 @@ impl ChildState {
             Err(to)
         }
     }
+
+    /// Applies `to` as [`transition`](Self::transition) does, at a site of
+    /// the supervisor's run loop or teardown whose own reads make the move
+    /// legal. A move the table refuses leaves the state as it was, is logged
+    /// with the `tracing` feature, and fails a debug build.
+    #[track_caller]
+    pub(crate) fn transition_expected(&mut self, to: ChildLifecycle) {
+        if let Err(to) = self.transition(to) {
+            self.log_refused(to, std::panic::Location::caller());
+            debug_assert!(
+                false,
+                "the ledger refused a move from {:?} to {to:?} for child {}",
+                self.lifecycle, self.id
+            );
+        }
+    }
+
+    /// Applies `to` as [`transition`](Self::transition) does, at a site that
+    /// runs inside a user's handler: a move the table refuses leaves the
+    /// state as it was and is logged with the `tracing` feature, in every
+    /// build.
+    #[track_caller]
+    pub(crate) fn transition_logged(&mut self, to: ChildLifecycle) {
+        if let Err(to) = self.transition(to) {
+            self.log_refused(to, std::panic::Location::caller());
+        }
+    }
+
+    /// The log line of a move the table refused.
+    #[allow(unused_variables)]
+    fn log_refused(&self, to: ChildLifecycle, at: &'static std::panic::Location<'static>) {
+        #[cfg(feature = "tracing")]
+        caught_log!(error,
+            child = %self.id,
+            from = ?self.lifecycle,
+            to = ?to,
+            at = %at,
+            "the ledger refused a move its caller's reads allow; the state is unchanged"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // ChildRegistry
 // ---------------------------------------------------------------------------
 
-/// Ordered child registry with O(1) lookup by ID.
+/// Child registry in start order, with lookup by id.
 ///
-/// Children are stored in insertion order (start order).
-/// `Vec<ChildState>` preserves ordering for RestForOne/OneForAll.
-/// `HashMap<ActorId, usize>` provides O(1) lookup.
+/// Each child is registered under a sequence number above every live
+/// child's, and `order` iterates by that number, so iteration is start order
+/// with removed children skipped (RestForOne's later children, the newest
+/// first walk of a teardown). `by_id` holds the rows. A restart changes a row
+/// in place and keeps its number; removing a child touches only its own two
+/// entries.
 pub(crate) struct ChildRegistry {
-    children: Vec<ChildState>,
-    index: HashMap<ActorId, usize>,
+    by_id: HashMap<ActorId, Entry>,
+    order: BTreeMap<u64, ActorId>,
+    /// The record of the incarnation this registry belongs to, set once by the
+    /// first child spawned through the supervisor's context. The registry
+    /// writes its length there at every add and remove, which is where a
+    /// system snapshot reads a supervisor's child count without asking it.
+    owner: Option<AbortRecord>,
+}
+
+/// A registered child and its place in start order.
+struct Entry {
+    seq: u64,
+    state: ChildState,
 }
 
 impl ChildRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            children: Vec::new(),
-            index: HashMap::new(),
+            by_id: HashMap::new(),
+            order: BTreeMap::new(),
+            owner: None,
         }
     }
 
+    /// Names the record the child count is published to, unless one is named
+    /// already. The count is published from the next add or remove on.
+    pub(crate) fn adopt_owner(&mut self, record: &AbortRecord) {
+        if self.owner.is_none() {
+            self.owner = Some(record.clone());
+        }
+    }
+
+    /// The record of the supervisor that owns this registry, if named.
+    pub(crate) fn owner_record(&self) -> Option<AbortRecord> {
+        self.owner.clone()
+    }
+
+    /// Publishes the number of children to the owner's record, if any.
+    fn publish_count(&self) {
+        if let Some(owner) = &self.owner {
+            owner.set_children(self.by_id.len());
+        }
+    }
+
+    /// Adds a child after every child registered so far. Ids are unique (the
+    /// spawn refuses a duplicate first); a row under the same id would be
+    /// replaced.
     pub(crate) fn register(&mut self, state: ChildState) {
-        let idx = self.children.len();
-        self.index.insert(state.id.clone(), idx);
-        self.children.push(state);
+        let seq = self
+            .order
+            .last_key_value()
+            .map_or(0, |(seq, _)| seq.saturating_add(1));
+        self.order.insert(seq, state.id.clone());
+        let replaced = self.by_id.insert(state.id.clone(), Entry { seq, state });
+        debug_assert!(replaced.is_none(), "a child id is registered twice");
+        if let Some(replaced) = replaced {
+            self.order.remove(&replaced.seq);
+        }
+        self.publish_count();
     }
 
     pub(crate) fn remove(&mut self, id: &ActorId) -> Option<ChildState> {
-        let idx = self.index.remove(id)?;
-        let child = self.children.remove(idx);
-        // Rebuild index for items after the removed one
-        for (new_idx, child) in self.children.iter().enumerate().skip(idx) {
-            self.index.insert(child.id.clone(), new_idx);
-        }
-        Some(child)
+        let entry = self.by_id.remove(id)?;
+        self.order.remove(&entry.seq);
+        self.publish_count();
+        Some(entry.state)
     }
 
     pub(crate) fn get(&self, id: &ActorId) -> Option<&ChildState> {
-        self.index.get(id).map(|&idx| &self.children[idx])
+        self.by_id.get(id).map(|entry| &entry.state)
     }
 
     pub(crate) fn get_mut(&mut self, id: &ActorId) -> Option<&mut ChildState> {
-        self.index
-            .get(id)
-            .copied()
-            .map(|idx| &mut self.children[idx])
+        self.by_id.get_mut(id).map(|entry| &mut entry.state)
     }
 
     /// Every child, in start order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &ChildState> {
-        self.children.iter()
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &ChildState> {
+        self.order
+            .values()
+            .filter_map(|id| self.by_id.get(id).map(|entry| &entry.state))
     }
 
     /// Returns IDs of children started after the given child.
     #[cfg(test)]
     pub(crate) fn children_after(&self, id: &ActorId) -> Vec<ActorId> {
-        if let Some(&idx) = self.index.get(id) {
-            self.children[idx + 1..]
-                .iter()
-                .map(|c| c.id.clone())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let Some(seq) = self.by_id.get(id).map(|entry| entry.seq) else {
+            return Vec::new();
+        };
+        self.order
+            .range(seq.saturating_add(1)..)
+            .map(|(_, id)| id.clone())
+            .collect()
     }
 
     /// Returns all child IDs.
     #[cfg(test)]
     pub(crate) fn all_ids(&self) -> Vec<ActorId> {
-        self.children.iter().map(|c| c.id.clone()).collect()
+        self.iter().map(|c| c.id.clone()).collect()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.children.len()
+        self.by_id.len()
     }
 
     /// Adopts a restarted child instance after the parent accepted its
@@ -877,6 +1122,19 @@ pub(crate) struct SupervisionState {
     /// The names of owed reports whose child's spec is gone, by child and
     /// incarnation, for their final deliveries.
     pub owed_names: HashMap<(ActorId, u64), String>,
+    /// The acknowledgments of the children spawned while the supervisor
+    /// starts, in spawn order, kept only under `strict_start`: the start waits
+    /// for each of them before the supervisor answers its own spawn.
+    pub strict_acks: Vec<StrictAck>,
+    /// True from the supervisor's creation until its `on_started` returns,
+    /// when `strict_start` is set: a child spawned in that span keeps its
+    /// acknowledgment in `strict_acks`.
+    pub init_phase: bool,
+    /// The incarnations whose end the supervisor must not act on: a child
+    /// spawned with `await_init` whose initialization failed has no spec,
+    /// and its death report is dropped when it arrives (no callback, no
+    /// charge). Each entry is removed by the report it silences.
+    pub silenced: Vec<(ActorId, u64)>,
     /// The subtree of the last incarnation of each child whose spec was
     /// removed while that subtree still ran, by child id. An entry lives
     /// exactly until its subtree has ended.
@@ -886,6 +1144,7 @@ pub(crate) struct SupervisionState {
 impl SupervisionState {
     pub(crate) fn new(config: SupervisionConfig) -> Self {
         let budget = RestartBudget::new(config.max_restarts, config.restart_window);
+        let init_phase = config.strict_start;
         Self {
             config,
             registry: ChildRegistry::new(),
@@ -901,7 +1160,71 @@ impl SupervisionState {
             final_delivery: false,
             owed: VecDeque::new(),
             owed_names: HashMap::new(),
+            strict_acks: Vec::new(),
+            init_phase,
+            silenced: Vec::new(),
             retired: HashMap::new(),
+        }
+    }
+
+    /// Keeps the acknowledgment of a child spawned while the supervisor
+    /// starts.
+    pub(crate) fn push_strict_ack(
+        &mut self,
+        id: ActorId,
+        incarnation: u64,
+        rx: oneshot::Receiver<Result<(), ActorError>>,
+    ) {
+        self.strict_acks.push((id, incarnation, rx));
+    }
+
+    /// Takes the acknowledgments kept so far, in spawn order.
+    pub(crate) fn take_strict_acks(&mut self) -> Vec<StrictAck> {
+        std::mem::take(&mut self.strict_acks)
+    }
+
+    /// Whether the end of `child`, which the supervisor did not order and
+    /// does not restart, shuts the supervisor down: the mode, the child's
+    /// significance and whether another significant child is still active
+    /// (see [`rules::auto_active`]). Read before the spec is pruned.
+    pub(crate) fn auto_shutdown_due(&self, child: &ActorId) -> bool {
+        let mode = self.config.auto_shutdown;
+        if mode == AutoShutdown::Never {
+            return false;
+        }
+        let Some(spec) = self.registry.get(child) else {
+            return false;
+        };
+        let pool = matches!(self.config.strategy, RestartStrategy::SimpleOneForOne);
+        // Only `AllSignificant` of a significant child reads the others.
+        let others_active = mode == AutoShutdown::AllSignificant
+            && spec.spec.significant
+            && self.registry.iter().any(|other| {
+                other.id != *child
+                    && other.spec.significant
+                    && rules::auto_active(
+                        other.lifecycle,
+                        other.spec.restart_type,
+                        pool,
+                        self.in_restart_set(&other.id),
+                    )
+            });
+        rules::auto_shutdown_due(mode, spec.spec.significant, others_active)
+    }
+
+    /// Drops the entry that silences the report of this incarnation, if there
+    /// is one, and tells whether it was there.
+    pub(crate) fn take_silenced(&mut self, child: &ActorId, incarnation: u64) -> bool {
+        match self
+            .silenced
+            .iter()
+            .position(|(id, n)| id == child && *n == incarnation)
+        {
+            Some(at) => {
+                self.silenced.swap_remove(at);
+                true
+            }
+            None => false,
         }
     }
 
@@ -982,6 +1305,51 @@ impl SupervisionState {
             true
         } else {
             false
+        }
+    }
+
+    /// The decision on the death of the incarnation `incarnation` of a child
+    /// is made: the restart it owes has its ticket, or none is owed any more.
+    /// Quiescence stops counting the death. Safe to repeat.
+    pub(crate) fn death_decided(&self, incarnation: u64) {
+        if let Some(owner) = &self.registry.owner {
+            crate::telemetry::death_decided(owner, incarnation);
+        }
+    }
+
+    /// Tells quiescence whether a group restart is in flight: called after
+    /// every point where `pending_group` is set from nothing or cleared for
+    /// good, so the group is owed work from its decision until its last
+    /// member has its fate. Safe to repeat.
+    pub(crate) fn note_group(&self) {
+        if let Some(owner) = &self.registry.owner {
+            crate::telemetry::group_pending(owner, self.pending_group.is_some());
+        }
+    }
+
+    /// Keeps the ticket of the attempt that started the incarnation
+    /// `incarnation` of `child_id`, until the attempt's outcome is taken.
+    pub(crate) fn note_attempt(
+        &mut self,
+        child_id: &ActorId,
+        incarnation: u64,
+        ticket: AttemptTicket,
+    ) {
+        self.verdicts.keep_ticket(child_id, incarnation, ticket);
+    }
+
+    /// Ends the telemetry of the attempt that started the incarnation
+    /// `incarnation` of `child_id`, once: its ticket, if it has one, is
+    /// settled with the outcome `outcome` builds. Does nothing while no
+    /// attempt holds a ticket.
+    pub(crate) fn settle_attempt(
+        &mut self,
+        child_id: &ActorId,
+        incarnation: u64,
+        outcome: impl FnOnce() -> AttemptOutcome,
+    ) {
+        if let Some(ticket) = self.verdicts.take_ticket(child_id, incarnation) {
+            ticket.settle(child_id, incarnation, outcome());
         }
     }
 
@@ -1234,7 +1602,7 @@ impl SupervisionState {
             return self.remove_spec(child_id);
         }
         if let Some(child) = self.registry.get_mut(child_id) {
-            let _ = child.transition(ChildLifecycle::Down {
+            child.transition_logged(ChildLifecycle::Down {
                 incarnation,
                 pending: DownPending::Snapshot,
             });
@@ -1309,9 +1677,38 @@ impl SupervisionState {
                     shutdown: child.spec.shutdown,
                     is_alive,
                     restart_pending,
+                    is_supervisor: child.spec.is_supervisor,
                 }
             })
             .collect()
+    }
+
+    /// The child counts of `count_children`: every spec, the specs with an
+    /// incarnation alive, and the specs by the kind of child they hold. A
+    /// child between two incarnations is not active.
+    pub(crate) fn child_counts(&self) -> ChildCounts {
+        let mut counts = ChildCounts {
+            specs: 0,
+            active: 0,
+            supervisors: 0,
+            workers: 0,
+        };
+        for child in self.registry.iter() {
+            let fate_present = child.ctl.task_state() == TaskState::Ended;
+            let in_restart_set = self.in_restart_set(&child.id);
+            let (is_alive, _) =
+                rules::child_info_flags(child.lifecycle, fate_present, in_restart_set);
+            counts.specs += 1;
+            if is_alive {
+                counts.active += 1;
+            }
+            if child.spec.is_supervisor {
+                counts.supervisors += 1;
+            } else {
+                counts.workers += 1;
+            }
+        }
+        counts
     }
 
     /// Accounts for a task of the death plane that failed (panicked or was
@@ -1327,6 +1724,13 @@ impl SupervisionState {
         err: tokio::task::JoinError,
     ) -> (Option<ActorError>, Option<tokio::task::Id>) {
         let owner = self.task_owner.remove(&err.id());
+        #[cfg(test)]
+        if let Some((child_id, _, _)) = &owner {
+            crate::actor::runtime::end_hooks::run(
+                crate::actor::runtime::end_hooks::RUNNER_LOST,
+                child_id,
+            );
+        }
         let panic = join_error_panic(err);
         let mut replacement = None;
         if let Some((child_id, incarnation, _)) = owner {
@@ -1339,8 +1743,12 @@ impl SupervisionState {
             let task = match lost {
                 Some(lost) => {
                     let key = (child_id.clone(), incarnation);
+                    let owner = self.registry.owner_record();
                     let task = self.death_set.spawn(async move {
                         let reason = lost.wait().await;
+                        if let Some(owner) = &owner {
+                            crate::telemetry::death_landed(owner, incarnation);
+                        }
                         (child_id, reason, incarnation)
                     });
                     self.task_owner
@@ -1356,9 +1764,13 @@ impl SupervisionState {
                         None => StopReason::Kill,
                     };
                     let key = (child_id.clone(), incarnation);
-                    let task = self
-                        .death_set
-                        .spawn(async move { (child_id, reason, incarnation) });
+                    let owner = self.registry.owner_record();
+                    let task = self.death_set.spawn(async move {
+                        if let Some(owner) = &owner {
+                            crate::telemetry::death_landed(owner, incarnation);
+                        }
+                        (child_id, reason, incarnation)
+                    });
                     self.task_owner
                         .insert(task.id(), (key.0, key.1, TaskPlane::Death));
                     task
@@ -1396,11 +1808,48 @@ impl SupervisionState {
             .and_then(|child| child.slot_of(incarnation));
         let ended = slot.is_some_and(|ctl| ctl.status_ended());
         let lost = slot.and_then(|ctl| ctl.lost_end());
+        // The incarnation the ledger still holds as the attempt's, when its
+        // lane was published: the death task below follows it.
+        let followed = self
+            .registry
+            .get(&child_id)
+            .filter(|child| {
+                matches!(child.lifecycle, ChildLifecycle::Restarting { next, .. } if next == incarnation)
+            })
+            .and(slot)
+            .and_then(SlotCtl::lane);
         match lost {
             Some(lost) => {
+                let owner = self.registry.owner_record();
+                // The death task's claim comes before the attempt settles,
+                // as an adoption's does: an incarnation that already ended
+                // is owed from here.
+                if let Some(lane) = &followed {
+                    crate::actor::runtime::claim_death(
+                        owner.as_ref(),
+                        &child_id,
+                        incarnation,
+                        lane.abort_record(),
+                    );
+                }
+                // No outcome follows: the attempt ends here, and its
+                // incarnation is followed through the death plane.
+                self.settle_attempt(&child_id, incarnation, || AttemptOutcome::Failed {
+                    reason: StopReason::Failure(panic.clone().unwrap_or_else(|| {
+                        ActorError::Panic("restart attempt task failed".to_string())
+                    })),
+                });
+                #[cfg(test)]
+                crate::actor::runtime::end_hooks::run(
+                    crate::actor::runtime::end_hooks::SETTLED,
+                    &child_id,
+                );
                 let key = (child_id.clone(), incarnation);
                 let task = self.death_set.spawn(async move {
                     let reason = lost.wait().await;
+                    if let Some(owner) = &owner {
+                        crate::telemetry::death_landed(owner, incarnation);
+                    }
                     (child_id, reason, incarnation)
                 });
                 self.task_owner
@@ -1425,26 +1874,33 @@ impl SupervisionState {
     }
 
     /// The tasks the final collection waits for before it reads the planes
-    /// (the runners and the attempts), keyed by task id.
+    /// (the runners and the attempts), keyed by task id, and the attempts it
+    /// reports from their status planes.
     ///
-    /// The two sets are told apart by the plane each task was registered on,
+    /// The sets are told apart by the plane each task was registered on,
     /// never by the ledger:
     /// - Runners (death plane): an occupant whose task published its end,
     ///   and every incarnation that does not occupy its key (another one does,
     ///   or the key is down or gone), which the ledger leaves only after its
     ///   end was seen. A replacement task that follows an attempt's
     ///   incarnation is a runner too; it returns at once when the
-    ///   incarnation ended, and is not awaited before.
+    ///   incarnation ended, and is not awaited before. A runner whose
+    ///   incarnation ended on its own with its task still dropping is read
+    ///   later, by [`final_deaths`](Self::final_deaths).
     /// - Attempts (restart plane): a restart attempt whose incarnation's task
-    ///   published its end.
-    pub(crate) fn final_await_sets(
-        &self,
-    ) -> (
-        std::collections::HashSet<tokio::task::Id>,
-        std::collections::HashSet<tokio::task::Id>,
-    ) {
-        let mut runners = std::collections::HashSet::new();
-        let mut attempts = std::collections::HashSet::new();
+    ///   published its end, and one whose incarnation's start completed and
+    ///   then ended on its own while the attempt hands it over at its next
+    ///   poll ([`slot::FinalAttempt::Adopts`], also listed in `adopts` with
+    ///   the watch on its cell).
+    /// - Reported: the restart attempts that are not awaited, whose
+    ///   incarnation's final reason is written and which hand nothing over
+    ///   ([`slot::final_attempt`]), each with the outcome the attempt reports
+    ///   itself: the collection reports them from the status plane, so an
+    ///   attempt whose incarnation is still dropping what it holds gets the
+    ///   outcome, the death report and the final delivery an awaited one
+    ///   gets, and nothing waits for that drop.
+    pub(crate) fn final_await_sets(&self) -> FinalSets {
+        let mut sets = FinalSets::default();
         // Each task is registered on the plane it runs in, so the entries
         // naming a plane never outnumber the tasks that plane holds. This is
         // a bound on the counts, not a check of membership: a `JoinSet` cannot
@@ -1469,8 +1925,19 @@ impl SupervisionState {
                 (TaskPlane::Restart, Some((ChildLifecycle::Restarting { next, .. }, ctl)))
                     if next == *incarnation =>
                 {
-                    if ctl.status_ended() {
-                        attempts.insert(*task);
+                    match slot::final_attempt(ctl, child_id, *incarnation) {
+                        slot::FinalAttempt::Await => {
+                            sets.attempts.insert(*task);
+                        }
+                        slot::FinalAttempt::Adopts => {
+                            sets.attempts.insert(*task);
+                            sets.adopts
+                                .push((*task, child_id.clone(), *incarnation, ctl.watch()));
+                        }
+                        slot::FinalAttempt::Report(outcome) => {
+                            sets.reported.push((*task, *outcome))
+                        }
+                        slot::FinalAttempt::Leave => {}
                     }
                 }
                 (TaskPlane::Restart, _) => {}
@@ -1483,26 +1950,142 @@ impl SupervisionState {
                     )),
                 ) if n == *incarnation => {
                     if ctl.status_ended() {
-                        runners.insert(*task);
+                        sets.runners.insert(*task);
                     }
                 }
                 (TaskPlane::Death, Some((ChildLifecycle::Restarting { next, .. }, ctl)))
                     if next == *incarnation =>
                 {
                     if ctl.status_ended() {
-                        runners.insert(*task);
+                        sets.runners.insert(*task);
                     }
                 }
                 // Another incarnation holds the key, or the key is down or
                 // gone: the incarnation of this task was retired after its
                 // end was seen.
                 (TaskPlane::Death, _) => {
-                    runners.insert(*task);
+                    sets.runners.insert(*task);
                 }
             }
         }
-        (runners, attempts)
+        sets
     }
+
+    /// The final collection's read of the runners still in the death plane,
+    /// in the children's start order, once the plane holds none that has
+    /// returned: the runners to await, and the deaths to collect now.
+    ///
+    /// An incarnation the ledger still holds is read once from its status
+    /// plane ([`slot::final_death`]): its runner is awaited when its task
+    /// published its end, and its death is collected when its final reason
+    /// is written while its task may still be dropping what it holds, with
+    /// that reason, the one the runner returns. `early` holds the
+    /// incarnations whose deaths the collection took that way, keyed by
+    /// child and incarnation: the ledger holds them as down, and their
+    /// runners are awaited once their tasks published their ends, so the
+    /// plane is left with the incarnations still dropping; their reports
+    /// are dropped when they are joined.
+    pub(crate) fn final_deaths(
+        &self,
+        early: &HashSet<(ActorId, u64)>,
+    ) -> (Vec<tokio::task::Id>, Vec<ChildStoppedInternal>) {
+        let position: HashMap<&ActorId, usize> = self
+            .registry
+            .iter()
+            .enumerate()
+            .map(|(index, child)| (&child.id, index))
+            .collect();
+        let mut runners: Vec<(usize, u64, tokio::task::Id, &ActorId)> = self
+            .task_owner
+            .iter()
+            .filter(|(_, (_, _, plane))| *plane == TaskPlane::Death)
+            .filter_map(|(task, (child_id, incarnation, _))| {
+                Some((*position.get(child_id)?, *incarnation, *task, child_id))
+            })
+            .collect();
+        runners.sort_unstable_by_key(|(index, incarnation, _, _)| (*index, *incarnation));
+        let mut ended = Vec::new();
+        let mut deaths = Vec::new();
+        for (_, incarnation, task, child_id) in runners {
+            let Some(child) = self.registry.get(child_id) else {
+                continue;
+            };
+            let Some(ctl) = child.slot_of(incarnation) else {
+                continue;
+            };
+            if early.contains(&(child_id.clone(), incarnation)) {
+                if ctl.status_ended() {
+                    ended.push(task);
+                }
+                continue;
+            }
+            if matches!(child.lifecycle, ChildLifecycle::Down { .. }) {
+                continue;
+            }
+            match slot::final_death(ctl) {
+                slot::FinalDeath::Await => ended.push(task),
+                slot::FinalDeath::Report(reason) => deaths.push(ChildStoppedInternal {
+                    child_id: child_id.clone(),
+                    reason,
+                    incarnation,
+                }),
+                slot::FinalDeath::Leave => {}
+            }
+        }
+        (ended, deaths)
+    }
+
+    /// The incarnations whose ends the final collection took from their
+    /// status planes ([`final_await_sets`](Self::final_await_sets) for the
+    /// attempts, [`final_deaths`](Self::final_deaths) for the runners) and
+    /// whose tasks have not returned: the ledger holds each as down, while
+    /// its task may still run. Each with whether its task is an attempt. The
+    /// teardown waits for each to end, as it waits for every occupant, before
+    /// the supervisor publishes its end.
+    pub(crate) fn reported_ends(&self) -> Vec<(ActorId, u64, bool, CellWatch)> {
+        self.task_owner
+            .values()
+            .filter_map(|(child_id, incarnation, plane)| {
+                let child = self.registry.get(child_id)?;
+                let reported = matches!(
+                    child.lifecycle,
+                    ChildLifecycle::Down { incarnation: n, .. } if n == *incarnation
+                );
+                reported.then(|| {
+                    (
+                        child_id.clone(),
+                        *incarnation,
+                        *plane == TaskPlane::Restart,
+                        child.ctl.watch(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the ledger holds the incarnation `incarnation` of `child_id` as
+    /// down. For a restart attempt whose task returns only now, that means
+    /// the final collection reported it from its status plane.
+    pub(crate) fn reported_early(&self, child_id: &ActorId, incarnation: u64) -> bool {
+        self.registry.get(child_id).is_some_and(|child| {
+            matches!(child.lifecycle, ChildLifecycle::Down { incarnation: n, .. } if n == incarnation)
+        })
+    }
+}
+
+/// What [`SupervisionState::final_await_sets`] returns.
+#[derive(Default)]
+pub(crate) struct FinalSets {
+    /// The runners to await.
+    pub runners: HashSet<tokio::task::Id>,
+    /// The attempts to await.
+    pub attempts: HashSet<tokio::task::Id>,
+    /// The attempts among `attempts` that hand their incarnation over at
+    /// their next poll, with the watch on the cell whose settling ends the
+    /// wait on one early.
+    pub adopts: Vec<(tokio::task::Id, ActorId, u64, CellWatch)>,
+    /// The attempts reported from their status planes, with their outcomes.
+    pub reported: Vec<(tokio::task::Id, RestartOutcome)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,10 +2112,22 @@ pub(crate) enum StrategyOutcome {
 ///
 /// Charges the budget ONCE per triggering failure regardless of group size
 /// (OTP counts supervisor restarts, not per-child spawns).
+#[cfg(test)]
 pub(crate) fn evaluate_strategy(
     sup: &mut SupervisionState,
     failed_child_id: &ActorId,
     reason: &crate::types::StopReason,
+) -> StrategyOutcome {
+    evaluate_strategy_charged(sup, failed_child_id, reason, &mut |_, _| {})
+}
+
+/// [`evaluate_strategy`], telling `charged` the incarnation and the charge of
+/// the budget when the death is charged against it.
+pub(crate) fn evaluate_strategy_charged(
+    sup: &mut SupervisionState,
+    failed_child_id: &ActorId,
+    reason: &crate::types::StopReason,
+    charged: &mut dyn FnMut(u64, BudgetCharge),
 ) -> StrategyOutcome {
     let child = match sup.registry.get(failed_child_id) {
         Some(c) => c,
@@ -1540,19 +2135,16 @@ pub(crate) fn evaluate_strategy(
     };
 
     let restart_type = child.spec.restart_type;
+    let incarnation = child.lifecycle.held_token();
     let should_restart = match restart_type {
         RestartType::Permanent => true,
         // OTP transient parity: restart only on ABNORMAL exits. The clean
-        // reasons are normal and shutdown - our Graceful and ParentRequest
-        // (which is also the exit reason of a budget-exhausted supervisor),
-        // and ParentKilled, a clean exit ordered from above. Kill (OTP
-        // `killed`) is abnormal and does restart.
-        RestartType::Transient => !matches!(
-            reason,
-            crate::types::StopReason::Graceful
-                | crate::types::StopReason::ParentRequest
-                | crate::types::StopReason::ParentKilled
-        ),
+        // reasons are normal, shutdown and {shutdown, Term} - our Graceful,
+        // ParentRequest (which is also the exit reason of a budget-exhausted
+        // supervisor) and Shutdown, and ParentKilled, a clean exit ordered
+        // from above. Kill (OTP `killed`) is abnormal and does restart. The
+        // supervisor's `child_terminated` report reads the same test.
+        RestartType::Transient => !reason.is_normal(),
         RestartType::Temporary => false,
     };
 
@@ -1561,7 +2153,9 @@ pub(crate) fn evaluate_strategy(
     }
 
     // Check budget
-    if !sup.budget.check_and_record() {
+    let charge = sup.budget.check_and_record();
+    charged(incarnation, charge);
+    if !charge.accepted {
         return StrategyOutcome::BudgetExhausted;
     }
 
@@ -1656,6 +2250,7 @@ pub(crate) fn advance_restart_chain(
         };
         let Some(id) = front else {
             sup.pending_group = None;
+            sup.note_group();
             work.extend(sup.queued_triggers.drain(..));
             return ChainStep::Done;
         };
@@ -1713,7 +2308,6 @@ pub(crate) fn advance_restart_chain(
 mod tests {
     use super::*;
 
-    use crate::types::StopReason;
     use tokio::task::JoinHandle;
 
     // - RestartBudget -------------------------------------------------------
@@ -1731,6 +2325,8 @@ mod tests {
                 start_timeout: None,
                 kill_grace: crate::actor::supervision::DEFAULT_KILL_GRACE,
                 is_supervisor: false,
+                significant: false,
+                sys: crate::actor::sys::SysOptions::default(),
             },
             ctl,
             lifecycle: if alive {
@@ -1748,6 +2344,45 @@ mod tests {
 
     fn dummy_child(id: &str) -> ChildState {
         dummy_child_with(id, RestartType::Permanent, true)
+    }
+
+    #[tokio::test]
+    async fn registry_remove_reindexes() {
+        let mut reg = ChildRegistry::new();
+        reg.register(dummy_child("a"));
+        reg.register(dummy_child("b"));
+        reg.register(dummy_child("c"));
+
+        reg.remove(&ActorId::from("a"));
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get(&ActorId::from("a")).is_none());
+        assert!(reg.get(&ActorId::from("b")).is_some());
+        assert!(reg.get(&ActorId::from("c")).is_some());
+
+        // Iteration stays in start order across removals and new children:
+        // a removed child leaves no gap and a new one comes last.
+        let ids = |reg: &ChildRegistry| -> Vec<String> {
+            reg.iter().map(|c| c.id.as_str().to_string()).collect()
+        };
+        reg.register(dummy_child("a"));
+        reg.register(dummy_child("d"));
+        assert_eq!(ids(&reg), ["b", "c", "a", "d"]);
+        reg.remove(&ActorId::from("c"));
+        reg.register(dummy_child("c"));
+        assert_eq!(ids(&reg), ["b", "a", "d", "c"]);
+        reg.remove(&ActorId::from("c"));
+        reg.register(dummy_child("e"));
+        assert_eq!(ids(&reg), ["b", "a", "d", "e"]);
+        let newest_first: Vec<String> = reg
+            .iter()
+            .rev()
+            .map(|c| c.id.as_str().to_string())
+            .collect();
+        assert_eq!(newest_first, ["e", "d", "a", "b"]);
+        for id in ["a", "b", "d", "e"] {
+            assert_eq!(reg.get(&ActorId::from(id)).unwrap().id.as_str(), id);
+        }
+        assert_eq!(reg.len(), 4);
     }
 
     #[tokio::test]
@@ -1776,32 +2411,23 @@ mod tests {
             ReportClass::Occupant
         );
         assert_eq!(rules::report_class(child.lifecycle, 0), ReportClass::Stale);
+
+        // A move the table refuses leaves the state as it was. At a site of
+        // the run loop it fails a debug build; at a site inside a user's
+        // handler it is only logged.
+        let running = ChildLifecycle::Running(seq);
+        let refused = ChildLifecycle::Running(seq + 1);
+        let child = reg.get_mut(&ActorId::from("a")).unwrap();
+        let expected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            child.transition_expected(refused);
+        }));
+        assert_eq!(expected.is_err(), cfg!(debug_assertions));
+        assert_eq!(child.lifecycle, running);
+        child.transition_logged(refused);
+        assert_eq!(child.lifecycle, running);
     }
 
     // - GroupRestart --------------------------------------------------------
-
-    #[test]
-    fn an_end_settles_only_the_awaited_incarnation() {
-        let mut group = GroupRestart {
-            awaiting: HashMap::from([(ActorId::from("a"), 3)]),
-            stop_queue: VecDeque::new(),
-            head_reached: false,
-            restart_order: Vec::new(),
-            manual_overrides: HashMap::new(),
-            scope: GroupScope::default(),
-        };
-        let a = ActorId::from("a");
-        // The end of another incarnation under the same id awaits nothing,
-        // a newer one or a retired one.
-        assert!(!group.settle_awaited(&a, 9));
-        assert!(!group.settle_awaited(&a, 2));
-        assert!(!group.settle_awaited(&ActorId::from("b"), 3));
-        assert_eq!(group.awaiting.get(&a), Some(&3));
-        // The end of the awaited incarnation settles it, once.
-        assert!(group.settle_awaited(&a, 3));
-        assert!(group.awaiting.is_empty());
-        assert!(!group.settle_awaited(&a, 3));
-    }
 
     // - group membership -------------------------------------------------------
 
@@ -1861,157 +2487,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_member_is_released_only_while_its_released_incarnation_is_down_or_stopping_for_good() {
-        for phase in [
-            || stop_phase(&[], &[], &[("m", 5)]),
-            || chain_phase(&[], &[("m", 5)]),
-        ] {
-            let membership = |life| {
-                let (sup, id) = a_group_state(life, phase());
-                sup.group_membership(&id)
-            };
-            // The released incarnation, down: released, whatever it owes.
-            assert_eq!(
-                membership(down(5, DownPending::Snapshot)),
-                GroupMembership::Released
-            );
-            assert_eq!(
-                membership(down(5, DownPending::None)),
-                GroupMembership::Released
-            );
-            // The released incarnation, stopped for good by a terminate, is
-            // released too; a bounce in progress never is.
-            assert_eq!(
-                membership(Some(ChildLifecycle::Stopping {
-                    incarnation: 5,
-                    kind: ManualStop::Terminate
-                })),
-                GroupMembership::Released
-            );
-            assert_eq!(
-                membership(Some(ChildLifecycle::Stopping {
-                    incarnation: 5,
-                    kind: ManualStop::Bounce
-                })),
-                GroupMembership::None
-            );
-            assert_eq!(
-                membership(Some(ChildLifecycle::Stopping {
-                    incarnation: 6,
-                    kind: ManualStop::Terminate
-                })),
-                GroupMembership::None
-            );
-            // Another incarnation under the same id is not a member, down or
-            // not, and neither is a released incarnation that runs or restarts.
-            assert_eq!(
-                membership(down(6, DownPending::None)),
-                GroupMembership::None
-            );
-            assert_eq!(
-                membership(Some(ChildLifecycle::Running(6))),
-                GroupMembership::None
-            );
-            assert_eq!(
-                membership(Some(ChildLifecycle::Running(5))),
-                GroupMembership::None
-            );
-            assert_eq!(
-                membership(Some(ChildLifecycle::Restarting {
-                    incarnation: 5,
-                    next: 6
-                })),
-                GroupMembership::None
-            );
-            assert_eq!(membership(None), GroupMembership::None);
-        }
-    }
-
-    #[test]
-    fn a_retry_leaves_down_only_the_incarnation_a_terminate_named() {
-        let overrides = [("m", 5)];
-        let plan = |life| {
-            let (sup, _id) = a_group_state(life, chain_phase(&["m"], &overrides));
-            sup.plan_retry(&ActorId::from("m"))
-        };
-        // The ledger holds the incarnation the terminate named: the retry
-        // leaves the key down.
-        assert!(plan(down(5, DownPending::None)).restart_order.is_empty());
-        // The ledger holds another incarnation under the id: the key is not
-        // the one released, and the retry restarts it.
-        assert_eq!(
-            plan(down(6, DownPending::None)).restart_order,
-            vec![ActorId::from("m")]
-        );
-    }
-
-    #[test]
-    fn a_member_is_awaited_only_while_the_ledger_holds_the_awaited_incarnation() {
-        let phase = || stop_phase(&[("m", 5)], &[], &[]);
-        let membership = |life| {
-            let (sup, id) = a_group_state(life, phase());
-            sup.group_membership(&id)
-        };
-        let awaited = GroupMembership::Awaited { overridden: false };
-        assert_eq!(membership(Some(ChildLifecycle::Running(5))), awaited);
-        // A death that owes its decision is still awaited: the group folds it.
-        assert_eq!(membership(down(5, DownPending::Evaluate)), awaited);
-        // A child spawned again under the id holds another incarnation.
-        assert_eq!(
-            membership(Some(ChildLifecycle::Running(6))),
-            GroupMembership::None
-        );
-        assert_eq!(
-            membership(down(6, DownPending::None)),
-            GroupMembership::None
-        );
-        assert_eq!(membership(None), GroupMembership::None);
-        // An override recorded for the awaited incarnation shows; one for
-        // another incarnation does not.
-        let (sup, id) = a_group_state(
-            Some(ChildLifecycle::Running(5)),
-            stop_phase(&[("m", 5)], &[], &[("m", 5)]),
-        );
-        assert_eq!(
-            sup.group_membership(&id),
-            GroupMembership::Awaited { overridden: true }
-        );
-        let (sup, id) = a_group_state(
-            Some(ChildLifecycle::Running(5)),
-            stop_phase(&[("m", 5)], &[], &[("m", 4)]),
-        );
-        assert_eq!(sup.group_membership(&id), awaited);
-    }
-
-    #[test]
-    fn a_removed_spec_leaves_the_pending_groups_sets() {
-        let (mut sup, id) = a_group_state(
-            down(5, DownPending::Snapshot),
-            stop_phase(&[("m", 5)], &["m", "n"], &[("m", 5)]),
-        );
-        drop(sup.remove_spec(&id));
-        assert!(sup.registry.get(&id).is_none());
-        let Some(GroupPhase::Stopping(group)) = sup.pending_group.as_ref() else {
-            panic!("the group still pends");
-        };
-        assert_eq!(group.restart_order, vec![ActorId::from("n")]);
-        assert!(group.manual_overrides.is_empty());
-        // The barrier entry stays: it is the end of the removed child's last
-        // incarnation.
-        assert_eq!(group.awaiting.get(&id), Some(&5));
-        let (mut sup, id) =
-            a_group_state(down(5, DownPending::None), chain_phase(&["m"], &[("m", 5)]));
-        drop(sup.remove_spec(&id));
-        let Some(GroupPhase::Restarting {
-            queue, overrides, ..
-        }) = sup.pending_group.as_ref()
-        else {
-            panic!("the group still pends");
-        };
-        assert!(queue.is_empty() && overrides.is_empty());
-    }
-
     // - the restart chain ------------------------------------------------------
 
     fn a_chain_with_front(life: Option<ChildLifecycle>, started: Option<u64>) -> SupervisionState {
@@ -2029,70 +2504,23 @@ mod tests {
         sup
     }
 
-    #[tokio::test]
-    async fn the_chain_decides_its_front_member_by_the_ledger() {
-        let mut work = VecDeque::new();
-        // A down member is started.
-        let mut sup = a_chain_with_front(down(1, DownPending::None), None);
-        assert!(matches!(
-            advance_restart_chain(&mut sup, &mut work),
-            ChainStep::Initiate(id) if id.as_str() == "m"
-        ));
-        // A member running the incarnation the chain started is done, and the
-        // group completes with it.
-        let mut sup = a_chain_with_front(Some(ChildLifecycle::Running(7)), Some(7));
-        let queued = ChildStoppedInternal {
-            child_id: ActorId::from("x"),
-            reason: StopReason::Kill,
-            incarnation: 1,
-        };
-        sup.queued_triggers.push_back(queued);
-        assert!(matches!(
-            advance_restart_chain(&mut sup, &mut work),
-            ChainStep::Done
-        ));
-        assert!(sup.pending_group.is_none());
-        assert_eq!(work.len(), 1, "the queued trigger is released");
-        // A member running an incarnation the chain did not start is stopped
-        // and then started in its slot. The group stops every incarnation it
-        // laid out before the chain begins, so the chain does not meet one;
-        // the decision is read from the pure rule.
-        for started in [None, Some(6)] {
-            assert_eq!(
-                rules::chain_front(ChildLifecycle::Running(7), started),
-                rules::FrontAction::StopThenInitiate
-            );
-        }
-        assert_eq!(
-            rules::chain_front(ChildLifecycle::Running(7), Some(7)),
-            rules::FrontAction::Fresh
-        );
-        // A member being stopped, or with the attempt the chain started in
-        // flight, holds the chain without any order.
-        for life in [
-            ChildLifecycle::Stopping {
-                incarnation: 7,
-                kind: ManualStop::Bounce,
-            },
-            ChildLifecycle::Restarting {
-                incarnation: 7,
-                next: 8,
-            },
-        ] {
-            let mut sup = a_chain_with_front(Some(life), Some(8));
-            assert!(matches!(
-                advance_restart_chain(&mut sup, &mut work),
-                ChainStep::Hold
-            ));
-            let child = sup.registry.get(&ActorId::from("m")).unwrap();
-            assert!(!child.ctl.has_order());
-        }
-        // A spec that is gone is skipped.
-        let mut sup = a_chain_with_front(None, None);
-        assert!(matches!(
-            advance_restart_chain(&mut sup, &mut work),
-            ChainStep::Done
-        ));
+    /// The members the group waits for (reverse start order) and the members
+    /// it restarts (start order) a group commit names.
+    fn stops_and_restarts(
+        commit: &[(ActorId, u64, rules::MemberAction)],
+    ) -> (Vec<ActorId>, Vec<ActorId>) {
+        let stops = commit
+            .iter()
+            .rev()
+            .filter(|(_, _, action)| action.held)
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let restarts = commit
+            .iter()
+            .filter(|(_, _, action)| action.restarts)
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        (stops, restarts)
     }
 
     // - evaluate_strategy ---------------------------------------------------
@@ -2102,44 +2530,8 @@ mod tests {
             strategy,
             max_restarts: 3,
             restart_window: Duration::from_secs(60),
+            ..SupervisionConfig::default()
         })
-    }
-
-    // A restart_window wider than any representable Instant forces
-    // checked_sub to return None on every single check - the same underflow
-    // a paused/simulated clock sitting close to its own epoch can trigger
-    // (this crate does not depend on tokio's test-util feature, so the
-    // window itself is used to force the underflow deterministically rather
-    // than driving it through tokio::time::pause()). Two restarts fired
-    // back-to-back with no await between them (genuinely zero elapsed
-    // wall-clock time) must still be accounted for correctly, and the
-    // arithmetic must never panic.
-    #[tokio::test]
-    async fn strategy_survives_zero_elapsed_restarts_with_underflowing_window() {
-        let mut sup = SupervisionState::new(SupervisionConfig {
-            strategy: RestartStrategy::OneForOne,
-            max_restarts: 2,
-            restart_window: Duration::MAX,
-        });
-        sup.registry.register(dummy_child("child"));
-        let id = ActorId::from("child");
-
-        // Two immediate restarts consume the budget, no panic on either.
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
-            StrategyOutcome::RestartOne(_)
-        ));
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
-            StrategyOutcome::RestartOne(_)
-        ));
-        // A third restart, still with zero elapsed time, is correctly
-        // denied: the count-based gate works even though the time-based
-        // prune step above never fires (cutoff is None on every call).
-        assert!(matches!(
-            evaluate_strategy(&mut sup, &id, &StopReason::Kill),
-            StrategyOutcome::BudgetExhausted
-        ));
     }
 
     // - ChildLinkGuard / death plane -----------------------------------------
@@ -2175,84 +2567,65 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn guard_drop_of_a_supervisor_child_whose_lane_holds_a_kill_keeps_that_kill_s_abort() {
-        // A `Kill` the child's runner or restart attempt raised is owed an
-        // abort a kill grace after it, whatever the child's `Shutdown`: the
-        // guard that fires then feeds the worker's entry.
-        let grace = Duration::from_millis(150);
-        for window in [None, Some(Duration::ZERO), Some(Duration::from_secs(2))] {
-            let sys = dummy_system();
-            let (lane, lane_rx) = StopLane::new();
-            lane.raise(StopReason::Kill);
-            let (join, abort) = spawn_forever();
-            let guard = ChildLinkGuard::new(
-                lane.clone(),
-                abort,
-                sys.reaper_handle(&Handle::current()),
-                orderly(window, grace),
-                sys.clone(),
-                Handle::current(),
-            );
-            drop(guard);
-            settle().await;
-            assert!(
-                matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
-                "the Kill stays on the lane (window {window:?})"
-            );
-            tokio::time::advance(grace - Duration::from_millis(10)).await;
-            settle().await;
-            assert!(!join.is_finished(), "window {window:?}");
-            tokio::time::advance(Duration::from_millis(10)).await;
-            let ended = tokio::time::timeout(Duration::from_secs(1), join)
-                .await
-                .unwrap_or_else(|_| panic!("aborted a grace after the guard (window {window:?})"));
-            assert!(ended.unwrap_err().is_cancelled());
-        }
-    }
-
-    #[tokio::test]
-    async fn guard_drop_of_a_supervisor_child_under_kill_raises_kill_at_once_after_parent_killed() {
-        let sys = dummy_system();
-        let (lane, lane_rx) = StopLane::new();
-        let (join, abort) = spawn_forever();
-        let grace = Duration::from_secs(60);
-        let guard = ChildLinkGuard::new(
-            lane.clone(),
-            abort,
-            sys.reaper_handle(&Handle::current()),
-            orderly(Some(Duration::ZERO), grace),
-            sys.clone(),
-            Handle::current(),
-        );
-        // The first thing a watcher of the lane can read is the orderly
-        // stop; the reaper raises the Kill from its own task.
-        drop(guard);
-        let mut seen = vec![lane_rx.borrow().reason.clone()];
-        for _ in 0..400 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let now = lane_rx.borrow().reason.clone();
-            if seen.last() != Some(&now) {
-                seen.push(now);
-            }
-            if matches!(seen.last(), Some(Some(StopReason::Kill))) {
-                break;
-            }
-        }
-        assert!(
-            matches!(seen[0], Some(StopReason::ParentKilled)),
-            "{seen:?}"
-        );
-        assert!(
-            matches!(seen.last(), Some(Some(StopReason::Kill))),
-            "a zero window raises the Kill from the reaper at once: {seen:?}"
-        );
-        // The abort still follows the grace, never the Kill itself.
-        assert!(!join.is_finished());
-        join.abort();
-    }
-
     // - The kill grace ----------------------------------------------------------
+
+    /// Spawns two children, one with no `kill_grace` call and one with its
+    /// own, and reports the grace each stored in its spec.
+    struct SpecReader {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    #[derive(Default)]
+    struct Leaf;
+
+    impl crate::actor::Actor for Leaf {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::actor::Actor for SpecReader {
+        type Message = ();
+        type Response = ();
+
+        async fn on_started(
+            &mut self,
+            ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            ctx.spawn_child(Leaf::default).named("plain").await?;
+            ctx.spawn_child(Leaf::default)
+                .named("graced")
+                .kill_grace(Duration::from_millis(700))
+                .await?;
+            let sup = ctx.supervision_ref().expect("a supervisor");
+            let mut seen = self.seen.lock().unwrap();
+            for name in ["plain", "graced"] {
+                seen.push(
+                    sup.registry
+                        .get(&ActorId::from(name))
+                        .expect("the child is registered")
+                        .spec
+                        .kill_grace,
+                );
+            }
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

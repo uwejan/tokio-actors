@@ -166,6 +166,10 @@ struct Rig {
     debug_lines: Arc<Mutex<Vec<String>>>,
 }
 
+async fn rig(tag: &str, choice: Choice, bound: Duration) -> Rig {
+    rig_with_shutdown(tag, choice, bound, Shutdown::Kill).await
+}
+
 async fn rig_with_shutdown(tag: &str, choice: Choice, bound: Duration, shutdown: Shutdown) -> Rig {
     let sys = ActorSystem::create(format!("unbounded-start-{tag}")).unwrap();
     let name = format!("unbounded-start-{tag}-child");

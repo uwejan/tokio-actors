@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorHandle, ActorResult, AskError, SpawnError, StopReason,
+    ActorError, ActorHandle, ActorResult, AskError, ChildEvent, RestartType, SpawnError,
+    StopReason, SupervisionAction,
 };
 
 mod common;
@@ -339,14 +340,158 @@ fn check_plain(site: Site) {
 }
 
 #[test]
-fn a_completed_on_stopped_future_whose_drop_panics_fails_the_stop_as_a_panic_in_on_stopped_does() {
-    check_plain(Site::OnStopped);
+fn a_completed_handle_future_whose_drop_panics_fails_the_send_as_a_panic_in_handle_does() {
+    check_plain(Site::HandleSend);
 }
 
 // ---------------------------------------------------------------------------
 // on_child_stopped of a supervisor, from its loop and from its final deliveries
 // ---------------------------------------------------------------------------
 
+/// A child that fails the first message it is sent.
+struct Crasher;
+
+impl Actor for Crasher {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Err(ActorError::user("child crashed"))
+    }
+}
+
+enum Order {
+    /// Starts a child that fails at once.
+    ChildFails,
+    /// Starts a child and stops it, then asks for the supervisor's own stop
+    /// before its loop reads the child's death, so the death is left for the
+    /// final deliveries.
+    StopWithAPendingDeath,
+}
+
+struct Watcher {
+    final_delivery: bool,
+    how: How,
+    record: Arc<Record>,
+}
+
+impl Actor for Watcher {
+    type Message = Order;
+    type Response = ();
+
+    async fn handle(&mut self, msg: Order, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let child = ctx
+            .spawn_child(|| Crasher)
+            .restart_type(RestartType::Temporary)
+            .await?;
+        match msg {
+            Order::ChildFails => {
+                child.notify(()).await.ok();
+            }
+            Order::StopWithAPendingDeath => {
+                child.stop(StopReason::Cancelled).await.unwrap();
+                child.wait_stopped().await;
+                ctx.self_handle().stop(StopReason::Graceful).await.unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = ActorResult<()>> + Send {
+        let in_final_delivery = event.action == SupervisionAction::SupervisorStopping;
+        if in_final_delivery == self.final_delivery {
+            Scripted::under_test(self.how, Ok(()), Err(ActorError::user("delivery failed")))
+        } else {
+            Scripted::fine(Ok(()))
+        }
+    }
+
+    async fn on_stopped(
+        &mut self,
+        reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.record.on_stopped(reason);
+        Ok(())
+    }
+}
+
+/// Spawns a [`Watcher`] whose `on_child_stopped` goes wrong as `how` says in
+/// the delivery from its loop, or in a final delivery, and reports what
+/// happened.
+async fn supervisor(final_delivery: bool, how: How) -> Outcome {
+    let record = Arc::new(Record::default());
+    let handle = Watcher {
+        final_delivery,
+        how,
+        record: record.clone(),
+    }
+    .spawn()
+    .supervisor()
+    .await
+    .unwrap();
+    let order = if final_delivery {
+        Order::StopWithAPendingDeath
+    } else {
+        Order::ChildFails
+    };
+    let caller = format!("notify: {:?}", handle.notify(order).await);
+    let reason = wait_ended(&handle).await;
+    record.outcome(caller, reason)
+}
+
+fn check_supervisor(site: Site, final_delivery: bool) {
+    common::run(2, async move {
+        for how in ALL {
+            assert_eq!(
+                supervisor(final_delivery, how).await,
+                expected(site),
+                "{site:?} {how:?}"
+            );
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The same outcome from a handler written as an `async fn`
 // ---------------------------------------------------------------------------
+
+/// A value that panics when it is dropped.
+struct PanicsWhenDropped;
+
+impl Drop for PanicsWhenDropped {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!("{BOOM}");
+        }
+    }
+}
+
+/// A handler whose last poll drops a local that panics.
+struct LocalDrop {
+    record: Arc<Record>,
+}
+
+impl Actor for LocalDrop {
+    type Message = u32;
+    type Response = u32;
+
+    async fn handle(&mut self, msg: u32, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
+        self.record.handled.fetch_add(1, Ordering::SeqCst);
+        let _local = PanicsWhenDropped;
+        Ok(msg + 1)
+    }
+
+    async fn on_stopped(
+        &mut self,
+        reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.record.on_stopped(reason);
+        Ok(())
+    }
+}

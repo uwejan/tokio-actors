@@ -7,7 +7,7 @@ use std::any::{Any, TypeId};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::actor::handle::{ActorHandle, SubtreeObserver};
+use crate::actor::handle::{emit_stop_requested, ActorHandle, SubtreeObserver};
 use crate::actor::panic::{contain_waker_panic, send_contained};
 use crate::actor::runtime::{bounded_wait, saturating_deadline};
 use crate::actor::subtree::{AbortRecord, SubtreeHold};
@@ -24,19 +24,67 @@ use crate::actor::supervision::{rules, ABORT_SETTLE};
 use crate::actor::Actor;
 use crate::error::{SendError, SpawnError};
 use crate::helper::HelperKind;
+use crate::telemetry::{
+    Delivery, EventKind, KillStepKind, MonitorConfig, MonitorError, MonitorSettings, TelemetryEvent,
+};
 use crate::types::{
-    ActorId, ActorStatus, RaiseResult, ShutdownReport, StatusRx, StatusTx, StopLane, StopOutcome,
-    StopReason, StopReport, TurnClock,
+    ActorId, ActorStatus, Incarnation, RaiseResult, ShutdownReport, StatusRx, StatusTx, StopLane,
+    StopOutcome, StopReason, StopReport, TurnClock,
 };
 
 // ---------------------------------------------------------------------------
 // Global systems registry
 // ---------------------------------------------------------------------------
 
-static SYSTEMS: OnceLock<DashMap<String, Arc<ActorSystem>>> = OnceLock::new();
+/// The name of the ambient system that bare spawns join. Its slot in the
+/// process map is always strong.
+const DEFAULT_SYSTEM: &str = "default";
 
-fn systems() -> &'static DashMap<String, Arc<ActorSystem>> {
+static SYSTEMS: OnceLock<DashMap<String, Slot>> = OnceLock::new();
+
+fn systems() -> &'static DashMap<String, Slot> {
     SYSTEMS.get_or_init(DashMap::new)
+}
+
+/// The source of every system's generation. Generations start at 1: `0`
+/// stands for "no system" in a handle no spawn made.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// What the process map holds for one name.
+///
+/// The slot holds its system strongly from the system's creation until the
+/// shutdown that completes it (the one that stores `Defunct`), and weakly from
+/// then until [`ActorSystem::reactivate`] puts the strong reference back. The
+/// ambient `"default"` system is never demoted. A weakly held system leaves
+/// the map when its last holder lets go (see `Drop for ActorSystem`).
+///
+/// No `Arc` is created while a shard guard of the map is held unless it
+/// escapes by return, and none is dropped under one: a system's drop removes
+/// its own slot, which takes the same shard lock. Liveness under a guard is
+/// read from the counts (`is_live`), and a `Weak` is upgraded only after the
+/// guard has ended.
+struct Slot {
+    /// The generation of the system that owns this slot.
+    generation: u64,
+    weak: Weak<ActorSystem>,
+    strong: Option<Arc<ActorSystem>>,
+}
+
+impl Slot {
+    fn new(system: &Arc<ActorSystem>) -> Self {
+        Self {
+            generation: system.generation,
+            weak: Arc::downgrade(system),
+            strong: Some(system.clone()),
+        }
+    }
+
+    /// Whether the system can still be reached. A count of zero is final; a
+    /// stale positive count only makes a caller see a system that has just
+    /// died, which is a legal order.
+    fn is_live(&self) -> bool {
+        self.strong.is_some() || self.weak.strong_count() > 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +124,9 @@ pub struct ShutdownPolicy {
     /// its kill grace, plus the short wait that confirms an abort), or the
     /// largest of them for a `SimpleOneForOne` pool. A shorter window escalates
     /// the root to `Kill`, and its children still running then take the path of
-    /// a killed supervisor's children: workers receive `Kill`, and a child that
-    /// is itself a supervisor stops in order within its own `Shutdown`. It
+    /// a killed supervisor's children: workers that do not trap exit signals
+    /// receive `Kill`, and a child that is itself a supervisor, or a worker
+    /// that traps, stops in order within its own `Shutdown`. It
     /// bounds only the roots' request step: a non-root actor still registered
     /// once every root has been handled is waited on, bounded by the global
     /// deadline of [`timeout`](Self::timeout) (or the earlier deadline the
@@ -104,7 +153,7 @@ pub struct SystemConfig {
     /// Shutdown policy for this system.
     pub shutdown_policy: ShutdownPolicy,
     /// Initial stuck-turn watchdog threshold for this system. `None` (the
-    /// default) leaves the watchdog off: turns are timed only while a
+    /// default) leaves the watchdog off: the watchdog times turns only while a
     /// threshold is set, so with this left `None`,
     /// [`ActorSystem::turn_elapsed`] returns `None` for every actor and
     /// [`ActorSystem::stuck_actors`] is empty. Setting a threshold adds one
@@ -113,6 +162,12 @@ pub struct SystemConfig {
     /// is not timed; the next turn that actor starts is. See
     /// [`ActorSystem::set_turn_warning_threshold`] for what this controls.
     pub turn_warning_threshold: Option<Duration>,
+    /// Whether turn tracking starts on (the default is off). See
+    /// [`ActorSystem::set_turn_tracking`].
+    pub turn_tracking: bool,
+    /// Whether wait-cycle detection starts on (the default is off). See
+    /// [`ActorSystem::set_wait_cycle_detection`].
+    pub wait_cycle_detection: bool,
 }
 
 impl SystemConfig {
@@ -120,6 +175,20 @@ impl SystemConfig {
     /// [`ActorSystem::set_turn_warning_threshold`]).
     pub fn with_turn_warning_threshold(mut self, threshold: Duration) -> Self {
         self.turn_warning_threshold = Some(threshold);
+        self
+    }
+
+    /// Starts the system with turn tracking on (see
+    /// [`ActorSystem::set_turn_tracking`]).
+    pub fn with_turn_tracking(mut self) -> Self {
+        self.turn_tracking = true;
+        self
+    }
+
+    /// Starts the system with wait-cycle detection on (see
+    /// [`ActorSystem::set_wait_cycle_detection`]).
+    pub fn with_wait_cycle_detection(mut self) -> Self {
+        self.wait_cycle_detection = true;
         self
     }
 }
@@ -130,7 +199,7 @@ impl SystemConfig {
 
 struct AnyActorHandle {
     type_id: TypeId,
-    handle: Box<dyn Any + Send + Sync>,
+    handle: Box<dyn StoredHandle>,
     /// Clone of the actor's stop lane. Enough on its own to signal a stop or
     /// kill without downcasting, and cheap to clone out of a `DashMap` `Ref`
     /// before an `.await` (raising it is synchronous and never waits for capacity anyway).
@@ -151,15 +220,19 @@ struct AnyActorHandle {
     /// call; treated as not-yet-abortable by a shutdown sweep that lands in
     /// that window.
     abort: Option<AbortHandle>,
-    /// True for actors registered via the top-level `SpawnBuilder` path;
-    /// false for supervised children (`spawn_child` and its restart path).
-    /// System shutdown walks the roots; each root's own supervision cascade
-    /// takes its subtree down in turn.
-    is_root: bool,
-    /// Monotonic registration counter (deliberately not a wall-clock
-    /// timestamp): shutdown stops roots in reverse registration order, and a
-    /// counter is race-free where two registrations landing in the same
-    /// clock tick would not be.
+    /// `None` for actors registered via the top-level `SpawnBuilder` path;
+    /// for supervised children (`spawn_child` and its restart path) the id
+    /// and incarnation number of the supervisor that spawned them, by which
+    /// the child's telemetry identity finds its supervisor's. System shutdown
+    /// walks the roots; each root's own supervision cascade takes its subtree
+    /// down in turn.
+    parent: Option<(ActorId, u64)>,
+    /// The registered run's incarnation number, drawn once from the process
+    /// counter when the run's block is made (deliberately not a wall-clock
+    /// timestamp): shutdown stops roots in reverse order of it, and a counter
+    /// is race-free where two spawns landing in the same clock tick would not
+    /// be. Two spawns that overlap in time are ordered by the order their
+    /// blocks were made.
     registration_seq: u64,
     /// The time this actor is given, after a `Kill` is raised on it, to
     /// reach its next turn boundary before its task is aborted. Every kill
@@ -177,10 +250,140 @@ struct AnyActorHandle {
     kill_due: u64,
 }
 
+/// What a snapshot copied out of one registry entry.
+struct Seen {
+    id: ActorId,
+    seq: u64,
+    /// The address of the incarnation's abort record.
+    key: usize,
+    /// The address of the incarnation's subtree token, and of its
+    /// supervisor's.
+    token: Option<usize>,
+    parent: Option<usize>,
+    /// The identity of the incarnation's turn clock, which is the caller token
+    /// of the wait graph.
+    clock: u64,
+    /// Present while the incarnation's end is not final; an entry without it
+    /// is kept only so its live children can name it as their supervisor.
+    live: Option<LiveRead>,
+}
+
+/// What a snapshot reads of an actor that has not ended.
+struct LiveRead {
+    status: ActorStatus,
+    mail: MailView,
+    children: usize,
+    in_turn: Option<Duration>,
+    suspended: bool,
+    coupling: crate::telemetry::CouplingInfo,
+}
+
+/// The reference of the entry `at`, with its ancestry, built from the entries
+/// the snapshot copied out: each supervisor is found by its subtree token, so
+/// the incarnation named is the one that spawned the child, never one looked
+/// up by id. A supervisor the registry does not hold ends the chain there.
+fn ref_of(
+    seen: &[Seen],
+    by_token: &HashMap<usize, usize>,
+    refs: &mut [Option<crate::telemetry::ActorRef>],
+    at: usize,
+) -> crate::telemetry::ActorRef {
+    use crate::telemetry::ActorRef;
+
+    let mut chain = vec![at];
+    let mut top = at;
+    while refs[top].is_none() {
+        let next = seen[top]
+            .parent
+            .and_then(|parent| by_token.get(&parent).copied())
+            .filter(|next| !chain.contains(next));
+        match next {
+            Some(next) => {
+                chain.push(next);
+                top = next;
+            }
+            None => break,
+        }
+    }
+    let mut above = if refs[top].is_some() {
+        chain.pop();
+        refs[top].clone()
+    } else {
+        None
+    };
+    while let Some(index) = chain.pop() {
+        let row = &seen[index];
+        let built = match &above {
+            Some(parent) => ActorRef::new_child(row.id.clone(), row.seq, parent),
+            None => ActorRef::new_root(row.id.clone(), row.seq),
+        };
+        refs[index] = Some(built.clone());
+        above = Some(built);
+    }
+    refs[at]
+        .clone()
+        .expect("the chain ends at the entry asked for")
+}
+
+/// One read of the state quiescence compares.
+#[derive(PartialEq, Eq)]
+struct QuietPass {
+    /// Registration number, turns begun, inside a turn, mailbox length and
+    /// priority length of each actor whose end is not final.
+    rows: Vec<(u64, u64, bool, usize, usize)>,
+    /// The restart attempts of all supervisors that have begun and not
+    /// settled, and the child deaths their runners landed and the
+    /// supervisors have not finished handling.
+    in_flight: u64,
+    /// Every actor read idle with empty lanes and none in flight.
+    idle: bool,
+}
+
+/// What a registry entry tells about its incarnation: id, incarnation number,
+/// root flag, turn clock id and actor type name.
+type EntryFacts = (ActorId, u64, Option<(ActorId, u64)>, u64, &'static str);
+
+/// The numbers a snapshot reads from an actor's handle: its type name and the
+/// fill of its two lanes. Each is one or two atomic reads; nothing waits and
+/// no actor is asked.
+#[derive(Clone, Copy, Debug)]
+struct MailView {
+    type_name: &'static str,
+    mailbox_len: usize,
+    mailbox_capacity: usize,
+    priority_len: usize,
+    priority_capacity: usize,
+}
+
+/// What the registry keeps of an actor's handle: the handle itself, for a
+/// typed lookup, and the view of its mailbox, which only code that knows the
+/// actor type can build. The view is a method of the stored object's own
+/// table, so an entry holds no pointer for it.
+trait StoredHandle: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn mail_view(&self) -> MailView;
+}
+
+impl<A: Actor> StoredHandle for ActorHandle<A> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn mail_view(&self) -> MailView {
+        MailView {
+            type_name: std::any::type_name::<A>(),
+            mailbox_len: self.mailbox_len(),
+            mailbox_capacity: self.mailbox_capacity(),
+            priority_len: self.priority_len(),
+            priority_capacity: self.priority_capacity(),
+        }
+    }
+}
+
 impl AnyActorHandle {
     fn new<A: Actor>(
         handle: &ActorHandle<A>,
-        is_root: bool,
+        parent: Option<(ActorId, u64)>,
         registration_seq: u64,
         turn_clock: TurnClock,
         kill_grace: Duration,
@@ -193,7 +396,7 @@ impl AnyActorHandle {
             status_rx: handle.status_rx(),
             turn_clock,
             abort: None,
-            is_root,
+            parent,
             registration_seq,
             kill_grace,
             runtime,
@@ -213,11 +416,58 @@ impl AnyActorHandle {
 
     fn downcast<A: Actor>(&self) -> Option<ActorHandle<A>> {
         if self.type_id == TypeId::of::<ActorHandle<A>>() {
-            self.handle.downcast_ref::<ActorHandle<A>>().cloned()
+            self.handle
+                .as_any()
+                .downcast_ref::<ActorHandle<A>>()
+                .cloned()
         } else {
             None
         }
     }
+}
+
+/// Queues the `KillStep` event `step` of the incarnation whose abort record is
+/// `record`, in the system in hand or the one the record names. It builds
+/// nothing when no sink takes the event or the incarnation has no recorded
+/// identity, never waits and runs no user code, so the reaper, a drop and the
+/// raiser call it with no care for what they hold. `after` is read only when
+/// the event is built.
+#[inline]
+fn push_kill_step(
+    record: &AbortRecord,
+    system: Option<&ActorSystem>,
+    step: KillStepKind,
+    after: impl FnOnce() -> Option<Duration>,
+) {
+    crate::telemetry::push_about(record, system, EventKind::KillStep, |actor| {
+        TelemetryEvent::KillStep {
+            actor: actor.clone(),
+            step,
+            after: after(),
+        }
+    });
+}
+
+/// Builds the `AbortFired` step of the incarnation behind `record`, to be
+/// queued by [`AbortRecord::abort`] under the record's lock for the abort that
+/// writes the record's first instant, so the step is queued once per
+/// incarnation whichever abort (the reaper's, a caller's force path, a
+/// ladder's, a start bound's) finds the task unfinished first. Takes no lock
+/// of the record, queues nothing, and builds nothing unless a sink takes the
+/// kind.
+pub(crate) fn stage_abort_fired(record: &AbortRecord) -> Option<crate::telemetry::Staged> {
+    crate::telemetry::stage_about(record, None, EventKind::KillStep, |actor| {
+        TelemetryEvent::KillStep {
+            actor: actor.clone(),
+            step: KillStepKind::AbortFired,
+            after: None,
+        }
+    })
+}
+
+/// The time from now to `deadline`.
+fn step_deadline_in(deadline: Instant) -> Option<Duration> {
+    Some(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// Names the registry entry a `Kill` raiser targets.
@@ -237,6 +487,47 @@ pub(crate) struct KillRaised {
     pub(crate) abort: Option<AbortHandle>,
 }
 
+/// Raises `reason` on `lane` where the crate itself stops an actor (a
+/// supervisor's orderly stop, its ladder, the link guard of a child, the cut
+/// of a start, the shutdown walk) and queues the events of the raise: the
+/// request with the lane's own answer and, for a `Kill` the lane took, its
+/// `Raised` step. Called with no registry guard or other lock held, since the
+/// events run no user code but resolve the actor's identity from the
+/// registry. With no sink and no identity recorded it is the raise alone.
+/// Returns the lane's answer.
+///
+/// `origin` is where the request came from: the crate's own stop, a
+/// caller's (the actor's own `ctx.stop`), or the failure of an actor whose
+/// signal map panicked.
+#[inline]
+pub(crate) fn raise_noted(
+    system: Option<&ActorSystem>,
+    lane: &StopLane,
+    reason: StopReason,
+    origin: crate::telemetry::StopOrigin,
+) -> RaiseResult {
+    if !crate::telemetry::engaged_for(lane.abort_record(), system) {
+        return lane.try_raise(reason);
+    }
+    raise_noted_engaged(system, lane, reason, origin)
+}
+
+/// The part of [`raise_noted`] that runs only while telemetry is on.
+#[inline(never)]
+fn raise_noted_engaged(
+    system: Option<&ActorSystem>,
+    lane: &StopLane,
+    reason: StopReason,
+    origin: crate::telemetry::StopOrigin,
+) -> RaiseResult {
+    let result = lane.try_raise(reason.clone());
+    if matches!(reason, StopReason::Kill) && result != RaiseResult::Refused {
+        push_kill_step(lane.abort_record(), system, KillStepKind::Raised, || None);
+    }
+    emit_stop_requested(system, lane, &reason, result, origin, None);
+    result
+}
+
 /// The one way a `Kill` is raised on an actor the registry holds. In this
 /// order, it declares the deadline of the `Kill` on the registry entry `key`
 /// names (`window` from now, or the entry's kill grace when `None`), raises
@@ -253,8 +544,14 @@ pub(crate) struct KillRaised {
 /// (the caller found none) nothing is declared and nothing is armed: the
 /// `Kill` is still raised.
 ///
+/// With a `cause` (and no `step`) the `Kill` is raised on behalf of that
+/// reason, an exit signal's: the lane stores it when it holds no `Kill` yet,
+/// and the actor ends with it in place of `Kill`. A bounded stop's step cell
+/// has no caused form.
+///
 /// Never call it while holding a registry guard: the declaration takes a
 /// write lock on the same shard.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn raise_kill_declared(
     system: Option<&ActorSystem>,
     key: KillKey<'_>,
@@ -263,20 +560,51 @@ pub(crate) fn raise_kill_declared(
     window: Option<Duration>,
     step: Option<&StopStep>,
     between: impl FnOnce(),
+    cause: Option<StopReason>,
 ) -> KillRaised {
+    debug_assert!(
+        cause.is_none() || step.is_none(),
+        "a caused Kill has no step cell form"
+    );
     if let Some(system) = system {
-        match key {
+        let declared = match key {
             KillKey::Id(id) => system.declare_kill(id, status_rx, window),
             KillKey::Name(name) => system.declare_kill_by_name(name, status_rx, window),
+        };
+        // The declaration has returned, so no registry guard is held.
+        if declared {
+            push_kill_step(
+                lane.abort_record(),
+                Some(system),
+                KillStepKind::Declared,
+                || window,
+            );
         }
     }
+    // The event names the cause a `Kill` for an exit signal carries; it is
+    // copied only for such a `Kill`, before the lane takes it.
+    let noted_cause = cause.clone();
     let result = match step {
         Some(step) => step.raise_kill(lane, between),
         None => {
             between();
-            lane.try_raise(StopReason::Kill)
+            match cause {
+                Some(cause) => lane.try_raise_kill_caused(cause),
+                None => lane.try_raise(StopReason::Kill),
+            }
         }
     };
+    if result != RaiseResult::Refused {
+        push_kill_step(lane.abort_record(), system, KillStepKind::Raised, || None);
+    }
+    emit_stop_requested(
+        system,
+        lane,
+        &StopReason::Kill,
+        result,
+        crate::telemetry::StopOrigin::Requested,
+        noted_cause.as_ref(),
+    );
     let abort = match system {
         Some(system) if result != RaiseResult::Refused => {
             #[cfg(test)]
@@ -348,6 +676,33 @@ impl Drop for RegistryGuard {
     fn drop(&mut self) {
         #[cfg(test)]
         crate::actor::runtime::end_hooks::run(crate::actor::runtime::end_hooks::NAME, &self.id);
+        // An incarnation spawned while no sink took events and ending while
+        // one does is identified now, while its registry entry still names
+        // it: its end and what follows it are events about it.
+        if self.system.telemetry_mode().any_armed() {
+            if let Some(status) = &self._status {
+                self.system
+                    .resolve_identity(status.abort_record(), &self.id);
+            }
+        }
+        // The end is recorded for the supervisor, which owes a decision on the
+        // death, before the entry leaves the registry and ahead of the
+        // runner's join. Read only while turn tracking is on.
+        let mode = self.system.telemetry_mode();
+        if mode.word() & crate::telemetry::CTL_TRACK_TURNS != 0 {
+            if let Some(status) = &self._status {
+                let own = crate::telemetry::identity_for(
+                    mode,
+                    status.abort_record(),
+                    Some(&self.system),
+                    Some(&self.id),
+                );
+                if let Some(supervisor) = own.as_deref().and_then(|own| own.parent()) {
+                    status.abort_record().mark_guard_ended();
+                    supervisor.death_ended(self.registration_seq);
+                }
+            }
+        }
         self.system
             .unregister_by_id(&self.id, self.registration_seq);
         if let Some(name) = &self.name {
@@ -358,6 +713,23 @@ impl Drop for RegistryGuard {
             crate::actor::runtime::end_hooks::NAME_FREED,
             &self.id,
         );
+        // The run's memberships go before its status can read `Stopped`: the
+        // run is marked ended first and its count read after, and a join
+        // counts before it lists, so whichever of a join and this mark comes
+        // second sees the other. A run that never joined pays this one swap.
+        if let Some(status) = &self._status {
+            let record = status.record();
+            let joined = record.pg_mark_ended();
+            #[cfg(test)]
+            crate::actor::runtime::end_hooks::run(
+                crate::actor::runtime::end_hooks::PG_MARKED,
+                &self.id,
+            );
+            if joined != 0 {
+                self.system
+                    .pg_remove_member(&(self.id.clone(), record.incarnation()));
+            }
+        }
     }
 }
 
@@ -435,6 +807,16 @@ fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
 /// `actor_status` read the registry, `stop` and `kill` act on a named actor,
 /// and `kill_by_id` on any registered id.
 ///
+/// A system lives in the process map of named systems ([`create`](Self::create),
+/// [`get_named`](Self::get_named), [`all`](Self::all)) until a shutdown of it
+/// has completed, and from then on only as long as something else holds it:
+/// its user's `Arc`, or an actor of it that has not ended. When the last holder
+/// lets go the system is freed and its name is free; its reaper tasks end once
+/// their pending entries have fired.
+/// [`reactivate`](Self::reactivate) puts a shut-down system back to staying in
+/// the map, and the system named `"default"` stays for the life of the
+/// process.
+///
 /// `ActorSystem` is a phone book, not a runtime. It does not create or own a
 /// Tokio runtime. Actors spawn on whatever runtime is current via
 /// `Handle::try_current()`, and a supervised child on the runtime its
@@ -468,11 +850,11 @@ fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
 /// the process.
 pub struct ActorSystem {
     name: String,
-    /// `name` as one shared allocation, handed to every handle's identity.
-    shared_name: Arc<str>,
     by_name: DashMap<Arc<str>, AnyActorHandle>,
     by_id: DashMap<ActorId, AnyActorHandle>,
     shutdown_policy: ShutdownPolicy,
+    /// The system's telemetry gate and sinks.
+    telemetry: crate::telemetry::ModeOwner,
     /// `Active` until `shutdown`/`shutdown_with` is called (moves to
     /// `ShuttingDown`, then to `Defunct` once the last shutdown in flight has
     /// ended, if a shutdown has completed since the system was last `Active`).
@@ -503,13 +885,12 @@ pub struct ActorSystem {
     /// shutdowns was stopped by the one that completed. Read and written only
     /// under `registration_gate`'s exclusive side.
     completed_since_active: AtomicBool,
-    /// Source of `AnyActorHandle::registration_seq`.
-    registration_seq: AtomicU64,
-    /// Source of every child incarnation token this system ever hands out -
-    /// fresh spawns and restarts alike, so no two incarnations of any child,
-    /// under any name, in any supervisor's registry, are ever equal (see
-    /// [`next_incarnation`](Self::next_incarnation)).
-    incarnation_seq: AtomicU64,
+    /// The process-group scopes of this system by name, each made on first
+    /// use (see [`pg_scope`](Self::pg_scope)). Never cleared by a shutdown.
+    pub(crate) pg_scopes: Mutex<HashMap<Arc<str>, Arc<crate::actor::pg::PgScopeInner>>>,
+    /// How many times a run's end looked for its process-group memberships.
+    #[cfg(test)]
+    pub(crate) pg_sweeps: AtomicU64,
     /// This system's reaper feeds, one per runtime, each spawned lazily on
     /// its runtime's first use and replaced when its task has finished (see
     /// [`reaper_handle`](Self::reaper_handle)).
@@ -518,10 +899,10 @@ pub struct ActorSystem {
     /// reaper, the turn-watchdog sweep, the drain of a closed queue's late
     /// values), one per runtime: each helper's end is recorded there.
     helpers: crate::helper::HelperSlots,
-    /// Stuck-turn watchdog threshold, in nanoseconds; `0` means off. Shared
-    /// (via [`turn_threshold_cell`](Self::turn_threshold_cell)) directly with
-    /// every actor's [`TurnClock`], so a change here takes effect for
-    /// already-spawned actors without any extra signaling. See
+    /// Stuck-turn watchdog threshold, in nanoseconds; `0` means off. The
+    /// watchdog bit of the mode word (read by every actor's [`TurnClock`])
+    /// follows it, so a change here takes effect for already-spawned actors
+    /// without any extra signaling. See
     /// [`set_turn_warning_threshold`](Self::set_turn_warning_threshold).
     turn_warning_threshold_nanos: Arc<AtomicU64>,
     /// Runs once between a system-side kill's lookup and its raise, so a test
@@ -548,6 +929,20 @@ pub struct ActorSystem {
     /// inserts.
     #[cfg(test)]
     after_phase_check: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once inside `is_quiescent`, between its two reads.
+    #[cfg(test)]
+    between_quiet_passes: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside a snapshot, after the registry walk and before the
+    /// rows are built.
+    #[cfg(test)]
+    after_snapshot_walk: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// How many identity passes walked the registry.
+    #[cfg(test)]
+    identity_walks: std::sync::atomic::AtomicUsize,
+    /// Runs once in the sweep task, after it decided to end and before it
+    /// clears its latch, so a test can land a want in that window.
+    #[cfg(test)]
+    before_sweep_latch_clear: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Set once a shutdown has taken its last root snapshot.
     #[cfg(test)]
     root_snapshots_done: AtomicBool,
@@ -562,15 +957,11 @@ pub struct ActorSystem {
     /// runtime it was spawned on is dropped out from under it - so a system
     /// that outlives its sweep's runtime can always spawn a fresh one on the
     /// next runtime that becomes current, instead of believing forever that
-    /// a sweep is still running. Only meaningful (and only compiled) when
-    /// the sweep task itself exists, which requires the `tracing` feature -
-    /// the sweep's sole job is emitting a `tracing::warn!`.
-    #[cfg(feature = "tracing")]
+    /// a sweep is still running.
     sweep_spawned: Arc<AtomicBool>,
     /// The runtimes the sweep's spawn found without the time driver, so a
     /// spawn on such a runtime does not probe it again. Bounded: cleared when
     /// full.
-    #[cfg(feature = "tracing")]
     timerless_runtimes: Mutex<std::collections::HashSet<tokio::runtime::Id>>,
     /// The earliest global deadline of a final sweep that started, held while
     /// that sweep runs and after its shutdown completed or was cut short: its
@@ -582,6 +973,23 @@ pub struct ActorSystem {
     sweep_deadline: watch::Sender<Option<Instant>>,
     /// The instant `AnyActorHandle::kill_due` counts from.
     epoch: Instant,
+    /// This system's identity for the life of the process, from
+    /// `NEXT_GENERATION`: the slot in the process map, a handle's equality
+    /// and the stop paths of a handle all name a system by it.
+    generation: u64,
+    /// A weak reference to this system's own allocation, for the code that
+    /// holds `&self` and needs the shared pointer (`reactivate`'s slot, the
+    /// turn-watchdog sweep).
+    me: Weak<ActorSystem>,
+    /// Runs at the top of `Drop`, before the system's slot is removed, so a
+    /// test can claim the name at that exact point.
+    #[cfg(test)]
+    before_slot_removal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside the registration gate, right after the move to
+    /// `Defunct` took the map's strong reference out of the slot, so a test
+    /// can act at that exact point.
+    #[cfg(test)]
+    after_demotion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl std::fmt::Debug for ActorSystem {
@@ -592,6 +1000,31 @@ impl std::fmt::Debug for ActorSystem {
     }
 }
 
+impl Drop for ActorSystem {
+    /// Removes this system's own slot from the process map, exact to its
+    /// generation: a later system that claimed the name after this one's last
+    /// holder let go keeps its slot. The fields drop after this body: the
+    /// reaper feeds close (each reaper fires what it holds and ends), the
+    /// helper slots and both registries are freed.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_slot_removal
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let generation = self.generation;
+        let removed = systems().remove_if(&self.name, |_, slot| slot.generation == generation);
+        // The guard is gone; the slot (a dead `Weak`) is freed here.
+        drop(removed);
+    }
+}
+
 impl ActorSystem {
     // - Construction -------------------------------------------------------
 
@@ -599,6 +1032,9 @@ impl ActorSystem {
         name: String,
         shutdown_policy: ShutdownPolicy,
         turn_warning_threshold: Option<Duration>,
+        turn_tracking: bool,
+        wait_cycle_detection: bool,
+        me: Weak<ActorSystem>,
     ) -> Self {
         #[cfg(all(feature = "tracing", panic = "abort"))]
         {
@@ -610,19 +1046,33 @@ impl ActorSystem {
             });
         }
 
+        let telemetry = crate::telemetry::ModeOwner::bound(me.clone(), &name);
+        telemetry.0.set_ctl(
+            crate::telemetry::CTL_WATCHDOG,
+            threshold_to_nanos(turn_warning_threshold) != 0,
+        );
+        telemetry
+            .0
+            .set_ctl(crate::telemetry::CTL_TRACK_TURNS, turn_tracking);
+        telemetry
+            .0
+            .set_ctl(crate::telemetry::CTL_DEADLOCK, wait_cycle_detection);
+        // The registry is empty: a switch turned on here owes no pass.
+        telemetry.0.mark_bound();
         Self {
-            shared_name: Arc::from(name.as_str()),
             name,
             by_name: registry_map(),
             by_id: registry_map(),
             shutdown_policy,
+            helpers: crate::helper::HelperSlots::new(telemetry.0.clone()),
+            telemetry,
             phase: AtomicU8::new(SystemPhase::Active.as_u8()),
             registration_gate: std::sync::RwLock::new(0),
             completed_since_active: AtomicBool::new(false),
-            registration_seq: AtomicU64::new(0),
-            incarnation_seq: AtomicU64::new(0),
+            pg_scopes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            pg_sweeps: AtomicU64::new(0),
             reaper: Mutex::new(HashMap::new()),
-            helpers: crate::helper::HelperSlots::default(),
             turn_warning_threshold_nanos: Arc::new(AtomicU64::new(threshold_to_nanos(
                 turn_warning_threshold,
             ))),
@@ -639,58 +1089,147 @@ impl ActorSystem {
             #[cfg(test)]
             after_phase_check: Mutex::new(None),
             #[cfg(test)]
+            between_quiet_passes: Mutex::new(None),
+            #[cfg(test)]
+            after_snapshot_walk: Mutex::new(None),
+            #[cfg(test)]
+            identity_walks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_sweep_latch_clear: Mutex::new(None),
+            #[cfg(test)]
             root_snapshots_done: AtomicBool::new(false),
             #[cfg(test)]
             shutdown_at_the_gate: AtomicBool::new(false),
-            #[cfg(feature = "tracing")]
             sweep_spawned: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "tracing")]
             timerless_runtimes: Mutex::new(std::collections::HashSet::new()),
             sweep_deadline: watch::channel(None).0,
             epoch: Instant::now(),
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            me,
+            #[cfg(test)]
+            before_slot_removal: Mutex::new(None),
+            #[cfg(test)]
+            after_demotion: Mutex::new(None),
         }
     }
 
-    /// Returns the default system (named `"default"`), creating it lazily.
-    ///
-    /// This is intentionally not `std::default::Default` because it returns
-    /// `Arc<ActorSystem>` (shared ownership), not an owned value.
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> Arc<ActorSystem> {
-        let reg = systems();
-        if let Some(found) = reg.get("default") {
-            return found.value().clone();
-        }
-        reg.entry("default".to_string())
-            .or_insert_with(|| {
-                Arc::new(Self::empty(
-                    "default".to_string(),
-                    ShutdownPolicy::default(),
-                    None,
-                ))
-            })
-            .value()
-            .clone()
+    /// A new system in its own allocation, which knows its own `Weak`.
+    fn build(
+        name: String,
+        shutdown_policy: ShutdownPolicy,
+        turn_warning_threshold: Option<Duration>,
+        turn_tracking: bool,
+        wait_cycle_detection: bool,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| {
+            Self::empty(
+                name,
+                shutdown_policy,
+                turn_warning_threshold,
+                turn_tracking,
+                wait_cycle_detection,
+                me.clone(),
+            )
+        })
     }
 
-    /// Creates a new named system and registers it in the global systems map.
+    /// Puts a new system under `name` in the process map, if the name is free
+    /// or its slot is dead. `Err` carries the live occupant when the map holds
+    /// it strongly (and `None` when it holds it only weakly), and nothing is
+    /// built then.
     ///
-    /// Returns [`SpawnError::SystemNameTaken`] if a system with this name
-    /// already exists.
-    pub fn create(name: impl Into<String>) -> Result<Arc<ActorSystem>, SpawnError> {
-        let name = name.into();
-        let reg = systems();
-        match reg.entry(name.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => Err(SpawnError::SystemNameTaken(name)),
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                let system = Arc::new(Self::empty(name, ShutdownPolicy::default(), None));
-                v.insert(system.clone());
+    /// The new system is built under the entry's lock and escapes by return;
+    /// a dead slot it replaces holds no live `Arc`, so dropping it under the
+    /// lock drops nothing that takes it.
+    fn claim(
+        name: String,
+        build: impl FnOnce(String) -> Arc<ActorSystem>,
+    ) -> Result<Arc<ActorSystem>, Option<Arc<ActorSystem>>> {
+        use dashmap::mapref::entry::Entry;
+        match systems().entry(name.clone()) {
+            Entry::Vacant(v) => {
+                let system = build(name);
+                v.insert(Slot::new(&system));
+                Ok(system)
+            }
+            Entry::Occupied(mut o) => {
+                if o.get().is_live() {
+                    return Err(o.get().strong.clone());
+                }
+                let system = build(name);
+                let dead = o.insert(Slot::new(&system));
+                debug_assert!(dead.strong.is_none() && dead.weak.strong_count() == 0);
+                drop(dead);
                 Ok(system)
             }
         }
     }
 
+    /// Returns the default system (named `"default"`), creating it lazily.
+    ///
+    /// The default system is the one ambient system bare spawns join, and it
+    /// stays in the process map of named systems for the life of the process,
+    /// shut down or not.
+    ///
+    /// This is intentionally not `std::default::Default` because it returns
+    /// `Arc<ActorSystem>` (shared ownership), not an owned value.
+    #[allow(clippy::should_implement_trait)]
+    pub fn default() -> Arc<ActorSystem> {
+        // The ambient system never leaves the map of named systems, and its
+        // slot is always strong, so the system the map answers once is the
+        // answer for the life of the process. Kept here, a bare spawn skips
+        // the hash of the name and the map's shard lock.
+        static AMBIENT: OnceLock<Arc<ActorSystem>> = OnceLock::new();
+        if let Some(system) = AMBIENT.get() {
+            return system.clone();
+        }
+        let system = Self::ambient();
+        AMBIENT.get_or_init(|| system.clone()).clone()
+    }
+
+    /// The ambient system as the map holds it, created on first use.
+    fn ambient() -> Arc<ActorSystem> {
+        loop {
+            if let Some(found) = Self::get_named(DEFAULT_SYSTEM) {
+                return found;
+            }
+            let made = Self::claim(DEFAULT_SYSTEM.to_string(), |name| {
+                Self::build(name, ShutdownPolicy::default(), None, false, false)
+            });
+            match made {
+                Ok(system) | Err(Some(system)) => return system,
+                // The slot is weak and its system is still alive for another
+                // thread only: look again.
+                Err(None) => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Creates a new named system and registers it in the global systems map.
+    ///
+    /// A system stays in the map from its creation until a shutdown of it
+    /// has completed; from then on the map holds it only as long as someone
+    /// else does, and when the last holder lets go (the caller's `Arc` and
+    /// every actor of the system that has not ended) the system is freed, its
+    /// name leaves the map and a later `create` can claim the name again.
+    /// [`reactivate`](Self::reactivate) puts a shut-down system back to
+    /// staying in the map. The system named `"default"` is the exception: it
+    /// stays in the map for the life of the process.
+    ///
+    /// Returns [`SpawnError::SystemNameTaken`] if a system with this name
+    /// already exists.
+    pub fn create(name: impl Into<String>) -> Result<Arc<ActorSystem>, SpawnError> {
+        let name = name.into();
+        Self::claim(name.clone(), |name| {
+            Self::build(name, ShutdownPolicy::default(), None, false, false)
+        })
+        .map_err(|_| SpawnError::SystemNameTaken(name))
+    }
+
     /// Creates a new named system with custom configuration.
+    ///
+    /// The system's life in the map of named systems is the one
+    /// [`create`](Self::create) describes.
     ///
     /// Returns [`SpawnError::SystemNameTaken`] if a system with this name
     /// already exists.
@@ -699,39 +1238,49 @@ impl ActorSystem {
         config: SystemConfig,
     ) -> Result<Arc<ActorSystem>, SpawnError> {
         let name = name.into();
-        let reg = systems();
-        match reg.entry(name.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => Err(SpawnError::SystemNameTaken(name)),
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                let system = Arc::new(Self::empty(
-                    name,
-                    config.shutdown_policy,
-                    config.turn_warning_threshold,
-                ));
-                v.insert(system.clone());
-                Ok(system)
-            }
-        }
+        Self::claim(name.clone(), |name| {
+            Self::build(
+                name,
+                config.shutdown_policy,
+                config.turn_warning_threshold,
+                config.turn_tracking,
+                config.wait_cycle_detection,
+            )
+        })
+        .map_err(|_| SpawnError::SystemNameTaken(name))
     }
 
-    /// Looks up a named system. Returns `None` if no system with this name exists.
+    /// Looks up a named system. Returns `None` if no system with this name
+    /// exists, which includes a system that has completed a shutdown and has
+    /// no holder left (see [`create`](Self::create)).
     pub fn get_named(name: &str) -> Option<Arc<ActorSystem>> {
-        systems().get(name).map(|entry| entry.value().clone())
+        // The slot's own `Arc` escapes by return. A weakly held system is
+        // upgraded only after the map's guard has ended, since the upgrade
+        // can make this call the last holder and the system's drop takes the
+        // same shard.
+        let weak = {
+            let slot = systems().get(name)?;
+            if let Some(strong) = &slot.strong {
+                return Some(strong.clone());
+            }
+            slot.weak.clone()
+        };
+        weak.upgrade()
     }
 
-    /// Lists the names of all registered systems.
+    /// Lists the names of all registered systems: the systems of the map that
+    /// can still be reached (see [`get_named`](Self::get_named)).
     pub fn all() -> Vec<String> {
-        systems().iter().map(|e| e.key().clone()).collect()
+        systems()
+            .iter()
+            .filter(|e| e.value().is_live())
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// Returns this system's name.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// This system's name as a shared string.
-    pub(crate) fn shared_name(&self) -> Arc<str> {
-        self.shared_name.clone()
     }
 
     // - Actor lookup -------------------------------------------------------
@@ -829,7 +1378,16 @@ impl ActorSystem {
             let entry = self.by_name.get(name).ok_or(SendError::NotFound)?;
             entry.stop_lane.clone()
         };
-        match lane.try_raise(StopReason::Graceful) {
+        let raised = lane.try_raise(StopReason::Graceful);
+        emit_stop_requested(
+            Some(self),
+            &lane,
+            &StopReason::Graceful,
+            raised,
+            crate::telemetry::StopOrigin::Requested,
+            None,
+        );
+        match raised {
             RaiseResult::Refused => Err(SendError::Closed),
             RaiseResult::Recorded | RaiseResult::Superseded => Ok(()),
         }
@@ -851,8 +1409,9 @@ impl ActorSystem {
     /// runs `on_stopped` and while its children are being stopped. The name
     /// leaves the registry once the actor's children are stopped (an actor
     /// ending by `Kill` does not wait for them: as its links drop, a worker
-    /// child is raised `Kill` and a supervisor child `ParentKilled`, which can
-    /// come after the name has left), before its
+    /// child that does not trap exit signals is raised `Kill` and a supervisor
+    /// child or a worker that traps them `ParentKilled`, which can come after
+    /// the name has left), before its
     /// stop lane is sealed and before its queued messages and its value are
     /// dropped (an aborted actor's when its task ends); from then on this
     /// answers `NotFound`. A `Kill` accepted after the actor left the
@@ -885,6 +1444,7 @@ impl ActorSystem {
             None,
             None,
             || {},
+            None,
         );
         if raised.result == RaiseResult::Refused {
             return Err(SendError::Closed);
@@ -903,8 +1463,9 @@ impl ActorSystem {
     /// named or anonymous, however it was spawned; an actor leaves the list
     /// when its registration ends, after its children are stopped (or, when it
     /// ends by `Kill`, without waiting for them: as its links drop, a worker
-    /// child is raised `Kill` and a supervisor child `ParentKilled`, which can
-    /// come after the id has left) and before it reads `Stopped`. To wait
+    /// child that does not trap exit signals is raised `Kill` and a supervisor
+    /// child or a worker that traps them `ParentKilled`, which can come after
+    /// the id has left) and before it reads `Stopped`. To wait
     /// until the actors below a killed actor have ended, take an observer with
     /// [`observe_subtree`](Self::observe_subtree) before the kill. Erlang/OTP's
     /// `processes/0` lists every process of the
@@ -995,6 +1556,36 @@ impl ActorSystem {
             .map(|e| SubtreeObserver::new(e.status_rx.clone()))
     }
 
+    /// Resolves the key of a monitor target in this system: the registered
+    /// actor's run, or the absence of one. A key that matches nothing keeps
+    /// the id the key names (a name is its actor's id) and has no run.
+    pub(crate) fn resolve_monitor_target(&self, key: MonitorKey<'_>) -> ResolvedTarget {
+        let (actor_id, found) = match key {
+            MonitorKey::Id(id) => (
+                id.clone(),
+                self.by_id
+                    .get(id)
+                    .map(|e| (e.status_rx.clone(), e.stop_lane.clone())),
+            ),
+            MonitorKey::Name(name) => (
+                ActorId::from(name),
+                self.by_name
+                    .get(name)
+                    .map(|e| (e.status_rx.clone(), e.stop_lane.clone())),
+            ),
+        };
+        let (status_rx, lane) = match found {
+            Some((rx, lane)) => (Some(rx), Some(lane)),
+            None => (None, None),
+        };
+        ResolvedTarget {
+            actor_id,
+            incarnation: status_rx.as_ref().map(|rx| rx.record().incarnation()),
+            status_rx,
+            lane,
+        }
+    }
+
     /// Force-kills an actor by id with the same `Kill` as [`kill`](Self::kill):
     /// no lifecycle callback begins once it is read, a callback still awaiting
     /// after the kill grace is aborted (at once when the actor's runtime has no
@@ -1030,10 +1621,13 @@ impl ActorSystem {
     /// To force a restart of a supervised child, kill it: its supervisor
     /// restarts it per its restart type and charges the restart budget, as
     /// `exit(Child, kill)` does in Erlang/OTP. An
-    /// [`ActorContext`](crate::actor::context::ActorContext) has no kill by
-    /// id: a supervisor handler gets its system with
-    /// [`ActorSystem::get_named`](Self::get_named) and calls `kill_by_id` on
-    /// it, or calls
+    /// [`ActorContext`](crate::actor::context::ActorContext) has no
+    /// `kill_by_id`, but
+    /// [`exit`](crate::actor::context::ActorContext::exit) with
+    /// [`StopReason::Kill`] kills a registered actor by id (it cannot be
+    /// trapped and is backstopped like a kill). A supervisor handler can also
+    /// get its system with [`ActorSystem::get_named`](Self::get_named) and call
+    /// `kill_by_id` on it, or call
     /// [`stop_within`](crate::actor::handle::ActorHandle::stop_within) with
     /// [`StopReason::Kill`] on a handle it kept.
     /// [`stop_child`](crate::actor::context::ActorContext::stop_child) is
@@ -1101,6 +1695,14 @@ impl ActorSystem {
         // A target that does not take a `Kill` answers `None` without a
         // timer; the timer check comes before the raise.
         if lane.refuses(&StopReason::Kill) {
+            emit_stop_requested(
+                Some(self),
+                &lane,
+                &StopReason::Kill,
+                RaiseResult::Refused,
+                crate::telemetry::StopOrigin::Requested,
+                None,
+            );
             return None;
         }
         crate::time_probe::require_caller_timers("ActorSystem::kill_by_id");
@@ -1118,6 +1720,7 @@ impl ActorSystem {
             None,
             None,
             || {},
+            None,
         );
         if raised.result == RaiseResult::Refused {
             return None;
@@ -1150,16 +1753,19 @@ impl ActorSystem {
     }
 
     /// Registers a spawned actor, returning its registration sequence
-    /// number (the source of [`RegistryGuard`]'s seq-checked removal).
+    /// number: the incarnation number the actor's handle carries, unique in
+    /// the process (the source of [`RegistryGuard`]'s seq-checked removal).
     /// `is_root` distinguishes a top-level (`SpawnBuilder`) spawn, which the
     /// system shutdown walks, from a supervised child (`spawn_child`), which
-    /// its supervisor's cascade or the final sweep takes down.
+    /// its supervisor's cascade or the final sweep takes down; such a test
+    /// child names no supervisor the registry holds.
     ///
     /// Returns [`SpawnError::SystemShuttingDown`] unless the system is
     /// currently `Active`: OTP's application controller rejects new
     /// registrations while stopping, and (unlike a one-way flag) this also
     /// covers a `Defunct` system that has not yet been
     /// [`reactivate`](Self::reactivate)d.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_actor<A: Actor>(
         &self,
@@ -1171,6 +1777,44 @@ impl ActorSystem {
         kill_grace: Duration,
         runtime: Handle,
     ) -> Result<u64, SpawnError> {
+        let seq = handle.incarnation().number();
+        // A hand-built child names a supervisor the registry never holds, so
+        // its identity, like that of a child whose supervisor has ended, is
+        // never guessed.
+        let parent = (!is_root).then(|| (ActorId::from(""), crate::telemetry::UNKNOWN_INCARNATION));
+        self.register_actor_as(
+            id, name, handle, parent, turn_clock, kill_grace, runtime, seq,
+        )
+    }
+
+    /// Registers the incarnation numbered `seq`, which the caller drew from
+    /// [`next_incarnation`](Self::next_incarnation). The number is the
+    /// registration's sequence: shutdown stops roots in reverse order of it,
+    /// and a stale guard's removal is checked against it. `parent` is `None`
+    /// for a root and the spawning supervisor's id and incarnation number for
+    /// a supervised child.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_actor_as<A: Actor>(
+        &self,
+        id: &ActorId,
+        name: Option<&Arc<str>>,
+        handle: &ActorHandle<A>,
+        parent: Option<(ActorId, u64)>,
+        turn_clock: TurnClock,
+        kill_grace: Duration,
+        runtime: Handle,
+        seq: u64,
+    ) -> Result<u64, SpawnError> {
+        // One run has one number: the registration's sequence is the
+        // incarnation the handle's record carries.
+        debug_assert_eq!(seq, handle.incarnation().number());
+        // A handle a unit test built by hand belongs to the system it is
+        // registered in; every spawn has recorded its system already, and the
+        // record is set once.
+        #[cfg(test)]
+        if let Some(me) = self.me.upgrade() {
+            handle.stop_lane_ref().abort_record().set_system(&me);
+        }
         // Held from the phase check through the inserts (see
         // `registration_gate`). Nothing in this section awaits or panics.
         let gate = self
@@ -1188,7 +1832,6 @@ impl ActorSystem {
             }
         }
 
-        let seq = self.registration_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(n) = name {
             let entry = self.by_name.entry(Arc::clone(n));
             match entry {
@@ -1201,7 +1844,7 @@ impl ActorSystem {
                 dashmap::mapref::entry::Entry::Vacant(v) => {
                     v.insert(AnyActorHandle::new(
                         handle,
-                        is_root,
+                        parent.clone(),
                         seq,
                         turn_clock.clone(),
                         kill_grace,
@@ -1222,27 +1865,21 @@ impl ActorSystem {
             }
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(AnyActorHandle::new(
-                    handle, is_root, seq, turn_clock, kill_grace, runtime,
+                    handle, parent, seq, turn_clock, kill_grace, runtime,
                 ));
             }
         }
         drop(gate);
 
-        // Lazily start the turn-watchdog sweep the first time a threshold is
-        // in effect at registration time. The spawn path resolves a runtime
-        // via `Handle::try_current()` before ever reaching here, so one is
-        // normally current - but `try_current()` is used here too rather
-        // than the panicking `Handle::current()`, so a registration reached
-        // some other way, with no runtime current, quietly skips the spawn
-        // instead of panicking. If the threshold is set later instead, via
-        // `set_turn_warning_threshold`, that method makes its own attempt;
-        // either way, the next call with a runtime current retries.
-        #[cfg(feature = "tracing")]
-        if self.turn_warning_threshold_nanos.load(Ordering::Relaxed) != 0 {
-            if let Ok(rt) = Handle::try_current() {
-                self.ensure_sweep_spawned_with(&rt);
-            }
-        }
+        // Start the sweep when something asks for it and none is running.
+        // The spawn path resolves a runtime via `Handle::try_current()`
+        // before ever reaching here, so one is normally current - but
+        // `try_current()` is used here too rather than the panicking
+        // `Handle::current()`, so a registration reached some other way, with
+        // no runtime current, quietly skips the spawn instead of panicking.
+        // Whatever asks later makes its own attempt; either way, the next
+        // call with a runtime current retries.
+        self.ensure_sweep();
 
         Ok(seq)
     }
@@ -1263,16 +1900,147 @@ impl ActorSystem {
             .remove_if(name, |_, entry| entry.registration_seq == registration_seq);
     }
 
-    /// Draws the next child incarnation token for this system: every
-    /// registration a supervisor ever makes for a child - the initial spawn
-    /// included, not just restarts - draws from this single monotonic
-    /// counter. No two incarnations of any child anywhere in this system ever
-    /// collide, so a stale runner completion (from a superseded instance,
-    /// including one that shared its predecessor's name after a
-    /// terminate/delete/respawn cycle) can never be mistaken for the fresh
-    /// one's death.
+    /// The identity of the incarnation behind `record`, the actor `id`,
+    /// recorded now when its spawn recorded none: an incarnation spawned
+    /// while no sink took events has an entry in the registry and nothing in
+    /// the telemetry table, so the first event about it (or about a child
+    /// that names it as supervisor) reads its number and name from its
+    /// registry entry and its supervisor from the entry its own entry names
+    /// by id and incarnation number, records the result and returns it.
+    /// Returns `None` for an incarnation the registry does not hold under
+    /// `id` (it ended, or no spawn made it), and for a supervised child whose
+    /// supervisor's incarnation the registry does not hold: nothing is
+    /// guessed. Every lookup is by id; no registry guard is held when this
+    /// returns, so the caller may push at once.
+    pub(crate) fn resolve_identity(
+        &self,
+        record: &AbortRecord,
+        id: &ActorId,
+    ) -> Option<Arc<crate::telemetry::Identity>> {
+        let mode = self.telemetry_mode();
+        let key = record.key();
+        if let Some(found) = mode.find(key) {
+            return Some(found);
+        }
+        if record.has_stopped() {
+            return None;
+        }
+        let (id, incarnation, parent, _clock, type_name) = self.entry_of_record(key, id)?;
+        let name = self
+            .by_name
+            .get(id.as_str())
+            .filter(|entry| entry.stop_lane.abort_record().key() == key)
+            .map(|entry| entry.key().clone());
+        let parent = match parent {
+            None => None,
+            Some((parent_id, parent_seq)) => {
+                Some(self.resolve_identity_of(&parent_id, parent_seq)?)
+            }
+        };
+        // The wait token is the incarnation number, the same value a spawn
+        // that recorded the identity would give, so a wait cycle through an
+        // actor spawned before any sink or switch is reported like any other.
+        let identity = Arc::new(
+            crate::telemetry::Identity::new(id, incarnation, parent, name, None)
+                .with_type(type_name),
+        );
+        Some(mode.bind_if_absent(key, identity))
+    }
+
+    /// [`resolve_identity`](Self::resolve_identity) for the live actor
+    /// registered under `id`.
+    pub(crate) fn resolve_identity_of_id(
+        &self,
+        id: &ActorId,
+    ) -> Option<Arc<crate::telemetry::Identity>> {
+        let record = self
+            .by_id
+            .get(id)
+            .map(|entry| entry.stop_lane.abort_record().clone())?;
+        self.resolve_identity(&record, id)
+    }
+
+    /// [`resolve_identity`](Self::resolve_identity) for the incarnation
+    /// numbered `seq` of the actor `id`; `None` when the registry holds
+    /// another incarnation under `id`, or none.
+    pub(crate) fn resolve_identity_of(
+        &self,
+        id: &ActorId,
+        seq: u64,
+    ) -> Option<Arc<crate::telemetry::Identity>> {
+        let record = self
+            .by_id
+            .get(id)
+            .filter(|entry| entry.registration_seq == seq)
+            .map(|entry| entry.stop_lane.abort_record().clone())?;
+        self.resolve_identity(&record, id)
+    }
+
+    /// The pass of an engagement: records the identity of every incarnation
+    /// the registry holds, once per engagement (see
+    /// [`Mode::bind_once`](crate::telemetry::Mode::bind_once)). The entries
+    /// are copied out in one walk, each shard's guard dropped once it is
+    /// read, and resolved by id after the walk, outside every guard; an
+    /// incarnation already recorded costs one lookup of the table. Never call
+    /// it under a registry guard or with the registry mutex of the sinks held.
+    pub(crate) fn bind_registered(&self) {
+        let mode = self.telemetry_mode();
+        mode.bind_once(|| {
+            #[cfg(test)]
+            self.identity_walks.fetch_add(1, Ordering::Relaxed);
+            let rows: Vec<(ActorId, AbortRecord)> = self
+                .by_id
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.stop_lane.abort_record().clone()))
+                .collect();
+            for (id, record) in rows {
+                let _ = self.resolve_identity(&record, &id);
+            }
+        });
+    }
+
+    /// How many passes walked the registry for identities.
+    #[cfg(test)]
+    pub(crate) fn identity_walks(&self) -> usize {
+        self.identity_walks.load(Ordering::Relaxed)
+    }
+
+    /// The id, incarnation number, supervisor, turn clock id and actor type
+    /// name of the registry entry under `id`, when its stop lane's record is
+    /// at `key`. The registry guard is dropped before this returns.
+    fn entry_of_record(&self, key: usize, id: &ActorId) -> Option<EntryFacts> {
+        let entry = self.by_id.get(id)?;
+        (entry.stop_lane.abort_record().key() == key).then(|| {
+            (
+                id.clone(),
+                entry.registration_seq,
+                entry.parent.clone(),
+                entry.turn_clock.id(),
+                entry.handle.mail_view().type_name,
+            )
+        })
+    }
+
+    /// The system's telemetry gate and sinks.
+    #[allow(dead_code)]
+    pub(crate) fn telemetry_mode(&self) -> &Arc<crate::telemetry::Mode> {
+        &self.telemetry.0
+    }
+
+    /// Draws the next incarnation number: roots, fresh child spawns and
+    /// restarts alike, in every system of the process, come from the one
+    /// process-wide counter behind [`Incarnation`](crate::types::Incarnation)
+    /// (numbers start at 1, so `0` stands for "no incarnation"). A supervisor
+    /// draws a child's number before the spawn, for its ledger; the spawn
+    /// draws a root's. The same number is the record's incarnation, the
+    /// registration's sequence, the turn clock's id and the wait graph's
+    /// token, so no two incarnations of any child, under any name, in any
+    /// system, are ever equal, and a stale runner completion (from a
+    /// superseded instance, including one that shared its predecessor's name
+    /// after a terminate/delete/respawn cycle) can never be mistaken for the
+    /// fresh one's death.
     pub(crate) fn next_incarnation(&self) -> u64 {
-        self.incarnation_seq.fetch_add(1, Ordering::Relaxed)
+        crate::types::Incarnation::mint().number()
     }
 
     /// Moves a `Defunct` system (one with no `shutdown`/`shutdown_with` in
@@ -1288,21 +2056,64 @@ impl ActorSystem {
     /// by calling [`shutdown`](Self::shutdown) again and letting it complete;
     /// once a shutdown has completed since the system was last `Active`, the
     /// system is `Defunct` whenever no shutdown is in flight, however later
-    /// calls ended.
+    /// calls ended. A reactivated system is held by the process map of named
+    /// systems again, as a new system is, until a shutdown of it completes
+    /// (see [`create`](Self::create)).
     pub fn reactivate(&self) -> bool {
-        let in_flight = self
-            .registration_gate
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *in_flight != 0
-            || SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) != SystemPhase::Defunct
+        // Taken before the gate and the map's shard: the slot takes this
+        // reference if it needs it, and what it does not take is dropped
+        // after both are released.
+        let mut me = self.me.upgrade();
         {
-            return false;
+            let in_flight = self
+                .registration_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *in_flight != 0
+                || SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) != SystemPhase::Defunct
+            {
+                return false;
+            }
+            self.completed_since_active.store(false, Ordering::Relaxed);
+            self.phase
+                .store(SystemPhase::Active.as_u8(), Ordering::Release);
+            // The map holds the system strongly again, in the same section
+            // that clears the flag.
+            self.promote_slot(&mut me);
         }
-        self.completed_since_active.store(false, Ordering::Relaxed);
-        self.phase
-            .store(SystemPhase::Active.as_u8(), Ordering::Release);
+        drop(me);
         true
+    }
+
+    /// Puts the strong reference back into this system's slot of the process
+    /// map, taking it from `me`. Called under the registration gate's
+    /// exclusive side, in the section that clears `completed_since_active`.
+    /// A system whose slot the map does not hold (another generation holds the
+    /// name, or none) leaves `me` untouched. The caller drops what is left in
+    /// `me` after the gate.
+    fn promote_slot(&self, me: &mut Option<Arc<ActorSystem>>) {
+        if let Some(mut slot) = systems().get_mut(&self.name) {
+            if slot.generation == self.generation && slot.strong.is_none() {
+                slot.strong = me.take();
+            }
+        }
+    }
+
+    /// Takes the strong reference out of this system's slot of the process
+    /// map, so the map holds the system only weakly, and returns it for the
+    /// caller to drop after the gate and the map's shard are released. Called
+    /// under the registration gate's exclusive side, in the section that
+    /// stores `Defunct`. The `"default"` system is never demoted, and neither
+    /// is a system whose slot another generation holds.
+    fn demote_slot(&self) -> Option<Arc<ActorSystem>> {
+        if self.name == DEFAULT_SYSTEM {
+            return None;
+        }
+        let mut slot = systems().get_mut(&self.name)?;
+        if slot.generation != self.generation {
+            return None;
+        }
+        slot.strong.take()
     }
 
     /// Attaches the task's abort handle to the just-created registry entries.
@@ -1404,28 +2215,39 @@ impl ActorSystem {
     /// deadline declared before that raise. The entry is matched by its
     /// status plane, never by the id alone, and nothing else runs under the
     /// shard's lock.
-    fn declare_kill(&self, id: &ActorId, status_rx: &StatusRx, window: Option<Duration>) {
+    fn declare_kill(&self, id: &ActorId, status_rx: &StatusRx, window: Option<Duration>) -> bool {
         let now = self.kill_clock();
+        let mut declared = false;
         if let Some(mut entry) = self.by_id.get_mut(id) {
             if entry.status_rx.same_channel(status_rx) {
                 entry.declare_kill(now, window);
+                declared = true;
             }
         }
         #[cfg(test)]
         self.run_after_kill_declaration();
+        declared
     }
 
     /// [`declare_kill`](Self::declare_kill) for a raiser that found its target
     /// by name.
-    fn declare_kill_by_name(&self, name: &str, status_rx: &StatusRx, window: Option<Duration>) {
+    fn declare_kill_by_name(
+        &self,
+        name: &str,
+        status_rx: &StatusRx,
+        window: Option<Duration>,
+    ) -> bool {
         let now = self.kill_clock();
+        let mut declared = false;
         if let Some(mut entry) = self.by_name.get_mut(name) {
             if entry.status_rx.same_channel(status_rx) {
                 entry.declare_kill(now, window);
+                declared = true;
             }
         }
         #[cfg(test)]
         self.run_after_kill_declaration();
+        declared
     }
 
     /// Schedules the abort of a task whose actor was just sent `Kill`: the
@@ -1541,6 +2363,17 @@ impl ActorSystem {
         rx
     }
 
+    /// The task ids of the reapers this system holds.
+    #[cfg(test)]
+    pub(crate) fn reaper_task_ids(&self) -> Vec<tokio::task::Id> {
+        self.reaper
+            .lock()
+            .unwrap()
+            .values()
+            .map(|slot| slot.task.id())
+            .collect()
+    }
+
     /// How many runtimes hold a reaper of this system.
     #[cfg(test)]
     pub(crate) fn reaper_slots(&self) -> usize {
@@ -1610,12 +2443,13 @@ impl ActorSystem {
     /// every instant.
     ///
     /// Every callback is timed: `pre_start`, `on_started`, `handle`,
-    /// `pre_stop`, `on_child_stopped` and `on_stopped`. An actor stuck in its
-    /// initialization or inside its stop is reported too, while its
-    /// [`actor_status`](Self::actor_status) reads `Initializing`, `Running`
+    /// `pre_stop`, `on_child_stopped`, `on_stopped`, `on_idle` and an inline
+    /// signal map (the map of an exit that rides the priority lane). An actor
+    /// stuck in its initialization or inside its stop is reported too, while
+    /// its [`actor_status`](Self::actor_status) reads `Initializing`, `Running`
     /// (inside `pre_stop`) or `Stopping`.
     ///
-    /// Turns are timed only while a threshold is set: while it is `None`,
+    /// The watchdog times turns only while a threshold is set: while it is `None`,
     /// [`turn_elapsed`](Self::turn_elapsed) returns `None` for every actor
     /// and [`stuck_actors`](Self::stuck_actors) is empty. Setting a
     /// threshold adds one monotonic clock read per callback of every
@@ -1646,16 +2480,18 @@ impl ActorSystem {
     /// again, when a threshold is in effect, by the next call to this method
     /// or the next actor registration made with a runtime current.
     pub fn set_turn_warning_threshold(&self, threshold: Option<Duration>) {
+        let nanos = threshold_to_nanos(threshold);
         self.turn_warning_threshold_nanos
-            .store(threshold_to_nanos(threshold), Ordering::Relaxed);
-        #[cfg(feature = "tracing")]
-        if threshold.is_some() {
-            if let Ok(rt) = Handle::try_current() {
-                self.ensure_sweep_spawned_with(&rt);
-            }
-            // No runtime current: nothing to spawn onto yet. The next
-            // `register_actor` call (which always has one) tries again.
-        }
+            .store(nanos, Ordering::Relaxed);
+        // The watchdog bit stays on while the system monitor's `long_schedule`
+        // wants turns timed, whatever this threshold says.
+        crate::telemetry::monitor::refresh_watchdog(
+            &self.telemetry.0,
+            &self.turn_warning_threshold_nanos,
+        );
+        // With no runtime current nothing is spawned yet; the next
+        // `register_actor` call (which always has one) tries again.
+        self.ensure_sweep();
     }
 
     /// Returns this system's current stuck-turn watchdog threshold, as set
@@ -1667,12 +2503,586 @@ impl ActorSystem {
         nanos_to_threshold(self.turn_warning_threshold_nanos.load(Ordering::Relaxed))
     }
 
+    /// Makes `monitor` the actor that is told about long turns and long
+    /// mailboxes, as Erlang/OTP's `erlang:system_monitor/2` does for its
+    /// monitor process, and returns the settings it replaces. A system has
+    /// one monitor. An empty `config` clears it.
+    ///
+    /// The monitor is told through `map`, which turns each report into a
+    /// message of the monitor's own type; the message is offered to the
+    /// monitor's mailbox without waiting. A message the full mailbox refuses
+    /// is counted in the next
+    /// [`SubscriptionNotice::Overflow`](crate::telemetry::SubscriptionNotice::Overflow)
+    /// notice the monitor is given, and its report is offered again at the
+    /// next look while the turn still runs or the mailbox is still long,
+    /// until the monitor takes it; a report the monitor took is not offered
+    /// again, and a mailbox whose long report the monitor never took is not
+    /// reported short to it. A mailbox already long at the monitor's first
+    /// look is reported to it neither long nor short; its next crossing is.
+    /// `config` names what the monitor is told about:
+    /// [`TurnStuck`](crate::telemetry::EventKind::TurnStuck) for a turn that
+    /// has run longer than `long_schedule`, or longer than the system's turn
+    /// warning threshold when that is smaller (the event carries the threshold
+    /// it passed), and
+    /// [`MailboxBacklog`](crate::telemetry::EventKind::MailboxBacklog) for a
+    /// mailbox that reached `enable` messages and again when it fell to
+    /// `disable`. Both are sampled by a task of the system, so a report comes
+    /// some time after the crossing and a mailbox that grew and shrank between
+    /// two looks is not reported; a `map` that panics ends the monitor after
+    /// one more call with a [`SubscriptionNotice::MapPanicked`](crate::telemetry::SubscriptionNotice::MapPanicked)
+    /// notice. The monitor's own turns and mailbox are never reported to it.
+    /// Setting a `long_schedule` makes the system time turns, as the turn
+    /// warning threshold does, and leaves that threshold and
+    /// [`stuck_actors`](Self::stuck_actors) as they were.
+    ///
+    /// The monitor is cleared when its actor ends or when it is replaced.
+    ///
+    /// # Errors
+    /// - [`MonitorError::ZeroEnable`] and [`MonitorError::DisableNotBelowEnable`]
+    ///   for a queue length that cannot work;
+    /// - [`MonitorError::MonitorEnded`] when `monitor` has ended or is not an
+    ///   actor of this system;
+    /// - [`MonitorError::NoTimeDriver`] when no runtime with the time driver
+    ///   is current, since the sampling sleeps on it.
+    ///
+    /// A call that fails leaves the monitor the system had.
+    pub fn system_monitor<A: Actor>(
+        &self,
+        monitor: &ActorHandle<A>,
+        map: impl FnMut(Delivery) -> A::Message + Send + 'static,
+        config: MonitorConfig,
+    ) -> Result<Option<MonitorSettings>, MonitorError> {
+        use crate::telemetry::monitor as mon;
+
+        mon::validate(&config)?;
+        let config = mon::normalized(config);
+        if mon::is_empty(&config) {
+            return Ok(self.clear_system_monitor());
+        }
+        let ended = {
+            let status = monitor.status_rx();
+            let reason = status.borrow().reason.is_some();
+            reason || status.status() == crate::types::ActorStatus::Stopped
+        };
+        let identity = if ended {
+            None
+        } else {
+            self.resolve_identity(monitor.stop_lane_ref().abort_record(), monitor.id())
+        };
+        let Some(identity) = identity else {
+            return Err(MonitorError::MonitorEnded);
+        };
+        let rt = match Handle::try_current() {
+            Ok(rt) if crate::time_probe::runtime_has_timers(&rt) => rt,
+            _ => return Err(MonitorError::NoTimeDriver),
+        };
+
+        let mode = self.telemetry_mode();
+        let sub = crate::telemetry::subscription::next_id(mode);
+        let (inbox, rx) = mon::MonitorInbox::new(identity.actor().clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Built before the task is spawned and moved into it, so the monitor
+        // is cleared whether the task runs to its end, is aborted, or is
+        // dropped unpolled with its runtime.
+        let guard =
+            mon::MonitorGuard::new(mode.clone(), sub, self.turn_warning_threshold_nanos.clone());
+        let previous = mon::install(
+            mode,
+            MonitorSettings {
+                monitor: identity.actor().clone(),
+                config,
+            },
+            sub,
+            inbox.clone(),
+            cancel.clone(),
+            &self.turn_warning_threshold_nanos,
+        );
+        // The sweep offers the monitor's reports; it starts here when the
+        // monitor is the first thing that wants it.
+        self.ensure_sweep();
+        let handle = monitor.clone();
+        // The monitor's record goes with its id: the handle this task holds
+        // keeps that record alive as long, and the helper's end is then
+        // counted among the monitor's own events.
+        drop(self.spawn_helper(
+            &rt,
+            HelperKind::Monitor,
+            Some(crate::helper::HelperOwner::new(
+                monitor.id().clone(),
+                Some(monitor.stop_lane_ref().abort_record().clone()),
+            )),
+            |end| end.observe(mon::forward(guard, rx, inbox, map, handle, cancel)),
+        ));
+        Ok(previous)
+    }
+
+    /// The settings of the system's monitor, if it has one.
+    pub fn system_monitor_settings(&self) -> Option<MonitorSettings> {
+        crate::telemetry::monitor::settings(self.telemetry_mode())
+    }
+
+    /// Clears the system's monitor and returns its settings.
+    pub fn clear_system_monitor(&self) -> Option<MonitorSettings> {
+        crate::telemetry::monitor::clear(self.telemetry_mode(), &self.turn_warning_threshold_nanos)
+    }
+
+    /// Turns turn tracking on or off. While it is on, the system counts the
+    /// turns of its actors and flags the turn each one is inside, which is
+    /// what [`is_quiescent`](Self::is_quiescent) and the `in_turn` field of a
+    /// [`snapshot`](Self::snapshot) read. Off by default. Switch it on before
+    /// the turns, restart attempts and child deaths it should see: a turn
+    /// already in flight when it is switched on is not flagged, and an
+    /// attempt or a death that began earlier is not counted.
+    pub fn set_turn_tracking(&self, on: bool) {
+        self.telemetry
+            .0
+            .set_ctl(crate::telemetry::CTL_TRACK_TURNS, on);
+        self.telemetry.0.engage_pass();
+    }
+
+    /// Whether turn tracking is on (see
+    /// [`set_turn_tracking`](Self::set_turn_tracking)).
+    pub fn turn_tracking(&self) -> bool {
+        self.telemetry.0.word() & crate::telemetry::CTL_TRACK_TURNS != 0
+    }
+
+    /// Turns wait-cycle detection on or off. While it is on, a send made from
+    /// inside an actor's hook that has to wait on another actor is recorded
+    /// for as long as it waits, and a cycle of such waits raises one
+    /// [`WaitCycle`](crate::telemetry::EventKind::WaitCycle) event. Detection
+    /// reports and changes no send. Off by default.
+    ///
+    /// What is recorded: `send`, `send_priority`, `notify` and
+    /// `notify_priority` made from a hook, while they wait for room in the
+    /// target's mailbox or priority lane, and while `send` and `send_priority`
+    /// wait for the reply. What is not recorded: sends with a deadline
+    /// (`send_timeout` and `send_priority_timeout`). A cycle that passes
+    /// through such a wait is not reported.
+    ///
+    /// What detection sees is a send future polled inside a hook: the switch
+    /// is read when the send begins, its wait is recorded when the send first
+    /// returns pending and ends when the future completes or drops, so poll a
+    /// send where you await it (a send future
+    /// moved to another task keeps describing the hook it first waited in
+    /// until it is dropped). A hook that was already running when the switch
+    /// was turned on records nothing for the rest of that turn. Cycles are
+    /// searched within one system: waits between actors of different systems
+    /// are not joined into a cycle.
+    pub fn set_wait_cycle_detection(&self, on: bool) {
+        self.telemetry.0.set_ctl(crate::telemetry::CTL_DEADLOCK, on);
+        self.telemetry.0.engage_pass();
+    }
+
+    /// Whether wait-cycle detection is on (see
+    /// [`set_wait_cycle_detection`](Self::set_wait_cycle_detection)).
+    pub fn wait_cycle_detection(&self) -> bool {
+        self.telemetry.0.word() & crate::telemetry::CTL_DEADLOCK != 0
+    }
+
+    /// A read-only record of every actor registered in the system, in the
+    /// order they were registered. It asks no actor anything, so a stuck actor
+    /// does not delay it; it takes no lock a running actor holds across a
+    /// turn and runs no user code. An actor whose end is final is not listed.
+    ///
+    /// The records are read one after another, each at its own instant, so
+    /// the snapshot is not atomic across actors: a queue length and a status
+    /// of two actors may belong to different moments. `in_turn` is filled
+    /// while [`turn tracking`](Self::set_turn_tracking) is on, a turn warning
+    /// threshold is set or the system monitor watches turns, and `waiting_on`
+    /// while
+    /// [`wait-cycle detection`](Self::set_wait_cycle_detection) is on.
+    ///
+    /// The coupling counts of a row ([`monitors`](crate::telemetry::ActorRecord::monitors),
+    /// [`monitored_by`](crate::telemetry::ActorRecord::monitored_by),
+    /// [`links`](crate::telemetry::ActorRecord::links),
+    /// [`pg_groups`](crate::telemetry::ActorRecord::pg_groups) and
+    /// [`group_monitors`](crate::telemetry::ActorRecord::group_monitors)) are
+    /// read from the incarnation's shared block, where the actor records the
+    /// lengths of its own monitor, link and group-monitor tables when they
+    /// change and where its watchers and its groups keep the other two
+    /// counts: they are the values of the last change, as [`get_status`](crate::actor::handle::ActorHandle::get_status)
+    /// reports them, without asking the actor.
+    pub fn snapshot(&self) -> Vec<crate::telemetry::ActorRecord> {
+        use crate::telemetry::{
+            ActorRecord, ActorRef, CTL_DEADLOCK, CTL_TRACK_TURNS, CTL_WATCHDOG,
+        };
+
+        let mode = self.telemetry_mode();
+        let word = mode.word();
+        let timed = word & (CTL_WATCHDOG | CTL_TRACK_TURNS) != 0;
+
+        // One walk of the registry. A shard guard is held only while its
+        // entries are read, and what is read under it is atomics, the
+        // status plane's leaf cell and the mailbox's counters: no user code,
+        // no await, no other registry lock.
+        let mut seen: Vec<Seen> = Vec::new();
+        for entry in &self.by_id {
+            let record = entry.stop_lane.abort_record();
+            let ended = {
+                let value = entry.status_rx.borrow();
+                value.reason.is_some()
+            };
+            seen.push(Seen {
+                id: entry.key().clone(),
+                seq: entry.registration_seq,
+                key: record.key(),
+                token: record.token_addr(),
+                parent: record.parent_token_addr(),
+                clock: entry.turn_clock.id(),
+                live: (!ended).then(|| LiveRead {
+                    status: entry.status_rx.status(),
+                    mail: entry.handle.mail_view(),
+                    children: record.children(),
+                    in_turn: if timed {
+                        entry.turn_clock.snapshot().map(|(_, elapsed)| elapsed)
+                    } else {
+                        None
+                    },
+                    suspended: record.sys_bits() & crate::actor::subtree::SYS_SUSPENDED != 0,
+                    coupling: crate::telemetry::CouplingInfo::of(record),
+                }),
+            });
+        }
+        // Named actors are found in the second map, after the first walk, so
+        // every actor the first walk saw is there unless its name was freed.
+        // Each name is kept with the registration number of the entry that
+        // holds it, never by a record address alone: a freed address can be
+        // reused by a new actor before the rows are built.
+        let mut names: HashMap<u64, Arc<str>> = HashMap::new();
+        for entry in &self.by_name {
+            names.insert(entry.registration_seq, entry.key().clone());
+        }
+
+        #[cfg(test)]
+        {
+            let hook = self.after_snapshot_walk.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Everything below works on what was copied out: no guard is held.
+        seen.sort_by_key(|row| row.seq);
+        let by_token: HashMap<usize, usize> = seen
+            .iter()
+            .enumerate()
+            .filter_map(|(at, row)| row.token.map(|token| (token, at)))
+            .collect();
+        let by_clock: HashMap<u64, usize> = seen
+            .iter()
+            .enumerate()
+            .map(|(at, row)| (row.clock, at))
+            .collect();
+        let mut refs: Vec<Option<ActorRef>> = vec![None; seen.len()];
+        let mut records = Vec::new();
+        for at in 0..seen.len() {
+            let Some(live) = &seen[at].live else {
+                continue;
+            };
+            // The table is read by a record address that may have been reused
+            // since the walk: an identity is kept only when it is the one of
+            // this entry's registration, and the row is built from the
+            // walk's own copy otherwise.
+            let identity = mode
+                .find(seen[at].key)
+                .filter(|identity| identity.incarnation() == seen[at].seq);
+            let actor = match &identity {
+                Some(identity) => identity.actor().clone(),
+                None => ref_of(&seen, &by_token, &mut refs, at),
+            };
+            let waiting_on = if word & CTL_DEADLOCK != 0 {
+                mode.wait
+                    .target_of(seen[at].clock)
+                    .and_then(|target| by_clock.get(&target).copied())
+                    .map(|target| ref_of(&seen, &by_token, &mut refs, target))
+            } else {
+                None
+            };
+            records.push(ActorRecord {
+                actor,
+                name: names
+                    .get(&seen[at].seq)
+                    .filter(|name| name.as_ref() == seen[at].id.as_str())
+                    .map(|name| name.to_string()),
+                status: live.status,
+                type_name: live.mail.type_name,
+                label: identity
+                    .as_ref()
+                    .and_then(|identity| identity.label())
+                    .map(|label| label.to_string()),
+                mailbox_len: live.mail.mailbox_len,
+                mailbox_capacity: live.mail.mailbox_capacity,
+                priority_len: live.mail.priority_len,
+                priority_capacity: live.mail.priority_capacity,
+                child_count: live.children,
+                in_turn: live.in_turn,
+                waiting_on,
+                suspended: live.suspended,
+                coupling: live.coupling,
+            });
+        }
+        records
+    }
+
+    /// Whether the system is quiescent now: no actor is inside a turn, none
+    /// has a queued message or is still initializing, and no restart attempt
+    /// is in flight. `None` unless [turn tracking](Self::set_turn_tracking) is
+    /// on.
+    ///
+    /// The registry is read twice. The answer is `true` only when both reads
+    /// found the same actors with the same turn counts and every actor idle
+    /// with empty lanes, so a turn that began and ended between the reads
+    /// makes it `false`. It says the system is quiet at the instant of the
+    /// call, not that it will stay quiet: an item a stream forwarder holds, a
+    /// send that has not begun and a timer that is not yet due are not seen,
+    /// and neither is a message taken from a mailbox and not yet inside its
+    /// turn (a window of a few instructions), or a child death before the
+    /// child's end is recorded.
+    ///
+    /// A child's death counts from the child's end until the supervisor has
+    /// decided on it, and a restart attempt from its start until the
+    /// supervisor takes its outcome, so the gap between them is not quiet. A
+    /// group restart counts from the supervisor's decision on the group until
+    /// the group's last member has its fate, so the span between its stops
+    /// and its starts is not quiet either.
+    /// Turn tracking must be on before the turns, attempts and deaths the
+    /// answer should cover. The answer is `None` when the tracking switch
+    /// changed during the call, an off and on again included.
+    pub fn is_quiescent(&self) -> Option<bool> {
+        use crate::telemetry::CTL_TRACK_TURNS;
+
+        let mode = self.telemetry_mode();
+        if mode.word() & CTL_TRACK_TURNS == 0 {
+            return None;
+        }
+        let switches = mode.ctl_changes();
+        let first = self.quiet_pass();
+        #[cfg(test)]
+        {
+            let hook = self.between_quiet_passes.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let second = self.quiet_pass();
+        // A switch turned off during the call leaves no counters to compare,
+        // and one that moved at all (off and on again included) means turns
+        // may have run uncounted between the reads.
+        if mode.word() & CTL_TRACK_TURNS == 0 || mode.ctl_changes() != switches {
+            return None;
+        }
+        Some(first.idle && first == second)
+    }
+
+    /// Runs `hook` once, in the sweep task, after it decided to end and
+    /// before it clears its latch.
+    #[cfg(test)]
+    pub(crate) fn run_before_sweep_latch_clear(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.before_sweep_latch_clear.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Runs `hook` once, inside the next snapshot, after the registry walk and
+    /// before the rows are built.
+    #[cfg(test)]
+    pub(crate) fn run_after_snapshot_walk(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_snapshot_walk.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` once, inside the next [`is_quiescent`](Self::is_quiescent),
+    /// between its two reads.
+    #[cfg(test)]
+    pub(crate) fn run_between_quiet_passes(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.between_quiet_passes.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// One read of what quiescence compares: for every actor whose end is not
+    /// final, its registration number, turn count, in-turn flag and lane
+    /// lengths, and the restart attempts in flight across them.
+    fn quiet_pass(&self) -> QuietPass {
+        let mut rows = Vec::new();
+        let mut keys = Vec::new();
+        let mut idle = true;
+        for entry in &self.by_id {
+            if entry.status_rx.borrow().reason.is_some() {
+                continue;
+            }
+            let mail = entry.handle.mail_view();
+            let in_turn = entry.turn_clock.token() != 0;
+            let starting = entry.status_rx.status() == ActorStatus::Initializing;
+            idle &= !in_turn && !starting && mail.mailbox_len == 0 && mail.priority_len == 0;
+            rows.push((
+                entry.registration_seq,
+                entry.turn_clock.turns(),
+                in_turn,
+                mail.mailbox_len,
+                mail.priority_len,
+            ));
+            keys.push((entry.stop_lane.abort_record().key(), entry.registration_seq));
+        }
+        rows.sort_unstable();
+        // Read after the walk, outside every registry guard. A record address
+        // may have been reused since the walk, so an identity counts only
+        // when it is the one of the registration the walk read.
+        let mode = self.telemetry_mode();
+        let attempts: u64 = keys
+            .into_iter()
+            .filter_map(|(key, seq)| {
+                mode.find(key)
+                    .filter(|identity| identity.incarnation() == seq)
+            })
+            .map(|identity| {
+                u64::from(identity.restarts_in_flight()) + u64::from(identity.deaths_owed())
+            })
+            .sum();
+        let in_flight = attempts;
+        QuietPass {
+            rows,
+            in_flight,
+            idle: idle && in_flight == 0,
+        }
+    }
+
+    /// Attaches a synchronous handler for the telemetry events of `kinds`
+    /// under `id`.
+    ///
+    /// Returns `false`, and attaches nothing, when a handler is already
+    /// attached under `id`. The handler takes effect from the next event: an
+    /// event being delivered when the call is made goes to the handlers it
+    /// started with.
+    ///
+    /// An actor carries nothing for telemetry until a handler or a
+    /// subscription takes events. An actor spawned while one does has its
+    /// events raised with its incarnation number and its ancestry. An actor
+    /// spawned before that is identified from the system's registry, with
+    /// every other actor the registry holds, by the call that attached the
+    /// first handler or subscription: the events about it carry its incarnation
+    /// number and its ancestry too, and a supervisor is named with its id and
+    /// its incarnation number. Such an actor has no recorded birth time, so
+    /// its end event reports no lifetime.
+    ///
+    /// The [`TurnFinished`](crate::telemetry::EventKind::TurnFinished) event of
+    /// a `handle` turn that went on, the
+    /// [`RunFinished`](crate::telemetry::EventKind::RunFinished) event and the
+    /// [`Trace`](crate::telemetry::EventKind::Trace) events of the actor's
+    /// turns run the handler on the actor's own task, between turns, while the
+    /// helper holds no event about that actor, so a handler that blocks holds that actor's
+    /// next take and whatever waits on its task: a stop request is read only
+    /// at the turn boundary, and the stop clock counts the handler because the
+    /// turn has already been timed. While the helper holds an event about the
+    /// actor (its start events after a spawn, the event of a stop request, a
+    /// sender wait, a timer tick or a child's death, or a backlog the helper
+    /// has not yet delivered), such an event is queued behind it and runs on
+    /// the helper, so it never reaches a handler ahead of an event about the
+    /// same actor that was raised before it. The turn events of every other
+    /// hook, those of a turn after the actor's loop ended or of a turn that
+    /// stopped its own actor, and every other kind, the timer tick and the
+    /// sender wait included, run the handler on a helper task of the system,
+    /// never on the task or thread that raised the event. The one exception is
+    /// [`HandlerDetached`](crate::telemetry::EventKind::HandlerDetached), which
+    /// reaches the remaining handlers on the thread that ran the handler that
+    /// panicked.
+    /// [`KindSet::all`](crate::telemetry::KindSet::all) includes the hot
+    /// kinds. The handlers attached for one event run one after another, each
+    /// call ending before the next begins, and the crate holds no lock while
+    /// one runs; a turn or run event delivered on its actor's own task can run
+    /// while the helper delivers an event about another actor, so handlers
+    /// guard the state they share. On the helper, events reach a handler in
+    /// the order they were raised. The helper runs on
+    /// the runtime that started it, so a handler that blocks holds a worker
+    /// thread of that runtime, delays the events behind it, and on a
+    /// `current_thread` runtime stalls every task on it, the actors and the
+    /// stop steps included: handlers must not block. The helper's queue holds
+    /// 4096 events; what finds it full is dropped and counted, what finds the
+    /// system gone is counted too, and so is what is raised inside a handler of
+    /// this system. The count is reported to the handlers that
+    /// take [`Dropped`](crate::telemetry::EventKind::Dropped) events, and to
+    /// each subscription that would have taken the dropped event as
+    /// `missed_before` of its next delivery, only while a handler or
+    /// subscription still exists to receive it. Events still queued when the
+    /// system is dropped are counted as dropped too. `shutdown` does not wait
+    /// for delivery; events raised by the last actors reach handlers only while
+    /// the helper's runtime is driven. Hand slow work to a
+    /// bounded channel with `try_send`, sending the owned copy
+    /// [`to_static`](crate::telemetry::TelemetryEvent::to_static) makes, and
+    /// count what is dropped:
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    /// use tokio_actors::telemetry::{KindSet, TelemetryEvent};
+    /// use tokio_actors::ActorSystem;
+    ///
+    /// let system = ActorSystem::create("exporter-example").unwrap();
+    /// let (tx, mut rx) = tokio::sync::mpsc::channel::<TelemetryEvent<'static>>(1024);
+    /// let lost = Arc::new(AtomicU64::new(0));
+    /// let counted = lost.clone();
+    /// system.attach_telemetry("export", KindSet::all(), move |event| {
+    ///     if tx.try_send(event.to_static()).is_err() {
+    ///         counted.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// });
+    /// // A task of the user's reads `rx` and does the slow work there.
+    /// # drop(rx.try_recv());
+    /// ```
+    ///
+    /// The helper stays on the runtime that started it. A handler that holds an
+    /// `Arc<ActorSystem>` keeps the system, and with it the helper, alive:
+    /// detach it first.
+    ///
+    /// A handler that panics is detached, the panic is contained, the
+    /// remaining handlers still run, and one
+    /// [`HandlerDetached`](crate::telemetry::EventKind::HandlerDetached) event
+    /// goes to the handlers that remain; a handler that attaches another from
+    /// that event and panics in turn starts the chain again, one handler per
+    /// step. Under `panic = "abort"` there is no containment: a panic of a
+    /// handler ends the process, as a panic of any hook does.
+    ///
+    /// A handler may call `attach_telemetry` and
+    /// [`detach_telemetry`](Self::detach_telemetry). An event of this system
+    /// raised from inside one of its handlers is skipped and counted as
+    /// dropped like any other: it reaches no handler and no subscription, and
+    /// the subscriptions that would have taken it read it as `missed_before`.
+    /// A handler of this system that raises events of another system does not
+    /// make that system skip them.
+    pub fn attach_telemetry(
+        &self,
+        id: &str,
+        kinds: crate::telemetry::KindSet,
+        handler: impl Fn(&crate::telemetry::TelemetryEvent<'_>) + Send + Sync + 'static,
+    ) -> bool {
+        let attached =
+            crate::telemetry::handlers::attach(&self.telemetry.0, id, kinds, Arc::new(handler));
+        // The registry mutex of the sinks is released: an attach that made
+        // the system resolve identities records every registered actor's
+        // here, on the caller's thread, not on the first event's.
+        self.telemetry.0.engage_pass();
+        crate::telemetry::subscription::start_sweep_for(&self.telemetry.0, kinds);
+        attached
+    }
+
+    /// Detaches the handler attached under `id`; `false` when there is none.
+    ///
+    /// No event delivered after the call reaches the handler, and the state it
+    /// captured is dropped once the last call in flight ends; a panic of that
+    /// drop is contained. The call does not wait for a handler that is
+    /// running.
+    ///
+    /// An actor that delivered an event on its own task (a turn event, the run
+    /// event or a trace entry) keeps a copy of the whole handler list, read
+    /// again when it next delivers such an event and dropped at its end. Until then the state a detached
+    /// handler captured, of any kind, stays alive, so do not rely on a detach
+    /// to close a channel or release a resource the handler captured while
+    /// actors are running.
+    pub fn detach_telemetry(&self, id: &str) -> bool {
+        crate::telemetry::handlers::detach(&self.telemetry.0, id)
+    }
+
     /// How long the actor registered under `id` has been inside its current
     /// callback (`pre_start`, `on_started`, `handle`, `pre_stop`,
-    /// `on_child_stopped` or `on_stopped`). `None` if it is between
+    /// `on_child_stopped`, `on_stopped`, `on_idle` or an inline signal map).
+    /// `None` if it is between
     /// callbacks, not registered, or this system's threshold is currently
-    /// `None` - turns are timed
-    /// only while a threshold is set, so this always returns `None` for
+    /// `None` - the watchdog
+    /// times turns only while a threshold is set, so this always returns `None` for
     /// every actor while the watchdog is off, regardless of whether a turn
     /// happens to be in flight.
     ///
@@ -1692,7 +3102,8 @@ impl ActorSystem {
     }
 
     /// Actors whose current callback (`pre_start`, `on_started`, `handle`,
-    /// `pre_stop`, `on_child_stopped` or `on_stopped`) has run longer than the
+    /// `pre_stop`, `on_child_stopped`, `on_stopped`, `on_idle` or an inline
+    /// signal map) has run longer than the
     /// configured threshold, longest first. Empty when no threshold is set.
     ///
     /// Observation only - see
@@ -1721,12 +3132,47 @@ impl ActorSystem {
         stuck
     }
 
-    /// Returns a clone of this system's turn-warning threshold cell, handed
-    /// to each actor's [`TurnClock`] at spawn time so every actor always
-    /// reads the same cell this system writes: a threshold change made after
-    /// spawn takes effect immediately, with no separate signaling needed.
-    pub(crate) fn turn_threshold_cell(&self) -> Arc<AtomicU64> {
-        self.turn_warning_threshold_nanos.clone()
+    /// Starts the sweep on the runtime current now, when something wants it
+    /// and none is alive. A call with no runtime current starts nothing; the
+    /// next call with one retries.
+    #[inline]
+    pub(crate) fn ensure_sweep(&self) {
+        if self.sweep_wanted() {
+            self.ensure_sweep_wanted();
+        }
+    }
+
+    /// The part of [`ensure_sweep`](Self::ensure_sweep) that runs only when
+    /// something wants the sweep, kept out of line so a spawn that nothing
+    /// watches tests the want and goes on.
+    #[inline(never)]
+    fn ensure_sweep_wanted(&self) {
+        // The want was published before this call and the latch is read
+        // below; a sweep that is ending clears its latch and then reads the
+        // want. The fence orders both pairs, so at least one side sees the
+        // other and a want is never left with no sweep.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Ok(rt) = Handle::try_current() {
+            self.ensure_sweep_spawned_with(&rt);
+        }
+    }
+
+    /// Whether anything wants the sweep to run: a sink that takes
+    /// [`TurnStuck`](crate::telemetry::EventKind::TurnStuck) or
+    /// [`MailboxBacklog`](crate::telemetry::EventKind::MailboxBacklog), an
+    /// installed system monitor (it arms no kind: its thresholds are in the
+    /// mode), or, with the `tracing` feature, a turn warning threshold. Three
+    /// relaxed loads when nothing asks and the feature is off.
+    #[inline]
+    pub(crate) fn sweep_wanted(&self) -> bool {
+        use crate::telemetry::EventKind;
+        let mode = self.telemetry_mode();
+        let sampled = EventKind::TurnStuck.bit() | EventKind::MailboxBacklog.bit();
+        mode.word() & sampled != 0
+            || mode.monitor_long_schedule_nanos() != 0
+            || mode.monitor_queue() != 0
+            || (cfg!(feature = "tracing")
+                && self.turn_warning_threshold_nanos.load(Ordering::Relaxed) != 0)
     }
 
     /// Spawns the turn-watchdog sweep task for this system, unless one is
@@ -1739,7 +3185,6 @@ impl ActorSystem {
     /// never used for it: the call does nothing there, and the next call on a
     /// runtime with the driver starts it. A runtime found without the driver
     /// is remembered by this system, so a spawn there does not probe it again.
-    #[cfg(feature = "tracing")]
     fn ensure_sweep_spawned_with(&self, rt: &Handle) {
         // A sweep that is alive needs no probe. A runtime known to have the
         // driver goes on; one this system already found without it returns;
@@ -1784,11 +3229,26 @@ impl ActorSystem {
         // completion, is aborted mid-flight, or is dropped unpolled because
         // its runtime never gets around to it before shutting down.
         let guard = SweepLatchGuard(self.sweep_spawned.clone());
-        let name = self.name.clone();
+        let system = self.me.clone();
         drop(self.helpers.spawn(rt, HelperKind::Sweep, None, |end| {
             end.observe(async move {
-                let _guard = guard;
-                turn_watchdog_sweep(name).await
+                turn_watchdog_sweep(system.clone()).await;
+                // The sweep decided to end. A want that arrived since its last
+                // look found the latch set and started nothing, so the latch
+                // clears first and the want is read again after it: either
+                // that caller or this read starts the next sweep.
+                #[cfg(test)]
+                if let Some(live) = system.upgrade() {
+                    let hook = live.before_sweep_latch_clear.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                drop(guard);
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if let Some(live) = system.upgrade() {
+                    live.ensure_sweep();
+                }
             })
         }));
     }
@@ -1799,7 +3259,7 @@ impl ActorSystem {
         &self,
         rt: &Handle,
         kind: HelperKind,
-        owner: Option<ActorId>,
+        owner: Option<crate::helper::HelperOwner>,
         make: F,
     ) -> tokio::task::JoinHandle<()>
     where
@@ -1813,6 +3273,12 @@ impl ActorSystem {
     #[cfg(test)]
     pub(crate) fn live_helpers(&self) -> usize {
         self.helpers.live()
+    }
+
+    /// The helper slot of `rt`, if this system has started a helper there.
+    #[cfg(test)]
+    pub(crate) fn helper_slot_of(&self, rt: &Handle) -> Option<Arc<crate::helper::HelperSlot>> {
+        self.helpers.slot_of(rt)
     }
 
     /// The ends the helper slot of `rt` has recorded, in order.
@@ -2027,6 +3493,10 @@ impl ActorSystem {
             owner.spawn_helper(&rt, HelperKind::ShutdownWalk, None, move |end| {
                 end.observe(async move {
                     let report = walker.walk(walk_policy, deadline, roots, in_flight).await;
+                    // The helper's hold on the system ends before the caller
+                    // is woken, so a caller that drops its own handle right
+                    // after the call is the last holder.
+                    drop(walker);
                     report_tx.send(report);
                 })
             }),
@@ -2048,8 +3518,8 @@ impl ActorSystem {
     /// map holds under its name.
     fn walk_host(&self) -> Option<(Handle, Arc<ActorSystem>)> {
         let rt = Handle::try_current().ok()?;
-        let held = systems().get(&self.name)?.value().clone();
-        std::ptr::eq(Arc::as_ptr(&held), self).then_some((rt, held))
+        let held = Self::get_named(&self.name)?;
+        (held.generation == self.generation).then_some((rt, held))
     }
 
     /// The roots a shutdown that has just entered takes on first, in the
@@ -2302,7 +3772,7 @@ impl ActorSystem {
     fn snapshot_roots(&self) -> Vec<RootSnapshot> {
         self.by_id
             .iter()
-            .filter(|e| e.is_root)
+            .filter(|e| e.parent.is_none())
             .map(|e| RootSnapshot {
                 id: e.key().clone(),
                 registration_seq: e.registration_seq,
@@ -2456,6 +3926,7 @@ impl ActorSystem {
                 None,
                 None,
                 || {},
+                None,
             );
             let took = raised_kill.result != RaiseResult::Refused;
             let raised = took || kill_raised;
@@ -2514,7 +3985,12 @@ impl ActorSystem {
             .filter(|e| e.status_rx.same_channel(status_rx))
             .map(|e| e.stop_lane.clone());
         if let Some(lane) = lane {
-            lane.raise(reason);
+            raise_noted(
+                Some(self),
+                &lane,
+                reason,
+                crate::telemetry::StopOrigin::Requested,
+            );
         }
     }
 
@@ -2542,6 +4018,7 @@ impl ActorSystem {
             None,
             None,
             || {},
+            None,
         )
         .result
             != RaiseResult::Refused
@@ -2589,10 +4066,8 @@ fn nanos_to_threshold(nanos: u64) -> Option<Duration> {
 /// was spawned on shuts down first. Without this, a sweep task that never
 /// clears the latch would leave `sweep_spawned` stuck at `true` forever, and
 /// no later runtime could ever spawn a replacement for it.
-#[cfg(feature = "tracing")]
 struct SweepLatchGuard(Arc<AtomicBool>);
 
-#[cfg(feature = "tracing")]
 impl Drop for SweepLatchGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -2603,75 +4078,528 @@ impl Drop for SweepLatchGuard {
 /// warning threshold: a quarter of the threshold, never less than 50 ms and
 /// never more than 1 s. A zero threshold gives 50 ms and `Duration::MAX`
 /// gives 1 s; the division cannot overflow.
-#[cfg(feature = "tracing")]
 fn sweep_tick(threshold: Duration) -> Duration {
     (threshold / 4).clamp(Duration::from_millis(50), Duration::from_secs(1))
 }
 
-/// Background task, spawned by [`ActorSystem::ensure_sweep_spawned_with`]
-/// whenever none is currently alive for this system, that periodically logs
-/// actors whose current turn has run longer than their system's turn
-/// warning threshold. Re-resolves its system by name every tick instead of
-/// holding a strong reference, and exits the moment that lookup comes back
-/// empty - so this task never keeps an otherwise-unreferenced system alive,
-/// and never needs a separate shutdown signal. The caller spawns this
-/// alongside a [`SweepLatchGuard`] built from the owning system's
-/// `sweep_spawned`, so that latch clears on the way out by any exit path,
-/// including this task being dropped before it is ever polled, or being
-/// dropped outright by its runtime shutting down.
-#[cfg(feature = "tracing")]
-async fn turn_watchdog_sweep(name: String) {
-    let mut last_warned: std::collections::HashMap<ActorId, u64> = std::collections::HashMap::new();
+/// An actor whose turn ran past a threshold, as the sweep saw it. It holds
+/// the actor's record itself, not the record's address: the record names the
+/// actor in the telemetry table for as long as it lives, so an actor that
+/// ends while the sweep writes the lines before its own is still named by its
+/// own identity and never by a new actor placed at the same address.
+struct StuckTurn {
+    id: ActorId,
+    seq: u64,
+    token: u64,
+    elapsed: Duration,
+    record: crate::actor::subtree::AbortRecord,
+}
 
+impl StuckTurn {
+    /// The address that names the record in the telemetry table.
+    #[cfg(test)]
+    fn key(&self) -> usize {
+        self.record.key()
+    }
+
+    /// The identity the telemetry table holds for this actor's record.
+    #[cfg(feature = "tracing")]
+    fn identity(&self, mode: &crate::telemetry::Mode) -> Option<Arc<crate::telemetry::Identity>> {
+        mode.find(self.record.key())
+    }
+}
+
+/// The actors whose current turn has run longer than `threshold`.
+fn stuck_turns(system: &ActorSystem, threshold: Duration) -> Vec<StuckTurn> {
+    system
+        .by_id
+        .iter()
+        .filter_map(|e| {
+            let (token, elapsed) = e.turn_clock.snapshot()?;
+            (elapsed > threshold).then(|| StuckTurn {
+                id: e.key().clone(),
+                seq: e.registration_seq,
+                token,
+                elapsed,
+                record: e.stop_lane.abort_record().clone(),
+            })
+        })
+        .collect()
+}
+
+/// Background task, spawned by [`ActorSystem::ensure_sweep_spawned_with`]
+/// whenever none is currently alive for this system and something asks for
+/// it, that looks at the actors now and then: it reports a turn that has run
+/// past the smaller of the monitor's `long_schedule` and the turn warning
+/// threshold, whichever of them is set, reports a mailbox that crossed the
+/// monitor's lengths, and with the `tracing` feature logs actors over the
+/// turn warning threshold. Holds its system only weakly and upgrades it for
+/// the length of one look, and exits the moment that upgrade comes back
+/// empty - so this task never keeps an otherwise-unreferenced system alive,
+/// never sweeps a later system that claimed the name, and never needs a
+/// separate shutdown signal. It also exits after two looks in a row that
+/// found nothing asking for it. The caller spawns this alongside a
+/// [`SweepLatchGuard`] built from the owning system's `sweep_spawned`, so
+/// that latch clears on the way out by any exit path, including this task
+/// being dropped before it is ever polled, or being dropped outright by its
+/// runtime shutting down.
+async fn turn_watchdog_sweep(system: Weak<ActorSystem>) {
+    let mut state = crate::telemetry::monitor::SweepState::default();
+    let mut idle_looks = 0u8;
     loop {
-        let Some(system) = ActorSystem::get_named(&name) else {
+        let Some(live) = system.upgrade() else {
             return;
         };
-
-        let threshold_nanos = system.turn_warning_threshold_nanos.load(Ordering::Relaxed);
-        if threshold_nanos == 0 {
-            drop(system);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+        if live.sweep_wanted() {
+            idle_looks = 0;
+        } else {
+            idle_looks += 1;
+            if idle_looks >= 2 {
+                return;
+            }
         }
-        let threshold = Duration::from_nanos(threshold_nanos);
-        let tick = sweep_tick(threshold);
+        // The look has no `.await` in it: never hold a `DashMap` guard across
+        // one.
+        let tick = live.sweep_look(&mut state);
+        drop(live);
+        tokio::time::sleep(tick).await;
+    }
+}
 
-        // Collected with no `.await` in the loop body: never hold a
-        // `DashMap` guard across one. `snapshot()` reads the token and the
-        // elapsed time from a single atomic load, so the token recorded
-        // below always corresponds to the exact turn `elapsed` was measured
-        // against - unlike calling `elapsed()` and `token()` separately,
-        // which can straddle the actor ending one turn and starting the
-        // next between the two loads.
-        let stuck_now: Vec<(ActorId, u64, Duration)> = system
-            .by_id
-            .iter()
-            .filter_map(|e| {
-                let (token, elapsed) = e.turn_clock.snapshot()?;
-                (elapsed > threshold).then(|| (e.key().clone(), token, elapsed))
-            })
-            .collect();
-        drop(system);
+impl ActorSystem {
+    /// One look of the sweep; returns how long to wait before the next.
+    ///
+    /// The smallest nonzero threshold among the turn warning threshold and
+    /// the monitor's `long_schedule` is the one a turn is reported at (once
+    /// per turn), and a quarter of it sets the wait; a monitor of mailboxes
+    /// alone counts as a second. Events go to the pump; reports for the
+    /// system monitor go to its inbox; no handler and no map runs here.
+    fn sweep_look(&self, state: &mut crate::telemetry::monitor::SweepState) -> Duration {
+        use crate::telemetry::EventKind;
 
-        let mut still_stuck: HashSet<ActorId> = HashSet::with_capacity(stuck_now.len());
-        for (id, token, elapsed) in &stuck_now {
+        let mode = self.telemetry_mode();
+        let watchdog = self.turn_warning_threshold_nanos.load(Ordering::Relaxed);
+        let long_schedule = mode.monitor_long_schedule_nanos();
+        let smallest = [watchdog, long_schedule]
+            .into_iter()
+            .filter(|nanos| *nanos != 0)
+            .min()
+            .map(Duration::from_nanos);
+        let tick = sweep_tick(smallest.unwrap_or(Duration::from_secs(1)));
+        state.pass += 1;
+        let inbox = self.monitor_inbox_for(state);
+
+        let turns_inbox = inbox.as_ref().filter(|_| long_schedule != 0);
+        let report =
+            smallest.is_some() && (mode.armed(EventKind::TurnStuck) || turns_inbox.is_some());
+        let warn = cfg!(feature = "tracing") && watchdog != 0;
+        match smallest {
+            Some(threshold) if report || warn => {
+                let turns = stuck_turns(self, threshold);
+                if report {
+                    self.report_stuck_turns(&turns, threshold, state, turns_inbox.map(|i| &**i));
+                } else {
+                    state.stuck.clear();
+                }
+                #[cfg(feature = "tracing")]
+                if warn {
+                    self.warn_stuck_turns(&turns, Duration::from_nanos(watchdog), state);
+                }
+            }
+            _ => state.stuck.clear(),
+        }
+
+        match crate::telemetry::monitor::unpack_queue(mode.monitor_queue()) {
+            Some((enable, disable)) => {
+                self.report_backlogs(enable, disable, state, inbox.as_deref());
+            }
+            _ => {
+                state.alarms.clear();
+                state.leaving.clear();
+            }
+        }
+        tick
+    }
+
+    /// The system monitor's inbox for this look, after the helper's answers
+    /// since the last look are read into `state`. A monitor that is not the
+    /// one the tracked states were told to is owed none of them: they read as
+    /// owed nothing, the offers and short reports still out are forgotten,
+    /// and the look is that monitor's first.
+    fn monitor_inbox_for(
+        &self,
+        state: &mut crate::telemetry::monitor::SweepState,
+    ) -> Option<Arc<crate::telemetry::monitor::MonitorInbox>> {
+        use crate::telemetry::monitor::{Offer, Told};
+
+        let current = crate::telemetry::monitor::inbox(self.telemetry_mode());
+        let id = current.as_ref().map(|(id, _)| *id);
+        state.first_look = state.monitor != id;
+        if state.first_look {
+            state.monitor = id;
+            state.offered.clear();
+            state.leaving.clear();
+            for stuck in state.stuck.values_mut() {
+                stuck.told = Told::Unowed;
+            }
+            for alarm in state.alarms.values_mut() {
+                alarm.told = Told::Unowed;
+            }
+        }
+        let (_, inbox) = current?;
+        for (tag, landed) in inbox.take_outcomes() {
+            let Some(offer) = state.offered.remove(&tag) else {
+                continue;
+            };
+            let answer = if landed { Told::Landed } else { Told::Refused };
+            // An answer counts only for the offer the state still waits on:
+            // a state that ended or moved on since has another offer or none.
+            match offer {
+                Offer::Turn(seq) => {
+                    if let Some(stuck) = state.stuck.get_mut(&seq) {
+                        if stuck.told == Told::Pending(tag) {
+                            stuck.told = answer;
+                        }
+                    }
+                }
+                Offer::Entered(seq) => {
+                    if let Some(alarm) = state.alarms.get_mut(&seq) {
+                        if alarm.told == Told::Pending(tag) {
+                            alarm.told = answer;
+                        }
+                    }
+                    // A short report held behind this long one goes out once
+                    // the long one landed, and never when it was refused.
+                    if state
+                        .leaving
+                        .get(&seq)
+                        .is_some_and(|l| l.after == Some(tag))
+                    {
+                        if landed {
+                            if let Some(leaving) = state.leaving.get_mut(&seq) {
+                                leaving.after = None;
+                            }
+                        } else {
+                            state.leaving.remove(&seq);
+                        }
+                    }
+                }
+                Offer::Left(seq) => {
+                    if state
+                        .leaving
+                        .get(&seq)
+                        .is_some_and(|l| l.told == Told::Pending(tag))
+                    {
+                        if landed {
+                            state.leaving.remove(&seq);
+                        } else if let Some(leaving) = state.leaving.get_mut(&seq) {
+                            leaving.told = Told::Refused;
+                        }
+                    }
+                }
+            }
+        }
+        inbox.prompt_missed();
+        Some(inbox)
+    }
+
+    /// Offers `event` to the monitor as a new offer for `what`; the state's
+    /// `Told` after the offer.
+    fn offer_to_monitor(
+        state: &mut crate::telemetry::monitor::SweepState,
+        inbox: &crate::telemetry::monitor::MonitorInbox,
+        what: crate::telemetry::monitor::Offer,
+        event: TelemetryEvent<'static>,
+    ) -> crate::telemetry::monitor::Told {
+        use crate::telemetry::monitor::Told;
+        state.next_tag += 1;
+        let tag = state.next_tag;
+        if inbox.offer(event, tag) {
+            state.offered.insert(tag, what);
+            Told::Pending(tag)
+        } else {
+            Told::Refused
+        }
+    }
+
+    /// Reports each turn in `turns` that was not reported yet, once, to the
+    /// sinks that take the kind; offers it to the monitor's `inbox` until the
+    /// monitor's mailbox takes it while the turn lasts; and forgets the turns
+    /// that are over.
+    fn report_stuck_turns(
+        &self,
+        turns: &[StuckTurn],
+        threshold: Duration,
+        state: &mut crate::telemetry::monitor::SweepState,
+        inbox: Option<&crate::telemetry::monitor::MonitorInbox>,
+    ) {
+        use crate::telemetry::monitor::{Offer, Stuck, Told};
+        use crate::telemetry::EventKind;
+
+        let mode = self.telemetry_mode();
+        let pass = state.pass;
+        for turn in turns {
+            let known = state
+                .stuck
+                .get(&turn.seq)
+                .filter(|stuck| stuck.token == turn.token);
+            let new = known.is_none();
+            let told = known.map_or(Told::Unoffered, |stuck| stuck.told);
+            let to_sinks = new && mode.armed(EventKind::TurnStuck);
+            let to_monitor = inbox.is_some() && matches!(told, Told::Unoffered | Told::Refused);
+            let mut told = if inbox.is_some() { told } else { Told::Unowed };
+            if to_sinks || to_monitor {
+                match crate::telemetry::identity_for(mode, &turn.record, Some(self), Some(&turn.id))
+                {
+                    Some(identity) => {
+                        let event = || TelemetryEvent::TurnStuck {
+                            actor: identity.actor().clone(),
+                            elapsed: turn.elapsed,
+                            threshold,
+                        };
+                        if to_sinks {
+                            mode.push_owned(&identity, EventKind::TurnStuck, event);
+                        }
+                        if let Some(inbox) = inbox.filter(|_| to_monitor) {
+                            told = if inbox.is_monitor(identity.actor()) {
+                                Told::Unowed
+                            } else {
+                                Self::offer_to_monitor(state, inbox, Offer::Turn(turn.seq), event())
+                            };
+                        }
+                    }
+                    None => {
+                        // The registry has let go of the actor and nothing
+                        // recorded it, so no report can name it: counted with
+                        // the other drops.
+                        mode.pump.count_dropped();
+                        told = Told::Unowed;
+                    }
+                }
+            }
+            state.stuck.insert(
+                turn.seq,
+                Stuck {
+                    token: turn.token,
+                    seen: pass,
+                    told,
+                },
+            );
+        }
+        state.stuck.retain(|_, stuck| stuck.seen == pass);
+    }
+
+    /// Logs each turn in `turns` over `threshold` that was not logged yet.
+    #[cfg(feature = "tracing")]
+    fn warn_stuck_turns(
+        &self,
+        turns: &[StuckTurn],
+        threshold: Duration,
+        state: &mut crate::telemetry::monitor::SweepState,
+    ) {
+        let mode = self.telemetry_mode();
+        let system_name = self.name();
+        let mut still_stuck: HashSet<ActorId> = HashSet::new();
+        for turn in turns.iter().filter(|turn| turn.elapsed > threshold) {
+            let (id, token, elapsed) = (&turn.id, turn.token, turn.elapsed);
             still_stuck.insert(id.clone());
-            if last_warned.get(id) != Some(token) {
+            if state.warned.get(id) != Some(&token) {
                 let elapsed_ms = elapsed.as_millis() as u64;
                 let threshold_ms = threshold.as_millis() as u64;
+                let fields = crate::telemetry::LogFields::of(turn.identity(mode), system_name);
                 caught_log!(warn,
                     actor_id = %id,
+                    actor_name = fields.name(),
+                    incarnation = fields.incarnation(),
+                    system = fields.system(),
                     elapsed_ms,
                     threshold_ms,
                     "actor turn exceeds the turn warning threshold"
                 );
-                last_warned.insert(id.clone(), *token);
+                state.warned.insert(id.clone(), token);
             }
         }
-        last_warned.retain(|id, _| still_stuck.contains(id));
+        state.warned.retain(|id, _| still_stuck.contains(id));
+    }
 
-        tokio::time::sleep(tick).await;
+    /// Reports each mailbox that reached `enable` and each reported mailbox
+    /// that fell to `disable` or whose actor is gone, once per edge, to the
+    /// sinks that take the kind. The monitor's `inbox` is offered the same
+    /// edges until its mailbox takes each while it lasts; a short report is
+    /// offered only for a long report the monitor took.
+    fn report_backlogs(
+        &self,
+        enable: usize,
+        disable: usize,
+        state: &mut crate::telemetry::monitor::SweepState,
+        inbox: Option<&crate::telemetry::monitor::MonitorInbox>,
+    ) {
+        use crate::telemetry::monitor::{backlog_edge, Alarm, Leaving, Offer, Told};
+        use crate::telemetry::EventKind;
+
+        let mode = self.telemetry_mode();
+        let to_sinks = mode.armed(EventKind::MailboxBacklog);
+        let pass = state.pass;
+        // Collected under the registry guards; the identities are resolved
+        // and the events pushed after the last guard is gone.
+        let mut entered: Vec<(u64, ActorId, AbortRecord, usize, usize)> = Vec::new();
+        let mut left: Vec<(u64, Alarm, usize)> = Vec::new();
+        let mut long: Vec<(u64, usize)> = Vec::new();
+        for entry in &self.by_id {
+            let seq = entry.registration_seq;
+            let alarmed = state.alarms.contains_key(&seq);
+            let view = entry.handle.mail_view();
+            let Some(edge) = backlog_edge(alarmed, view.mailbox_len, enable, disable) else {
+                if let Some(alarm) = state.alarms.get_mut(&seq) {
+                    alarm.seen = pass;
+                    long.push((seq, view.mailbox_len));
+                }
+                continue;
+            };
+            if entry.status_rx.borrow().reason.is_some() {
+                // An ended actor is gone as far as its mailbox is concerned.
+                continue;
+            }
+            if edge {
+                entered.push((
+                    seq,
+                    entry.key().clone(),
+                    entry.stop_lane.abort_record().clone(),
+                    view.mailbox_len,
+                    view.mailbox_capacity,
+                ));
+            } else if let Some(alarm) = state.alarms.remove(&seq) {
+                left.push((seq, alarm, view.mailbox_len));
+            }
+        }
+        // A reported mailbox the walk did not see alive is reported short once.
+        let gone: Vec<u64> = state
+            .alarms
+            .iter()
+            .filter(|(_, alarm)| alarm.seen != pass)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in gone {
+            if let Some(alarm) = state.alarms.remove(&seq) {
+                left.push((seq, alarm, 0));
+            }
+        }
+        for (seq, alarm, len) in left {
+            let event = || TelemetryEvent::MailboxBacklog {
+                actor: alarm.identity.actor().clone(),
+                entered: false,
+                len,
+                capacity: alarm.capacity,
+            };
+            if to_sinks {
+                mode.push_owned(&alarm.identity, EventKind::MailboxBacklog, event);
+            }
+            // The monitor is owed the short report only for a long one it
+            // took, or one whose answer is still out.
+            let after = match alarm.told {
+                Told::Landed => None,
+                Told::Pending(tag) => Some(tag),
+                Told::Unoffered | Told::Refused | Told::Unowed => continue,
+            };
+            if inbox.is_none() {
+                continue;
+            }
+            state.leaving.insert(
+                seq,
+                Leaving {
+                    identity: alarm.identity.clone(),
+                    len,
+                    capacity: alarm.capacity,
+                    after,
+                    told: Told::Unoffered,
+                },
+            );
+        }
+        for (seq, id, record, len, capacity) in entered {
+            let Some(identity) =
+                crate::telemetry::identity_for(mode, &record, Some(self), Some(&id))
+            else {
+                // The registry has let go of the actor and nothing recorded
+                // it, so no report can name it: counted with the other drops.
+                mode.pump.count_dropped();
+                continue;
+            };
+            if to_sinks {
+                mode.push_owned(&identity, EventKind::MailboxBacklog, || {
+                    TelemetryEvent::MailboxBacklog {
+                        actor: identity.actor().clone(),
+                        entered: true,
+                        len,
+                        capacity,
+                    }
+                });
+            }
+            // A mailbox long again ends the short state the monitor was
+            // still owed.
+            state.leaving.remove(&seq);
+            let told = match inbox {
+                // A mailbox long at the monitor's first look stood before it,
+                // and the monitor's own mailbox is never reported to it.
+                Some(inbox) if !state.first_look && !inbox.is_monitor(identity.actor()) => {
+                    Told::Unoffered
+                }
+                _ => Told::Unowed,
+            };
+            state.alarms.insert(
+                seq,
+                Alarm {
+                    identity,
+                    capacity,
+                    seen: pass,
+                    told,
+                },
+            );
+            long.push((seq, len));
+        }
+        let Some(inbox) = inbox else {
+            return;
+        };
+        // Offer each long mailbox the monitor has not taken yet, with its
+        // length now, and each short report owed and not held back.
+        for (seq, len) in long {
+            let Some(alarm) = state.alarms.get(&seq) else {
+                continue;
+            };
+            if !matches!(alarm.told, Told::Unoffered | Told::Refused) {
+                continue;
+            }
+            let event = TelemetryEvent::MailboxBacklog {
+                actor: alarm.identity.actor().clone(),
+                entered: true,
+                len,
+                capacity: alarm.capacity,
+            };
+            let told = Self::offer_to_monitor(state, inbox, Offer::Entered(seq), event);
+            if let Some(alarm) = state.alarms.get_mut(&seq) {
+                alarm.told = told;
+            }
+        }
+        let owed: Vec<u64> = state
+            .leaving
+            .iter()
+            .filter(|(_, l)| l.after.is_none() && matches!(l.told, Told::Unoffered | Told::Refused))
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in owed {
+            let Some(leaving) = state.leaving.get(&seq) else {
+                continue;
+            };
+            let event = TelemetryEvent::MailboxBacklog {
+                actor: leaving.identity.actor().clone(),
+                entered: false,
+                len: leaving.len,
+                capacity: leaving.capacity,
+            };
+            let told = Self::offer_to_monitor(state, inbox, Offer::Left(seq), event);
+            if let Some(leaving) = state.leaving.get_mut(&seq) {
+                leaving.told = told;
+            }
+        }
     }
 }
 
@@ -2706,7 +4634,6 @@ type LadderHook = Arc<dyn Fn(LadderPoint, &ActorId) + Send + Sync>;
 
 /// How many runtimes without the time driver a system remembers before it
 /// starts its memo over.
-#[cfg(feature = "tracing")]
 const TIMERLESS_MEMO_LIMIT: usize = 64;
 
 /// The channel a shutdown walk run by a helper task reports on. The report is
@@ -2731,6 +4658,13 @@ impl Drop for WalkReport {
         }
     }
 }
+
+/// What the move to `Defunct` takes out of a system: the process map's strong
+/// reference to it and its reaper feeds.
+type Released = (
+    Option<Arc<ActorSystem>>,
+    HashMap<tokio::runtime::Id, ReaperSlot>,
+);
 
 /// Counts one shutdown in flight (see `ActorSystem::registration_gate`):
 /// entered with the phase change out of `Active`, and left when the shutdown
@@ -2768,26 +4702,58 @@ impl<S: std::ops::Deref<Target = ActorSystem>> ShutdownInFlight<S> {
 
 impl<S: std::ops::Deref<Target = ActorSystem>> Drop for ShutdownInFlight<S> {
     fn drop(&mut self) {
-        let mut in_flight = self
-            .system
-            .registration_gate
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *in_flight -= 1;
-        if self.completed {
-            self.system
-                .completed_since_active
-                .store(true, Ordering::Relaxed);
+        // What the move to `Defunct` lets go of, dropped after the gate is
+        // released: the map's strong reference to the system and the reaper
+        // feeds (each reaper fires what it holds, then ends once the last
+        // clone of its feed is gone; the next feed starts a new one).
+        let mut released: Option<Released> = None;
+        {
+            let mut in_flight = self
+                .system
+                .registration_gate
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *in_flight -= 1;
+            if self.completed {
+                self.system
+                    .completed_since_active
+                    .store(true, Ordering::Relaxed);
+            }
+            if *in_flight == 0 && self.system.completed_since_active.load(Ordering::Relaxed) {
+                // No sweep of this system is in flight any more: the deadline
+                // it held for them goes with the move to `Defunct`, under the
+                // same lock, so a shutdown after a reactivation folds only its
+                // own.
+                self.system.sweep_deadline.send_replace(None);
+                self.system
+                    .phase
+                    .store(SystemPhase::Defunct.as_u8(), Ordering::Release);
+                // The map's hold goes in the same section, so the slot is
+                // strong exactly until `Defunct` is stored.
+                let slot = self.system.demote_slot();
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .system
+                        .after_demotion
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                let reapers = std::mem::take(
+                    &mut *self
+                        .system
+                        .reaper
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                released = Some((slot, reapers));
+            }
         }
-        if *in_flight == 0 && self.system.completed_since_active.load(Ordering::Relaxed) {
-            // No sweep of this system is in flight any more: the deadline it
-            // held for them goes with the move to `Defunct`, under the same
-            // lock, so a shutdown after a reactivation folds only its own.
-            self.system.sweep_deadline.send_replace(None);
-            self.system
-                .phase
-                .store(SystemPhase::Defunct.as_u8(), Ordering::Release);
-        }
+        drop(released);
     }
 }
 
@@ -2837,7 +4803,7 @@ pub(crate) fn read_status(rx: &StatusRx) -> ActorStatus {
 /// plane that closed without one. Meaningful only once the plane is
 /// terminal.
 pub(crate) fn terminal_reason(rx: &StatusRx) -> StopReason {
-    rx.borrow().reason_or_kill()
+    rx.reason_or_kill()
 }
 
 /// Waits, without a bound, until the plane is terminal and returns its
@@ -2845,10 +4811,10 @@ pub(crate) fn terminal_reason(rx: &StatusRx) -> StopReason {
 pub(crate) async fn wait_reason(rx: &mut StatusRx) -> StopReason {
     loop {
         if rx.status() == ActorStatus::Stopped {
-            return rx.borrow().reason_or_kill();
+            return rx.reason_or_kill();
         }
         if rx.changed().await.is_err() {
-            return rx.borrow().reason_or_kill();
+            return rx.reason_or_kill();
         }
     }
 }
@@ -2872,6 +4838,26 @@ pub(crate) async fn wait_closed(rx: &mut StatusRx) {
     }
 }
 
+/// The key a monitor target is looked up by.
+pub(crate) enum MonitorKey<'a> {
+    /// An actor id.
+    Id(&'a ActorId),
+    /// A registered name.
+    Name(&'a str),
+}
+
+/// What a monitor key resolved to. `status_rx` is `None` when nothing is
+/// registered under the key, and then there is no run to name.
+#[derive(Debug)]
+pub(crate) struct ResolvedTarget {
+    pub(crate) actor_id: ActorId,
+    pub(crate) incarnation: Option<Incarnation>,
+    pub(crate) status_rx: Option<StatusRx>,
+    /// The target's stop lane, from the registry entry or the handle that
+    /// named it: `None` exactly when `status_rx` is.
+    pub(crate) lane: Option<StopLane>,
+}
+
 /// Waits, without a bound, until the plane carries the actor's final reason
 /// (written at its lane seal; for a task that never reaches its seal, by its
 /// abort guard once its name is free, or by its context when it is dropped
@@ -2883,10 +4869,10 @@ pub(crate) async fn wait_final_reason(rx: &mut StatusRx) -> StopReason {
             return reason;
         }
         if rx.status() == ActorStatus::Stopped {
-            return rx.borrow().reason_or_kill();
+            return rx.reason_or_kill();
         }
         if rx.changed().await.is_err() {
-            return rx.borrow().reason_or_kill();
+            return rx.reason_or_kill();
         }
     }
 }
@@ -3439,6 +5425,9 @@ pub(crate) struct ReaperEntry {
 impl ReaperEntry {
     pub(crate) fn new(deadline: Instant, abort: AbortHandle, record: AbortRecord) -> Self {
         record.owe_for(&abort);
+        push_kill_step(&record, None, KillStepKind::AbortArmed, || {
+            step_deadline_in(deadline)
+        });
         Self {
             kill_at: None,
             deadline,
@@ -3459,6 +5448,9 @@ impl ReaperEntry {
     ) -> Self {
         let record = lane.abort_record().clone();
         record.owe_for(&abort);
+        push_kill_step(&record, None, KillStepKind::AbortArmed, || {
+            step_deadline_in(deadline)
+        });
         Self {
             kill_at: Some((kill_at, lane, deadline.saturating_duration_since(kill_at))),
             deadline,
@@ -3495,12 +5487,24 @@ impl ReaperEntry {
             if let Some((_, lane, grace)) = self.kill_at.take() {
                 // The entry holds the abort handle itself, so no deadline is
                 // owed to an attach: a duplicate arm by one is harmless.
-                match &self.step {
-                    Some(step) => {
-                        step.raise_kill(&lane, || {});
-                    }
-                    None => lane.raise(StopReason::Kill),
+                // Decided by the lane's own answer to this raise, never by a
+                // second read of the lane: a seal between the raise and a
+                // later read would hide a `Kill` the lane accepted.
+                let result = match &self.step {
+                    Some(step) => step.raise_kill(&lane, || {}),
+                    None => lane.try_raise(StopReason::Kill),
+                };
+                if result != RaiseResult::Refused {
+                    push_kill_step(&self.record, None, KillStepKind::Raised, || None);
                 }
+                emit_stop_requested(
+                    None,
+                    &lane,
+                    &StopReason::Kill,
+                    result,
+                    crate::telemetry::StopOrigin::Requested,
+                    None,
+                );
                 self.deadline = self
                     .deadline
                     .max(saturating_deadline(Instant::now(), grace));
@@ -3508,15 +5512,23 @@ impl ReaperEntry {
             }
         }
         self.fired = true;
-        self.record.abort(&self.abort);
+        self.abort_task();
         None
+    }
+
+    /// Aborts the task through the record, which reports the `AbortFired`
+    /// step for the abort that finds the task unfinished first: a finished
+    /// task gets no abort and no step, and a task a caller's force path
+    /// aborted already has had its step reported by that abort.
+    fn abort_task(&self) {
+        self.record.abort(&self.abort);
     }
 }
 
 impl Drop for ReaperEntry {
     fn drop(&mut self) {
         if !self.fired {
-            self.record.abort(&self.abort);
+            self.abort_task();
         }
     }
 }
@@ -3618,6 +5630,9 @@ async fn reaper_run(mut state: ReaperState) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod cause_tests;
+
+#[cfg(test)]
 mod duplicate_id_registration_tests;
 
 #[cfg(test)]
@@ -3627,6 +5642,9 @@ mod kill_raiser_tests;
 mod observer_pairing_tests;
 
 #[cfg(test)]
+mod process_map_tests;
+
+#[cfg(test)]
 mod refused_raiser_tests;
 
 #[cfg(test)]
@@ -3634,6 +5652,9 @@ mod shutdown_walk_tests;
 
 #[cfg(all(test, feature = "tracing"))]
 mod sweep_tick_tests;
+
+#[cfg(all(test, feature = "tracing"))]
+mod sweep_identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3668,7 +5689,7 @@ mod tests {
         }
     }
 
-    fn dummy_handle(id: &ActorId, system_name: &str) -> ActorHandle<Dummy> {
+    fn dummy_handle(id: &ActorId, _system_name: &str) -> ActorHandle<Dummy> {
         let (tx, _rx) = crate::actor::mailbox::test_channel(1);
         let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, _stop_rx) = StopLane::new();
@@ -3678,7 +5699,6 @@ mod tests {
             stop_lane,
             1,
             status_rx,
-            system_name.into(),
             None,
             Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
         )
@@ -3783,54 +5803,6 @@ mod tests {
         );
     }
 
-    // A second live registration under one id is refused, for a root and for
-    // a supervised child alike, and the refusal leaves neither a name nor a
-    // second entry behind.
-    #[tokio::test]
-    async fn second_live_registration_under_one_id_is_refused_and_leaves_no_name_behind() {
-        for is_root in [true, false] {
-            let sys = ActorSystem::create(format!("dup-id-{}", uuid::Uuid::new_v4())).unwrap();
-            let id = ActorId::from("one-id");
-
-            let first = dummy_handle(&id, sys.name());
-            let first_seq = sys
-                .register_actor::<Dummy>(
-                    &id,
-                    None,
-                    &first,
-                    is_root,
-                    TurnClock::default(),
-                    DEFAULT_KILL_GRACE,
-                    Handle::current(),
-                )
-                .unwrap();
-
-            let second = dummy_handle(&id, sys.name());
-            let err = sys
-                .register_actor::<Dummy>(
-                    &id,
-                    Some(&Arc::from("second-name")),
-                    &second,
-                    is_root,
-                    TurnClock::default(),
-                    DEFAULT_KILL_GRACE,
-                    Handle::current(),
-                )
-                .unwrap_err();
-            assert_eq!(err, SpawnError::DuplicateChild(id.clone()));
-            assert!(
-                err.to_string().contains("one-id"),
-                "the message names the id, got {err}"
-            );
-            assert!(
-                sys.registered().is_empty(),
-                "the refused registration leaves no name behind"
-            );
-            let entry = sys.by_id.get(&id).expect("the first registration stays");
-            assert_eq!(entry.registration_seq, first_seq);
-        }
-    }
-
     // - Reaper ----------------------------------------------------------------
 
     /// An entry that is dropped without having fired aborts its task; one that
@@ -3877,32 +5849,6 @@ mod tests {
         }
     }
 
-    /// A first stage that fires late (its instant and its abort's both
-    /// past, as when the reaper's runtime was busy) still gives the task its
-    /// kill grace after the `Kill`: the abort stage moves to one grace from
-    /// when the `Kill` fired.
-    #[tokio::test(start_paused = true)]
-    async fn a_kill_stage_fired_late_still_gives_its_kill_grace() {
-        let (child, lane, lane_rx) = parked_with_a_lane();
-        let start = Instant::now();
-        let entry = ReaperEntry::two_stage(
-            start + Duration::from_millis(100),
-            lane,
-            start + Duration::from_millis(500),
-            child.abort_handle(),
-        );
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let fired_at = Instant::now();
-        let rest = entry.fire().expect("the Kill stage hands its entry back");
-        assert!(matches!(lane_rx.borrow().reason, Some(StopReason::Kill)));
-        assert!(
-            rest.due() >= fired_at + Duration::from_millis(400),
-            "the abort is one kill grace after the late Kill"
-        );
-        assert!(!child.is_finished());
-        child.abort();
-    }
-
     /// A plane that holds `status`, `reason` and the instant `final_at` (the
     /// cell keeps its last value once its sender is gone).
     fn plane(status: ActorStatus, reason: StopReason, final_at: Option<Instant>) -> StatusRx {
@@ -3914,216 +5860,85 @@ mod tests {
         .1
     }
 
-    #[test]
-    fn an_ended_stop_reads_what_was_requested_when_it_published_stopped() {
-        use StopOutcome::{Aborted, Graceful, Killed};
-        let stopped = plane(ActorStatus::Stopped, StopReason::Kill, None);
-        assert_eq!(terminal_outcome(&stopped, Graceful), Graceful);
-        assert_eq!(terminal_outcome(&stopped, Killed), Killed);
-        let (tx, closed) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
-        drop(tx);
-        assert_eq!(terminal_outcome(&closed, Graceful), Aborted);
-        assert_eq!(terminal_outcome(&closed, Killed), Aborted);
-    }
+    // - The sweep runs only while something asks for it ------------------------
 
-    /// The leftover classifier, row by row: a plane that published `Stopped`
-    /// reads by the instant its end became final against the deadline, and
-    /// `Killed` whenever this shutdown took a `Kill` on it; a plane closed
-    /// without `Stopped` reads `Aborted` whatever its instant.
-    #[test]
-    fn a_leftover_reads_by_the_instant_its_end_became_final() {
-        use StopOutcome::{Aborted, Graceful, Killed};
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let before = deadline - Duration::from_secs(1);
-        let after = deadline + Duration::from_secs(1);
-        let rows = [
-            (Some(before), false, Graceful),
-            (Some(before), true, Killed),
-            (Some(deadline), false, Killed),
-            (Some(after), false, Killed),
-            (None, false, Killed),
-        ];
-        for (final_at, raised, want) in rows {
-            let stopped = plane(ActorStatus::Stopped, StopReason::Graceful, final_at);
-            let report = leftover_report(&stopped, raised, deadline);
-            assert_eq!(
-                report.outcome, want,
-                "Stopped, final at {final_at:?}, raised {raised}"
-            );
-            assert_eq!(report.reason, Some(StopReason::Graceful));
+    /// A system nobody asks anything of starts no task of its own, however
+    /// many actors register and however long it lives.
+    async fn nothing_asked_starts_nothing() {
+        use crate::actor::ActorExt;
+
+        let sys = ActorSystem::create(format!("sweep-none-{}", uuid::Uuid::new_v4())).unwrap();
+        let mut kept = Vec::new();
+        for _ in 0..4 {
+            kept.push(Dummy.spawn().on_system(&sys).await.unwrap());
         }
-        // A plane that closed without `Stopped`, its reason final before the
-        // deadline (an abort guard's write): aborted, never read by its
-        // instant.
-        let (tx, closed) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
-        StatusValue::write_reason(&tx, StopReason::Kill, false);
-        drop(tx);
-        assert!(closed.borrow().final_at.is_some_and(|at| at < deadline));
-        assert_eq!(leftover_outcome(&closed, false, deadline), Aborted);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(sys.live_helpers(), 0);
+        assert!(!sys.sweep_spawned.load(Ordering::Acquire));
+        drop(kept);
     }
 
-    /// A sweep's wait already parked follows the system's deadline when it
-    /// is lowered: it gives up at the new deadline, not at its own.
-    #[tokio::test(start_paused = true)]
-    async fn a_parked_wait_follows_a_system_deadline_lowered_while_it_waits() {
-        let (status_tx, mut rx) = StatusTx::channel(StatusValue::new(ActorStatus::Stopping));
-        let (system_tx, mut system) =
-            watch::channel(Some(Instant::now() + Duration::from_secs(10)));
-        let own = Instant::now() + Duration::from_secs(5);
-        let mut wait = Box::pin(wait_end_by_the_system_deadline(&mut rx, &mut system, own));
-        let parked = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(wait.as_mut(), cx).is_pending())
-        })
-        .await;
-        assert!(parked, "the wait parks on its leftover and its deadlines");
-        system_tx.send_replace(Some(Instant::now() + Duration::from_millis(100)));
-        let seen = tokio::time::timeout(Duration::from_millis(200), wait).await;
-        assert_eq!(
-            seen,
-            Ok(false),
-            "the wait gave up at the lowered deadline, the leftover not seen to end"
-        );
-        drop(status_tx);
+    #[tokio::test(flavor = "current_thread")]
+    async fn nothing_asked_starts_nothing_current_thread() {
+        nothing_asked_starts_nothing().await;
     }
 
-    /// An incarnation that ended before an entry's stages are due is left
-    /// alone at both: its lane is not raised, and nothing is aborted.
-    #[tokio::test(start_paused = true)]
-    async fn a_two_stage_entry_whose_task_ended_does_nothing_at_either_stage() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(reaper_loop(rx));
-        let (lane, lane_rx) = StopLane::new();
-        let ended = tokio::spawn(async {});
-        let abort = ended.abort_handle();
-        ended.await.unwrap();
-        let start = Instant::now();
-        tx.send(ReaperEntry::two_stage(
-            start + Duration::from_millis(100),
-            lane,
-            start + Duration::from_millis(300),
-            abort,
-        ))
-        .unwrap();
-        turns().await;
-        tokio::time::advance(Duration::from_millis(400)).await;
-        turns().await;
+    /// The sweep ends by itself once nothing asks for it, and a want that
+    /// lands after it decided to end and before its latch clears still has a
+    /// sweep running afterwards.
+    async fn the_sweep_ends_unasked_and_a_want_in_its_exit_window_restarts_it() {
+        use crate::helper::HelperEnd;
+        use crate::telemetry::{EventKind, KindSet};
+
+        let sys = ActorSystem::create(format!("sweep-exit-{}", uuid::Uuid::new_v4())).unwrap();
+        let kinds = KindSet::of(&[EventKind::TurnStuck]);
+        assert!(sys.attach_telemetry("first", kinds, |_| {}));
         assert!(
-            lane_rx.borrow().reason.is_none(),
-            "no Kill is raised for an incarnation that already ended"
+            sys.sweep_spawned.load(Ordering::Acquire),
+            "a handler for a sampled kind starts the sweep"
         );
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn reaper_orders_two_stage_and_single_stage_entries_by_their_next_due_instant() {
-        let start = Instant::now();
-        let at = |ms: u64| start + Duration::from_millis(ms);
-        let (staged, staged_lane, staged_rx) = parked_with_a_lane();
-        let single = tokio::spawn(std::future::pending::<()>());
-        let early = tokio::spawn(std::future::pending::<()>());
-        let mut heap = BinaryHeap::new();
-        // The two-stage entry's abort is the latest instant, its first stage
-        // the middle one: it sorts by the stage that is next.
-        heap.push(ReaperEntry::new(
-            at(500),
-            single.abort_handle(),
-            AbortRecord::new(),
-        ));
-        heap.push(ReaperEntry::two_stage(
-            at(100),
-            staged_lane,
-            at(1_000),
-            staged.abort_handle(),
-        ));
-        heap.push(ReaperEntry::new(
-            at(50),
-            early.abort_handle(),
-            AbortRecord::new(),
-        ));
+        let landed = Arc::new(AtomicBool::new(false));
+        let weak = Arc::downgrade(&sys);
+        let flag = landed.clone();
+        sys.run_before_sweep_latch_clear(move || {
+            let sys = weak.upgrade().expect("the system is alive");
+            assert!(
+                sys.sweep_spawned.load(Ordering::Acquire),
+                "the latch is still set in the exit window"
+            );
+            assert!(sys.attach_telemetry("second", kinds, |_| {}));
+            flag.store(true, Ordering::SeqCst);
+        });
+        assert!(sys.detach_telemetry("first"));
 
-        fire_due(&mut heap);
-        turns().await;
-        assert!(early.is_finished(), "the earliest instant is due first");
-        assert!(!staged.is_finished() && !single.is_finished());
-
-        fire_due(&mut heap);
-        turns().await;
+        let rt = Handle::current();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !sys
+            .helper_ends(&rt)
+            .iter()
+            .any(|(kind, end)| *kind == HelperKind::Sweep && *end == HelperEnd::Finished)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sweep did not end by itself"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
-            matches!(staged_rx.borrow().reason, Some(StopReason::Kill)),
-            "the two-stage entry's first stage is due before the single abort"
+            landed.load(Ordering::SeqCst),
+            "the want landed in the exit window"
         );
-        assert!(!staged.is_finished() && !single.is_finished());
-        assert_eq!(heap.len(), 2, "the entry is queued again for its abort");
-
-        fire_due(&mut heap);
-        turns().await;
-        assert!(single.is_finished(), "the single entry is due next");
-        assert!(!staged.is_finished());
-
-        fire_due(&mut heap);
-        turns().await;
-        assert!(staged.is_finished(), "the abort stage is due last");
-        assert!(heap.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_two_stage_entry_dropped_between_its_stages_aborts_its_task() {
-        let (child, lane, lane_rx) = parked_with_a_lane();
-        let entry = ReaperEntry::two_stage(
-            Instant::now(),
-            lane,
-            Instant::now() + Duration::from_secs(30),
-            child.abort_handle(),
-        );
-        let rest = entry
-            .fire()
-            .expect("the first stage hands the entry back for its abort");
-        assert!(matches!(lane_rx.borrow().reason, Some(StopReason::Kill)));
-        assert!(!rest.fired, "only the abort stage marks an entry fired");
-        assert!(!child.is_finished());
-
-        drop(rest);
-        let ended = tokio::time::timeout(Duration::from_secs(5), child)
-            .await
-            .expect("dropping the entry between its stages aborts the task");
-        assert!(ended.unwrap_err().is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_two_stage_entry_survives_a_closed_feed_until_its_abort_stage() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let reaper = tokio::spawn(reaper_loop(rx));
-        let (child, lane, lane_rx) = parked_with_a_lane();
-        let start = Instant::now();
-        tx.send(ReaperEntry::two_stage(
-            start + Duration::from_millis(100),
-            lane,
-            start + Duration::from_millis(300),
-            child.abort_handle(),
-        ))
-        .unwrap();
-        turns().await;
-        // The feed closes after the entry is queued.
-        drop(tx);
-        turns().await;
-
-        tokio::time::advance(Duration::from_millis(100)).await;
-        turns().await;
         assert!(
-            matches!(lane_rx.borrow().reason, Some(StopReason::Kill)),
-            "the first stage runs although the feed is closed"
+            sys.sweep_spawned.load(Ordering::Acquire),
+            "a sweep runs for the want that landed in the window"
         );
-        assert!(!child.is_finished(), "and the entry is still queued");
-        assert!(!reaper.is_finished());
+        assert_eq!(sys.live_helpers(), 1);
+    }
 
-        tokio::time::advance(Duration::from_millis(200)).await;
-        let ended = tokio::time::timeout(Duration::from_secs(2), child)
-            .await
-            .expect("the abort stage runs at its instant");
-        assert!(ended.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(2), reaper)
-            .await
-            .expect("the reaper ends once its queue is empty")
-            .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_ends_unasked_and_a_want_in_its_exit_window_restarts_it_multi_thread() {
+        the_sweep_ends_unasked_and_a_want_in_its_exit_window_restarts_it().await;
     }
 
     // - Turn-watchdog sweep latch ---------------------------------------------
@@ -4256,68 +6071,6 @@ mod tests {
         sys.set_turn_warning_threshold(None);
     }
 
-    /// A system asks a runtime without the time driver once, and remembers a
-    /// bounded number of such runtimes.
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn a_system_probes_a_runtime_without_the_driver_once_and_remembers_a_bounded_number() {
-        let _serial = crate::time_probe::serial_table();
-        let sys = ActorSystem::create(format!("sweep-memo-{}", uuid::Uuid::new_v4())).unwrap();
-        let bare = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        for _ in 0..5 {
-            sys.ensure_sweep_spawned_with(bare.handle());
-        }
-        assert_eq!(crate::time_probe::probes_run(bare.handle()), 1);
-        let other = ActorSystem::create(format!("sweep-memo-b-{}", uuid::Uuid::new_v4())).unwrap();
-        other.ensure_sweep_spawned_with(bare.handle());
-        assert_eq!(
-            crate::time_probe::probes_run(bare.handle()),
-            1,
-            "the answer is kept for the process, not for one system"
-        );
-        let many: Vec<_> = (0..TIMERLESS_MEMO_LIMIT + 6)
-            .map(|_| {
-                tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap()
-            })
-            .collect();
-        for rt in &many {
-            sys.ensure_sweep_spawned_with(rt.handle());
-        }
-        assert!(sys.timerless_runtimes.lock().unwrap().len() <= TIMERLESS_MEMO_LIMIT);
-        assert!(!sys.sweep_spawned.load(Ordering::Acquire));
-    }
-
-    /// The decision on a call's first request: the caller decides once, a
-    /// task lost before the decision owes nothing and tells the caller, a
-    /// task lost after an acceptance owes its steps.
-    #[test]
-    fn the_decision_on_a_first_request_settles_once() {
-        let step = StopStep::default();
-        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Nothing);
-        assert!(
-            step.decide_accepted(),
-            "the task was lost before the decision"
-        );
-        step.decide_refused();
-        assert!(!step.refused(), "a decided request stays decided");
-
-        let step = StopStep::default();
-        assert!(!step.decide_accepted());
-        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Steps);
-        assert!(!step.decide_accepted(), "decided once");
-
-        let step = StopStep::default();
-        step.decide_refused();
-        assert!(step.refused());
-        assert_eq!(step.lose_before_the_last_wait(), LossOwes::Nothing);
-        assert!(!step.decide_accepted(), "a refusal is not undone");
-        assert!(StopStep::accepted().lose_before_the_last_wait() == LossOwes::Steps);
-    }
-
     /// The declared `Kill` deadline is one `u64` on a registry entry: a named
     /// actor has two entries (by id and by name), so it costs 16 bytes, an
     /// anonymous one 8. The entry is exactly the size its fields need, the
@@ -4332,7 +6085,7 @@ mod tests {
             + size_of::<StatusRx>()
             + size_of::<crate::types::TurnClock>()
             + size_of::<Option<AbortHandle>>()
-            + size_of::<bool>()
+            + size_of::<Option<(ActorId, u64)>>()
             + size_of::<u64>()
             + size_of::<Duration>()
             + size_of::<Handle>();
@@ -4469,7 +6222,72 @@ mod tests {
         }
     }
 
+    fn undriven_host() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     // - A Kill raised between an entry's lookup and its abort being stored ----
+
+    /// A registered entry whose task is spawned but whose abort handle is not
+    /// stored yet; the hook stores it at the point between a system-side
+    /// kill's lookup and its raise. The returned task owns the status sender
+    /// and the lane's receiver, so its end is observable.
+    fn pre_attach_target(
+        grace: Duration,
+    ) -> (
+        Arc<ActorSystem>,
+        String,
+        ActorId,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let sys = ActorSystem::create(format!("pre-attach-hook-{}", uuid::Uuid::new_v4())).unwrap();
+        let name = format!("hook-target-{}", uuid::Uuid::new_v4());
+        let id = ActorId::from(name.clone());
+        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
+        let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
+        let (stop_lane, stop_rx) = StopLane::new();
+        let handle = ActorHandle::<Dummy>::new(
+            id.clone(),
+            tx,
+            stop_lane,
+            1,
+            status_rx,
+            None,
+            Some(Arc::new(AtomicBool::new(false))),
+        );
+        let seq = sys
+            .register_actor::<Dummy>(
+                &id,
+                Some(&Arc::from(name.as_str())),
+                &handle,
+                true,
+                TurnClock::default(),
+                grace,
+                Handle::current(),
+            )
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let _owned = (status_tx, stop_rx);
+            std::future::pending::<()>().await;
+        });
+        let abort = task.abort_handle();
+        let hook_sys = sys.clone();
+        let (hook_id, hook_name) = (id.clone(), name.clone());
+        *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || {
+            hook_sys.attach_abort(&hook_id, Some(&hook_name), abort.clone(), seq);
+        }));
+        (sys, name, id, task)
+    }
+
+    async fn ends_by_the_backstop(task: tokio::task::JoinHandle<()>, grace: Duration, what: &str) {
+        let ended = tokio::time::timeout(grace + ABORT_SETTLE + Duration::from_millis(500), task)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no backstop was armed"));
+        assert!(ended.unwrap_err().is_cancelled());
+    }
 
     /// Registers a root whose task owns its status sender and lane receiver,
     /// with its abort handle stored, and returns the task.
@@ -4488,7 +6306,6 @@ mod tests {
             stop_lane,
             1,
             status_rx,
-            sys.name().into(),
             None,
             Some(Arc::new(AtomicBool::new(false))),
         );
@@ -4511,61 +6328,45 @@ mod tests {
         task
     }
 
-    /// One sweep over more targets than any fixed feed capacity could hold
-    /// (1,200) gives every target its full grace: none is aborted before its
-    /// deadline. On a single thread the sweep arms every entry before any
-    /// reaper turn can drain the feed, so a bounded feed would drop entries.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_large_sweep_gives_every_target_its_full_grace() {
-        let sys = ActorSystem::create(format!("sweep-big-{}", uuid::Uuid::new_v4())).unwrap();
-        let grace = Duration::from_millis(600);
-        let tasks: Vec<_> = (0..1200).map(|n| registered_root(&sys, n, grace)).collect();
-        let started = Instant::now();
-        let sweep = {
-            let sys = sys.clone();
-            // A zero global timeout sends every root to the concurrent sweep.
-            tokio::spawn(async move {
-                sys.shutdown_with(ShutdownPolicy {
-                    timeout: Duration::ZERO,
-                    per_actor_timeout: Duration::from_secs(5),
-                })
-                .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // The observation counts only if the grace had not passed on the
-        // test's own clock by the time it was made, so the clock is read after
-        // it.
-        let aborted_early = tasks.iter().filter(|task| task.is_finished()).count();
-        if started.elapsed() < grace {
-            assert_eq!(
-                aborted_early, 0,
-                "{aborted_early} of 1200 targets were aborted before their {grace:?} grace"
-            );
-        }
-        for task in tasks {
-            let ended = tokio::time::timeout(grace + ABORT_SETTLE + Duration::from_secs(3), task)
-                .await
-                .expect("every target is aborted once its grace passed");
-            assert!(ended.unwrap_err().is_cancelled());
-        }
-        assert!(
-            started.elapsed() >= grace,
-            "no target ended before its grace"
-        );
-        let report = tokio::time::timeout(Duration::from_secs(10), sweep)
-            .await
-            .expect("the shutdown returns")
-            .unwrap();
-        assert_eq!(report.outcomes.len(), 1200);
-    }
-
     const HOOK_GRACE: Duration = Duration::from_millis(100);
 
     /// A grace far longer than the shutdown futures of the dropped-call tests
     /// are polled for, so only the system's own backstop can end the target
     /// before it.
     const SLOW_GRACE: Duration = Duration::from_millis(1000);
+
+    async fn kill_by_name_arms_when_the_abort_is_stored_after_the_lookup() {
+        let (sys, name, _id, task) = pre_attach_target(HOOK_GRACE);
+        sys.kill(&name).await.unwrap();
+        ends_by_the_backstop(task, HOOK_GRACE, "kill(name)").await;
+    }
+
+    async fn kill_by_id_arms_when_the_abort_is_stored_after_the_lookup() {
+        let (sys, _name, id, task) = pre_attach_target(HOOK_GRACE);
+        // The call is dropped at once: only the system's backstop is left.
+        let _ = tokio::time::timeout(Duration::ZERO, sys.kill_by_id(&id)).await;
+        ends_by_the_backstop(task, HOOK_GRACE, "kill_by_id").await;
+    }
+
+    async fn shutdown_kill_step_arms_when_the_abort_is_stored_after_the_lookup() {
+        let (sys, _name, _id, task) = pre_attach_target(SLOW_GRACE);
+        let policy = ShutdownPolicy {
+            timeout: Duration::from_secs(30),
+            per_actor_timeout: Duration::from_millis(10),
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(60), sys.shutdown_with(policy)).await;
+        ends_by_the_backstop(task, SLOW_GRACE, "the shutdown's Kill step").await;
+    }
+
+    async fn force_sweep_arms_when_the_abort_is_stored_after_the_lookup() {
+        let (sys, _name, _id, task) = pre_attach_target(SLOW_GRACE);
+        let policy = ShutdownPolicy {
+            timeout: Duration::from_millis(10),
+            per_actor_timeout: Duration::from_secs(5),
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(60), sys.shutdown_with(policy)).await;
+        ends_by_the_backstop(task, SLOW_GRACE, "the concurrent force sweep").await;
+    }
 
     // - A Kill arms the incarnation it was raised on, and only it -------------
 
@@ -4588,7 +6389,6 @@ mod tests {
             stop_lane,
             1,
             status_rx,
-            sys.name().into(),
             None,
             Some(Arc::new(AtomicBool::new(false))),
         );
@@ -4701,66 +6501,69 @@ mod tests {
         old.abort();
     }
 
-    macro_rules! successor_tests {
-        ($($site:ident => $multi:ident, $single:ident;)*) => {$(
-            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-            async fn $multi() {
-                a_kill_arms_only_the_incarnation_it_was_raised_on(KillSite::$site).await;
-            }
-
-            #[tokio::test(flavor = "current_thread")]
-            async fn $single() {
-                a_kill_arms_only_the_incarnation_it_was_raised_on(KillSite::$site).await;
-            }
-        )*};
-    }
-
-    successor_tests! {
-        ByName => kill_by_name_arms_only_the_incarnation_it_was_raised_on_multi_thread,
-            kill_by_name_arms_only_the_incarnation_it_was_raised_on_current_thread;
-    }
-
     // - The force sweep reports a root gone before it looked ------------------
 
-    /// A `Kill` raised in the window before the task's abort handle is stored
-    /// finds no abort to schedule: the attach itself arms the backstop.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn attach_abort_arms_the_backstop_when_the_lane_already_holds_a_kill() {
-        let sys = ActorSystem::create(format!("pre-attach-{}", uuid::Uuid::new_v4())).unwrap();
-        let id = ActorId::from("pre-attach-id");
-        let (tx, _rx) = crate::actor::mailbox::test_channel(1);
-        let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-        let (stop_lane, _stop_rx) = StopLane::new();
-        let handle = ActorHandle::<Dummy>::new(
-            id.clone(),
-            tx,
-            stop_lane.clone(),
-            1,
-            status_rx,
-            sys.name().into(),
-            None,
-            Some(Arc::new(AtomicBool::new(false))),
+    /// Two roots; the sequential ladder is cut at the first (global timeout
+    /// spent) so both reach the sweep. The second was aborted by another
+    /// caller's Kill and left the registry before the sweep looked: its
+    /// verdict comes from the status receiver its snapshot kept, as the
+    /// sequential ladder's would.
+    async fn the_sweep_classifies_a_root_gone_before_it_looked() {
+        let sys = ActorSystem::create(format!("sweep-gone-{}", uuid::Uuid::new_v4())).unwrap();
+        let (aborted_id, parked_id) = (
+            ActorId::from("sweep-aborted"),
+            ActorId::from("sweep-parked"),
         );
-        let grace = Duration::from_millis(100);
-        let seq = sys
-            .register_actor::<Dummy>(
-                &id,
-                Some(&Arc::from("pre-attach-name")),
-                &handle,
-                true,
-                TurnClock::default(),
-                grace,
-                Handle::current(),
-            )
-            .unwrap();
-        // The kill lands before the abort handle exists.
-        stop_lane.raise(StopReason::Kill);
-        let task = tokio::spawn(std::future::pending::<()>());
-        sys.attach_abort(&id, Some("pre-attach-name"), task.abort_handle(), seq);
-        let ended = tokio::time::timeout(grace + ABORT_SETTLE + Duration::from_millis(500), task)
+        // Registered first, so it is stopped last and swept as a straggler.
+        let (_seq, aborted_task) = register_incarnation(
+            &sys,
+            &aborted_id,
+            Some("sweep-aborted"),
+            Duration::from_millis(40),
+        );
+        let (_seq, parked_task) = register_incarnation(
+            &sys,
+            &parked_id,
+            Some("sweep-parked"),
+            Duration::from_millis(100),
+        );
+        let shutdown = {
+            let sys = sys.clone();
+            tokio::spawn(async move {
+                sys.shutdown_with(ShutdownPolicy {
+                    timeout: Duration::from_millis(2400),
+                    per_actor_timeout: Duration::from_secs(5),
+                })
+                .await
+            })
+        };
+        // Another caller kills the first-registered root while the ladder is
+        // still waiting on the second.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sys.kill("sweep-aborted").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), aborted_task)
             .await
-            .expect("the attach armed the backstop, which aborted the task");
-        assert!(ended.unwrap_err().is_cancelled());
+            .expect("the kill's backstop aborts the root")
+            .unwrap_err();
+        assert!(sys.get_by_id::<Dummy>(&aborted_id).is_none(), "gone");
+        let report = tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("the shutdown returns")
+            .unwrap();
+        let outcome = |id: &ActorId| {
+            report
+                .outcomes
+                .iter()
+                .find(|(reported, _)| reported == id)
+                .map(|(_, report)| report.outcome)
+        };
+        assert_eq!(
+            outcome(&aborted_id),
+            Some(StopOutcome::Aborted),
+            "a root aborted before the sweep looked is Aborted, as in the sequential ladder"
+        );
+        assert!(outcome(&parked_id).is_some());
+        parked_task.abort();
     }
 
     /// An attach that comes after its incarnation's registration was
@@ -4782,7 +6585,6 @@ mod tests {
                 stop_lane.clone(),
                 1,
                 status_rx,
-                sys.name().into(),
                 None,
                 Some(Arc::new(AtomicBool::new(false))),
             );
@@ -4837,83 +6639,6 @@ mod tests {
             "the stale attach armed no backstop"
         );
         new_task.abort();
-        old_task.abort();
-    }
-
-    /// A `kill` by name raises on the incarnation it looked up; when that
-    /// one is replaced under the same name before the raise lands, nothing is
-    /// armed on the later one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kill_by_name_arms_nothing_on_a_later_registration_of_the_name() {
-        let sys = scripted_system("kill-name");
-        let id = ActorId::from("kill-name-id");
-        let name = "kill-name-name";
-        let register = {
-            let id = id.clone();
-            move |sys: &Arc<ActorSystem>| {
-                let (tx, _rx) = crate::actor::mailbox::test_channel(1);
-                let (_status_tx, status_rx) =
-                    StatusTx::channel(StatusValue::new(ActorStatus::Running));
-                let (stop_lane, stop_rx) = StopLane::new();
-                let handle = ActorHandle::<Dummy>::new(
-                    id.clone(),
-                    tx,
-                    stop_lane,
-                    1,
-                    status_rx,
-                    sys.name().into(),
-                    None,
-                    Some(Arc::new(AtomicBool::new(false))),
-                );
-                let seq = sys
-                    .register_actor::<Dummy>(
-                        &id,
-                        Some(&Arc::from(name)),
-                        &handle,
-                        true,
-                        TurnClock::default(),
-                        LONG_GRACE,
-                        Handle::current(),
-                    )
-                    .unwrap();
-                let task = tokio::spawn(async move {
-                    let _owned = stop_rx;
-                    std::future::pending::<()>().await;
-                });
-                sys.attach_abort(&id, Some(name), task.abort_handle(), seq);
-                (seq, task)
-            }
-        };
-        let (old_seq, old_task) = register(&sys);
-        let later = Arc::new(Mutex::new(None));
-        {
-            let (hook_sys, hook_id, later) = (sys.clone(), id.clone(), later.clone());
-            *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || {
-                hook_sys.unregister_by_id(&hook_id, old_seq);
-                hook_sys.unregister_by_name(name, old_seq);
-                *later.lock().unwrap() = Some(register(&hook_sys));
-            }));
-        }
-        sys.kill(name)
-            .await
-            .expect("the kill raised on the incarnation it found");
-        assert!(
-            sys.after_kill_lookup.lock().unwrap().is_none(),
-            "the kill reached its lookup"
-        );
-        assert_eq!(
-            sys.backstop_arms.load(Ordering::SeqCst),
-            0,
-            "nothing was armed through the later registration"
-        );
-        let (_, later_task) = later
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the later one registered");
-        tokio::task::yield_now().await;
-        assert!(!later_task.is_finished());
-        later_task.abort();
         old_task.abort();
     }
 
@@ -5080,11 +6805,6 @@ mod tests {
             n += 1;
         }
         n
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kill_by_id_arms_exactly_one_backstop_entry_and_the_supervision_raisers_arm_none() {
-        backstop_entries_by_kill_path().await;
     }
 
     async fn backstop_entries_by_kill_path() {
@@ -5290,7 +7010,6 @@ mod tests {
                 stop_lane.clone(),
                 1,
                 status_rx,
-                sys.name().into(),
                 None,
                 Some(Arc::new(AtomicBool::new(false))),
             );
@@ -5418,6 +7137,46 @@ mod tests {
 
     /// A grace no test here waits out.
     const LONG_GRACE: Duration = Duration::from_secs(30);
+
+    /// Two roots cut at the first one's step 1. The first left the registry
+    /// before the sweep looked and had not published `Stopped`; it publishes
+    /// it only once the sweep has moved on to the second root. The sweep
+    /// waits for it and reports what it reached by itself.
+    async fn the_sweep_waits_for_a_root_gone_before_it_published_stopped() {
+        let sys = scripted_system("sweep-window");
+        let second = Scripted::register(&sys, &ActorId::from("window-second"), LONG_GRACE);
+        // Registered last, so the ladder reaches it first and is cut there.
+        // Its grace is short of the test's bounds: a sweep that waited for it
+        // before looking at the next root would give it `Unresponsive`.
+        let first = Scripted::register(
+            &sys,
+            &ActorId::from("window-first"),
+            Duration::from_millis(600),
+        );
+        {
+            let (first, second) = (first.clone(), second.clone());
+            set_ladder_hook(&sys, move |point, id| {
+                if point != LadderPoint::SweepLookup {
+                    return;
+                }
+                if *id == first.id {
+                    first.leave();
+                } else if *id == second.id {
+                    first.publish_stopped();
+                    second.end();
+                }
+            });
+        }
+        let report = shut_down(&sys, CUT_IN_STEP_ONE.0, CUT_IN_STEP_ONE.1).await;
+        assert_eq!(
+            outcome_of(&report, &first.id),
+            StopOutcome::Graceful,
+            "a root that left the registry and then published Stopped itself"
+        );
+        assert_eq!(outcome_of(&report, &second.id), StopOutcome::Graceful);
+        first.task().abort();
+        second.task().abort();
+    }
 
     /// The same window, held past the bound: a root that left the registry
     /// and has not published `Stopped` within its kill grace and the wait
@@ -5635,6 +7394,45 @@ mod tests {
         root.task().abort();
     }
 
+    /// Before the ladder begins, the incarnation it snapshotted is replaced
+    /// by a later one under the same id: no step of that ladder stops, kills
+    /// or aborts the successor, the snapshotted incarnation, which never
+    /// publishes `Stopped`, is `Unresponsive`, and the successor is stopped
+    /// as a late root.
+    async fn the_ladder_never_acts_on_a_successor_registered_before_it_began() {
+        let sys = scripted_system("successor-at-stop");
+        let grace = Duration::from_millis(20);
+        let root = Scripted::register(&sys, &ActorId::from("successor-at-stop"), grace);
+        let watch = watch_successor(&sys, &root, LadderPoint::Stop, false);
+        let report = shut_down(&sys, Duration::from_secs(30), grace).await;
+        let (lane, ended, arms) = watch.before_its_ladder();
+        assert!(lane.is_none(), "nothing was raised on the successor");
+        assert!(!ended, "the successor was not aborted");
+        assert_eq!(arms, 0, "nothing was armed");
+        reported_twice(&report, &root.id, StopOutcome::Unresponsive);
+        watch.successor().task().abort();
+        root.publish_stopped();
+        root.task().abort();
+    }
+
+    /// Before the ladder's abort step, the incarnation it raised `Kill` on is
+    /// replaced by a later one under the same id: the abort step does not
+    /// abort the successor, and the successor is stopped as a late root.
+    async fn the_abort_step_never_aborts_a_successor_registered_before_it() {
+        let sys = scripted_system("successor-at-abort");
+        let grace = Duration::from_millis(20);
+        let root = Scripted::register(&sys, &ActorId::from("successor-at-abort"), grace);
+        let watch = watch_successor(&sys, &root, LadderPoint::Abort, false);
+        let report = shut_down(&sys, Duration::from_secs(30), grace).await;
+        assert!(matches!(root.lane.reason(), Some(StopReason::Kill)));
+        let (lane, ended, _) = watch.before_its_ladder();
+        assert!(lane.is_none(), "nothing was raised on the successor");
+        assert!(!ended, "the successor was not aborted");
+        reported_twice(&report, &root.id, StopOutcome::Unresponsive);
+        watch.successor().task().abort();
+        root.publish_stopped();
+    }
+
     /// The ladder is cut in step 1; before the sweep looks, the root is
     /// replaced by a later incarnation under the same id and never publishes
     /// `Stopped`. The sweep reports the snapshotted root `Unresponsive` after
@@ -5685,6 +7483,79 @@ mod tests {
             0,
             "nothing was armed"
         );
+        assert_eq!(outcome_of(&report, &root.id), StopOutcome::Graceful);
+        root.task().abort();
+    }
+
+    /// The ladder is cut in step 1; before the sweep looks, the root
+    /// publishes `Stopped` and leaves: `Graceful`, no `Kill` having been
+    /// raised on it.
+    async fn a_root_cut_in_step_one_that_ends_before_the_sweep_is_graceful() {
+        let sys = scripted_system("cut-step-one");
+        let root = Scripted::register(&sys, &ActorId::from("cut-step-one"), LONG_GRACE);
+        {
+            let root = root.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::SweepLookup {
+                    root.end();
+                }
+            });
+        }
+        let report = shut_down(&sys, CUT_IN_STEP_ONE.0, CUT_IN_STEP_ONE.1).await;
+        assert!(matches!(
+            root.lane.reason(),
+            Some(StopReason::ParentRequest)
+        ));
+        assert_eq!(outcome_of(&report, &root.id), StopOutcome::Graceful);
+        root.task().abort();
+    }
+
+    /// The ladder is cut in step 2, after it raised `Kill`; before the sweep
+    /// looks, the root publishes `Stopped` and leaves: `Killed`.
+    async fn a_root_cut_in_step_two_that_ends_before_the_sweep_is_killed() {
+        let sys = scripted_system("cut-step-two");
+        let root = Scripted::register(&sys, &ActorId::from("cut-step-two"), LONG_GRACE);
+        {
+            let root = root.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::SweepLookup {
+                    root.end();
+                }
+            });
+        }
+        let report = shut_down(&sys, CUT_IN_STEP_TWO.0, CUT_IN_STEP_TWO.1).await;
+        assert!(
+            matches!(root.lane.reason(), Some(StopReason::Kill)),
+            "the ladder raised Kill before it was cut"
+        );
+        assert_eq!(outcome_of(&report, &root.id), StopOutcome::Killed);
+        root.task().abort();
+    }
+
+    /// The ladder is cut in step 1 and the sweep finds the root, but between
+    /// its lookup and its raise the root leaves, seals its lane and publishes
+    /// `Stopped`: the lane refuses the sweep's `Kill`, and the root, which
+    /// ended with its own reason, is `Graceful`.
+    async fn a_sweep_target_that_refuses_the_kill_keeps_its_own_outcome() {
+        let sys = scripted_system("sweep-refused");
+        let root = Scripted::register(&sys, &ActorId::from("sweep-refused"), LONG_GRACE);
+        {
+            let root = root.clone();
+            *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || {
+                root.leave();
+                let _ = root.lane.seal();
+                root.publish_stopped();
+            }));
+        }
+        let report = shut_down(&sys, CUT_IN_STEP_ONE.0, CUT_IN_STEP_ONE.1).await;
+        assert!(
+            sys.after_kill_lookup.lock().unwrap().is_none(),
+            "the sweep found the root"
+        );
+        assert!(matches!(
+            root.lane.reason(),
+            Some(StopReason::ParentRequest)
+        ));
         assert_eq!(outcome_of(&report, &root.id), StopOutcome::Graceful);
         root.task().abort();
     }
@@ -5745,6 +7616,44 @@ mod tests {
 
     // - Every wait bounded by a kill grace is the incarnation's own ----------
 
+    /// Two placements of one condition, a root with its own 600 ms grace that
+    /// leaves the registry and never publishes `Stopped` while the shutdown
+    /// runs: gone before the sweep's lookup, or gone between the lookup and
+    /// the raise. Both are waited the root's grace and the wait after an
+    /// abort, and both are `Unresponsive`.
+    async fn a_root_leaving_around_the_sweep_s_lookup_is_waited_its_own_grace() {
+        let grace = Duration::from_millis(600);
+        for after_the_lookup in [false, true] {
+            let sys = scripted_system("own-grace-sweep");
+            let root = Scripted::register(&sys, &ActorId::from("own-grace-sweep"), grace);
+            if after_the_lookup {
+                let root = root.clone();
+                *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || root.leave()));
+            } else {
+                let root = root.clone();
+                set_ladder_hook(&sys, move |point, _id| {
+                    if point == LadderPoint::SweepLookup {
+                        root.leave();
+                    }
+                });
+            }
+            let started = Instant::now();
+            let report = shut_down(&sys, CUT_IN_STEP_ONE.0, CUT_IN_STEP_ONE.1).await;
+            let took = started.elapsed();
+            assert_eq!(
+                outcome_of(&report, &root.id),
+                StopOutcome::Unresponsive,
+                "after_the_lookup={after_the_lookup}"
+            );
+            assert!(
+                took >= CUT_IN_STEP_ONE.0 + grace + ABORT_SETTLE,
+                "after_the_lookup={after_the_lookup}: the root's own grace, took {took:?}"
+            );
+            root.publish_stopped();
+            root.task().abort();
+        }
+    }
+
     /// `kill_by_id` on a root that leaves the registry between the lookup and
     /// the raise, and never publishes `Stopped` during the call: the call
     /// waits the root's own grace, not a default.
@@ -5762,6 +7671,42 @@ mod tests {
         assert!(
             took >= grace + ABORT_SETTLE,
             "the root's own grace, took {took:?}"
+        );
+        root.publish_stopped();
+        root.task().abort();
+    }
+
+    /// `stop_within(Graceful)` outlives its window; before its `Kill` step the
+    /// actor leaves the registry and never publishes `Stopped` during the
+    /// call. The `Kill` step waits the actor's own grace, read while the
+    /// entry held it.
+    async fn stop_within_waits_the_incarnation_s_own_grace_after_its_entry_is_gone() {
+        let sys = scripted_system("own-grace-stop-within");
+        let grace = Duration::from_millis(600);
+        let root = Scripted::register(&sys, &ActorId::from("own-grace-stop-within"), grace);
+        {
+            let root = root.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::StopWithinKill {
+                    root.leave();
+                }
+            });
+        }
+        let within = Duration::from_millis(20);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            root.handle.stop_within(StopReason::Graceful, within),
+        )
+        .await
+        .expect("stop_within returns")
+        .expect("the graceful request is accepted");
+        let took = started.elapsed();
+        *sys.ladder_hook.lock().unwrap() = None;
+        assert_eq!(outcome, StopOutcome::Unresponsive);
+        assert!(
+            took >= within + grace + ABORT_SETTLE,
+            "the actor's own grace, took {took:?}"
         );
         root.publish_stopped();
         root.task().abort();
@@ -5812,30 +7757,6 @@ mod tests {
                 root.task().abort();
             }
         }
-    }
-
-    /// A registered root whose lane does not take a `Kill`: `kill_by_id`
-    /// answers `None` on a calling runtime without the time driver, with no
-    /// timer needed, and arms nothing.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kill_by_id_answers_none_for_a_target_that_takes_no_kill_on_a_runtime_without_timers() {
-        let sys = scripted_system("refused-driverless");
-        let root = Scripted::register(&sys, &ActorId::from("refused-driverless"), LONG_GRACE);
-        let _ = root.lane.seal();
-        let (caller_system, id) = (sys.clone(), root.id.clone());
-        let answer = tokio::task::spawn_blocking(move || {
-            let bare = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            bare.block_on(async move { caller_system.kill_by_id(&id).await })
-        })
-        .await
-        .unwrap();
-        assert!(answer.is_none());
-        assert_eq!(sys.backstop_arms.load(Ordering::SeqCst), 0);
-        root.leave();
-        root.publish_stopped();
-        root.task().abort();
     }
 
     // - Late roots ------------------------------------------------------------
@@ -5934,6 +7855,70 @@ mod tests {
 
     // - The verdict follows the Kill the call's lane took --------------------
 
+    /// The same end, an actor that left the registry and then published
+    /// `Stopped` by itself, read by two calls. `stop_within` raises its `Kill`
+    /// on the actor's own lane, which takes it: `Killed`. The shutdown's
+    /// ladder finds the actor out of the registry at its `Kill` step and
+    /// raises nothing: `Graceful`.
+    async fn a_kill_the_lane_took_is_killed_and_one_never_raised_is_graceful() {
+        // stop_within: the actor leaves before the Kill step and publishes
+        // `Stopped` once its lane holds the `Kill`.
+        let sys = scripted_system("verdict-split-handle");
+        let root = Scripted::register(&sys, &ActorId::from("verdict-split-handle"), LONG_GRACE);
+        {
+            let root = root.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::StopWithinKill {
+                    root.leave();
+                }
+            });
+        }
+        let ends = {
+            let root = root.clone();
+            tokio::spawn(async move {
+                let bound = Instant::now() + Duration::from_secs(10);
+                while !matches!(root.lane.reason(), Some(StopReason::Kill))
+                    && Instant::now() < bound
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                root.publish_stopped();
+            })
+        };
+        let through_the_handle = tokio::time::timeout(
+            Duration::from_secs(10),
+            root.handle
+                .stop_within(StopReason::Graceful, Duration::from_millis(20)),
+        )
+        .await
+        .expect("stop_within returns")
+        .expect("the graceful request is accepted");
+        *sys.ladder_hook.lock().unwrap() = None;
+        ends.await.unwrap();
+        root.task().abort();
+
+        // The shutdown's ladder: the actor leaves and publishes `Stopped`
+        // before the Kill step, which finds no entry.
+        let sys = scripted_system("verdict-split-ladder");
+        let root = Scripted::register(&sys, &ActorId::from("verdict-split-ladder"), LONG_GRACE);
+        {
+            let root = root.clone();
+            set_ladder_hook(&sys, move |point, _id| {
+                if point == LadderPoint::Kill {
+                    root.leave();
+                    root.publish_stopped();
+                }
+            });
+        }
+        let report = shut_down(&sys, Duration::from_secs(30), Duration::from_millis(1)).await;
+        root.task().abort();
+
+        assert_eq!(
+            (through_the_handle, outcome_of(&report, &root.id)),
+            (StopOutcome::Killed, StopOutcome::Graceful)
+        );
+    }
+
     // - What the shutdown has taken on ----------------------------------------
 
     /// A root and a late root that both stay registered after their ladders
@@ -6019,7 +8004,6 @@ mod tests {
             stop_lane,
             1,
             status_rx,
-            sys.name().into(),
             None,
             Some(Arc::new(AtomicBool::new(false))),
         );
@@ -6425,57 +8409,9 @@ mod tests {
     }
 
     both_flavors! {
-        the_sweep_deadline_is_held_until_the_last_shutdown_completes =>
-            the_sweep_deadline_is_held_until_the_last_shutdown_completes_multi_thread,
-            the_sweep_deadline_is_held_until_the_last_shutdown_completes_current_thread;
-        a_leftover_final_before_the_deadline_and_stopped_at_the_force_reads_graceful =>
-            a_leftover_final_before_the_deadline_and_stopped_at_the_force_reads_graceful_multi_thread,
-            a_leftover_final_before_the_deadline_and_stopped_at_the_force_reads_graceful_current_thread;
-        a_root_gone_and_not_stopped_within_its_bound_is_unresponsive =>
-            a_root_gone_and_not_stopped_within_its_bound_is_unresponsive_multi_thread,
-            a_root_gone_and_not_stopped_within_its_bound_is_unresponsive_current_thread;
-        a_root_gone_at_the_kill_step_reports_no_raised_kill =>
-            a_root_gone_at_the_kill_step_reports_no_raised_kill_multi_thread,
-            a_root_gone_at_the_kill_step_reports_no_raised_kill_current_thread;
-        a_leftover_gone_at_the_sweep_lookup_reports_the_reason_its_plane_holds =>
-            a_leftover_gone_at_the_sweep_lookup_reports_the_reason_its_plane_holds_multi_thread,
-            a_leftover_gone_at_the_sweep_lookup_reports_the_reason_its_plane_holds_current_thread;
-        a_successor_registered_before_the_kill_step_is_never_raised_on =>
-            a_successor_registered_before_the_kill_step_is_never_raised_on_multi_thread,
-            a_successor_registered_before_the_kill_step_is_never_raised_on_current_thread;
-        a_root_that_refuses_the_kill_step_keeps_its_own_outcome =>
-            a_root_that_refuses_the_kill_step_keeps_its_own_outcome_multi_thread,
-            a_root_that_refuses_the_kill_step_keeps_its_own_outcome_current_thread;
-        the_sweep_never_kills_a_successor_registered_before_it_looked =>
-            the_sweep_never_kills_a_successor_registered_before_it_looked_multi_thread,
-            the_sweep_never_kills_a_successor_registered_before_it_looked_current_thread;
-        kill_by_id_waits_the_incarnation_s_own_grace_after_its_entry_is_gone =>
-            kill_by_id_waits_the_incarnation_s_own_grace_after_its_entry_is_gone_multi_thread,
-            kill_by_id_waits_the_incarnation_s_own_grace_after_its_entry_is_gone_current_thread;
-        a_refused_kill_arms_nothing_while_the_entry_is_registered =>
-            a_refused_kill_arms_nothing_while_the_entry_is_registered_multi_thread,
-            a_refused_kill_arms_nothing_while_the_entry_is_registered_current_thread;
-        late_roots_are_swept_together =>
-            late_roots_are_swept_together_multi_thread,
-            late_roots_are_swept_together_current_thread;
-        a_late_root_cut_in_step_two_that_ends_before_the_sweep_is_killed =>
-            a_late_root_cut_in_step_two_that_ends_before_the_sweep_is_killed_multi_thread,
-            a_late_root_cut_in_step_two_that_ends_before_the_sweep_is_killed_current_thread;
-        a_root_left_registered_after_its_ladder_is_reported_once =>
-            a_root_left_registered_after_its_ladder_is_reported_once_multi_thread,
-            a_root_left_registered_after_its_ladder_is_reported_once_current_thread;
-        a_root_the_ladder_raised_kill_on_is_killed_though_the_sweep_s_kill_is_refused =>
-            a_root_the_ladder_raised_kill_on_is_killed_though_the_sweep_s_kill_is_refused_multi_thread,
-            a_root_the_ladder_raised_kill_on_is_killed_though_the_sweep_s_kill_is_refused_current_thread;
         reactivate_waits_for_every_shutdown_in_flight =>
             reactivate_waits_for_every_shutdown_in_flight_multi_thread,
             reactivate_waits_for_every_shutdown_in_flight_current_thread;
-        a_registration_in_progress_when_the_shutdown_begins_is_stopped_by_it =>
-            a_registration_in_progress_when_the_shutdown_begins_is_stopped_by_it_multi_thread,
-            a_registration_in_progress_when_the_shutdown_begins_is_stopped_by_it_current_thread;
-        stop_within_reports_its_kill_only_when_the_lane_took_it =>
-            stop_within_reports_its_kill_only_when_the_lane_took_it_multi_thread,
-            stop_within_reports_its_kill_only_when_the_lane_took_it_current_thread;
     }
 
     // - The shutdown count and the phase it leaves behind --------------------
@@ -6505,48 +8441,159 @@ mod tests {
         assert!(sys.reactivate());
     }
 
-    /// The same two shutdowns ending in the other order.
-    #[test]
-    fn a_cut_short_shutdown_that_ends_first_leaves_defunct_when_the_completed_one_ends() {
-        let sys = scripted_system("episode-cut-short-first");
-        let completed = ShutdownInFlight::enter(sys.clone());
-        let cut_short = ShutdownInFlight::enter(sys.clone());
-        ends(cut_short, false);
-        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
-        ends(completed, true);
-        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
-        assert!(sys.reactivate());
-    }
-
-    /// Shutdowns that are all cut short leave the system shutting down.
-    #[test]
-    fn shutdowns_that_are_all_cut_short_leave_the_system_shutting_down() {
-        let sys = scripted_system("episode-all-cut-short");
-        let first = ShutdownInFlight::enter(sys.clone());
-        let second = ShutdownInFlight::enter(sys.clone());
-        ends(first, false);
-        ends(second, false);
-        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
-        assert!(!sys.reactivate());
-    }
-
-    /// A reactivation starts the record over: a later shutdown that is cut
-    /// short leaves the system shutting down.
-    #[test]
-    fn a_completed_shutdown_does_not_carry_over_a_reactivation() {
-        let sys = scripted_system("episode-reactivated");
-        ends(ShutdownInFlight::enter(sys.clone()), true);
-        assert_eq!(phase_of(&sys), SystemPhase::Defunct);
-        assert!(sys.reactivate());
-        ends(ShutdownInFlight::enter(sys.clone()), false);
-        assert_eq!(phase_of(&sys), SystemPhase::ShuttingDown);
-        assert!(!sys.reactivate());
-        // A shutdown that completes then still gets the system to `Defunct`.
-        ends(ShutdownInFlight::enter(sys.clone()), true);
-        assert!(sys.reactivate());
-    }
-
     // - A kill never arms the incarnation a supervisor restarted under its id -
+
+    /// Counts its starts; does nothing else.
+    struct Idle {
+        builds: Arc<AtomicU64>,
+    }
+
+    impl Actor for Idle {
+        type Message = ();
+        type Response = ();
+
+        async fn on_started(
+            &mut self,
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Supervises one permanent `Idle` child under `child`.
+    struct IdleBoss {
+        child: String,
+        builds: Arc<AtomicU64>,
+    }
+
+    impl Actor for IdleBoss {
+        type Message = ();
+        type Response = ();
+
+        async fn on_started(
+            &mut self,
+            ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            let builds = self.builds.clone();
+            ctx.spawn_child(move || Idle {
+                builds: builds.clone(),
+            })
+            .named(self.child.clone())
+            .restart_type(crate::types::RestartType::Permanent)
+            .await?;
+            Ok(())
+        }
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum KillCall {
+        ByName,
+        ById,
+    }
+
+    /// A supervised permanent child is killed; between the kill's raise and
+    /// its re-read of the registry, the caller waits until the supervisor has
+    /// restarted the child under the same id and name. The kill arms nothing:
+    /// the incarnation it raised on is gone, and the restarted one is not it.
+    /// `actors` is the runtime the supervisor and its child live on (the
+    /// caller's when `None`).
+    async fn a_kill_never_arms_the_restarted_incarnation(call: KillCall, actors: Option<Handle>) {
+        use crate::actor::ActorExt;
+
+        let sys = ActorSystem::create(format!("restarted-{}", uuid::Uuid::new_v4())).unwrap();
+        let builds = Arc::new(AtomicU64::new(0));
+        let child_name = format!("restarted-child-{}", uuid::Uuid::new_v4());
+        let spawn_boss = {
+            let (sys, child, builds) = (sys.clone(), child_name.clone(), builds.clone());
+            async move {
+                IdleBoss { child, builds }
+                    .spawn()
+                    .named(format!("restarted-boss-{}", uuid::Uuid::new_v4()))
+                    .on_system(&sys)
+                    .supervisor()
+                    .await
+                    .unwrap();
+            }
+        };
+        match &actors {
+            Some(rt) => rt.spawn(spawn_boss).await.unwrap(),
+            None => spawn_boss.await,
+        }
+        until("the first incarnation to start", || {
+            builds.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let child = loop {
+            if let Some(child) = sys.get::<Idle>(&child_name) {
+                break child;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        {
+            // The caller is the test's own thread (never a worker of the
+            // actors' runtime), so holding it here lets the supervisor run.
+            let builds = builds.clone();
+            *sys.after_kill_raise.lock().unwrap() = Some(Arc::new(move || {
+                let bound = std::time::Instant::now() + Duration::from_secs(10);
+                while builds.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < bound {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        }
+        match call {
+            KillCall::ByName => sys.kill(&child_name).await.unwrap(),
+            KillCall::ById => assert!(sys.kill_by_id(child.id()).await.is_some()),
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "{call:?}: the supervisor restarted the killed incarnation before the re-read"
+        );
+        assert_eq!(
+            sys.backstop_arms.load(Ordering::SeqCst),
+            0,
+            "{call:?}: the kill armed the restarted incarnation"
+        );
+        // Past the restarted incarnation's grace: it was not aborted, so the
+        // supervisor built nothing more.
+        tokio::time::sleep(DEFAULT_KILL_GRACE + ABORT_SETTLE + Duration::from_millis(300)).await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "{call:?}: it was aborted");
+    }
+
+    /// The caller on a `current_thread` runtime, the supervisor and its child
+    /// on a second runtime that keeps running while the caller is held.
+    fn a_kill_from_a_current_thread_caller_never_arms_the_restarted_incarnation(call: KillCall) {
+        let actors = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let on = actors.handle().clone();
+        caller.block_on(a_kill_never_arms_the_restarted_incarnation(call, Some(on)));
+        caller.shutdown_background();
+        actors.shutdown_background();
+    }
 
     /// A root that parks in `on_started`: a `Kill` raised on it is never
     /// observed, and only an abort ends its task.
@@ -6609,104 +8656,6 @@ mod tests {
         }
     }
 
-    /// After the abort step, the plane says how the actor ended: `Stopped`
-    /// published means it reached its end itself, `Killed`; a plane closed
-    /// without it means the abort ended the task, `Aborted`.
-    #[tokio::test(start_paused = true)]
-    async fn stop_within_reads_the_plane_after_its_abort() {
-        let sys = ActorSystem::create(format!("after-abort-{}", uuid::Uuid::new_v4())).unwrap();
-        for published in [true, false] {
-            let (handle, join, status_tx) = spawn_parked(&sys);
-            let call = tokio::spawn(async move {
-                handle
-                    .stop_within(crate::types::StopReason::Kill, Duration::from_millis(10))
-                    .await
-            });
-            advance_until_finished(&join).await;
-            if published {
-                crate::actor::runtime::publish_stopped(&status_tx);
-            } else {
-                drop(status_tx);
-            }
-            let outcome = call.await.unwrap().expect("accepted");
-            let expected = if published {
-                StopOutcome::Killed
-            } else {
-                StopOutcome::Aborted
-            };
-            assert_eq!(outcome, expected, "Stopped published: {published}");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_reads_the_plane_after_its_abort() {
-        for published in [true, false] {
-            let sys = ActorSystem::create(format!("after-abort-{}", uuid::Uuid::new_v4())).unwrap();
-            let (handle, join, status_tx) = spawn_parked(&sys);
-            let id = handle.id().clone();
-            let call = tokio::spawn({
-                let sys = sys.clone();
-                async move {
-                    sys.shutdown_with(ShutdownPolicy {
-                        timeout: Duration::from_secs(30),
-                        per_actor_timeout: Duration::from_millis(10),
-                    })
-                    .await
-                }
-            });
-            advance_until_finished(&join).await;
-            if published {
-                crate::actor::runtime::publish_stopped(&status_tx);
-            } else {
-                drop(status_tx);
-            }
-            let report = call.await.unwrap();
-            let outcome = report
-                .outcomes
-                .iter()
-                .find(|(actor, _)| *actor == id)
-                .map(|(_, report)| report.outcome);
-            let expected = if published {
-                StopOutcome::Killed
-            } else {
-                StopOutcome::Aborted
-            };
-            assert_eq!(outcome, Some(expected), "Stopped published: {published}");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn force_stop_reads_the_plane_after_its_abort() {
-        for published in [true, false] {
-            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-            let target = tokio::spawn(std::future::pending::<crate::types::StopReason>());
-            let abort = target.abort_handle();
-            let call = tokio::spawn(force_stop(
-                status_rx,
-                Some(abort),
-                AbortRecord::new(),
-                Duration::from_millis(10),
-                StopOutcome::Killed,
-            ));
-            advance_until_finished(&target).await;
-            if published {
-                crate::actor::runtime::publish_stopped(&status_tx);
-            } else {
-                drop(status_tx);
-            }
-            let expected = if published {
-                StopOutcome::Killed
-            } else {
-                StopOutcome::Aborted
-            };
-            let report = call.await.unwrap();
-            assert_eq!(report.outcome, expected, "Stopped published: {published}");
-            // An aborted task's plane closes with no reason written here, as
-            // a stand-in plane with no context: the report reads `Kill`.
-            assert_eq!(report.reason, Some(crate::types::StopReason::Kill));
-        }
-    }
-
     /// The force of a final-sweep leftover whose registry entry is freed:
     /// the sweep raises nothing on it and has no abort of its own, so the
     /// only `Kill` and abort it gets are the two-stage entry the sweep fed at
@@ -6764,29 +8713,6 @@ mod tests {
             assert_eq!(report.outcome, StopOutcome::Unresponsive);
             assert_eq!(at, deadline + LATE + GRACE + ABORT_SETTLE);
         }
-
-        /// The force's own abort is recorded: a reader of the same
-        /// incarnation's record sees it at the end of the force's grace.
-        #[tokio::test(start_paused = true)]
-        async fn a_forces_own_abort_is_recorded() {
-            let (lane, _lane_rx) = StopLane::new();
-            let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
-            let task = tokio::spawn(async move {
-                let _status = status_tx.clone();
-                std::future::pending::<()>().await;
-            });
-            let started = Instant::now();
-            let report = force_stop(
-                status_rx,
-                Some(task.abort_handle()),
-                lane.abort_record().clone(),
-                GRACE,
-                StopOutcome::Killed,
-            )
-            .await;
-            assert_eq!(report.outcome, StopOutcome::Aborted);
-            assert_eq!(lane.abort_record().view(), (Some(started + GRACE), false));
-        }
     }
 
     /// A mark never outlives its task. A hold of the actor can: a forwarder
@@ -6816,6 +8742,8 @@ mod tests {
                 parent: root.token(),
                 own: WINDOW + GRACE,
                 infinity: false,
+                trap_extra: std::time::Duration::ZERO,
+                trap_infinity: false,
             };
             let child = SubtreeHold::with_record(Some(link), lane.abort_record().clone());
             let task = tokio::spawn(async {});
@@ -6843,95 +8771,6 @@ mod tests {
                 "nothing is owed to a task that finished"
             );
         }
-
-        /// An entry built while the task runs owes its abort; the task's
-        /// end leaves the mark to the entry, which releases it at its first
-        /// stage.
-        #[tokio::test(start_paused = true)]
-        async fn the_reapers_fire_releases_the_mark_of_a_finished_task() {
-            let (root, _child, lane, task) = child_task();
-            let now = Instant::now();
-            let entry = ReaperEntry::two_stage(
-                now + WINDOW,
-                lane.clone(),
-                now + WINDOW + GRACE,
-                task.abort_handle(),
-            );
-            assert_eq!(root.watch().abort_view(), (None, true));
-            task.await.unwrap();
-            assert_eq!(
-                root.watch().abort_view(),
-                (None, true),
-                "the entry holds the mark until it finds the task finished"
-            );
-            tokio::time::advance(WINDOW).await;
-            let fired = Instant::now();
-            assert!(
-                entry.fire().is_none(),
-                "no stage is left for a finished task"
-            );
-            released(&root, &lane, fired);
-            assert!(
-                lane.reason().is_none(),
-                "no Kill is raised on a finished task"
-            );
-        }
-
-        /// An entry built while the task runs and dropped after its end
-        /// releases the mark at its drop.
-        #[tokio::test(start_paused = true)]
-        async fn the_entrys_drop_releases_the_mark_of_a_finished_task() {
-            let (root, _child, lane, task) = child_task();
-            let now = Instant::now();
-            let entry = ReaperEntry::two_stage(
-                now + WINDOW,
-                lane.clone(),
-                now + WINDOW + GRACE,
-                task.abort_handle(),
-            );
-            assert_eq!(root.watch().abort_view(), (None, true));
-            task.await.unwrap();
-            tokio::time::advance(Duration::from_millis(30)).await;
-            let dropped = Instant::now();
-            drop(entry);
-            released(&root, &lane, dropped);
-        }
-
-        /// An entry built over a task that already finished, its hold alive
-        /// (a forwarder still ending), takes no mark: the subtree reads
-        /// nothing owed and nothing recorded for the entry's whole window,
-        /// through its drop, and no mark is taken afterwards.
-        #[tokio::test(start_paused = true)]
-        async fn an_entry_built_over_a_finished_task_owes_nothing() {
-            let (root, _child, lane, abort) = finished_child().await;
-            assert!(abort.is_finished());
-            let now = Instant::now();
-            let entry = ReaperEntry::two_stage(
-                now + WINDOW,
-                lane.clone(),
-                now + WINDOW + GRACE,
-                abort.clone(),
-            );
-            assert_eq!(root.watch().abort_view(), (None, false));
-            tokio::time::advance(WINDOW - Duration::from_millis(1)).await;
-            assert_eq!(
-                root.watch().abort_view(),
-                (None, false),
-                "a mark never outlives its task"
-            );
-            drop(entry);
-            assert_eq!(root.watch().abort_view(), (None, false));
-            assert_eq!(lane.abort_record().view(), (None, false));
-            let backstop = ReaperEntry::new(now + WINDOW, abort, lane.abort_record().clone());
-            assert_eq!(root.watch().abort_view(), (None, false));
-            drop(backstop);
-            lane.abort_record().owe();
-            assert_eq!(
-                root.watch().abort_view(),
-                (None, false),
-                "nothing is owed to a task that finished"
-            );
-        }
     }
 
     /// Every abort the system issues against an actor records its instant on
@@ -6941,58 +8780,8 @@ mod tests {
     /// clock.
     mod abort_writers {
         use super::*;
-        use crate::actor::ActorExt;
-        use crate::error::SpawnError;
-        use crate::types::StopReason;
 
         const GRACE: Duration = Duration::from_millis(100);
-
-        /// The sequential shutdown's last step aborts a root that took
-        /// neither its stop nor its `Kill`: the record holds that step's
-        /// instant, the end of its stop window and its kill grace.
-        #[tokio::test(start_paused = true)]
-        async fn a_sequential_stops_abort_is_recorded_on_the_roots_lane() {
-            let sys = scripted_system("abort-sequential");
-            let _entries = counting_reaper(&sys);
-            let root = Scripted::register(&sys, &ActorId::from("hung-root"), GRACE);
-            let per_actor = Duration::from_millis(200);
-            let step = Arc::new(Mutex::new(None));
-            {
-                let step = step.clone();
-                set_ladder_hook(&sys, move |point, _| {
-                    if point == LadderPoint::Abort {
-                        *step.lock().unwrap() = Some(Instant::now());
-                    }
-                });
-            }
-            let started = Instant::now();
-            let report = shut_down(&sys, Duration::from_secs(5), per_actor).await;
-            assert_eq!(outcome_of(&report, &root.id), StopOutcome::Unresponsive);
-            let step = step.lock().unwrap().expect("the ladder reached its abort");
-            assert_eq!(step, started + per_actor + GRACE);
-            assert_eq!(root.lane.abort_record().view(), (Some(step), false));
-        }
-
-        /// `stop_within(Kill, within)` on an actor that never reaches a turn
-        /// boundary has it aborted, by the backstop the system armed at the
-        /// raise, once `within` has passed: the record holds that instant.
-        #[tokio::test(start_paused = true)]
-        async fn a_stop_withins_abort_is_recorded_on_the_actors_lane() {
-            let sys = scripted_system("abort-stop-within");
-            let root = Scripted::register(&sys, &ActorId::from("parked"), GRACE);
-            let within = Duration::from_millis(300);
-            let started = Instant::now();
-            let outcome = root
-                .handle
-                .stop_within(StopReason::Kill, within)
-                .await
-                .expect("the lane takes the Kill");
-            assert_eq!(outcome, StopOutcome::Unresponsive);
-            assert_eq!(
-                root.lane.abort_record().view(),
-                (Some(started + within), false)
-            );
-        }
 
         /// An actor whose `pre_start` never completes: it hands out its stop
         /// lane first.
@@ -7022,32 +8811,6 @@ mod tests {
             ) -> crate::error::ActorResult<()> {
                 Ok(())
             }
-        }
-
-        /// A root spawn's start timeout cuts the initialization: the lane
-        /// holds a `Kill`, and the record holds the instant the timeout ran
-        /// out.
-        #[tokio::test(start_paused = true)]
-        async fn a_root_start_timeouts_abort_is_recorded_on_the_actors_lane() {
-            let sys = scripted_system("abort-start-timeout");
-            let (lane_tx, lane_rx) = tokio::sync::oneshot::channel();
-            let timeout = Duration::from_millis(250);
-            let started = Instant::now();
-            let spawned = HangsInPreStart {
-                lane: Some(lane_tx),
-            }
-            .spawn()
-            .on_system(&sys)
-            .start_timeout(timeout)
-            .await;
-            match spawned {
-                Err(SpawnError::StartTimeout) => {}
-                Err(other) => panic!("expected StartTimeout, got {other:?}"),
-                Ok(_) => panic!("expected StartTimeout, the spawn succeeded"),
-            }
-            let lane = lane_rx.await.expect("pre_start ran");
-            assert_eq!(lane.reason(), Some(StopReason::Kill));
-            assert_eq!(lane.abort_record().view(), (Some(started + timeout), false));
         }
     }
 

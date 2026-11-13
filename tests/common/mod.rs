@@ -25,6 +25,34 @@ pub fn run<F: Future<Output = ()>>(workers: usize, body: F) {
     runtime.block_on(body);
 }
 
+/// [`run`] for a test whose failure can leave a runtime thread stuck (a task
+/// blocked on a lock a blocked thread holds): when `body` panics the runtime
+/// is leaked instead of dropped, since dropping it waits for that thread, and
+/// the panic reaches the harness at once. The leaked threads end with the
+/// process.
+pub fn run_or_leak<F: Future<Output = ()>>(workers: usize, body: F) {
+    let runtime = if std::env::var("TOKIO_ACTORS_TEST_FLAVOR").as_deref() == Ok("current_thread") {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build current-thread test runtime")
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if workers > 0 {
+            builder.worker_threads(workers);
+        }
+        builder
+            .enable_all()
+            .build()
+            .expect("failed to build multi-thread test runtime")
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(body)));
+    if let Err(panic) = outcome {
+        std::mem::forget(runtime);
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Always multi-threaded, for a test that needs real parallelism.
 pub fn run_multi_thread_only<F: Future<Output = ()>>(workers: usize, body: F) {
     let mut builder = tokio::runtime::Builder::new_multi_thread();

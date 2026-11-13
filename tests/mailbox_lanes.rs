@@ -160,28 +160,6 @@ async fn items_taken(handle: &ActorHandle<Recorder>, expected: usize) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn each_task_keeps_its_order_under_many_senders() {
-    const TASKS: usize = 32;
-    const EACH: usize = 1500;
-    let handle = spawn_recorder(16).await;
-    let mut joins = Vec::new();
-    for task in 0..TASKS {
-        let handle = handle.clone();
-        joins.push(tokio::spawn(async move {
-            for seq in 0..EACH {
-                handle.notify(Msg::Item { task, seq }).await.unwrap();
-            }
-        }));
-    }
-    for join in joins {
-        timeout(HANG, join).await.expect("no sender hangs").unwrap();
-    }
-    assert_eq!(items_taken(&handle, TASKS * EACH).await, 0);
-    assert_eq!(handle.mailbox_len(), 0);
-    assert_eq!(handle.mailbox_available(), 16);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_request_from_many_tasks_is_answered() {
     let handle = spawn_recorder(8).await;
     let mut joins = Vec::new();

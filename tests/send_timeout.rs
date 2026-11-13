@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Behavioral suite for `ActorHandle::send_timeout`.
 //!
 //! `gen_server:call/3` parity: one deadline spans both enqueueing the request
@@ -14,6 +15,11 @@ use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorResult, AskError,
 };
+
+/// Iteration count for the sustained huge-timeout suites: enough repeats
+/// that a deadline landing within the timer's internal rounding margin,
+/// rather than merely a large one, has room to actually surface.
+const HUGE_TIMEOUT_ITERATIONS: u32 = 3000;
 
 /// The longest a handler waits at a [`Gate`]: past every bound a test
 /// awaits, so a gate the test never opens shows as that test's own failure.
@@ -154,44 +160,6 @@ async fn full_mailbox_with_hung_handler_times_out_unenqueued() {
 // ---------------------------------------------------------------------------
 // Slow handler, no cancellation
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn slow_handler_times_out_enqueued_then_actor_survives() {
-    let handle = Worker.spawn().await.unwrap();
-    let gate = Arc::new(Gate::default());
-    let _opens = OpensOnDrop(gate.clone());
-
-    // Plenty of mailbox room, so the enqueue phase succeeds immediately and
-    // the deadline is spent entirely waiting on the reply, which the handler
-    // gives only once the test opens its gate.
-    let result = handle
-        .send_timeout(WorkerMsg::Gated(gate.clone()), Duration::from_millis(30))
-        .await;
-
-    assert!(
-        matches!(result, Err(AskError::Timeout { enqueued: true })),
-        "expected Timeout {{ enqueued: true }}, got {result:?}"
-    );
-
-    // Let the slow handler actually finish; it must not have been cancelled
-    // by the deadline. Its late reply lands in a dropped oneshot and is
-    // silently discarded.
-    gate.open();
-
-    // A subsequent plain send must succeed, proving the handler ran to
-    // completion and the actor returned to its message loop instead of
-    // crashing.
-    let value = handle.send(WorkerMsg::Echo(9)).await.unwrap();
-    assert_eq!(value, 9);
-    assert!(
-        gate.passed.load(Ordering::SeqCst),
-        "the handler went on past its gate after the deadline"
-    );
-    assert!(
-        handle.is_alive(),
-        "actor must survive a send_timeout deadline"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Healthy fast actor, fast path

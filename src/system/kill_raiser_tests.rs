@@ -8,6 +8,7 @@
 //! its call, without polling it again, to see it end with the window.
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
@@ -34,6 +35,94 @@ impl Actor for Idle {
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
+}
+
+/// How the `Kill` reaches the registry.
+#[derive(Clone, Copy, Debug)]
+enum Raiser {
+    KillById,
+    KillByName,
+    StopWithinKill,
+}
+
+/// What the hook read at the moment the declaration returned.
+#[derive(Debug)]
+struct AtDeclaration {
+    /// The deadline the entry held, `0` when none.
+    due: u64,
+    /// Whether the actor's stop lane already held a `Kill`.
+    kill_raised: bool,
+}
+
+async fn the_deadline_is_declared_before_the_kill_is_raised(raiser: Raiser) {
+    let sys = ActorSystem::create(format!("declare-first-{}", uuid::Uuid::new_v4())).unwrap();
+    let name = format!("declare-first-target-{}", uuid::Uuid::new_v4());
+    let handle = Idle
+        .spawn()
+        .named(name.clone())
+        .on_system(&sys)
+        .await
+        .expect("the actor starts");
+    let seen: Arc<Mutex<Option<AtDeclaration>>> = Arc::new(Mutex::new(None));
+    {
+        let (hook_sys, lane, id, hook_name, hook_seen) = (
+            sys.clone(),
+            handle.stop_lane(),
+            handle.id().clone(),
+            name.clone(),
+            seen.clone(),
+        );
+        sys.set_after_kill_declaration_hook(move || {
+            let due = match raiser {
+                Raiser::KillByName => hook_sys
+                    .by_name
+                    .get(hook_name.as_str())
+                    .map_or(0, |entry| entry.kill_due),
+                Raiser::KillById | Raiser::StopWithinKill => {
+                    hook_sys.by_id.get(&id).map_or(0, |entry| entry.kill_due)
+                }
+            };
+            *hook_seen.lock().unwrap() = Some(AtDeclaration {
+                due,
+                kill_raised: lane.reason() == Some(StopReason::Kill),
+            });
+        });
+    }
+    match raiser {
+        Raiser::KillById => {
+            timeout(BOUND, sys.kill_by_id(handle.id()))
+                .await
+                .expect("the kill returns");
+        }
+        Raiser::KillByName => {
+            timeout(BOUND, sys.kill(&name))
+                .await
+                .expect("the kill returns")
+                .expect("the kill is accepted");
+        }
+        Raiser::StopWithinKill => {
+            timeout(
+                BOUND,
+                handle.stop_within(StopReason::Kill, Duration::from_secs(5)),
+            )
+            .await
+            .expect("the call returns")
+            .expect("the request is accepted");
+        }
+    }
+    let seen = seen
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_else(|| panic!("{raiser:?}: the Kill declared no deadline"));
+    assert_ne!(
+        seen.due, 0,
+        "{raiser:?}: the entry holds the deadline once the declaration returns"
+    );
+    assert!(
+        !seen.kill_raised,
+        "{raiser:?}: the deadline is declared before the Kill is raised"
+    );
 }
 
 /// A bounded call made from a task, and kept there without being polled

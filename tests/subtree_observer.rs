@@ -15,6 +15,7 @@
 //! answer must not come.
 
 use std::future::Future;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -154,6 +155,11 @@ impl Spec {
         self
     }
 
+    fn shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
     fn probe(mut self, gate: &Gate, dropped: &Arc<AtomicBool>) -> Self {
         self.probe = Some(Probe {
             gate: gate.clone(),
@@ -288,6 +294,16 @@ async fn gated_tree(leaf_grace: Duration) -> Tree {
     }
 }
 
+/// The answer of `fut` if it is ready at its first poll, else `None`.
+fn ready_now<F: Future>(fut: F) -> Option<F::Output> {
+    let mut fut = pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(answer) => Some(answer),
+        Poll::Pending => None,
+    }
+}
+
 /// Polls `ready` until it holds or the hang bound passes.
 async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     let started = Instant::now();
@@ -338,6 +354,56 @@ async fn respawn(sys: &Arc<ActorSystem>, name: &str) -> Result<ActorHandle<Node>
 // ---------------------------------------------------------------------------
 // Ended means the names and ids are free
 // ---------------------------------------------------------------------------
+
+/// Three levels, a middle supervisor under a bounded and under an unbounded
+/// window, and a leaf whose `Drop` waits on a gate: `Ended` comes after the
+/// leaf's `Drop`, and the names of all three levels are free.
+async fn depth_case(middle: Shutdown) {
+    let sys = new_system("depth");
+    let gate = Gate::default();
+    let _open = OpenOnDrop(gate.clone());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (top_name, mid_name, leaf_name) = (unique("top"), unique("mid"), unique("leaf"));
+    let top = root(&sys, &top_name, Duration::from_millis(120)).await;
+    top.send(Cmd::Spawn(Spec::supervisor(&mid_name).shutdown(middle)))
+        .await
+        .expect("the middle supervisor spawns");
+    let mid = sys
+        .get::<Node>(&mid_name)
+        .expect("the middle is registered");
+    mid.send(Cmd::Spawn(Spec::worker(&leaf_name).probe(&gate, &dropped)))
+        .await
+        .expect("the leaf spawns");
+
+    let id = top.id().clone();
+    let observer = sys.observe_subtree(&id).expect("registered");
+    real_timeout(BOUND, sys.kill_by_id(&id))
+        .await
+        .expect("kill_by_id returns")
+        .expect("the top was registered");
+    assert!(!dropped.load(Ordering::SeqCst));
+    let mut wait = Box::pin(observer.wait_ended());
+    assert!(
+        real_timeout(PENDING, &mut wait).await.is_err(),
+        "wait_ended answered while the leaf, two levels down, was still running ({middle:?})"
+    );
+    gate.open();
+    assert_eq!(
+        real_timeout(HANG_BOUND, &mut wait).await.expect("answers"),
+        SubtreeEnd::Ended,
+        "{middle:?}"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "Ended came after the leaf's Drop"
+    );
+    assert!(sys.actor_ids().is_empty(), "{middle:?}");
+    for name in [&top_name, &mid_name, &leaf_name] {
+        respawn(&sys, name)
+            .await
+            .unwrap_or_else(|err| panic!("{middle:?}: the name {name} is taken: {err}"));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Registered or not

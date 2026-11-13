@@ -85,6 +85,14 @@
 //! unwind releases the lock. The locks do not poison: a poisoned lock is used
 //! as it is, because nothing under it can leave the data half written.
 //!
+//! A sender that parks while a sink takes the sender-wait event stamps its
+//! waiter with the clock before it is queued; a send that finds a free unit
+//! reads no clock and no gate. The event is raised once the wait is over: a
+//! grant or a close from the sender's own poll, after the unit is a permit and
+//! with no mailbox lock held, and a cancel from the reservation's drop through
+//! the pump, which runs no user code. A wait that began while no sink took the
+//! event never reports.
+//!
 //! A waker belongs to the task that polls with it. A wake or a drop that the
 //! mailbox makes on behalf of another task (a grant, the close and its notice,
 //! the wake-up of the receiver for a returned unit, the release of the
@@ -120,10 +128,14 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::types::ActorId;
+use crate::actor::subtree::AbortRecord;
+use crate::telemetry::{self, EventKind, TelemetryEvent, WaitOutcome};
+use crate::types::turn_clock::now_nanos;
+use crate::types::Who;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
 
@@ -145,14 +157,22 @@ pub(crate) fn lanes_for(workers: usize) -> usize {
 }
 
 /// Creates a mailbox with `capacity` units (at least 1) and `lanes` wait
-/// lists (clamped to 1 through [`MAILBOX_LANES`]) for the actor `owner`.
+/// lists (clamped to 1 through [`MAILBOX_LANES`]) for the actor `owner`,
+/// whose abort record the mailbox keeps when it has one, to reach the
+/// actor's system and identity.
 pub(crate) fn channel<T>(
     capacity: usize,
     lanes: usize,
-    owner: Option<ActorId>,
+    owner: Option<Who>,
+    telemetry: Option<AbortRecord>,
 ) -> (MailTx<T>, MailRx<T>) {
     assert!(capacity > 0, "a mailbox needs a capacity of at least 1");
-    let shared = Arc::new(Shared::new(capacity, lanes.clamp(1, MAILBOX_LANES), owner));
+    let shared = Arc::new(Shared::new(
+        capacity,
+        lanes.clamp(1, MAILBOX_LANES),
+        owner,
+        telemetry,
+    ));
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
     (
         MailTx {
@@ -169,7 +189,7 @@ pub(crate) fn channel<T>(
 /// A mailbox with every wait list, for tests that build a handle by hand.
 #[cfg(test)]
 pub(crate) fn test_channel<T>(capacity: usize) -> (MailTx<T>, MailRx<T>) {
-    channel(capacity, MAILBOX_LANES, None)
+    channel(capacity, MAILBOX_LANES, None, None)
 }
 
 /// Takes a lock, using the data of a poisoned one as it is.
@@ -189,6 +209,10 @@ const CLOSED: u8 = 2;
 /// lock, and only from `WAITING`; its waker lives in the list entry.
 struct Waiter {
     state: AtomicU8,
+    /// The instant the wait began, as nanoseconds plus one, or 0 when the
+    /// wait is untimed. Written before the waiter is queued, read by the
+    /// sender that owns the wait.
+    parked_at: AtomicU64,
 }
 
 thread_local! {
@@ -205,10 +229,12 @@ fn fresh_waiter() -> Arc<Waiter> {
     match SPARE_WAITERS.try_with(|spare| spare.borrow_mut().pop()) {
         Ok(Some(waiter)) => {
             waiter.state.store(WAITING, Relaxed);
+            waiter.parked_at.store(0, Relaxed);
             waiter
         }
         _ => Arc::new(Waiter {
             state: AtomicU8::new(WAITING),
+            parked_at: AtomicU64::new(0),
         }),
     }
 }
@@ -267,7 +293,9 @@ struct Shared<T> {
     closed_notify: Notify,
     /// The actor the mailbox belongs to, named in the log of a panic raised
     /// by the drop of a message that arrived after the end.
-    owner: Option<ActorId>,
+    owner: Option<Who>,
+    /// The abort record of the actor the mailbox belongs to.
+    telemetry: Option<AbortRecord>,
     /// Runs once inside the next park, after it read the closed flag as open
     /// and before it queued itself.
     #[cfg(test)]
@@ -280,7 +308,12 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
-    fn new(capacity: usize, lane_count: usize, owner: Option<ActorId>) -> Self {
+    fn new(
+        capacity: usize,
+        lane_count: usize,
+        owner: Option<Who>,
+        telemetry: Option<AbortRecord>,
+    ) -> Self {
         Self {
             capacity,
             lane_count,
@@ -295,6 +328,7 @@ impl<T> Shared<T> {
             },
             closed_notify: Notify::new(),
             owner,
+            telemetry,
             #[cfg(test)]
             park_hook: Mutex::new(None),
             lane0: Padded(Lane::new()),
@@ -419,6 +453,16 @@ impl<T> Shared<T> {
         false
     }
 
+    /// Whether a sink takes the sender-wait event now: one load of the mode
+    /// word, for a mailbox that belongs to an actor of a system.
+    #[inline]
+    fn sender_wait_is_taken(&self) -> bool {
+        self.telemetry
+            .as_ref()
+            .and_then(AbortRecord::mode)
+            .is_some_and(|mode| mode.armed(EventKind::SenderWaited))
+    }
+
     /// Queues the calling task as a waiter in list `lane_index`.
     fn park(&self, lane_index: usize, cx: &Context<'_>) -> Parked {
         let lane = self.lane_or_init(lane_index);
@@ -426,6 +470,12 @@ impl<T> Shared<T> {
         // the closed flag is visible here.
         fence(SeqCst);
         let waiter = fresh_waiter();
+        if self.sender_wait_is_taken() {
+            // Not yet listed, so no grant can read it.
+            waiter
+                .parked_at
+                .store(now_nanos().saturating_add(1), Relaxed);
+        }
         {
             let mut waiters = lock(&lane.waiters);
             if self.closed.load(SeqCst) {
@@ -657,7 +707,10 @@ impl<T> MailTx<T> {
     }
 
     /// Sends without waiting: `Full` when no unit is free now, `Closed` when
-    /// the mailbox is closed. The message comes back in either case.
+    /// the mailbox is closed. The message comes back with either error. A
+    /// queue that the actor's end closes after the check and before the push
+    /// does not take it: `push` drops it, inside a catch, and the call answers
+    /// `Ok`.
     pub(crate) fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
         let shared = &*self.shared;
         if shared.closed.load(SeqCst) {
@@ -670,20 +723,47 @@ impl<T> MailTx<T> {
         Ok(())
     }
 
+    /// Takes one unit without waiting: `Full` when none is free now, `Closed`
+    /// when the mailbox is closed.
+    pub(crate) fn try_reserve(&self) -> Result<Permit<'_, T>, crate::error::TrySendError> {
+        let shared = &*self.shared;
+        if shared.closed.load(SeqCst) {
+            return Err(crate::error::TrySendError::Closed);
+        }
+        if !shared.take_unit() {
+            return Err(crate::error::TrySendError::Full);
+        }
+        Ok(Permit::new(self))
+    }
+
     /// Pushes `message`, which the caller holds a unit for; the queue wakes
     /// the receiver. Once the actor's end closed the queue nothing takes it:
     /// the unit goes back and the message is dropped here, outside every lock,
     /// inside a catch; with the `tracing` feature a panic of that drop is
     /// logged with the actor's id.
-    fn push(&self, message: T) {
+    ///
+    /// Returns whether the message landed in the queue; `false` means the
+    /// queue was closed and the message was dropped here.
+    fn push(&self, message: T) -> bool {
         if let Err(mpsc::error::SendError(message)) = self.queue.send(message) {
             self.shared.release_unit(true);
             if let Some(payload) = crate::actor::runtime::end_value(message) {
+                // The line is written only where lines are: the owner's
+                // sensitivity is read from its record, never from the id.
+                #[cfg(any(test, feature = "tracing"))]
                 if let Some(owner) = &self.shared.owner {
-                    crate::actor::runtime::log_late_drop(&payload, owner);
+                    let owner = match &self.shared.telemetry {
+                        Some(record) => crate::actor::runtime::Owner::of(owner, record),
+                        None => crate::actor::runtime::Owner::new(owner.clone(), false),
+                    };
+                    crate::actor::runtime::log_late_drop(&payload, &owner);
                 }
+                #[cfg(not(any(test, feature = "tracing")))]
+                drop(payload);
             }
+            return false;
         }
+        true
     }
 
     /// [`reserve`](Self::reserve) for a sender the permit then owns, so the
@@ -698,6 +778,12 @@ impl<T> MailTx<T> {
     #[cfg(test)]
     pub(crate) fn strong_count(&self) -> usize {
         self.shared.tx_count.load(SeqCst)
+    }
+
+    /// The senders parked in the wait lists now.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.shared.waiting_total.load(SeqCst)
     }
 
     /// The wait lists this mailbox was made with.
@@ -744,6 +830,25 @@ pub(crate) struct Reserve<'a, T> {
     lane_override: Option<usize>,
 }
 
+impl<T> Reserve<'_, T> {
+    /// Whether the reservation waits in a list: its last poll found no free
+    /// unit and queued it. A poll that yielded to the task's budget leaves it
+    /// unqueued.
+    pub(crate) fn is_parked(&self) -> bool {
+        matches!(self.step, Step::Parked { .. })
+    }
+
+    /// Gives up a wait the caller refuses to make: the waiter leaves its
+    /// list, or gives back a unit granted meanwhile, and no wait is reported,
+    /// since none was made for the caller. The reservation is done.
+    pub(crate) fn withdraw(&mut self) {
+        if let Step::Parked { lane, waiter } = std::mem::replace(&mut self.step, Step::Done) {
+            self.tx.shared.cancel(lane, &waiter);
+            recycle_waiter(waiter);
+        }
+    }
+}
+
 impl<'a, T> Future for Reserve<'a, T> {
     type Output = Result<Permit<'a, T>, Closed>;
 
@@ -781,52 +886,85 @@ impl<'a, T> Future for Reserve<'a, T> {
                         Parked::Waiting(waiter) => this.step = Step::Parked { lane, waiter },
                     }
                 }
-                Step::Parked { lane, waiter } => match waiter.state.load(SeqCst) {
-                    GRANTED => {
-                        // The unit is this reservation's. A permit holds it
-                        // before anything else runs, so no step below can lose it.
-                        let permit = Permit::new(tx);
-                        if let Step::Parked { waiter, .. } =
-                            std::mem::replace(&mut this.step, Step::Done)
-                        {
-                            recycle_waiter(waiter);
-                        }
-                        if shared.closed.load(SeqCst) {
-                            drop(permit);
-                            return Poll::Ready(Err(Closed));
-                        }
-                        return Poll::Ready(Ok(permit));
-                    }
-                    CLOSED => {
-                        this.step = Step::Done;
-                        return Poll::Ready(Err(Closed));
-                    }
-                    _ => {
-                        // Polled while still waiting: refresh the entry's
-                        // waker under the list's lock, where a grant takes it.
-                        let old = shared.try_lane(*lane).and_then(|list| {
-                            let mut waiters = lock(&list.waiters);
-                            let entry = waiters
-                                .iter_mut()
-                                .find(|(queued, _)| Arc::ptr_eq(queued, waiter))?;
-                            if entry.1.will_wake(cx.waker()) {
-                                None
-                            } else {
-                                Some(std::mem::replace(&mut entry.1, cx.waker().clone()))
+                Step::Parked { lane, waiter } => {
+                    // How the wait ended and when it began, or the poll that
+                    // goes back to sleep or round again.
+                    let (stamp, result) = match waiter.state.load(SeqCst) {
+                        GRANTED => {
+                            // The unit is this reservation's. A permit holds it
+                            // before anything else runs, so no step below can
+                            // lose it.
+                            let permit = Permit::new(tx);
+                            let stamp = waiter.parked_at.load(Relaxed);
+                            if let Step::Parked { waiter, .. } =
+                                std::mem::replace(&mut this.step, Step::Done)
+                            {
+                                recycle_waiter(waiter);
                             }
-                        });
-                        // A grant between the first read and the new waker
-                        // took the old one: look again.
-                        let settled = waiter.state.load(SeqCst) != WAITING;
-                        // The old waker is the polling task's own; its drop
-                        // runs with the reservation parked and listed.
-                        drop(old);
-                        if settled {
-                            continue;
+                            if shared.closed.load(SeqCst) {
+                                drop(permit);
+                                (stamp, Err(Closed))
+                            } else {
+                                (stamp, Ok(permit))
+                            }
                         }
-                        return Poll::Pending;
+                        CLOSED => {
+                            let stamp = waiter.parked_at.load(Relaxed);
+                            this.step = Step::Done;
+                            (stamp, Err(Closed))
+                        }
+                        _ => {
+                            // Polled while still waiting: refresh the entry's
+                            // waker under the list's lock, where a grant takes
+                            // it.
+                            let old = shared.try_lane(*lane).and_then(|list| {
+                                let mut waiters = lock(&list.waiters);
+                                let entry = waiters
+                                    .iter_mut()
+                                    .find(|(queued, _)| Arc::ptr_eq(queued, waiter))?;
+                                if entry.1.will_wake(cx.waker()) {
+                                    None
+                                } else {
+                                    Some(std::mem::replace(&mut entry.1, cx.waker().clone()))
+                                }
+                            });
+                            // A grant between the first read and the new waker
+                            // took the old one: look again.
+                            let settled = waiter.state.load(SeqCst) != WAITING;
+                            // The old waker is the polling task's own; its drop
+                            // runs with the reservation parked and listed.
+                            drop(old);
+                            if settled {
+                                continue;
+                            }
+                            return Poll::Pending;
+                        }
+                    };
+                    // The wait is over and no lock is held: a timed wait
+                    // reports it through the pump, with the permit already
+                    // built. The polling task may be a timer or stream
+                    // forwarder that the actor's end waits on, so no handler
+                    // runs here, and the three outcomes take one route.
+                    if stamp != 0 {
+                        if let Some(record) = &shared.telemetry {
+                            let waited =
+                                Duration::from_nanos(now_nanos().saturating_sub(stamp - 1));
+                            let outcome = if result.is_ok() {
+                                WaitOutcome::Granted
+                            } else {
+                                WaitOutcome::Closed
+                            };
+                            telemetry::push_about(record, None, EventKind::SenderWaited, |owner| {
+                                TelemetryEvent::SenderWaited {
+                                    owner: owner.clone(),
+                                    waited,
+                                    outcome,
+                                }
+                            });
+                        }
                     }
-                },
+                    return Poll::Ready(result);
+                }
                 Step::Done => panic!("`Reserve` polled after completion"),
             }
         }
@@ -836,7 +974,24 @@ impl<'a, T> Future for Reserve<'a, T> {
 impl<T> Drop for Reserve<'_, T> {
     fn drop(&mut self) {
         if let Step::Parked { lane, waiter } = &self.step {
-            self.tx.shared.cancel(*lane, waiter);
+            let shared = &self.tx.shared;
+            shared.cancel(*lane, waiter);
+            // The list's lock is released. A timed wait that ends here, with
+            // or without a grant it never saw, reports through the pump: a
+            // drop runs no user code.
+            let stamp = waiter.parked_at.load(Relaxed);
+            if stamp != 0 {
+                if let Some(record) = &shared.telemetry {
+                    let waited = Duration::from_nanos(now_nanos().saturating_sub(stamp - 1));
+                    telemetry::push_about(record, None, EventKind::SenderWaited, |owner| {
+                        TelemetryEvent::SenderWaited {
+                            owner: owner.clone(),
+                            waited,
+                            outcome: WaitOutcome::Cancelled,
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -862,10 +1017,11 @@ impl<'a, T> Permit<'a, T> {
 
     /// Puts `message` in the queue. It goes in after the mailbox closed too,
     /// for the receiver; once the actor's end closed the queue itself, the
-    /// push fails and the message is dropped here.
-    pub(crate) fn send(mut self, message: T) {
+    /// push fails and the message is dropped here. Returns whether the
+    /// message landed.
+    pub(crate) fn send(mut self, message: T) -> bool {
         self.live = false;
-        self.tx.push(message);
+        self.tx.push(message)
     }
 }
 
@@ -912,6 +1068,7 @@ pub(crate) struct MailRx<T> {
 impl<T> MailRx<T> {
     /// The next message, waiting for one; `None` once the mailbox has ended.
     /// Cancel safe.
+    #[cfg(test)]
     pub(crate) async fn recv(&mut self) -> Option<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }

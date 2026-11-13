@@ -6,7 +6,11 @@
 //! task that drops what arrives at an actor's queue after the actor ended, and
 //! the three tasks that carry the steps of a call: the start bound of a spawn
 //! with a start timeout, the stop ladder of a bounded stop, and the shutdown
-//! walk. A system keeps one slot for each runtime its helpers run on. The
+//! walk. Three further tasks hold no obligation: the reply of a supervisor
+//! reference's `terminate_child`, which waits for the child's end because the
+//! supervisor classifies and reports the end by itself, the telemetry pump, and
+//! the delivery of the system monitor's reports. A system
+//! keeps one slot for each runtime its helpers run on. The
 //! slot sees every helper start and every helper end, whichever way it ends:
 //!
 //! - a task that runs to its end is counted down;
@@ -42,6 +46,8 @@ use tokio::runtime::{Handle, Id};
 use tokio::task::JoinHandle;
 
 use crate::actor::panic::{catch_callback, payload_into_string};
+use crate::actor::subtree::AbortRecord;
+use crate::telemetry::{EventKind, Mode, TelemetryEvent};
 use crate::types::ActorId;
 
 /// Which helper a task is.
@@ -53,7 +59,6 @@ pub(crate) enum HelperKind {
     /// Aborts the tasks that outlive their grace.
     Reaper,
     /// Reports the turns that run longer than the system's threshold.
-    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
     Sweep,
     /// Cuts the start of a spawn that outlives its start timeout.
     StartBound,
@@ -62,6 +67,15 @@ pub(crate) enum HelperKind {
     StopLadder,
     /// Walks a system shutdown to its end.
     ShutdownWalk,
+    /// Waits for the end of a child a `SupervisorRef` asked its supervisor to
+    /// terminate, and answers the caller. It holds no obligation: the
+    /// supervisor classifies the end by itself.
+    SupervisorReply,
+    /// Delivers queued telemetry events.
+    Pump,
+    /// Delivers the system monitor's reports to its actor.
+    #[allow(dead_code)]
+    Monitor,
 }
 
 impl HelperKind {
@@ -74,13 +88,32 @@ impl HelperKind {
             Self::StartBound => "start bound",
             Self::StopLadder => "stop ladder",
             Self::ShutdownWalk => "shutdown walk",
+            Self::SupervisorReply => "supervisor reply",
+            Self::Pump => "telemetry pump",
+            Self::Monitor => "system monitor",
         }
+    }
+}
+
+/// The incarnation a helper task works for: its id, which the logs and the
+/// event of the helper's end name, and, when the caller has it, its abort
+/// record, which finds the incarnation's telemetry identity when the end is
+/// recorded. Without the record the end is queued without an incarnation to
+/// count it in.
+#[derive(Debug)]
+pub(crate) struct HelperOwner {
+    id: ActorId,
+    record: Option<AbortRecord>,
+}
+
+impl HelperOwner {
+    pub(crate) fn new(id: ActorId, record: Option<AbortRecord>) -> Self {
+        Self { id, record }
     }
 }
 
 /// How a helper task ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum HelperEnd {
     /// The task ran to its end.
     Finished,
@@ -92,23 +125,60 @@ pub(crate) enum HelperEnd {
 }
 
 /// The slots of one system, one for each runtime its helpers run on.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HelperSlots {
+    /// The system's telemetry mode, which every slot reports helper ends to.
+    mode: Arc<Mode>,
     by_runtime: Mutex<HashMap<Id, Arc<HelperSlot>>>,
 }
 
 /// The helper tasks of one system on one runtime.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HelperSlot {
     live: AtomicUsize,
+    mode: Arc<Mode>,
     #[cfg(test)]
     ends: Mutex<Vec<(HelperKind, HelperEnd)>>,
 }
 
+impl HelperSlot {
+    fn new(mode: Arc<Mode>) -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            mode,
+            #[cfg(test)]
+            ends: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The helpers of this slot that have started and not ended.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The ends recorded on this slot so far, in order.
+    #[cfg(test)]
+    pub(crate) fn ends(&self) -> Vec<(HelperKind, HelperEnd)> {
+        self.ends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 impl HelperSlots {
+    /// Slots that report helper ends to `mode`.
+    pub(crate) fn new(mode: Arc<Mode>) -> Self {
+        Self {
+            mode,
+            by_runtime: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// The guard of a helper about to start on `rt`; the helper counts as
     /// live from here until the guard records its end.
-    fn guard(&self, rt: &Handle, kind: HelperKind, owner: Option<ActorId>) -> EndGuard {
+    fn guard(&self, rt: &Handle, kind: HelperKind, owner: Option<HelperOwner>) -> EndGuard {
         let id = rt.id();
         let slot = {
             let mut slots = self
@@ -121,7 +191,7 @@ impl HelperSlots {
                     // A slot with no guard out serves no task: its runtime
                     // ended, or every helper on it finished.
                     slots.retain(|_, slot| Arc::strong_count(slot) > 1);
-                    let slot = Arc::new(HelperSlot::default());
+                    let slot = Arc::new(HelperSlot::new(self.mode.clone()));
                     slots.insert(id, slot.clone());
                     slot
                 }
@@ -145,6 +215,16 @@ impl HelperSlots {
             .values()
             .map(|slot| slot.live.load(Ordering::Acquire))
             .sum()
+    }
+
+    /// The slot of `rt`, if it has one.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, rt: &Handle) -> Option<Arc<HelperSlot>> {
+        self.by_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&rt.id())
+            .cloned()
     }
 
     /// The ends recorded on `rt` so far, in order.
@@ -172,7 +252,7 @@ impl HelperSlots {
         &self,
         rt: &Handle,
         kind: HelperKind,
-        owner: Option<ActorId>,
+        owner: Option<HelperOwner>,
         make: F,
     ) -> JoinHandle<()>
     where
@@ -189,7 +269,7 @@ macro_rules! helper_log {
     ($guard:expr, $($arg:tt)+) => {
         match &$guard.owner {
             Some(owner) => caught_log!(warn,
-                actor_id = %owner,
+                actor_id = %owner.id,
                 helper = $guard.kind.name(),
                 $($arg)+
             ),
@@ -205,11 +285,11 @@ macro_rules! helper_log {
 #[derive(Debug)]
 pub(crate) struct EndGuard {
     slot: Arc<HelperSlot>,
-    /// Named by the log lines of an end, which the `tracing` feature writes.
-    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+    /// Named by the log lines of an end, which the `tracing` feature writes,
+    /// and by the telemetry event of an end.
     kind: HelperKind,
-    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
-    owner: Option<ActorId>,
+    /// Held until the end is recorded, then dropped.
+    owner: Option<HelperOwner>,
     recorded: bool,
 }
 
@@ -232,11 +312,14 @@ impl EndGuard {
     /// A poll of the task panicked; the panic is logged.
     pub(crate) fn panicked(mut self, payload: &str) {
         #[cfg(feature = "tracing")]
-        helper_log!(
-            self,
-            panic = %payload,
-            "a helper task of the crate panicked; the panic is contained"
-        );
+        {
+            let fields = self.log_fields();
+            helper_log!(
+                self,
+                panic = %fields.panic_text(payload),
+                "a helper task of the crate panicked; the panic is contained"
+            );
+        }
         #[cfg(not(feature = "tracing"))]
         let _ = payload;
         self.record(HelperEnd::Panicked);
@@ -246,6 +329,21 @@ impl EndGuard {
     /// are dropped with it unsettled.
     pub(crate) fn cancelled(mut self, dropped: usize) {
         self.record_cancelled(dropped);
+    }
+
+    /// The fields of a line that carries text of the owner's failure: they
+    /// hide the text when the owner's incarnation is sensitive, read from the
+    /// owner's record. A helper with no owner, or whose owner has no record,
+    /// works for no actor's failure and hides nothing.
+    #[cfg(feature = "tracing")]
+    fn log_fields(&self) -> crate::telemetry::LogFields<'static> {
+        match &self.owner {
+            Some(HelperOwner {
+                id,
+                record: Some(record),
+            }) => crate::actor::runtime::Owner::of(id, record).fields(),
+            _ => crate::telemetry::LogFields::foreign(),
+        }
     }
 
     fn record_cancelled(&mut self, dropped: usize) {
@@ -263,6 +361,31 @@ impl EndGuard {
     fn record(&mut self, end: HelperEnd) {
         if std::mem::replace(&mut self.recorded, true) {
             return;
+        }
+        // The pump reports no end of its own: its end could only be queued
+        // for itself.
+        let owner = self.owner.take();
+        if self.kind != HelperKind::Pump {
+            let mode = &self.slot.mode;
+            let kind = self.kind;
+            let build = || TelemetryEvent::HelperEnded {
+                kind: kind.into(),
+                owner: owner.as_ref().map(|owner| owner.id.clone()),
+                end: end.clone().into(),
+            };
+            // An end that names an actor is counted in that incarnation's
+            // events in the pump, so a turn of the actor never reaches a
+            // handler ahead of it. The identity is looked up now, by the
+            // incarnation's record: once the actor has ended it is released,
+            // and nothing about the actor follows its end.
+            let identity = owner
+                .as_ref()
+                .and_then(|owner| owner.record.as_ref())
+                .and_then(|record| mode.find(record.key()));
+            match identity {
+                Some(identity) => mode.push_owned(&identity, EventKind::HelperEnded, build),
+                None => mode.push(EventKind::HelperEnded, build),
+            }
         }
         #[cfg(test)]
         self.slot
@@ -286,3 +409,34 @@ impl Drop for EndGuard {
 
 #[cfg(all(test, feature = "tracing"))]
 mod end_log_tests;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::system::ActorSystem;
+
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// The longest a wait for a condition may take. It only limits how long a real
+    /// hang takes to report; a slow host must not read as one.
+    const HANG_BOUND: Duration = Duration::from_secs(60);
+
+    fn fresh_system() -> Arc<ActorSystem> {
+        ActorSystem::create(format!("helpers-{}", uuid::Uuid::new_v4())).unwrap()
+    }
+
+    /// Yields until `condition` holds. The bound only limits how long a real hang takes to report.
+    async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+        let waited = timeout(HANG_BOUND, async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "{what}");
+    }
+}

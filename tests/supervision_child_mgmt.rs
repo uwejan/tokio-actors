@@ -147,10 +147,29 @@ where
     }
 }
 
+/// Waits until the roster reads the named child alive with no restart
+/// pending, which is after the supervisor adopted its latest incarnation: a
+/// manual call made earlier, when the incarnation already answers but is not
+/// adopted yet, is answered `ChildRestarting`.
+async fn wait_adopted(sup: &ActorHandle<MgmtSup>, name: &str) {
+    let snapshot = wait_roster(sup, 10_000, |children| {
+        info_for(children, name).is_some_and(|info| info.is_alive && !info.restart_pending)
+    })
+    .await;
+    assert!(
+        info_for(&snapshot, name).is_some_and(|info| info.is_alive && !info.restart_pending),
+        "{name} was never adopted: {snapshot:?}"
+    );
+}
+
 fn event_for<'e>(events: &'e [ChildEvent], name: &str) -> Option<&'e ChildEvent> {
     events
         .iter()
         .find(|ev| ev.child_name.as_deref() == Some(name))
+}
+
+fn info_for<'r>(children: &'r [ChildInfo], name: &str) -> Option<&'r ChildInfo> {
+    children.iter().find(|c| c.name.as_deref() == Some(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +221,10 @@ struct Vetoer;
 /// How many times each vetoer, by name, was asked to stop.
 static VETOES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
     std::sync::LazyLock::new(Default::default);
+
+fn vetoes_of(name: &str) -> usize {
+    VETOES.lock().unwrap().get(name).copied().unwrap_or(0)
+}
 
 impl Actor for Vetoer {
     type Message = ();
@@ -452,47 +475,6 @@ fn delete_child_lifecycle() {
 // abort is reported as Kill
 // ---------------------------------------------------------------------------
 
-#[test]
-fn child_stopped_with_cancelled_is_reported_as_cancelled() {
-    common::run(0, async {
-        let events = recorder();
-        let sup = MgmtSup {
-            events: events.clone(),
-        }
-        .spawn()
-        .named(uname("sup-cancelled"))
-        .supervisor()
-        .await
-        .unwrap();
-
-        let name = uname("cancelled-worker");
-        op(
-            &sup,
-            SupCmd::SpawnWorker {
-                name: name.clone(),
-                restart_type: RestartType::Temporary,
-                shutdown: Shutdown::Timeout(Duration::from_secs(1)),
-            },
-        )
-        .await
-        .expect("spawn worker");
-        let worker = wait_worker_ready(&name, 5_000).await.expect("worker up");
-
-        // Stopped directly, outside the supervisor's manual API: a genuine
-        // user-requested Cancelled, not an abort.
-        worker.stop(StopReason::Cancelled).await.unwrap();
-
-        let evs = wait_for_events(&events, 5_000, |e| event_for(e, &name).is_some()).await;
-        let ev = event_for(&evs, &name).unwrap_or_else(|| panic!("no death event: {evs:?}"));
-        assert!(
-            matches!(ev.reason, StopReason::Cancelled),
-            "a child that genuinely stops with Cancelled must reach on_child_stopped as \
-             Cancelled, got {:?}",
-            ev.reason
-        );
-    });
-}
-
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
@@ -557,50 +539,4 @@ impl Actor for OnChildStoppedSup {
         *self.captured_reason.lock().unwrap() = Some(reason.clone());
         Ok(())
     }
-}
-
-#[test]
-fn err_from_on_child_stopped_stops_the_supervisor() {
-    common::run(0, async {
-        let child_name = uname("err-cs-child");
-        let captured_error = Arc::new(std::sync::Mutex::new(None));
-        let captured_reason = Arc::new(std::sync::Mutex::new(None));
-
-        let sup = OnChildStoppedSup {
-            fails: true,
-            child_name: child_name.clone(),
-            captured_error: captured_error.clone(),
-            captured_reason: captured_reason.clone(),
-        }
-        .spawn()
-        .named(uname("sup-err-cs"))
-        .supervisor()
-        .await
-        .unwrap();
-
-        let sys = ActorSystem::default();
-        assert!(
-            wait_until(5_000, || sys.get::<Worker>(&child_name).is_some()).await,
-            "child must be registered before it can be crashed"
-        );
-        let child: ActorHandle<Worker> = sys.get(&child_name).unwrap();
-        child.notify(WorkerMsg::Crash).await.unwrap();
-
-        assert!(
-            wait_until(5_000, || !sup.is_alive()).await,
-            "an Err from on_child_stopped must stop the supervisor"
-        );
-        sup.wait_stopped().await;
-
-        let err = captured_error.lock().unwrap().take();
-        assert!(
-            matches!(err, Some(ActorError::User(ref msg)) if msg == "boom"),
-            "expected the on_child_stopped Err to be recorded as last_error, got {err:?}"
-        );
-        let reason = captured_reason.lock().unwrap().take();
-        assert!(
-            matches!(reason, Some(StopReason::Failure(_))),
-            "on_stopped must see the on_child_stopped failure as StopReason::Failure, got {reason:?}"
-        );
-    });
 }

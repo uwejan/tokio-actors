@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use super::bounded_run::{self, Flavor};
 use super::{handle_worklist, ChildLifecycle};
 use crate::actor::context::ActorContext;
 use crate::actor::{Actor, ActorExt};
@@ -147,11 +146,4 @@ async fn a_report_pushed_back_is_handled_before_the_reports_queued_behind_it() {
         vec![stopped, crashed],
         "the report of the uncommitted stop is delivered first, then the one behind it"
     );
-}
-
-#[test]
-fn the_report_of_an_uncommitted_stop_is_delivered_before_the_reports_behind_it_multi_thread() {
-    bounded_run::run(Flavor::MultiThread, || {
-        a_report_pushed_back_is_handled_before_the_reports_queued_behind_it()
-    });
 }

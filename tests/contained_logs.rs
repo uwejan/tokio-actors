@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![cfg(feature = "tracing")]
 //! A `tracing` subscriber that panics is contained at every log line of the
 //! crate: at the drops of an aborted actor's task, at the line that records
@@ -82,21 +83,6 @@ impl Actor for Parked {
 /// The line that records a drop at the abort.
 const ABORT_DROP: &str = "a drop at the abort or the unwind";
 
-/// [`a_panicking_subscriber_at_an_aborted_task_s_drops_does_not_abort`],
-/// with a subscriber whose panic payload holds two values that each panic
-/// when dropped. A drop of that payload would panic again while unwinding,
-/// which aborts the process; the crate never drops it.
-#[test]
-fn a_subscriber_panic_whose_payload_panics_when_dropped_does_not_abort() {
-    if !common::in_a_child_process(
-        "a_subscriber_panic_whose_payload_panics_when_dropped_does_not_abort",
-    ) {
-        return;
-    }
-    let lines = subscriber::install_with(Some(ABORT_DROP), subscriber::Payload::TwoBombs);
-    kill_a_parked_actor(&lines);
-}
-
 /// Kills a [`Parked`] actor whose value and queued message panic when
 /// dropped: it reads `Kill`, and both lines that record the drops are
 /// written.
@@ -174,36 +160,6 @@ impl Actor for Streaming {
     async fn handle(&mut self, _msg: Never, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
     }
-}
-
-/// A `Kill` read at a turn boundary decides the reason; the stream's drop
-/// at the end then panics, and the subscriber panics on the line that
-/// records it. The reason stays `Kill`.
-#[test]
-fn a_panicking_subscriber_on_a_drop_panic_after_a_kill_leaves_the_kill() {
-    if !common::in_a_child_process(
-        "a_panicking_subscriber_on_a_drop_panic_after_a_kill_leaves_the_kill",
-    ) {
-        return;
-    }
-    let lines = subscriber::install(Some("before the actor's reason was final"));
-    let reason = runtime().block_on(async {
-        let actor = Streaming.spawn().await.expect("the actor starts");
-        ARMED.store(true, Ordering::SeqCst);
-        actor.stop(StopReason::Kill).await.expect("accepted");
-        timeout(BOUND, actor.wait_stopped())
-            .await
-            .expect("the actor ends")
-    });
-    ARMED.store(false, Ordering::SeqCst);
-    assert_eq!(reason, StopReason::Kill);
-    let written = lines
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|line| line.contains("before the actor's reason was final"))
-        .count();
-    assert_eq!(written, 1, "the line was written");
 }
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ use tokio::time::{sleep, Instant};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatusInfo, ActorSystem, ChildEvent,
-    RestartType, Shutdown, StopReason, SupervisionAction, SupervisionConfig,
+    RestartType, Shutdown, StopReason, StreamEvent, SupervisionAction, SupervisionConfig,
 };
 
 mod common;
@@ -44,6 +44,23 @@ static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn uname(base: &str) -> String {
     format!("crash-{base}-{}", UNIQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Polls a synchronous predicate until it holds or the deadline passes.
+async fn wait_until<F>(timeout_ms: u64, mut pred: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if pred() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Polls the recorder until `pred` holds (or the deadline passes) and returns a snapshot.
@@ -66,6 +83,24 @@ where
     }
 }
 
+/// Re-looks a named `PanicWorker` up until a FRESH instance responds (counter == 0).
+///
+/// A fresh counter doubles as proof of a completed restart: a pre-crash instance
+/// with a bumped counter can never satisfy this predicate.
+async fn wait_worker_ready(name: &str, timeout_ms: u64) -> Option<ActorHandle<PanicWorker>> {
+    let sys = ActorSystem::default();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some(handle) = sys.get::<PanicWorker>(name) {
+            if let Ok(0) = handle.send(WorkerMsg::Count).await {
+                return Some(handle);
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
 /// Re-looks a named actor up until it answers `get_status` (proof of liveness).
 async fn wait_status<A: Actor>(name: &str, timeout_ms: u64) -> Option<ActorStatusInfo> {
     let sys = ActorSystem::default();
@@ -79,6 +114,11 @@ async fn wait_status<A: Actor>(name: &str, timeout_ms: u64) -> Option<ActorStatu
         sleep(Duration::from_millis(10)).await;
     }
     None
+}
+
+fn is_panic_restart(event: &ChildEvent) -> bool {
+    matches!(event.reason, StopReason::Failure(ActorError::Panic(_)))
+        && event.action == SupervisionAction::RestartInitiated
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +296,46 @@ impl Actor for TimedCrasher {
 
     async fn handle(&mut self, _msg: TimedMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         panic!("timed mass crash");
+    }
+}
+
+/// Actor with a recurring timer and an attached stream (test 15).
+struct Ticker;
+
+#[derive(Clone)]
+enum TickMsg {
+    Tick,
+    Data,
+    Done,
+    Boom,
+}
+
+impl From<StreamEvent<u32>> for TickMsg {
+    fn from(event: StreamEvent<u32>) -> Self {
+        match event {
+            StreamEvent::Data(_) => TickMsg::Data,
+            StreamEvent::Finished => TickMsg::Done,
+        }
+    }
+}
+
+impl Actor for Ticker {
+    type Message = TickMsg;
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.schedule(TickMsg::Tick)
+            .every(Duration::from_millis(20))
+            .await?;
+        ctx.add_stream(tokio_stream::iter(0u32..5_000_000));
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: TickMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            TickMsg::Boom => panic!("ticker boom"),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -534,42 +614,42 @@ fn is_err_restart(event: &ChildEvent) -> bool {
 }
 
 #[test]
-fn err_from_handle_notify_path_restarts_supervised_twin() {
+fn err_from_handle_notify_path_stops_actor_like_send() {
     common::run(0, async {
-        let events = recorder();
-        let name = uname("poison-worker");
-        let sup = PoisonSupervisor {
-            events: events.clone(),
-            child_name: name.clone(),
+        let stopped: StopLog = Arc::new(tokio::sync::Mutex::new(None));
+        let handle = PoisonWorker {
+            count: 0,
+            stopped: stopped.clone(),
         }
         .spawn()
-        .named(uname("sup-poison"))
-        .supervisor()
         .await
         .unwrap();
 
-        let worker = wait_poison_ready(&name, 5_000).await.expect("worker up");
-        assert_eq!(worker.send(PoisonMsg::Bump).await.unwrap(), 1);
+        // notify (fire-and-forget): under the removed `handle_failure` limp mode
+        // this would have continued running. v0.8.0 makes a returned `Err`
+        // stop the actor identically on the notify and send paths.
+        handle.notify(PoisonMsg::Poison).await.unwrap();
 
-        // The same kind of poison notify as the unsupervised twin above: proves
-        // the supervision path observes the Err-stop and restarts per policy.
-        worker.notify(PoisonMsg::Poison).await.unwrap();
-
-        let evs = wait_for_events(&events, 10_000, |e| e.iter().any(is_err_restart)).await;
-        assert!(
-            evs.iter().any(is_err_restart),
-            "expected Failure(User) + RestartInitiated, got {evs:?}"
-        );
-
-        let fresh = wait_poison_ready(&name, 10_000)
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
             .await
-            .expect("restarted worker should re-register under the same name");
-        assert_eq!(fresh.send(PoisonMsg::Count).await.unwrap(), 0);
-
+            .expect("wait_stopped must resolve after a notify-path Err (cast-exception parity)");
+        // wait_stopped resolves on the status plane's terminal state; is_alive
+        // (mailbox closure) can lag it by one teardown beat under heavy
+        // instrumentation, so poll briefly instead of asserting instantly.
         assert!(
-            sup.is_alive(),
-            "supervisor must survive the child's Err-stop"
+            wait_until(2_000, || !handle.is_alive()).await,
+            "actor must be dead after the poison notify"
         );
+
+        let observed = stopped.lock().await.take();
+        match observed {
+            Some(StopReason::Failure(ActorError::User(msg))) => {
+                assert!(msg.contains("poisoned"), "unexpected message: {msg}");
+            }
+            other => {
+                panic!("expected on_stopped to observe StopReason::Failure(User), got {other:?}")
+            }
+        }
     });
 }
 
@@ -580,3 +660,60 @@ fn err_from_handle_notify_path_restarts_supervised_twin() {
 // reaper task from any other test's, so its short link-guard grace is never
 // starved by unrelated concurrent activity on the shared default system).
 // ---------------------------------------------------------------------------
+
+/// A child whose SECOND construction (the crash's own restart attempt) hangs
+/// forever in `on_started`; every other construction returns immediately.
+struct HungRestartWorker {
+    hang: bool,
+}
+
+#[derive(Clone)]
+enum HungMsg {
+    Crash,
+}
+
+impl Actor for HungRestartWorker {
+    type Message = HungMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: HungMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            HungMsg::Crash => panic!("hung-restart worker crashed on command"),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if self.hang {
+            std::future::pending().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct HungRestartSup {
+    name: String,
+    constructions: Arc<AtomicUsize>,
+}
+
+impl Actor for HungRestartSup {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let constructions = self.constructions.clone();
+        ctx.spawn_child(move || {
+            let n = constructions.fetch_add(1, Ordering::SeqCst);
+            HungRestartWorker { hang: n == 1 }
+        })
+        .named(self.name.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Kill)
+        .await?;
+        Ok(())
+    }
+}

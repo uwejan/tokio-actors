@@ -22,11 +22,11 @@
 //! its system, and killable through it with
 //! [`ActorSystem::kill_by_id`](crate::system::ActorSystem::kill_by_id) (which
 //! needs a runtime with the Tokio time driver when the id is registered and
-//! its actor takes the `Kill`), regardless of how it was spawned. Erlang/OTP gives a
-//! process's lifetime structure through links, monitors and `supervisor` trees
-//! (erlang.org/docs/28); this crate provides supervision trees, which is why
-//! structuring actors under supervisors is the recommended way to manage their
-//! lifetimes here.
+//! its actor takes the `Kill`), regardless of how it was spawned. Erlang/OTP
+//! gives a process's lifetime structure through links, monitors and
+//! `supervisor` trees (erlang.org/docs/28); this crate provides supervision
+//! trees, links and monitors, and structuring actors under supervisors is still
+//! the recommended way to manage their lifetimes here.
 //!
 //! ```rust,no_run
 //! use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult, StopReason};
@@ -85,29 +85,94 @@ macro_rules! caught_log {
             ::tracing::$level!($($arg)+);
         });
     }};
+    // The span the actor task runs in, as a type.
+    (@span_type) => {
+        ::tracing::Span
+    };
+    // The guard of an entered span, as a type.
+    (@entered_type $lt:lifetime) => {
+        ::tracing::span::Entered<$lt>
+    };
+    // Whether the process-wide level checks every tracing macro makes first
+    // pass for a level: the compile-time ceiling and the highest level any
+    // installed subscriber takes. False when no subscriber takes the level.
+    (@level $level:ident) => {
+        ::tracing::Level::$level <= ::tracing::level_filters::STATIC_MAX_LEVEL
+            && ::tracing::Level::$level <= ::tracing::level_filters::LevelFilter::current()
+    };
+    // Whether a subscriber takes error-level statements, the most severe
+    // level, which every subscriber filtering on severity accepts; the
+    // statements of the crate that carry the identity fields of an actor are
+    // written at error, warn or info level.
+    (@interest) => {
+        ::tracing::enabled!(::tracing::Level::ERROR)
+    };
+    // Whether a subscriber takes statements of `$level` for the target
+    // `$target`, asked inside a catch so a subscriber that panics reads as
+    // not interested; false without the feature. A crate path that owes a
+    // step asks this only to decide whether to format text it would
+    // otherwise never build.
+    (@enabled $level:ident, $target:expr) => {{
+        #[cfg(feature = "tracing")]
+        let interested = $crate::actor::panic::catch_sync(|| {
+            ::tracing::enabled!(target: $target, ::tracing::Level::$level)
+        })
+        .unwrap_or_else(|payload| {
+            std::mem::forget(payload);
+            false
+        });
+        #[cfg(not(feature = "tracing"))]
+        let interested = false;
+        interested
+    }};
+    // A new root span for one incarnation; the fields are evaluated only
+    // when the span's callsite is enabled.
+    (@new_span $id:expr, $name:expr, $incarnation:expr, $system:expr) => {
+        ::tracing::debug_span!(
+            parent: None,
+            "actor",
+            actor.id = %$id,
+            actor.name = $name,
+            actor.incarnation = $incarnation,
+            system = $system,
+        )
+    };
 }
 
 pub mod actor;
+pub mod behavior;
 pub mod error;
 mod helper;
 pub mod system;
+pub mod telemetry;
 mod time_probe;
+#[cfg(test)]
+#[cfg(feature = "tracing")]
+mod tracing_isolation;
 pub mod types;
 
+pub use actor::sys;
 pub use actor::{
+    alias::{Alias, AliasOptions},
     context::{ActorContext, ChildSpawnBuilder, RecurringScheduleBuilder, ScheduleBuilder},
     handle::{ActorHandle, SubtreeObserver},
+    monitor::IntoMonitorTarget,
+    pg::PgScope,
     runtime::{ActorConfig, MailboxConfig},
-    supervision::SupervisionConfig,
-    Actor, ActorExt, SpawnBuilder,
+    supervision::{AutoShutdown, SupervisionConfig},
+    supervisor_ref::SupervisorRef,
+    Actor, ActorExt, LinkedSpawn, MonitoredSpawn, SpawnBuilder,
 };
+pub use behavior::{Behavior, BehaviorActor, BehaviorContext, Next};
 pub use error::{
-    ActorError, ActorResult, AskError, SendError, SpawnError, StreamError, SupervisionError,
-    TimerError, TrySendError,
+    ActorError, ActorResult, AliasError, AskError, ExitError, LinkError, MonitorError, PgError,
+    RequestError, SendError, SpawnError, StopError, StreamError, SupervisionError,
+    SupervisorRefError, TimerError, TrySendError,
 };
 pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{
-    ActorId, ActorStatus, ActorStatusInfo, ChildEvent, ChildInfo, MissPolicy, RecurringId,
-    RestartStrategy, RestartType, SchedulePolicy, Shutdown, ShutdownReport, StopChildOutcome,
+    ActorId, ActorStatus, ActorStatusInfo, ChildCounts, ChildEvent, ChildInfo, Down, DownReason,
+    GroupChange, Incarnation, LinkExit, MissPolicy, MonitorId, PeerRef, RecurringId, RequestId,
+    RequestReply, RestartStrategy, RestartType, Shutdown, ShutdownReport, StopChildOutcome,
     StopOutcome, StopReason, StopReport, StreamEvent, StreamId, SubtreeEnd, SupervisionAction,
 };

@@ -92,8 +92,9 @@ use tokio::time::{advance, sleep, timeout, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorHandle, ActorResult, ActorSystem, MissPolicy, RecurringId, StopReason,
-    SystemConfig, TimerError,
+    ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatus, ActorSystem, AskError,
+    MissPolicy, RecurringId, RestartType, Shutdown, ShutdownPolicy, StopOutcome, StopReason,
+    SupervisionConfig, SystemConfig, TimerError,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,23 @@ const HANG_BOUND: Duration = Duration::from_secs(60);
 
 /// How long a cell that must not fire is observed on a running clock.
 const QUIET: Duration = Duration::from_millis(250);
+
+/// How far past its exact instant an outcome may land on the paused clock:
+/// one poll step of a waiting loop and the timers' rounding, far short of any
+/// grace a test configures.
+const PAUSED_SLACK: Duration = Duration::from_millis(30);
+
+/// The upper bound of a timed outcome: its `exact` instant plus
+/// [`PAUSED_SLACK`] on the paused clock, where an outcome lands on its
+/// instant, and a hang bound past it on a real-time runtime, loose enough for
+/// a host that stalls its threads.
+fn upper(paused: bool, exact: Duration) -> Duration {
+    if paused {
+        exact + PAUSED_SLACK
+    } else {
+        exact + BOUND
+    }
+}
 
 /// How far below the 30 year cap a paused clock stops to check that nothing
 /// fired, and how far past it the clock then moves.
@@ -144,11 +162,28 @@ fn edge_now() -> Duration {
     largest_addable_from(Instant::now())
 }
 
+/// The edge duration with `step` further margins of 900 us below it, measured
+/// now. The margins cover a call that reads its clock a few milliseconds
+/// after this was measured.
+fn edge_at(step: u32) -> Duration {
+    edge_now().saturating_sub(Duration::from_micros(900) * step)
+}
+
+/// How many margins a sweep over the edge covers.
+const EDGE_STEPS: u32 = 16;
+
 fn resolve(d: Duration) -> Duration {
     if d == EDGE {
         edge_now()
     } else {
         d
+    }
+}
+
+fn resolve_shutdown(shutdown: Shutdown) -> Shutdown {
+    match shutdown {
+        Shutdown::Timeout(d) => Shutdown::Timeout(resolve(d)),
+        other => other,
     }
 }
 
@@ -472,6 +507,11 @@ impl Shared {
             asked: AtomicUsize::new(0),
         })
     }
+
+    fn open_gates(&self) {
+        self.gate.add_permits(1_000_000);
+        self.init_gate.add_permits(1_000_000);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -539,9 +579,257 @@ impl Actor for Worker {
     }
 }
 
+/// A supervisor that spawns worker and supervisor children on command.
+struct Sup {
+    shared: Arc<Shared>,
+}
+
+#[derive(Clone)]
+enum Cmd {
+    Worker {
+        name: String,
+        grace: Duration,
+        shutdown: Shutdown,
+        restart: RestartType,
+        veto: bool,
+        start_timeout: Option<Duration>,
+    },
+    Sup {
+        name: String,
+        grace: Duration,
+        shutdown: Shutdown,
+        restart: RestartType,
+    },
+    /// A temporary worker child with its own configuration.
+    Sized { name: String, config: ActorConfig },
+}
+
+impl Actor for Sup {
+    type Message = Cmd;
+    type Response = Result<(), String>;
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.shared.sups.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn handle(
+        &mut self,
+        cmd: Cmd,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<Self::Response> {
+        let shared = self.shared.clone();
+        match cmd {
+            Cmd::Worker {
+                name,
+                grace,
+                shutdown,
+                restart,
+                veto,
+                start_timeout,
+            } => {
+                let mut builder = ctx
+                    .spawn_child(move || Worker::new(&shared, veto))
+                    .named(name)
+                    .restart_type(restart)
+                    .shutdown(resolve_shutdown(shutdown))
+                    .kill_grace(resolve(grace));
+                if let Some(bound) = start_timeout {
+                    builder = builder.start_timeout(resolve(bound));
+                }
+                Ok(builder.await.map(|_| ()).map_err(|err| err.to_string()))
+            }
+            Cmd::Sized { name, config } => Ok(ctx
+                .spawn_child(move || Worker::new(&shared, false))
+                .named(name)
+                .restart_type(RestartType::Temporary)
+                .with_config(config)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())),
+            Cmd::Sup {
+                name,
+                grace,
+                shutdown,
+                restart,
+            } => Ok(ctx
+                .spawn_child(move || Sup {
+                    shared: shared.clone(),
+                })
+                .named(name)
+                .restart_type(restart)
+                .shutdown(resolve_shutdown(shutdown))
+                .kill_grace(resolve(grace))
+                .with_config(ActorConfig::default().supervisor())
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())),
+        }
+    }
+}
+
+async fn spawn_sup(
+    at: &str,
+    sys: &Arc<ActorSystem>,
+    shared: &Arc<Shared>,
+    supervision: Option<SupervisionConfig>,
+) -> ActorHandle<Sup> {
+    let builder = Sup {
+        shared: shared.clone(),
+    }
+    .spawn()
+    .named(uname("sup"))
+    .on_system(sys);
+    let spawned = match supervision {
+        Some(config) => {
+            within(
+                at,
+                "a supervisor to start",
+                builder.with_supervision(config),
+            )
+            .await
+        }
+        None => within(at, "a supervisor to start", builder.supervisor()).await,
+    };
+    spawned.unwrap_or_else(|err| panic!("{at}: the supervisor did not start: {err}"))
+}
+
+async fn spawn_worker(at: &str, shared: &Arc<Shared>, veto: bool) -> ActorHandle<Worker> {
+    within(at, "a worker to start", Worker::new(shared, veto).spawn())
+        .await
+        .unwrap_or_else(|err| panic!("{at}: the worker did not start: {err}"))
+}
+
+async fn ask_spawn(at: &str, sup: &ActorHandle<Sup>, cmd: Cmd) {
+    if let Err(err) = ask(at, "the supervisor to answer a spawn", sup, cmd).await {
+        panic!("{at}: the child did not spawn: {err}");
+    }
+}
+
+fn worker_cmd(name: &str, grace: Duration, shutdown: Shutdown, restart: RestartType) -> Cmd {
+    Cmd::Worker {
+        name: name.to_string(),
+        grace,
+        shutdown,
+        restart,
+        veto: false,
+        start_timeout: None,
+    }
+}
+
+async fn registered(at: &str, sys: &Arc<ActorSystem>, name: &str) -> ActorHandle<Worker> {
+    let mut found = None;
+    wait_until(at, "the actor to be registered", || {
+        found = sys.get::<Worker>(name);
+        found.is_some()
+    })
+    .await;
+    found.unwrap()
+}
+
+async fn park(at: &str, handle: &ActorHandle<Worker>, shared: &Arc<Shared>) {
+    shared.parked.store(false, Ordering::SeqCst);
+    within(at, "the park request", handle.notify(Msg::Park))
+        .await
+        .unwrap_or_else(|err| panic!("{at}: the park request was refused: {err:?}"));
+    wait_until(at, "the turn to park", || {
+        shared.parked.load(Ordering::SeqCst)
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Send timeouts
 // ---------------------------------------------------------------------------
+
+/// Parks its first turn at the gate; every other message answers at once.
+struct Gated {
+    gate: Arc<Semaphore>,
+    started: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum GateMsg {
+    Block,
+    Fill,
+}
+
+impl Actor for Gated {
+    type Message = GateMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: GateMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let GateMsg::Block = msg {
+            self.started.store(true, Ordering::SeqCst);
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An actor whose turn is parked and whose mailbox (or priority lane) holds
+/// one message: a full lane of capacity one.
+async fn full_gated(at: &str, priority: bool) -> (ActorHandle<Gated>, Arc<Semaphore>) {
+    let gate = Arc::new(Semaphore::new(0));
+    let started = Arc::new(AtomicBool::new(false));
+    let mut config = ActorConfig::default().with_mailbox_capacity(1);
+    if priority {
+        config = config.with_priority_lane(1);
+    }
+    let handle = within(
+        at,
+        "a gated actor to start",
+        Gated {
+            gate: gate.clone(),
+            started: started.clone(),
+        }
+        .spawn()
+        .with_config(config),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{at}: the gated actor did not start: {err}"));
+    within(at, "the first message", handle.notify(GateMsg::Block))
+        .await
+        .unwrap_or_else(|err| panic!("{at}: the first message was refused: {err:?}"));
+    wait_until(at, "the first turn to park", || {
+        started.load(Ordering::SeqCst)
+    })
+    .await;
+    let filled = if priority {
+        within(
+            at,
+            "the filling message",
+            handle.notify_priority(GateMsg::Fill),
+        )
+        .await
+    } else {
+        within(at, "the filling message", handle.notify(GateMsg::Fill)).await
+    };
+    filled.unwrap_or_else(|err| panic!("{at}: the filling message was refused: {err:?}"));
+    (handle, gate)
+}
+
+fn send_parameter(priority: bool) -> &'static str {
+    if priority {
+        "send_priority_timeout"
+    } else {
+        "send_timeout"
+    }
+}
+
+async fn timed_send(
+    handle: ActorHandle<Gated>,
+    priority: bool,
+    d: Duration,
+) -> Result<(), AskError> {
+    if priority {
+        handle.send_priority_timeout(GateMsg::Fill, d).await
+    } else {
+        handle.send_timeout(GateMsg::Fill, d).await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Timers
@@ -685,139 +973,6 @@ async fn finish_ticker(at: &str, handle: &ActorHandle<Ticker>) {
         _ => panic!("{at}: the count was not answered"),
     }
     stop_quietly(at, handle, StopReason::Graceful).await;
-}
-
-#[test]
-fn boundary_every() {
-    let _begun = begin();
-    run(0, async {
-        for (builder, parameter) in [(false, "every"), (true, "every_with")] {
-            for policy in [MissPolicy::Skip, MissPolicy::Delay, MissPolicy::CatchUp] {
-                for (label, d) in durations() {
-                    let at = cell(parameter, &format!("{label} ({policy:?})"));
-                    let (handle, ticks) = spawn_ticker(&at).await;
-                    let msg = if builder {
-                        TickMsg::EveryWith(d, policy)
-                    } else {
-                        TickMsg::Every(d, policy)
-                    };
-                    let TickResp::Registered {
-                        result,
-                        before,
-                        after,
-                    } = register(&at, &handle, msg).await
-                    else {
-                        panic!("{at}: no registration answer");
-                    };
-                    if d.is_zero() {
-                        assert!(
-                            matches!(result, Err(TimerError::ZeroInterval)),
-                            "{at}: a zero interval must answer ZeroInterval, got {result:?}"
-                        );
-                        assert_eq!(
-                            before, after,
-                            "{at}: a rejected interval registered a timer"
-                        );
-                        sleep(Duration::from_millis(100)).await;
-                        assert_eq!(
-                            ticks.load(Ordering::SeqCst),
-                            0,
-                            "{at}: a rejected interval ticked"
-                        );
-                    } else {
-                        assert!(
-                            result.is_ok(),
-                            "{at}: expected a registration, got {result:?}"
-                        );
-                        assert_eq!(after, before + 1, "{at}: the timer was not registered");
-                        if is_small(d) {
-                            wait_until(&at, "the first tick", || ticks.load(Ordering::SeqCst) >= 1)
-                                .await;
-                        } else {
-                            sleep(QUIET).await;
-                            assert_eq!(
-                                ticks.load(Ordering::SeqCst),
-                                0,
-                                "{at}: an interval of 30 years or more fired"
-                            );
-                        }
-                    }
-                    finish_ticker(&at, &handle).await;
-                    assert_no_panic(&at);
-                }
-            }
-        }
-    });
-    run_paused(async {
-        // On a paused clock an interval of 30 years or more first ticks at the
-        // 30 year cap.
-        for (builder, parameter) in [(false, "every"), (true, "every_with")] {
-            for (label, d) in large() {
-                let at = cell(parameter, &format!("{label}, paused clock"));
-                let (handle, ticks) = spawn_ticker(&at).await;
-                let msg = if builder {
-                    TickMsg::EveryWith(d, MissPolicy::Skip)
-                } else {
-                    TickMsg::Every(d, MissPolicy::Skip)
-                };
-                let TickResp::Registered { result, .. } = register(&at, &handle, msg).await else {
-                    panic!("{at}: no registration answer");
-                };
-                assert!(
-                    result.is_ok(),
-                    "{at}: expected a registration, got {result:?}"
-                );
-                pass_the_cap(&at, || ticks.load(Ordering::SeqCst) > 0).await;
-                drive(&at, "the first tick", || ticks.load(Ordering::SeqCst) > 0).await;
-                finish_ticker(&at, &handle).await;
-            }
-        }
-
-        // The cap holds for every deadline of a recurring timer, not only the
-        // first: a timer that stays registered ticks once at each 30 years, for
-        // every miss policy, and no later deadline overflows.
-        for (builder, parameter) in [(false, "every"), (true, "every_with")] {
-            for policy in [MissPolicy::Skip, MissPolicy::Delay, MissPolicy::CatchUp] {
-                for (label, d) in large() {
-                    let at = at_label(parameter, &format!("{label} ({policy:?}), second tick"));
-                    let (handle, ticks) = spawn_ticker(&at).await;
-                    let msg = if builder {
-                        TickMsg::EveryWithKeep(d, policy)
-                    } else {
-                        TickMsg::EveryKeep(d, policy)
-                    };
-                    let TickResp::Registered { result, .. } = register(&at, &handle, msg).await
-                    else {
-                        panic!("{at}: no registration answer");
-                    };
-                    assert!(
-                        result.is_ok(),
-                        "{at}: expected a registration, got {result:?}"
-                    );
-                    settle().await;
-                    advance(THIRTY_YEARS + CAP_SLACK).await;
-                    settle().await;
-                    drive(&at, "the first tick", || ticks.load(Ordering::SeqCst) >= 1).await;
-                    assert_eq!(
-                        ticks.load(Ordering::SeqCst),
-                        1,
-                        "{at}: one tick by the first cap"
-                    );
-                    advance(THIRTY_YEARS + CAP_SLACK).await;
-                    settle().await;
-                    drive(&at, "the second tick", || ticks.load(Ordering::SeqCst) >= 2).await;
-                    assert_eq!(
-                        ticks.load(Ordering::SeqCst),
-                        2,
-                        "{at}: two ticks by the second cap"
-                    );
-                    assert_no_panic(&at);
-                    finish_ticker(&at, &handle).await;
-                }
-            }
-        }
-    });
-    assert_no_panic("every, paused clock");
 }
 
 #[test]
@@ -983,6 +1138,179 @@ fn at_label(parameter: &str, label: &str) -> String {
 // Kill grace
 // ---------------------------------------------------------------------------
 
+/// The rows of the kill grace table that run on a real-time runtime and, with
+/// `paused`, on a paused clock, where an abort lands on its exact instant.
+async fn boundary_kill_grace_rows(paused: bool) {
+    for (label, d) in durations() {
+        // A root, killed by name and by `stop(Kill)`.
+        for entry in ["ActorSystem::kill", "stop(Kill)"] {
+            let parameter = format!("SpawnBuilder::kill_grace via {entry}");
+            let at = cell(&parameter, label);
+            let sys = ActorSystem::create(uname("grace-root")).unwrap();
+            let shared = Shared::new();
+            let name = uname("root");
+            let handle = within(
+                &at,
+                "the root to start",
+                Worker::new(&shared, false)
+                    .spawn()
+                    .named(&name)
+                    .on_system(&sys)
+                    .kill_grace(resolve(d)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{at}: the root did not start: {err}"));
+            park(&at, &handle, &shared).await;
+            if entry == "stop(Kill)" {
+                within(&at, "the kill request", handle.stop(StopReason::Kill))
+                    .await
+                    .unwrap_or_else(|err| panic!("{at}: the kill was refused: {err:?}"));
+            } else {
+                within(&at, "the kill request", sys.kill(&name))
+                    .await
+                    .unwrap_or_else(|err| panic!("{at}: the kill was refused: {err:?}"));
+            }
+            if is_small(d) {
+                within_for(
+                    upper(paused, d),
+                    &at,
+                    "a parked target to be aborted within its grace",
+                    handle.wait_stopped(),
+                )
+                .await;
+            } else {
+                sleep(QUIET).await;
+                assert_ne!(
+                    handle.status(),
+                    ActorStatus::Stopped,
+                    "{at}: aborted inside a grace of 30 years or more"
+                );
+                shared.open_gates();
+                within(
+                    &at,
+                    "the target to end at its boundary",
+                    handle.wait_stopped(),
+                )
+                .await;
+            }
+            assert_no_panic(&at);
+        }
+
+        // A zero or tiny grace aborts the parked turn at once and the
+        // verdict is an abort, never unresponsive.
+        if is_small(d) {
+            let at = cell("SpawnBuilder::kill_grace verdict", label);
+            let shared = Shared::new();
+            let handle = within(
+                &at,
+                "the actor to start",
+                Worker::new(&shared, false).spawn().kill_grace(resolve(d)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{at}: the actor did not start: {err}"));
+            park(&at, &handle, &shared).await;
+            let outcome = within(
+                &at,
+                "stop_within to escalate a parked turn",
+                handle.stop_within(StopReason::Graceful, Duration::from_millis(1)),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{at}: the stop was refused: {err:?}"));
+            assert!(
+                matches!(outcome, StopOutcome::Killed | StopOutcome::Aborted),
+                "{at}: a parked turn is ended by the abort, not reported unresponsive, \
+                 got {outcome:?}"
+            );
+            assert_no_panic(&at);
+        }
+
+        // A supervised child whose supervisor is killed: the child's link
+        // guard raises Kill and arms the child's own grace.
+        let at = cell("ChildSpawnBuilder::kill_grace", label);
+        let sys = ActorSystem::create(uname("grace-child")).unwrap();
+        let shared = Shared::new();
+        let sup = spawn_sup(&at, &sys, &shared, None).await;
+        let name = uname("child");
+        ask_spawn(
+            &at,
+            &sup,
+            worker_cmd(
+                &name,
+                d,
+                Shutdown::Timeout(Duration::from_secs(5)),
+                RestartType::Temporary,
+            ),
+        )
+        .await;
+        let child = registered(&at, &sys, &name).await;
+        park(&at, &child, &shared).await;
+        within(&at, "the kill request", sup.stop(StopReason::Kill))
+            .await
+            .unwrap_or_else(|err| panic!("{at}: the kill was refused: {err:?}"));
+        if is_small(d) {
+            within_for(
+                upper(paused, d),
+                &at,
+                "a parked child to be aborted within its grace",
+                child.wait_stopped(),
+            )
+            .await;
+        } else {
+            sleep(QUIET).await;
+            assert_ne!(
+                child.status(),
+                ActorStatus::Stopped,
+                "{at}: aborted inside a grace of 30 years or more"
+            );
+            shared.open_gates();
+            within(
+                &at,
+                "the child to end at its boundary",
+                child.wait_stopped(),
+            )
+            .await;
+        }
+        assert_no_panic(&at);
+    }
+
+    // The edge of the range, with several margins (see the sweep over
+    // `send_timeout`): the grace is read when the kill is raised, a
+    // moment after it was configured.
+    for step in 0..EDGE_STEPS {
+        let at = cell(
+            "SpawnBuilder::kill_grace via ActorSystem::kill",
+            &format!("largest addable, margin {step}"),
+        );
+        let sys = ActorSystem::create(uname("grace-edge-root")).unwrap();
+        let shared = Shared::new();
+        let name = uname("root");
+        let handle = within(
+            &at,
+            "the root to start",
+            Worker::new(&shared, false)
+                .spawn()
+                .named(&name)
+                .on_system(&sys)
+                .kill_grace(edge_at(step)),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{at}: the root did not start: {err}"));
+        park(&at, &handle, &shared).await;
+        within(&at, "the kill request", sys.kill(&name))
+            .await
+            .unwrap_or_else(|err| panic!("{at}: the kill was refused: {err:?}"));
+        shared.open_gates();
+        within(
+            &at,
+            "the root to end at its boundary",
+            handle.wait_stopped(),
+        )
+        .await;
+        sleep(Duration::from_millis(20)).await;
+        assert_no_panic(&at);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Start timeouts
 // ---------------------------------------------------------------------------
@@ -991,108 +1319,125 @@ fn at_label(parameter: &str, label: &str) -> String {
 // Shutdown timeouts
 // ---------------------------------------------------------------------------
 
+/// A system whose shutdown policy is `timeout` and `per_actor_timeout`.
+fn policy_system(timeout: Duration, per_actor_timeout: Duration) -> Arc<ActorSystem> {
+    ActorSystem::create_with(
+        uname("policy"),
+        SystemConfig {
+            shutdown_policy: ShutdownPolicy {
+                timeout,
+                per_actor_timeout,
+            },
+            ..SystemConfig::default()
+        },
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // The turn warning threshold
 // ---------------------------------------------------------------------------
-
-#[test]
-fn boundary_turn_warning_threshold() {
-    let _begun = begin();
-    run(0, async {
-        for (label, d) in durations() {
-            let at = cell("turn warning threshold", label);
-            let d = resolve(d);
-            // What the threshold reads back: zero is off, and a value beyond
-            // what a u64 of nanoseconds holds saturates to it.
-            let expected = if d.is_zero() {
-                None
-            } else if d.as_nanos() > u128::from(u64::MAX) {
-                Some(Duration::from_nanos(u64::MAX))
-            } else {
-                Some(d)
-            };
-
-            let configured = ActorSystem::create_with(
-                uname("threshold-config"),
-                SystemConfig::default().with_turn_warning_threshold(d),
-            )
-            .unwrap();
-            assert_eq!(
-                configured.turn_warning_threshold(),
-                expected,
-                "{at}: SystemConfig::with_turn_warning_threshold"
-            );
-
-            let direct = ActorSystem::create_with(
-                uname("threshold-field"),
-                SystemConfig {
-                    turn_warning_threshold: Some(d),
-                    ..SystemConfig::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                direct.turn_warning_threshold(),
-                expected,
-                "{at}: SystemConfig::turn_warning_threshold"
-            );
-
-            let sys = ActorSystem::create(uname("threshold-set")).unwrap();
-            sys.set_turn_warning_threshold(Some(d));
-            assert_eq!(
-                sys.turn_warning_threshold(),
-                expected,
-                "{at}: set_turn_warning_threshold"
-            );
-
-            // With the threshold in effect an actor handles messages and the
-            // observers answer without panicking.
-            let shared = Shared::new();
-            let name = uname("timed");
-            let handle = within(
-                &at,
-                "the actor to start",
-                Worker::new(&shared, false)
-                    .spawn()
-                    .named(&name)
-                    .on_system(&sys),
-            )
-            .await
-            .unwrap_or_else(|err| panic!("{at}: the actor did not start: {err}"));
-            for _ in 0..3 {
-                ask(&at, "a ping", &handle, Msg::Ping).await;
-            }
-            let _ = sys.turn_elapsed(handle.id());
-            let stuck = sys.stuck_actors();
-            if d >= THIRTY_YEARS {
-                assert!(
-                    stuck.is_empty(),
-                    "{at}: an idle actor was reported stuck: {stuck:?}"
-                );
-            }
-
-            sys.set_turn_warning_threshold(None);
-            assert_eq!(sys.turn_warning_threshold(), None, "{at}: None reads off");
-            assert!(
-                sys.stuck_actors().is_empty(),
-                "{at}: stuck actors with the watchdog off"
-            );
-            assert_eq!(
-                sys.turn_elapsed(handle.id()),
-                None,
-                "{at}: a turn is timed with the watchdog off"
-            );
-            stop_quietly(&at, &handle, StopReason::Graceful).await;
-            assert_no_panic(&at);
-        }
-    });
-    assert_no_panic("turn warning threshold, after the runtime stopped");
-}
 
 // ---------------------------------------------------------------------------
 // The restart window
 // ---------------------------------------------------------------------------
 
+/// What one crash led to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Next {
+    Restarted,
+    SupervisorStopped,
+}
+
+/// Crashes the live incarnation of `name` and waits for either a restart
+/// (another worker built) or the end of the supervisor. On a paused clock the
+/// waits only yield, so the clock does not move.
+async fn crash_once(
+    at: &str,
+    paused: bool,
+    sys: &Arc<ActorSystem>,
+    sup: &ActorHandle<Sup>,
+    shared: &Arc<Shared>,
+    name: &str,
+) -> Next {
+    async fn pause(paused: bool) {
+        if paused {
+            tokio::task::yield_now().await;
+        } else {
+            sleep(Duration::from_millis(2)).await;
+        }
+    }
+    let built = shared.built.load(Ordering::SeqCst);
+    let child = within(at, "a live child to crash", async {
+        loop {
+            if let Some(child) = sys.get::<Worker>(name) {
+                if child.send(Msg::Ping).await.is_ok() {
+                    return child;
+                }
+            }
+            pause(paused).await;
+        }
+    })
+    .await;
+    let _ = within(at, "the crash request", child.notify(Msg::Crash)).await;
+    within(at, "a restart or the end of the supervisor", async {
+        loop {
+            if shared.built.load(Ordering::SeqCst) > built {
+                return Next::Restarted;
+            }
+            if sup.status() == ActorStatus::Stopped {
+                return Next::SupervisorStopped;
+            }
+            pause(paused).await;
+        }
+    })
+    .await
+}
+
+/// A supervisor with one child of the given restart type and the given restart
+/// budget.
+async fn budgeted_sup(
+    at: &str,
+    shared: &Arc<Shared>,
+    count: u32,
+    window: Duration,
+    restart: RestartType,
+) -> (Arc<ActorSystem>, ActorHandle<Sup>, String) {
+    let sys = ActorSystem::create(uname("window")).unwrap();
+    let sup = spawn_sup(
+        at,
+        &sys,
+        shared,
+        Some(SupervisionConfig::default().max_restarts(count, window)),
+    )
+    .await;
+    let name = uname("child");
+    ask_spawn(
+        at,
+        &sup,
+        worker_cmd(
+            &name,
+            Duration::from_millis(50),
+            Shutdown::Timeout(Duration::from_secs(5)),
+            restart,
+        ),
+    )
+    .await;
+    (sys, sup, name)
+}
+
 // ---------------------------------------------------------------------------
 // Capacities
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Idle;
+
+impl Actor for Idle {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}

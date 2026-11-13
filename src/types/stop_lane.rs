@@ -37,7 +37,7 @@
 use std::convert::Infallible;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 
 use crate::actor::panic::contain_waker_panic;
@@ -69,7 +69,8 @@ fn unwind_after_the_write_if_armed() {
 /// `raise` decides whether an incoming request may overwrite the pending one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum StopSeverity {
-    /// Vetoable via `pre_stop`: [`StopReason::Graceful`], [`StopReason::ParentRequest`].
+    /// Vetoable via `pre_stop`: [`StopReason::Graceful`],
+    /// [`StopReason::ParentRequest`], [`StopReason::Shutdown`].
     Requested,
     /// Non-vetoable, but `on_stopped` still runs: [`StopReason::Failure`],
     /// [`StopReason::ParentKilled`], [`StopReason::Cancelled`].
@@ -81,7 +82,9 @@ pub(crate) enum StopSeverity {
 impl StopSeverity {
     pub(crate) fn of(reason: &StopReason) -> Self {
         match reason {
-            StopReason::Graceful | StopReason::ParentRequest => StopSeverity::Requested,
+            StopReason::Graceful | StopReason::ParentRequest | StopReason::Shutdown(_) => {
+                StopSeverity::Requested
+            }
             StopReason::Failure(_) | StopReason::ParentKilled | StopReason::Cancelled => {
                 StopSeverity::Forced
             }
@@ -89,14 +92,22 @@ impl StopSeverity {
         }
     }
 
+    /// Whether a request with this reason is a `Requested` one, which the
+    /// actor's `pre_stop` may veto. The one reader of the tier for the
+    /// `pre_stop` gate and for a supervisor's veto check.
+    pub(crate) fn is_vetoable(reason: &StopReason) -> bool {
+        StopSeverity::of(reason) == StopSeverity::Requested
+    }
+
     /// The order of two requests of the same severity: a parent's request
-    /// outranks a plain graceful one, and a failure outranks an inherited
-    /// stop, which outranks a cancellation.
+    /// outranks a shutdown the actor asked for itself, which outranks a plain
+    /// graceful one, and a failure outranks an inherited stop, which outranks
+    /// a cancellation. Ranks are compared only inside one severity.
     pub(crate) fn rank(reason: &StopReason) -> u8 {
         match reason {
             StopReason::Graceful | StopReason::Cancelled | StopReason::Kill => 0,
-            StopReason::ParentRequest | StopReason::ParentKilled => 1,
-            StopReason::Failure(_) => 2,
+            StopReason::Shutdown(_) | StopReason::ParentKilled => 1,
+            StopReason::ParentRequest | StopReason::Failure(_) => 2,
         }
     }
 }
@@ -111,12 +122,20 @@ impl StopSeverity {
 /// the lane accepts a `Kill` and nothing else. `sealed` is set at the end of
 /// the actor's teardown, just before its queued messages and its value are
 /// dropped: from there it accepts nothing.
+///
+/// `kill_cause` is the reason a `Kill` was raised on behalf of, when the
+/// raiser was an exit signal: the reason the actor ends with in place of
+/// `Kill`. It is written once, by the raise that puts the `Kill` on the lane
+/// (a lane that holds a `Kill` already keeps what it has), a plain `Kill`
+/// clears it, and it is `Some` only while the stored reason is `Kill`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LaneState {
     pub(crate) reason: Option<StopReason>,
     pub(crate) generation: u64,
     pub(crate) kill_only: bool,
     pub(crate) sealed: bool,
+    /// Boxed: a cause is rare, and the lane's cell is shared by every actor.
+    pub(crate) kill_cause: Option<Box<StopReason>>,
 }
 
 /// How the lane answered a raise.
@@ -146,6 +165,21 @@ pub(crate) struct LaneCell {
     version: AtomicU64,
     /// Set once, by the receiver's drop: the actor's task is gone.
     rx_gone: AtomicBool,
+    // The three fields below belong to the incarnation's record, not to the
+    // lane: they sit in this cell's tail padding, so the record's own small
+    // atomics fit one word and the record grows by nothing for them. Each is
+    // an independent atomic with the ordering its accessor on `AbortRecord`
+    // documents; none is read or written under the lane's lock.
+    /// The `sys` bundle's bits (`SYS_SUSPENDED`, `SYS_ALLOW_STATE`,
+    /// `SYS_SENSITIVE`) and the self-stop mark (`SELF_STOP`); see
+    /// `AbortRecord::sys_bits` and `AbortRecord::mark_self_stop`.
+    pub(crate) sys_bits: std::sync::atomic::AtomicU8,
+    /// The children the incarnation supervises now; see
+    /// `AbortRecord::children`.
+    pub(crate) children: std::sync::atomic::AtomicU32,
+    /// Set when the incarnation's registry guard starts to drop, while the
+    /// system tracks turns; see `AbortRecord::has_ended`.
+    pub(crate) ended: AtomicBool,
 }
 
 /// A held critical section of the cell: the state under the lock. Not
@@ -220,8 +254,14 @@ impl LaneCell {
         lane_accept(&section, reason, receiver_gone).0 == RaiseResult::Refused
     }
 
-    /// Decides and writes one raise in a single critical section. The
-    /// receiver-gone flag is read inside it.
+    /// The cause stored with a pending `Kill`, if any.
+    pub(crate) fn kill_cause(&self) -> Option<StopReason> {
+        self.section().kill_cause.as_deref().cloned()
+    }
+
+    /// Decides and writes one raise of a reason that is not `Kill` in a single
+    /// critical section. The receiver-gone flag is read inside it. A raise
+    /// of any other reason touches no stored cause.
     fn raise(&self, reason: StopReason) -> Raised {
         let mut section = self.section();
         let receiver_gone = self.rx_gone.load(Ordering::Acquire);
@@ -242,6 +282,43 @@ impl LaneCell {
             bumped: bump,
             replaced,
         }
+    }
+
+    /// As [`raise`](Self::raise), for a `Kill`. A `Kill` raised with a cause
+    /// stores the cause only when the lane held no `Kill` before the raise
+    /// and the cause is not `Kill` itself; a `Kill` raised without one
+    /// clears the stored cause. The cause the raise cleared or did not store
+    /// comes back with the result, to be dropped after the unlock.
+    fn raise_kill(&self, cause: Option<StopReason>) -> (Raised, Option<StopReason>) {
+        let mut section = self.section();
+        let receiver_gone = self.rx_gone.load(Ordering::Acquire);
+        let (result, store, bump) = lane_accept(&section, &StopReason::Kill, receiver_gone);
+        let mut replaced = None;
+        let mut spare_cause = None;
+        if bump {
+            section.generation = section.generation.wrapping_add(1);
+            let held_a_kill = matches!(section.reason, Some(StopReason::Kill));
+            match cause {
+                None => spare_cause = section.kill_cause.take().map(|boxed| *boxed),
+                Some(cause) if !held_a_kill && !matches!(cause, StopReason::Kill) => {
+                    section.kill_cause = Some(Box::new(cause));
+                }
+                Some(cause) => spare_cause = Some(cause),
+            }
+            if store {
+                replaced = section.reason.replace(StopReason::Kill);
+            }
+            self.version.store(section.generation, Ordering::Release);
+        }
+        drop(section);
+        (
+            Raised {
+                result,
+                bumped: bump,
+                replaced,
+            },
+            spare_cause,
+        )
     }
 }
 
@@ -396,9 +473,26 @@ impl WakeSlot {
 }
 
 impl StopLane {
-    /// Creates a fresh, unraised lane and the run loop's receiving half.
+    /// Creates a fresh, unraised lane and the run loop's receiving half, for
+    /// a unit test that names no system.
+    #[cfg(test)]
     pub(crate) fn new() -> (StopLane, LaneRx) {
         let aborted = AbortRecord::new();
+        let rx = LaneRx {
+            record: aborted.clone(),
+            seen: 0,
+        };
+        (StopLane { aborted }, rx)
+    }
+
+    /// As [`new`](Self::new), for the incarnation `incarnation` (a number the
+    /// spawn drew) of the system whose telemetry state is `mode`: the record
+    /// holds both from the start.
+    pub(crate) fn new_in(
+        mode: Arc<crate::telemetry::Mode>,
+        incarnation: crate::types::Incarnation,
+    ) -> (StopLane, LaneRx) {
+        let aborted = AbortRecord::in_system(mode, incarnation);
         let rx = LaneRx {
             record: aborted.clone(),
             seen: 0,
@@ -421,7 +515,32 @@ impl StopLane {
     /// Otherwise recorded, and the generation counter is bumped even when the
     /// specific reason is unchanged from the one already pending.
     pub(crate) fn try_raise(&self, reason: StopReason) -> RaiseResult {
+        if matches!(reason, StopReason::Kill) {
+            let (raised, spare_cause) = self.aborted.lane().raise_kill(None);
+            let result = self.after_raise(raised);
+            drop(spare_cause);
+            return result;
+        }
         let raised = self.aborted.lane().raise(reason);
+        self.after_raise(raised)
+    }
+
+    /// Raises a `Kill` on behalf of `cause`, the reason an exit signal
+    /// carried: the lane stores the cause when it holds no `Kill` yet, and the
+    /// actor ends with it in place of `Kill`. Answers as
+    /// [`try_raise`](Self::try_raise) does. Only
+    /// [`raise_kill_declared`](crate::system::raise_kill_declared) calls it,
+    /// so a caused `Kill` is always declared and backstopped.
+    pub(crate) fn try_raise_kill_caused(&self, cause: StopReason) -> RaiseResult {
+        let (raised, spare_cause) = self.aborted.lane().raise_kill(Some(cause));
+        let result = self.after_raise(raised);
+        drop(spare_cause);
+        result
+    }
+
+    /// What follows every raise, outside the critical section.
+    #[inline]
+    fn after_raise(&self, raised: Raised) -> RaiseResult {
         // The wakes run after the critical section, exactly when a new
         // version exists. Each one is contained (the run loop's and the
         // waiters' wakers belong to other tasks), so a raise returns whatever
@@ -450,6 +569,7 @@ impl StopLane {
     /// Raises a stop request exactly like [`try_raise`](Self::try_raise),
     /// for the callers that have no one to tell: a refused request is
     /// dropped silently.
+    #[cfg(test)]
     pub(crate) fn raise(&self, reason: StopReason) {
         let _ = self.try_raise(reason);
     }
@@ -469,10 +589,25 @@ impl StopLane {
     /// Seals the lane and returns the request pending on it, in one step.
     /// From here every raise is refused. Idempotent, and it works when the
     /// receiving half is gone.
+    #[cfg(test)]
     pub(crate) fn seal(&self) -> Option<StopReason> {
+        self.seal_caused().0
+    }
+
+    /// [`seal`](Self::seal), also returning the cause stored with a pending
+    /// `Kill`, read in the same step: the request and its cause cannot
+    /// differ.
+    pub(crate) fn seal_caused(&self) -> (Option<StopReason>, Option<StopReason>) {
         let mut section = self.aborted.lane().section();
         section.sealed = true;
-        section.reason.clone()
+        let reason = section.reason.clone();
+        // A cause is stored only while the stored reason is `Kill`.
+        let cause = if matches!(reason, Some(StopReason::Kill)) {
+            section.kill_cause.as_deref().cloned()
+        } else {
+            None
+        };
+        (reason, cause)
     }
 
     /// True once the lane takes no request but `Kill` any more: the actor
@@ -553,6 +688,11 @@ pub(crate) mod held {
             );
         });
     }
+
+    /// The number of critical sections this thread has entered.
+    pub(crate) fn sections() -> u64 {
+        SECTIONS.with(Cell::get)
+    }
 }
 
 /// A one-shot hook that runs inside `LaneRx::changed`, after the version read
@@ -564,6 +704,10 @@ pub(crate) mod hook {
 
     thread_local! {
         static AFTER_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm(hook: impl FnOnce() + 'static) {
+        AFTER_READ.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
     pub(super) fn run() {
@@ -578,7 +722,129 @@ mod tests {
     use super::*;
     use crate::error::ActorError;
 
+    fn severity_of(state: &LaneState) -> Option<StopSeverity> {
+        state.reason.as_ref().map(StopSeverity::of)
+    }
+
+    /// A `Shutdown` request is a vetoable one that ranks above a `Graceful`
+    /// one and below a parent's request: it takes the place of a `Graceful`
+    /// one, an outside `Graceful` one never takes its place, and a parent's
+    /// request or any forced one stays.
+    #[test]
+    fn a_shutdown_request_is_vetoable_and_ranks_above_graceful() {
+        let shutdown = || StopReason::Shutdown("x".into());
+        assert!(StopSeverity::is_vetoable(&shutdown()));
+        assert_eq!(StopSeverity::of(&shutdown()), StopSeverity::Requested);
+        assert!(StopSeverity::rank(&shutdown()) > StopSeverity::rank(&StopReason::Graceful));
+        assert!(StopSeverity::rank(&shutdown()) < StopSeverity::rank(&StopReason::ParentRequest));
+        // (pending, incoming, the reason the lane keeps)
+        let rows: Vec<(Option<StopReason>, StopReason, StopReason)> = vec![
+            (None, shutdown(), shutdown()),
+            (Some(StopReason::Graceful), shutdown(), shutdown()),
+            (Some(shutdown()), StopReason::Graceful, shutdown()),
+            (
+                Some(StopReason::ParentRequest),
+                shutdown(),
+                StopReason::ParentRequest,
+            ),
+            (
+                Some(shutdown()),
+                StopReason::ParentRequest,
+                StopReason::ParentRequest,
+            ),
+            (
+                Some(StopReason::ParentKilled),
+                shutdown(),
+                StopReason::ParentKilled,
+            ),
+            (
+                Some(StopReason::Cancelled),
+                shutdown(),
+                StopReason::Cancelled,
+            ),
+            (
+                Some(StopReason::Failure(ActorError::user("f"))),
+                shutdown(),
+                StopReason::Failure(ActorError::user("f")),
+            ),
+        ];
+        for (pending, incoming, kept) in rows {
+            let (lane, rx) = StopLane::new();
+            if let Some(pending) = pending.clone() {
+                lane.raise(pending);
+            }
+            let answer = lane.try_raise(incoming.clone());
+            let expected = if StopSeverity::of(&incoming)
+                < pending
+                    .as_ref()
+                    .map_or(StopSeverity::Requested, StopSeverity::of)
+            {
+                RaiseResult::Superseded
+            } else {
+                RaiseResult::Recorded
+            };
+            assert_eq!(answer, expected, "{pending:?} then {incoming:?}");
+            assert_eq!(
+                rx.borrow().reason.as_ref(),
+                Some(&kept),
+                "{pending:?} then {incoming:?}"
+            );
+        }
+    }
+
     // - Exhaustive raise table ------------------------------------------------
+
+    /// One representative [`StopReason`] per severity, used to build the
+    /// literal raise table below without reaching for `StopSeverity` itself.
+    #[derive(Debug, Clone, Copy)]
+    enum RaiseChoice {
+        Requested,
+        Forced,
+        Kill,
+    }
+
+    impl RaiseChoice {
+        fn reason(self) -> StopReason {
+            match self {
+                RaiseChoice::Requested => StopReason::Graceful,
+                RaiseChoice::Forced => StopReason::Cancelled,
+                RaiseChoice::Kill => StopReason::Kill,
+            }
+        }
+
+        /// True if `stored` holds exactly the reason this choice raises.
+        fn matches_stored(self, stored: &Option<StopReason>) -> bool {
+            matches!(
+                (self, stored),
+                (RaiseChoice::Requested, Some(StopReason::Graceful))
+                    | (RaiseChoice::Forced, Some(StopReason::Cancelled))
+                    | (RaiseChoice::Kill, Some(StopReason::Kill))
+            )
+        }
+    }
+
+    // Twelve rows: every combination of a prior lane state (none, or one of
+    // the three severities already raised) and a newly raised severity. This
+    // is an independent statement of the contract - not derived from
+    // `StopSeverity`'s ordering or from `StopLane::raise`'s own comparison.
+    const RAISE_TABLE: [(Option<RaiseChoice>, RaiseChoice, bool); 12] = [
+        // no prior raise: everything is accepted
+        (None, RaiseChoice::Requested, true),
+        (None, RaiseChoice::Forced, true),
+        (None, RaiseChoice::Kill, true),
+        // prior: Requested (Graceful/ParentRequest)
+        (Some(RaiseChoice::Requested), RaiseChoice::Requested, true),
+        (Some(RaiseChoice::Requested), RaiseChoice::Forced, true),
+        (Some(RaiseChoice::Requested), RaiseChoice::Kill, true),
+        // prior: Forced (Failure/Cancelled)
+        (Some(RaiseChoice::Forced), RaiseChoice::Requested, false),
+        (Some(RaiseChoice::Forced), RaiseChoice::Forced, true),
+        (Some(RaiseChoice::Forced), RaiseChoice::Kill, true),
+        // prior: Kill
+        (Some(RaiseChoice::Kill), RaiseChoice::Requested, false),
+        (Some(RaiseChoice::Kill), RaiseChoice::Forced, false),
+        (Some(RaiseChoice::Kill), RaiseChoice::Kill, true),
+    ];
 
     // - Rank, kill-only and sealed rows ---------------------------------------
 
@@ -659,59 +925,202 @@ mod tests {
         assert_eq!((answer, bump), (RaiseResult::Superseded, 0));
         assert!(matches!(kept, Some(StopReason::Failure(_))), "{kept:?}");
     }
-
-    #[test]
-    fn kill_only_lane_takes_a_kill_and_nothing_else() {
-        for new in [
-            StopReason::Graceful,
-            StopReason::ParentRequest,
-            StopReason::ParentKilled,
-            StopReason::Cancelled,
-            failure("f"),
-        ] {
-            let (answer, bump, kept) = row(None, Mode::KillOnly, new.clone());
-            assert_eq!((answer, bump), (RaiseResult::Refused, 0), "{new:?}");
-            assert!(kept.is_none(), "{new:?} stored {kept:?}");
-        }
-        let (answer, bump, kept) =
-            row(Some(StopReason::Graceful), Mode::KillOnly, StopReason::Kill);
-        assert_eq!((answer, bump), (RaiseResult::Recorded, 1));
-        assert!(matches!(kept, Some(StopReason::Kill)), "{kept:?}");
-        // A pending request does not change what the lane refuses.
-        let (answer, bump, _) = row(
-            Some(StopReason::Graceful),
-            Mode::KillOnly,
-            StopReason::ParentRequest,
-        );
-        assert_eq!((answer, bump), (RaiseResult::Refused, 0));
-    }
 }
 
 #[cfg(test)]
 mod cell_tests {
+    use std::future::Future;
+
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Duration;
 
     use super::*;
+    use crate::actor::Actor;
+    use crate::error::{ActorError, ActorResult};
 
-    #[test]
-    fn a_poisoned_lock_is_ignored() {
-        let (lane, mut rx) = StopLane::new();
-        let poisoner = {
-            let lane = lane.clone();
-            std::thread::spawn(move || {
-                let _section = lane.abort_record().lane().section();
-                panic!("poison the lane's lock");
-            })
-        };
-        assert!(poisoner.join().is_err());
-        assert!(lane.abort_record().lane().state.is_poisoned());
-        assert_eq!(lane.try_raise(StopReason::Graceful), RaiseResult::Recorded);
-        assert!(matches!(lane.reason(), Some(StopReason::Graceful)));
-        assert!(matches!(
-            rx.borrow_and_update().reason,
-            Some(StopReason::Graceful)
-        ));
-        assert!(matches!(lane.seal(), Some(StopReason::Graceful)));
+    use crate::types::Shutdown;
+    use crate::ActorContext;
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Counter {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn poll_once<F: Future>(fut: &mut Pin<Box<F>>, waker: &Waker) -> Poll<F::Output> {
+        fut.as_mut().poll(&mut Context::from_waker(waker))
+    }
+
+    /// A waker that probes the lane's lock: it records whether the lock was
+    /// free when the wake ran.
+    struct LockProbe {
+        record: AbortRecord,
+        free: AtomicUsize,
+        held: AtomicUsize,
+    }
+
+    impl LockProbe {
+        fn probe(&self) {
+            match self.record.lane().state.try_lock() {
+                Ok(_) => self.free.fetch_add(1, Ordering::SeqCst),
+                Err(_) => self.held.fetch_add(1, Ordering::SeqCst),
+            };
+        }
+    }
+
+    impl Wake for LockProbe {
+        fn wake(self: Arc<Self>) {
+            self.probe();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.probe();
+        }
+    }
+
+    /// A waker that counts its wakes and panics in them while it is armed.
+    #[derive(Default)]
+    struct LoudWake {
+        armed: AtomicBool,
+        woken: AtomicUsize,
+    }
+
+    impl LoudWake {
+        fn arm(&self, armed: bool) {
+            self.armed.store(armed, Ordering::SeqCst);
+        }
+
+        fn woken(&self) -> usize {
+            self.woken.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for LoudWake {
+        fn wake(self: Arc<Self>) {
+            self.woken.fetch_add(1, Ordering::SeqCst);
+            if self.armed.load(Ordering::SeqCst) {
+                panic!("a waker's wake panics");
+            }
+        }
     }
 
     // - A supervisor killed in its teardown ---------------------------------
+
+    /// A child that vetoes every graceful stop.
+    struct Vetoer {
+        pre_stops: Arc<AtomicUsize>,
+    }
+
+    impl Actor for Vetoer {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+            Ok(())
+        }
+
+        fn pre_stop(
+            &mut self,
+            _reason: &StopReason,
+            _ctx: &mut ActorContext<Self>,
+        ) -> impl Future<Output = bool> + Send {
+            self.pre_stops.fetch_add(1, Ordering::SeqCst);
+            async { false }
+        }
+    }
+
+    /// A supervisor of one [`Vetoer`] with a two-hour shutdown window.
+    struct Boss {
+        pre_stops: Arc<AtomicUsize>,
+    }
+
+    impl Actor for Boss {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(&mut self, _msg: (), ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+            let pre_stops = self.pre_stops.clone();
+            ctx.spawn_child(move || Vetoer {
+                pre_stops: pre_stops.clone(),
+            })
+            .named("vetoer")
+            .shutdown(Shutdown::Timeout(Duration::from_secs(2 * 3600)))
+            .kill_grace(Duration::from_secs(3600))
+            .await
+            .map_err(|err| ActorError::user(err.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod cause_rule_tests {
+    use super::*;
+    use crate::error::ActorError;
+
+    fn failure(text: &str) -> StopReason {
+        StopReason::Failure(ActorError::user(text))
+    }
+
+    fn held() -> StopReason {
+        StopReason::Shutdown("held".into())
+    }
+
+    fn incoming() -> StopReason {
+        StopReason::ParentRequest
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Pending {
+        Nothing,
+        Failure,
+        Kill,
+        KillWithCause,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Incoming {
+        CausedKill,
+        PlainKill,
+        Failure,
+        Graceful,
+    }
+
+    fn lane_with(pending: Pending) -> StopLane {
+        let state = match pending {
+            Pending::Nothing => LaneState::default(),
+            Pending::Failure => LaneState {
+                reason: Some(failure("pending")),
+                ..Default::default()
+            },
+            Pending::Kill => LaneState {
+                reason: Some(StopReason::Kill),
+                ..Default::default()
+            },
+            Pending::KillWithCause => LaneState {
+                reason: Some(StopReason::Kill),
+                kill_cause: Some(Box::new(held())),
+                ..Default::default()
+            },
+        };
+        let (lane, rx) = StopLane::with_state(state);
+        // The receiver stays alive for the lane's life in these rows.
+        std::mem::forget(rx);
+        lane
+    }
 }

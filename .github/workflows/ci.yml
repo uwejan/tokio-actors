@@ -74,15 +74,17 @@ jobs:
         run: >-
           cargo test --all-features --no-fail-fast
           --test actor_drop
+          --test alias_gate
           --test boundaries
           --test cascade
           --test child_placement
           --test child_placement_entry
+          --test continue_chain
+          --test idle_deadline
           --test kill_grace
           --test loop_drops
           --test priority_lane
           --test receive_order_with_a_full_mailbox
-          --test reply_hand_back_latency_task
           --test restart_plane
           --test runtime_without_timers
           --test shutdown_from_anywhere

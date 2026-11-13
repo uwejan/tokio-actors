@@ -7,7 +7,9 @@
 use std::time::{Duration, Instant};
 
 use crate::actor::runtime::FAR_FUTURE;
-use crate::actor::supervision::{ChildLifecycle, DownPending, ManualStop, Origin, ABORT_SETTLE};
+use crate::actor::supervision::{
+    AutoShutdown, ChildLifecycle, DownPending, ManualStop, Origin, ABORT_SETTLE,
+};
 use crate::types::{
     ActorId, LaneState, RaiseResult, RestartStrategy, RestartType, Shutdown, StopReason,
     StopSeverity, SupervisionAction,
@@ -989,7 +991,8 @@ pub(crate) enum AttemptEvent {
     Ack { ordered: bool, ended: bool },
     /// The init returned an error, or the acknowledgment channel closed.
     InitEnded,
-    /// The start timeout expired.
+    /// The start timeout expired and the acknowledgment channel holds no
+    /// answer: the executor reads it once more before it asks.
     StartTimeout,
     /// The ladder's two waits passed and the incarnation still runs.
     LadderSpent,
@@ -1050,7 +1053,9 @@ pub(crate) enum AttemptAction {
 /// an order starts the one ladder at once. An acknowledgment read under no
 /// order, before the ladder acted, hands the incarnation over, even when its
 /// task already ended. The start timeout acts whenever the init has not
-/// acknowledged and the ladder is not past its window: it raises `Kill`
+/// acknowledged (the executor reads the channel once more before it asks, so
+/// an acknowledgment stored when the timeout expires counts as read) and the
+/// ladder is not past its window: it raises `Kill`
 /// unless one is stored, whatever stored it, and runs the kill grace, the
 /// abort and the settle time itself. A join still running after the ladder's
 /// two waits gets the Unresponsive verdict, never a fate. The end of the task
@@ -1194,6 +1199,30 @@ pub(crate) fn own_fin(is_supervisor: bool, shutdown: Shutdown, kill_grace: Durat
     budget.unwrap_or(Duration::MAX)
 }
 
+/// What a worker adds to the budget it gives its subtree once its actor traps
+/// exit signals: its own `Shutdown` window. A killed supervisor then stops it
+/// in order within that window ([`inherited_stop_if_trapping`]) where it
+/// would kill it, so a wait on the subtree above must cover the window. Zero
+/// for a supervisor child (its [`own_budget`] has the window already), under
+/// `Shutdown::Kill` (no window) and under `Shutdown::Infinity` (the stop has
+/// no bound to add; such a worker counts among the unbounded stops instead,
+/// see [`trap_infinity`]).
+pub(crate) fn trap_extra(is_supervisor: bool, shutdown: Shutdown) -> Duration {
+    match (is_supervisor, shutdown) {
+        (false, Shutdown::Timeout(window)) => window,
+        _ => Duration::ZERO,
+    }
+}
+
+/// Whether a worker's orderly stop has no bound once its actor traps exit
+/// signals: a worker under `Shutdown::Infinity`. Such a worker is waited for
+/// as a supervisor child under `Infinity` is, without a bound, for as long as
+/// it lives and traps; a supervisor child is counted from its start, so this
+/// is false for it.
+pub(crate) fn trap_infinity(is_supervisor: bool, shutdown: Shutdown) -> bool {
+    !is_supervisor && shutdown == Shutdown::Infinity
+}
+
 /// What the link guard of a child does when the supervisor that owns it ends
 /// without stopping it: how the child is told to stop and when it is
 /// forced to.
@@ -1230,6 +1259,31 @@ pub(crate) fn inherited_stop(
             Shutdown::Infinity => None,
         },
         grace: kill_grace,
+    }
+}
+
+/// The inherited stop of a worker whose actor traps exit signals when the
+/// guard fires: the orderly stop of a supervisor child, bounded by the
+/// worker's own `Shutdown`. `None` for a supervisor child, which has that
+/// stop already.
+pub(crate) fn inherited_stop_if_trapping(
+    is_supervisor: bool,
+    shutdown: Shutdown,
+    kill_grace: Duration,
+) -> Option<InheritedStop> {
+    (!is_supervisor).then(|| inherited_stop(true, shutdown, kill_grace))
+}
+
+/// The stop a firing guard starts from: the spawn-time stop, or the orderly
+/// one when the child traps exit signals at that moment and has one.
+pub(crate) fn guard_stop(
+    spawn_time: InheritedStop,
+    if_trapping: Option<InheritedStop>,
+    trapping: bool,
+) -> InheritedStop {
+    match if_trapping {
+        Some(orderly) if trapping => orderly,
+        _ => spawn_time,
     }
 }
 
@@ -2002,7 +2056,7 @@ pub(crate) fn teardown_end_is_orderly(
     shutdown: Shutdown,
 ) -> bool {
     match reason {
-        StopReason::ParentRequest => true,
+        StopReason::ParentRequest | StopReason::Shutdown(_) => true,
         StopReason::Graceful => restart_type != RestartType::Permanent,
         StopReason::Kill => matches!(shutdown, Shutdown::Kill),
         _ => false,
@@ -2023,8 +2077,9 @@ pub(crate) fn teardown_end_is_orderly(
 /// lower severity than the stored one is superseded and changes nothing.
 /// Anything else is recorded and bumps the generation; a request of strictly
 /// higher severity, or of equal severity and at least the stored rank
-/// (`ParentRequest` over `Graceful`, `Failure` over `Cancelled`, the newer of
-/// two equals), also replaces the stored reason.
+/// (`ParentRequest` over `Shutdown` over `Graceful`, `Failure` over
+/// `ParentKilled` over `Cancelled`, the newer of two equals), also replaces
+/// the stored reason.
 pub(crate) fn lane_accept(
     state: &LaneState,
     new: &StopReason,
@@ -2064,12 +2119,168 @@ pub(crate) fn init_kill_check(lane_reason: Option<&StopReason>) -> InitStep {
     }
 }
 
+/// Whether the end of a child that the supervisor did not order, and does not
+/// restart, shuts the supervisor down: the child must be significant, and
+/// `AllSignificant` also needs that no other significant child is active.
+pub(crate) fn auto_shutdown_due(
+    mode: AutoShutdown,
+    significant: bool,
+    others_active: bool,
+) -> bool {
+    significant
+        && match mode {
+            AutoShutdown::Never => false,
+            AutoShutdown::AnySignificant => true,
+            AutoShutdown::AllSignificant => !others_active,
+        }
+}
+
+/// Whether a significant child in this state counts as active for
+/// `AllSignificant`: it has an incarnation, or a restart is owed for it, or
+/// a start follows its ordered end. A child being stopped counts only when
+/// its end is followed by a start: a bounce of a non-pool `Permanent` child,
+/// or a member of the pending group's restart set (`in_restart_set`). Any
+/// other stop in progress goes away by order, as Erlang/OTP's
+/// `terminate_child` leaves no process behind. A child that is down counts
+/// only while its restart decision is owed (`DownPending::Evaluate`) or the
+/// pending group restart will restart it.
+pub(crate) fn auto_active(
+    life: ChildLifecycle,
+    restart_type: RestartType,
+    pool: bool,
+    in_restart_set: bool,
+) -> bool {
+    match life {
+        ChildLifecycle::Running(_) | ChildLifecycle::Restarting { .. } => true,
+        ChildLifecycle::Stopping { kind, .. } => {
+            in_restart_set
+                || (kind == ManualStop::Bounce && restart_type == RestartType::Permanent && !pool)
+        }
+        ChildLifecycle::Down { pending, .. } => pending == DownPending::Evaluate || in_restart_set,
+    }
+}
+
+/// What a child's acknowledgment told the strict start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrictAckKind {
+    /// The child's initialization succeeded.
+    Ok,
+    /// The child's initialization returned an error.
+    Err,
+    /// The child ended before its initialization finished; `ordered` says
+    /// whether the supervisor itself ended it (see [`strict_closed_ordered`]).
+    Closed { ordered: bool },
+}
+
+/// What the strict start does after one child's acknowledgment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrictStep {
+    /// Go on to the next child.
+    Next,
+    /// The supervisor's start fails with this child's error.
+    Fail,
+}
+
+/// The strict start's step for one acknowledgment. A child that ended before
+/// its initialization finished fails the start, unless the supervisor itself
+/// ended it (it removed the spec, ordered the stop or replaced the
+/// incarnation), which is not a failure to start.
+pub(crate) fn strict_step(ack: StrictAckKind) -> StrictStep {
+    match ack {
+        StrictAckKind::Ok => StrictStep::Next,
+        StrictAckKind::Err => StrictStep::Fail,
+        StrictAckKind::Closed { ordered: false } => StrictStep::Fail,
+        StrictAckKind::Closed { ordered: true } => StrictStep::Next,
+    }
+}
+
+/// Whether the end of the incarnation `incarnation`, which closed its
+/// acknowledgment, was the supervisor's own doing. `held` is the ledger's
+/// entry for the child, `None` when the supervisor removed it, else the
+/// incarnation it holds as occupant (`None` while the child is down). The end
+/// is excused when the entry is gone, when another incarnation took the
+/// place, or when a stop order was written to the incarnation's slot before
+/// its cell read it as ended (`ordered_before_end`), so an ordered
+/// `stop_child` or `terminate_child` of a child whose spec is kept is not a
+/// failed start. Any other end is a failure to start, including one the
+/// supervisor merely classified without having ordered it and one that ended
+/// on its own before an order was written.
+pub(crate) fn strict_closed_ordered(
+    held: Option<Option<u64>>,
+    incarnation: u64,
+    ordered_before_end: bool,
+) -> bool {
+    match held {
+        None => true,
+        Some(occupant) => ordered_before_end || occupant.is_some_and(|n| n != incarnation),
+    }
+}
+
+/// What the supervisor's check for a verdict nobody will report reads of one
+/// ledger entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopVerdictFact {
+    /// The entry is `Stopping`: a stop is in progress for its occupant.
+    pub stopping: bool,
+    /// The occupant carries the Unresponsive verdict.
+    pub verdict: bool,
+    /// The occupant's end is recorded.
+    pub ended: bool,
+    /// A caller waits on the occupant's cell, or was handed the verdict.
+    pub audience: bool,
+}
+
+/// The child whose Unresponsive verdict no caller will report, among
+/// `entries` in reverse start order: the first stopping occupant that carries
+/// the verdict, has not ended and has no caller waiting or told. Its
+/// supervisor ends with `ChildUnresponsive` for it, as the group barrier, the
+/// restart succession and the teardown do, so that its own supervisor decides.
+/// A verdict a caller waits for, or was told, is that caller's to decide.
+pub(crate) fn unreported_verdict<'a>(
+    entries: impl IntoIterator<Item = (&'a ActorId, StopVerdictFact)>,
+) -> Option<ActorId> {
+    entries
+        .into_iter()
+        .find(|(_, fact)| fact.stopping && fact.verdict && !fact.ended && !fact.audience)
+        .map(|(id, _)| id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use CommitEffect::{Answer, Join, RaiseFirst, Reask, ReaskOnce, WriteOrder};
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// A child that closed its acknowledgment fails the strict start unless
+    /// the supervisor ended it: its entry is gone, another incarnation holds
+    /// the place, or a stop order reached the slot before its cell read the
+    /// end. A down entry with no such order (a child the supervisor
+    /// classified as ended without ordering a stop, or one that ended on its
+    /// own before an order was written) is a failed start.
+    #[test]
+    fn strict_closed_ordered_excuses_only_an_end_the_supervisor_ordered() {
+        let rows = [
+            // (held, ordered_before_end, excused)
+            (None, false, true),
+            (None, true, true),
+            (Some(Some(1)), false, false),
+            (Some(Some(1)), true, true),
+            (Some(Some(2)), false, true),
+            (Some(None), false, false),
+            (Some(None), true, true),
+        ];
+        for (held, ordered_before_end, want) in rows {
+            assert_eq!(
+                strict_closed_ordered(held, 1, ordered_before_end),
+                want,
+                "held {held:?}, ordered before the end {ordered_before_end}"
+            );
+        }
+    }
 
     fn running(n: u64) -> Option<ChildLifecycle> {
         Some(ChildLifecycle::Running(n))
@@ -2096,129 +2307,67 @@ mod tests {
         })
     }
 
-    #[test]
-    fn manual_commit_never_raises_without_an_order_or_orders_without_raising_twice() {
-        let lives = [
-            None,
-            running(1),
-            stopping(1, ManualStop::Bounce),
-            stopping(1, ManualStop::Terminate),
-            restarting(),
-            down(1, DownPending::None),
-            down(1, DownPending::Snapshot),
-            down(1, DownPending::Evaluate),
-        ];
-        let tasks = [TaskState::Live, TaskState::RunnerLost, TaskState::Ended];
-        let kinds = [ManualStop::Bounce, ManualStop::Terminate];
-        let memberships = [
-            GroupMembership::None,
-            GroupMembership::Awaited { overridden: false },
-            GroupMembership::Awaited { overridden: true },
-            GroupMembership::Queued,
-            GroupMembership::Released,
-        ];
-        let policies = [
-            Shutdown::Kill,
-            Shutdown::Timeout(MS(50)),
-            Shutdown::Infinity,
-        ];
-        let types = [
-            RestartType::Permanent,
-            RestartType::Transient,
-            RestartType::Temporary,
-        ];
-        for life in lives {
-            for task in tasks {
-                for kind in kinds {
-                    for membership in memberships {
-                        for policy in policies {
-                            for restart_type in types {
-                                for flags in 0..32u8 {
-                                    let f = ManualFacts {
-                                        life,
-                                        task,
-                                        membership,
-                                        restart_type,
-                                        pool: false,
-                                        restarted: flags & 1 != 0,
-                                        in_keep_scope: flags & 2 != 0,
-                                        policy,
-                                        lane_vetoable: flags & 4 != 0,
-                                        reasked: flags & 8 != 0,
-                                        has_order: flags & 16 != 0,
-                                    };
-                                    let got = manual_commit(kind, &f);
-                                    let raises = got.effects.contains(&RaiseFirst);
-                                    let orders = got.effects.contains(&WriteOrder);
-                                    assert!(
-                                        !raises || orders,
-                                        "a first signal is always followed by the order: {got:?}"
-                                    );
-                                    if f.membership != GroupMembership::None {
-                                        // Only a running member the stop queue has
-                                        // not reached, with no order, is given one.
-                                        let unreached =
-                                            matches!(f.membership, GroupMembership::Awaited { .. })
-                                                && matches!(
-                                                    f.life,
-                                                    Some(ChildLifecycle::Running(_))
-                                                )
-                                                && !f.has_order
-                                                && f.task != TaskState::Ended;
-                                        assert!(
-                                            unreached || (!raises && !orders),
-                                            "a member of a pending group is never given a \
-                                             second first signal or order by a manual call: \
-                                             {got:?} for {f:?}"
-                                        );
-                                    }
-                                    let asks = got.effects.contains(&Reask)
-                                        || got.effects.contains(&ReaskOnce);
-                                    if asks {
-                                        assert_eq!(policy, Shutdown::Infinity);
-                                        assert!(f.lane_vetoable);
-                                        assert_ne!(task, TaskState::Ended);
-                                        assert!(got.effects.contains(&Join));
-                                    }
-                                    if got.effects.contains(&ReaskOnce) {
-                                        assert!(!f.reasked, "the shared ask is given once");
-                                    }
-                                    // An answer ends the call: nothing follows it.
-                                    if let Some(at) = got
-                                        .effects
-                                        .iter()
-                                        .position(|e| matches!(e, CommitEffect::Answer(_)))
-                                    {
-                                        assert_eq!(at, got.effects.len() - 1, "{got:?}");
-                                    }
-                                    // The call goes on or answers, and a call
-                                    // that waits joins last.
-                                    if got.effects.contains(&Join) {
-                                        assert_eq!(got.effects.last(), Some(&Join), "{got:?}");
-                                    }
-                                    // The reply a call gives without waiting is the
-                                    // commit's bare answer, or `Ok`.
-                                    let op = match kind {
-                                        ManualStop::Bounce => ManualOp::StopChild,
-                                        ManualStop::Terminate => ManualOp::TerminateChild,
-                                    };
-                                    let reply = manual_answer(op, &f);
-                                    match got.effects.as_slice() {
-                                        [Answer(r)] => assert_eq!(reply, *r),
-                                        _ => assert_eq!(reply, ManualReply::Ok),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    fn commit(to: Option<ChildLifecycle>, effects: Vec<CommitEffect>) -> Commit {
+        Commit { to, effects }
+    }
+
+    /// The facts of a call on a `Permanent` child with no pending group, a
+    /// `Timeout` policy and no request to veto.
+    fn facts(
+        life: Option<ChildLifecycle>,
+        task: TaskState,
+        membership: GroupMembership,
+    ) -> ManualFacts {
+        ManualFacts {
+            life,
+            task,
+            membership,
+            restart_type: RestartType::Permanent,
+            pool: false,
+            restarted: false,
+            in_keep_scope: false,
+            policy: Shutdown::Timeout(MS(100)),
+            lane_vetoable: false,
+            reasked: false,
+            has_order: false,
+        }
+    }
+
+    impl ManualFacts {
+        fn ordered(mut self) -> Self {
+            self.has_order = true;
+            self
+        }
+
+        fn restart(mut self, restart_type: RestartType) -> Self {
+            self.restart_type = restart_type;
+            self
+        }
+
+        fn restarted(mut self) -> Self {
+            self.restarted = true;
+            self
+        }
+
+        fn keep(mut self) -> Self {
+            self.in_keep_scope = true;
+            self
+        }
+
+        fn asking(mut self) -> Self {
+            self.policy = Shutdown::Infinity;
+            self.lane_vetoable = true;
+            self
+        }
+
+        fn asked(mut self) -> Self {
+            self.reasked = true;
+            self
         }
     }
 
     // - the child ledger -------------------------------------------------------
 
-    use crate::actor::supervision::{slot_pair, ChildSpec, ChildState};
     use crate::types::ActorId;
 
     const TOKENS: [u64; 4] = [0, 1, 2, u64::MAX];
@@ -2266,57 +2415,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejected_transitions_leave_the_state_untouched() {
-        let lives = every_life();
-        let mut rejected = 0;
-        for from in &lives {
-            for to in &lives {
-                if is_legal(from, to) {
-                    continue;
-                }
-                let (ctl, _io) = slot_pair(Default::default());
-                let mut child = ChildState {
-                    id: ActorId::from("rejected"),
-                    name: None,
-                    spec: ChildSpec {
-                        restart_type: RestartType::Permanent,
-                        shutdown: Shutdown::default(),
-                        start_timeout: None,
-                        kill_grace: crate::actor::supervision::DEFAULT_KILL_GRACE,
-                        is_supervisor: false,
-                    },
-                    ctl,
-                    lifecycle: *from,
-                    origin: Origin::Initial,
-                    predecessor: None,
-                };
-                assert_eq!(child.transition(*to), Err(*to), "from {from:?} to {to:?}");
-                assert_eq!(child.lifecycle, *from);
-                rejected += 1;
-            }
+    fn restart(n: u64, next: u64) -> ChildLifecycle {
+        ChildLifecycle::Restarting {
+            incarnation: n,
+            next,
         }
-        assert!(rejected > 0);
-        // One legal pair, to confirm an accepted move applies.
-        let (ctl, _io) = slot_pair(Default::default());
-        let mut child = ChildState {
-            id: ActorId::from("accepted"),
-            name: None,
-            spec: ChildSpec {
-                restart_type: RestartType::Permanent,
-                shutdown: Shutdown::default(),
-                start_timeout: None,
-                kill_grace: crate::actor::supervision::DEFAULT_KILL_GRACE,
-                is_supervisor: false,
-            },
-            ctl,
-            lifecycle: run(1),
-            origin: Origin::Initial,
-            predecessor: None,
+    }
+
+    fn dn(n: u64, pending: DownPending) -> ChildLifecycle {
+        ChildLifecycle::Down {
+            incarnation: n,
+            pending,
+        }
+    }
+
+    /// The four shapes in declaration order.
+    fn shape(life: &ChildLifecycle) -> usize {
+        match life {
+            ChildLifecycle::Running(_) => 0,
+            ChildLifecycle::Stopping { .. } => 1,
+            ChildLifecycle::Restarting { .. } => 2,
+            ChildLifecycle::Down { .. } => 3,
+        }
+    }
+
+    /// The default-closed table by shape: rows are the "from" shape and
+    /// columns the "to" shape, in the order Running, Stopping, Restarting,
+    /// Down. A stopping entry moves to a stopping one only by the upgrade of
+    /// a bounce to a terminate, which has its own pair.
+    const SHAPE_TABLE: [[bool; 4]; 4] = [
+        // from Running:    Running false, Stopping true,  Restarting false, Down true
+        [false, true, false, true],
+        // from Stopping:   Running false, Stopping false, Restarting false, Down true
+        [false, false, false, true],
+        // from Restarting: Running true,  Stopping false, Restarting false, Down true
+        [true, false, false, true],
+        // from Down:       Running false, Stopping false, Restarting true,  Down true
+        [false, false, true, true],
+    ];
+
+    /// An entry of `from_shape` and one of `to_shape` whose payloads match the
+    /// move between them (the same incarnation, the drawn token for an
+    /// attempt, a later token for a new incarnation).
+    fn matching_pair(from_shape: usize, to_shape: usize) -> (ChildLifecycle, ChildLifecycle) {
+        let from = match from_shape {
+            0 => run(1),
+            1 => stop(1, ManualStop::Bounce),
+            2 => restart(1, 2),
+            _ => dn(1, DownPending::None),
         };
-        let target = stop(1, ManualStop::Bounce);
-        assert_eq!(child.transition(target), Ok(()));
-        assert_eq!(child.lifecycle, target);
+        let to = match (from_shape, to_shape) {
+            (2, 0) => run(2),
+            (2, 3) => dn(2, DownPending::None),
+            (3, 2) => restart(1, 2),
+            (_, 0) => run(1),
+            (_, 1) => stop(1, ManualStop::Bounce),
+            (_, 2) => restart(1, 2),
+            _ => dn(1, DownPending::None),
+        };
+        (from, to)
+    }
+
+    /// The eight rows of the table, each written as the shapes it joins and
+    /// the equalities between their payloads, independently of `is_legal`.
+    fn the_table_allows(from: &ChildLifecycle, to: &ChildLifecycle) -> bool {
+        use ChildLifecycle::{Down, Restarting, Running, Stopping};
+        let token = |life: &ChildLifecycle| match life {
+            Running(n) => *n,
+            Stopping { incarnation, .. } | Down { incarnation, .. } => *incarnation,
+            Restarting { incarnation, .. } => *incarnation,
+        };
+        match (shape(from), shape(to)) {
+            // Running to stopping, running to down, stopping to down: the
+            // same incarnation.
+            (0, 1) | (0, 3) | (1, 3) => token(from) == token(to),
+            // A bounce becomes a terminate: the same incarnation, nothing else
+            // between stopping entries.
+            (1, 1) => {
+                token(from) == token(to)
+                    && matches!(
+                        (from, to),
+                        (
+                            Stopping {
+                                kind: ManualStop::Bounce,
+                                ..
+                            },
+                            Stopping {
+                                kind: ManualStop::Terminate,
+                                ..
+                            }
+                        )
+                    )
+            }
+            // An attempt is adopted, or ends, as the incarnation it was
+            // drawn for.
+            (2, 0) => matches!(from, Restarting { next, .. } if *next == token(to)),
+            (2, 3) => matches!(from, Restarting { next, .. } if *next == token(to)),
+            // A new incarnation begins from a down entry, with a later token.
+            (3, 2) => {
+                matches!(to, Restarting { incarnation, next } if *incarnation == token(from) && *next > token(from))
+            }
+            // A down entry records what its end still owes.
+            (3, 3) => token(from) == token(to),
+            _ => false,
+        }
     }
 
     #[test]
@@ -2336,12 +2538,13 @@ mod tests {
                 for reason in [
                     StopReason::Graceful,
                     StopReason::ParentRequest,
+                    StopReason::Shutdown("x".into()),
                     failure.clone(),
                     StopReason::Cancelled,
                     StopReason::Kill,
                 ] {
                     let want = match reason {
-                        StopReason::ParentRequest => true,
+                        StopReason::ParentRequest | StopReason::Shutdown(_) => true,
                         StopReason::Graceful => restart_type != RestartType::Permanent,
                         StopReason::Kill => shutdown == Shutdown::Kill,
                         _ => false,
@@ -2361,43 +2564,6 @@ mod tests {
             id: ActorId::from(id),
             life,
             restart_type: RestartType::Permanent,
-        }
-    }
-
-    #[test]
-    fn what_a_down_member_still_owes_changes_neither_its_stop_nor_its_restart() {
-        use ChildLifecycle::{Down, Running};
-        let down = |pending| Down {
-            incarnation: 5,
-            pending,
-        };
-        for restart_type in [
-            RestartType::Permanent,
-            RestartType::Transient,
-            RestartType::Temporary,
-        ] {
-            for strategy in [RestartStrategy::OneForAll, RestartStrategy::RestForOne] {
-                let plan = |pending| {
-                    let mut owing = member("owing", down(pending));
-                    owing.restart_type = restart_type;
-                    let registry = vec![member("a", Running(1)), owing, member("z", Running(3))];
-                    (
-                        group_commit(strategy, &registry, &ActorId::from("a")),
-                        retry_plan(strategy, &registry, &[], &ActorId::from("a")),
-                    )
-                };
-                let none = plan(DownPending::None);
-                assert_eq!(
-                    plan(DownPending::Evaluate),
-                    none,
-                    "{strategy:?} {restart_type:?}"
-                );
-                assert_eq!(
-                    plan(DownPending::Snapshot),
-                    none,
-                    "{strategy:?} {restart_type:?}"
-                );
-            }
         }
     }
 }

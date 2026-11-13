@@ -18,7 +18,6 @@
 //!   `shutting_down` flag is never reset, so reusing `ActorSystem::default()`
 //!   here would permanently affect other tests in this file.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,12 +25,13 @@ use std::time::Duration;
 
 mod common;
 
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorHandle, ActorId, ActorResult, ActorSystem, RestartType, Shutdown,
-    ShutdownPolicy, ShutdownReport, SpawnError, StopOutcome, StopReason,
+    ActorConfig, ActorError, ActorHandle, ActorId, ActorResult, ActorStatus, ActorSystem,
+    ChildEvent, RestartType, Shutdown, ShutdownPolicy, ShutdownReport, SpawnError, StopOutcome,
+    StopReason, SupervisionAction, SystemConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -243,6 +243,31 @@ impl Actor for RootSupervisor {
     }
 }
 
+/// Records its own tag into a shared log when `on_stopped` runs - the
+/// reverse-registration-order probe for test 10.
+struct OrderActor {
+    tag: &'static str,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for OrderActor {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.log.lock().unwrap().push(self.tag);
+        Ok(())
+    }
+}
+
 /// Always vetoes a graceful/parent-requested stop - the vetoing-root probe
 /// for test 11.
 #[derive(Default)]
@@ -251,6 +276,32 @@ struct VetoActor;
 impl Actor for VetoActor {
     type Message = ();
     type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
+/// Vetoes every stoppable stop forever, exactly like `VetoActor`, but also
+/// supervises one plain child - the vetoing-root-with-a-child probe for the
+/// escalated-Kill cascade test.
+#[derive(Default)]
+struct VetoingSupervisorRoot;
+
+impl Actor for VetoingSupervisorRoot {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(Idle::default)
+            .named("veto-root-child")
+            .await?;
+        Ok(())
+    }
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         Ok(())
@@ -700,148 +751,6 @@ async fn registration_after_shutdown_begins_is_rejected() {
 // `outcomes`, never `swept`
 // ---------------------------------------------------------------------------
 
-/// Six tasks spawn detached, anonymous roots in a tight loop, from before
-/// `shutdown()` begins until it has returned, on the same system. Every root
-/// a spawn registered is reported in `outcomes`, never force-killed by the
-/// leftover sweep and reported as a non-root `swept` entry; a spawn the
-/// shutdown overtakes is refused with `SystemShuttingDown`, and some spawn is
-/// refused while the shutdown runs. A registration and the shutdown's phase
-/// change are atomic with respect to each other, so no root registers after
-/// the root snapshot. The shutdown is held in the stop of the first root, a
-/// root whose `pre_stop` waits for the test, until a refused spawn has been
-/// seen, so the refusal happens while the shutdown provably runs. The
-/// spawners stop adding roots at a bound until the test has called the
-/// shutdown, and keep trying after it, so a spawn is always attempted after
-/// the shutdown sealed registration, however long the test took to call it.
-#[tokio::test(flavor = "multi_thread")]
-async fn roots_registered_during_shutdown_are_reported_in_outcomes() {
-    let sys = ActorSystem::create(uname("late-roots")).unwrap();
-
-    const SPAWNERS: usize = 6;
-    const MAX_ROOTS: usize = 20_000;
-
-    let (in_pre_stop, accept, stopped_with) = (
-        Arc::new(Notify::new()),
-        Arc::new(Notify::new()),
-        Arc::new(Mutex::new(None)),
-    );
-    // Registered first, so the shutdown stops it last, after the roots the
-    // spawners registered.
-    let gate = Lingering {
-        in_pre_stop,
-        accept: accept.clone(),
-        stopped_with,
-    }
-    .spawn()
-    .named(uname("late-roots-gate"))
-    .on_system(&sys)
-    .await
-    .unwrap();
-
-    let spawned_ids: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
-    let shutdown_returned = Arc::new(AtomicBool::new(false));
-    let refused_while_running = Arc::new(AtomicUsize::new(0));
-    let first_refusal = Arc::new(Notify::new());
-    let shutdown_called = Arc::new(AtomicBool::new(false));
-
-    let mut spawn_tasks = Vec::with_capacity(SPAWNERS);
-    for _ in 0..SPAWNERS {
-        let sys = sys.clone();
-        let spawned_ids = spawned_ids.clone();
-        let (returned, refused) = (shutdown_returned.clone(), refused_while_running.clone());
-        let first_refusal = first_refusal.clone();
-        let shutdown_called = shutdown_called.clone();
-        spawn_tasks.push(tokio::spawn(async move {
-            // The bound keeps a system that stops refusing from growing
-            // without limit while the test waits for a refusal. A spawner at
-            // the bound waits, it does not end: before the shutdown is called
-            // it waits for the call, and after it the bound doubles.
-            while !returned.load(Ordering::SeqCst) {
-                let bound = if shutdown_called.load(Ordering::SeqCst) {
-                    2 * MAX_ROOTS
-                } else {
-                    MAX_ROOTS
-                };
-                if spawned_ids.lock().unwrap().len() >= bound {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                }
-                match Idle.spawn().on_system(&sys).detached().await {
-                    Ok(handle) => spawned_ids.lock().unwrap().push(handle.id().clone()),
-                    Err(SpawnError::SystemShuttingDown(_)) => {
-                        if !returned.load(Ordering::SeqCst) {
-                            refused.fetch_add(1, Ordering::SeqCst);
-                            first_refusal.notify_one();
-                        }
-                    }
-                    Err(other) => panic!("unexpected spawn error: {other}"),
-                }
-                tokio::task::yield_now().await;
-            }
-        }));
-    }
-
-    // Some spawns land before the shutdown begins; the rest race it.
-    let landed = spawned_ids.clone();
-    assert!(wait_until(5_000, move || landed.lock().unwrap().len() >= SPAWNERS).await);
-
-    shutdown_called.store(true, Ordering::SeqCst);
-    let shutdown = {
-        let sys = sys.clone();
-        tokio::spawn(async move {
-            sys.shutdown_with(ShutdownPolicy {
-                timeout: Duration::from_secs(30),
-                per_actor_timeout: Duration::from_secs(30),
-            })
-            .await
-        })
-    };
-    assert!(
-        tokio::time::timeout(HANG_BOUND, first_refusal.notified())
-            .await
-            .is_ok(),
-        "a spawn raced the running shutdown and was refused"
-    );
-    accept.notify_one();
-    let report = tokio::time::timeout(Duration::from_secs(30), shutdown)
-        .await
-        .expect("shutdown must not hang")
-        .unwrap();
-    shutdown_returned.store(true, Ordering::SeqCst);
-
-    for task in spawn_tasks {
-        task.await.expect("a spawner task must not panic");
-    }
-
-    assert!(
-        refused_while_running.load(Ordering::SeqCst) > 0,
-        "a spawn raced the running shutdown and was refused"
-    );
-    assert!(
-        report.outcomes.iter().any(|(id, _)| id == gate.id()),
-        "the gate root is reported in `outcomes`: {:?}",
-        outcomes_of(&report)
-    );
-    let spawned_ids = spawned_ids.lock().unwrap();
-    let spawned_set: HashSet<ActorId> = spawned_ids.iter().cloned().collect();
-
-    for (id, outcome) in &report.swept {
-        assert!(
-            !spawned_set.contains(id),
-            "a root spawned during shutdown must never be reported in `swept`: \
-             {id:?} ({outcome:?})"
-        );
-    }
-
-    let outcome_ids: HashSet<ActorId> = report.outcomes.iter().map(|(id, _)| id.clone()).collect();
-    for id in spawned_set.iter() {
-        assert!(
-            outcome_ids.contains(id),
-            "every successfully spawned root must be reported in `outcomes`: {id:?}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // A root that left the registry before it published `Stopped`
 // ---------------------------------------------------------------------------
@@ -850,6 +759,15 @@ async fn roots_registered_during_shutdown_are_reported_in_outcomes() {
 // glue can run in between (here, a queued message whose `Drop` holds its
 // thread). Such a root lives on a runtime of its own, so holding its thread
 // holds nothing the shutdown needs.
+
+/// Set when dropped.
+struct DropSignal(Arc<AtomicBool>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Notes the instant it was dropped and signals `entered`, then holds the
 /// dropping thread until `open` is set (for at most `HANG_BOUND`).
@@ -909,6 +827,28 @@ impl Actor for Lingering {
     }
 }
 
+enum ParkMsg {
+    Park(Arc<AtomicBool>),
+    Signal(#[allow(dead_code)] DropSignal),
+}
+
+/// Parks in `handle` on `Park`; a `Signal` queued behind it is dropped only
+/// when the task is aborted.
+struct Parked;
+
+impl Actor for Parked {
+    type Message = ParkMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: ParkMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let ParkMsg::Park(parked) = msg {
+            parked.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+}
+
 /// A `Lingering` root on its own runtime, and the flags that drive it.
 struct WindowRoot {
     handle: tokio_actors::ActorHandle<Lingering>,
@@ -961,6 +901,18 @@ impl WindowRoot {
         }
     }
 
+    /// Once the shutdown's stop request reached the root: queues a message
+    /// whose drop holds the root's teardown after its registry entry is
+    /// freed, lets `pre_stop` accept, and waits until the drop holds it.
+    /// Panics unless that happened before `deadline`, the instant the
+    /// shutdown's global timeout cuts its ladder.
+    async fn hold_in_the_window(&self, deadline: Instant) {
+        assert!(
+            self.hold_if_in_time(deadline).await,
+            "the root left the registry before the shutdown's ladder was cut"
+        );
+    }
+
     /// As [`hold_in_the_window`](Self::hold_in_the_window), and returns
     /// whether the drop took the root's teardown before `deadline`, read from
     /// the instant the drop itself noted, not from when this task looked. A
@@ -1001,86 +953,6 @@ impl WindowRoot {
         assert_eq!(self.handle.status(), tokio_actors::ActorStatus::Stopping);
         true
     }
-}
-
-/// A root in its own kill grace, out of the registry and not yet `Stopped`,
-/// read by `stop_within` and by the shutdown's sequential ladder. Both wait
-/// the root's own grace (read while its entry still held it) and the wait
-/// after an abort, and both give the one verdict for it: `Unresponsive`, the
-/// drop being held until each call has returned. A run counts only when the
-/// drop took the root's teardown inside the call's window (the instant the
-/// drop noted); a run the host's load pushed out of that order is run again,
-/// up to five times.
-#[test]
-fn stop_within_and_the_shutdown_wait_the_root_s_own_grace_after_its_entry_is_gone() {
-    let actors = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let on = actors.handle().clone();
-    common::run(2, async move {
-        const ATTEMPTS: usize = 5;
-        // Longer than the default grace, so the wait read is the root's own.
-        let grace = Duration::from_millis(600);
-        let settle = Duration::from_millis(100);
-        let window = Duration::from_millis(2500);
-        let mut verdicts = Vec::new();
-        for through_shutdown in [false, true] {
-            let mut counted = None;
-            for attempt in 1..=ATTEMPTS {
-                let sys = ActorSystem::create(uname("own-grace")).unwrap();
-                let open = Arc::new(AtomicBool::new(false));
-                let root = WindowRoot::spawn(&sys, &on, grace, open.clone()).await;
-                let started = Instant::now();
-                let call = {
-                    let (sys, handle) = (sys.clone(), root.handle.clone());
-                    tokio::spawn(async move {
-                        if through_shutdown {
-                            let report = sys
-                                .shutdown_with(ShutdownPolicy {
-                                    timeout: Duration::from_secs(30),
-                                    per_actor_timeout: window,
-                                })
-                                .await;
-                            assert_eq!(report.outcomes.len(), 1, "{report:?}");
-                            report.outcomes[0].1.outcome
-                        } else {
-                            handle
-                                .stop_within(StopReason::Graceful, window)
-                                .await
-                                .expect("the stop is accepted")
-                        }
-                    })
-                };
-                let in_time = root.hold_if_in_time(started + window).await;
-                let verdict = tokio::time::timeout(HANG_BOUND, call)
-                    .await
-                    .expect("the call returns")
-                    .unwrap();
-                let took = started.elapsed();
-                open.store(true, Ordering::SeqCst);
-                tokio::time::timeout(HANG_BOUND, root.handle.wait_stopped())
-                    .await
-                    .expect("the root publishes Stopped");
-                if in_time {
-                    assert!(
-                        took >= window + grace + settle,
-                        "through_shutdown={through_shutdown}: waited the root's own grace, took {took:?}"
-                    );
-                    counted = Some(verdict);
-                    break;
-                }
-                assert!(
-                    attempt < ATTEMPTS,
-                    "{ATTEMPTS} runs never had the root held inside the window"
-                );
-            }
-            verdicts.push(counted.expect("a run counted"));
-        }
-        assert_eq!(verdicts, vec![StopOutcome::Unresponsive; 2]);
-    });
-    actors.shutdown_background();
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1036,10 @@ struct SlowTree {
     child: ActorHandle<SlowToStop>,
 }
 
+async fn slow_tree(stop_for: Option<Duration>, veto: bool) -> SlowTree {
+    slow_tree_with_grace(stop_for, veto, None).await
+}
+
 async fn slow_tree_with_grace(
     stop_for: Option<Duration>,
     veto: bool,
@@ -1234,11 +1110,6 @@ async fn killed_root_tree(stop_for: Option<Duration>, kill_grace: Option<Duratio
     tree.root.stop(StopReason::Kill).await.unwrap();
     tree.root.wait_stopped().await;
     tree
-}
-
-#[test]
-fn leftover_sweep_waits_for_a_still_stopping_subtree() {
-    common::run(0, leftover_sweep_waits_for_a_still_stopping_subtree_body());
 }
 
 async fn leftover_sweep_waits_for_a_still_stopping_subtree_body() {
@@ -1342,23 +1213,6 @@ impl Actor for HoldsADropBlocker {
     }
 }
 
-/// A leftover whose end is final before the global deadline (its orderly
-/// stop finishes 200 ms after its parent was killed, the deadline is 500 ms
-/// after the shutdown began) but whose value then blocks in its drop for
-/// 700 ms, so it publishes `Stopped` only after the deadline: it is reported
-/// `Graceful` with the reason it ended with, by the instant its end became
-/// final. The drop records when it began and ended, and a round counts only
-/// when the sweep found the child, the drop began (after the end became
-/// final) before the deadline and ended after it; a round the host's load
-/// pushed out of that order is run again, up to five times.
-#[test]
-fn a_leftover_final_before_the_deadline_whose_drop_blocks_past_it_reads_graceful() {
-    common::run(
-        0,
-        a_leftover_final_before_the_deadline_whose_drop_blocks_past_it_reads_graceful_body(),
-    );
-}
-
 async fn a_leftover_final_before_the_deadline_whose_drop_blocks_past_it_reads_graceful_body() {
     const TIMEOUT: Duration = Duration::from_millis(500);
     for round in 1..=5 {
@@ -1432,17 +1286,6 @@ async fn a_leftover_final_before_the_deadline_whose_drop_blocks_past_it_reads_gr
     }
 }
 
-/// A leftover that never ends by itself is held until the global deadline
-/// and forced then: its end is timed against the policy's own timeout, from
-/// an instant taken before the shutdown computed its deadline.
-#[test]
-fn a_leftover_that_never_ends_is_forced_at_the_global_deadline_and_not_before() {
-    common::run(
-        0,
-        a_leftover_that_never_ends_is_forced_at_the_global_deadline_and_not_before_body(false),
-    );
-}
-
 async fn a_leftover_that_never_ends_is_forced_at_the_global_deadline_and_not_before_body(
     paused: bool,
 ) {
@@ -1501,6 +1344,64 @@ async fn a_leftover_that_never_ends_is_forced_at_the_global_deadline_and_not_bef
 // current_thread runtime the raise mostly or always comes first, so those
 // two tests check the orderly end without claiming that interleaving.
 
+/// One round: the child must end through its orderly stop (`on_stopped`
+/// ran, `ParentKilled`) and be reported `Graceful` in `swept`. Returns a
+/// description of a wrong outcome.
+async fn killed_root_s_child_round() -> Option<String> {
+    let tree = slow_tree(Some(Duration::from_millis(200)), true).await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        tree.sys.shutdown_with(ShutdownPolicy {
+            timeout: Duration::from_secs(5),
+            per_actor_timeout: Duration::from_millis(50),
+        }),
+    )
+    .await
+    .expect("shutdown must not hang");
+    let finished = tree.finished.load(Ordering::SeqCst);
+    let ok = finished
+        && report.swept.len() == 1
+        && &report.swept[0].0 == tree.child.id()
+        && report.swept[0].1.outcome == StopOutcome::Graceful
+        && report.swept[0].1.reason == Some(StopReason::ParentKilled);
+    (!ok).then(|| {
+        format!(
+            "finished={finished} swept={:?} outcomes={:?}",
+            report.swept, report.outcomes
+        )
+    })
+}
+
+/// Runs 20 rounds on `runtime`, the shutdown inside a spawned task or
+/// directly in `block_on`, and fails on any round whose child was not let
+/// stop in order.
+fn killed_root_s_child_rounds(runtime: tokio::runtime::Runtime, in_a_task: bool) {
+    const ROUNDS: usize = 20;
+    let mut wrong = Vec::new();
+    for _ in 0..ROUNDS {
+        let round = if in_a_task {
+            runtime.block_on(async { tokio::spawn(killed_root_s_child_round()).await.unwrap() })
+        } else {
+            runtime.block_on(killed_root_s_child_round())
+        };
+        wrong.extend(round);
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {ROUNDS} rounds cut the orderly stop short; first: {}",
+        wrong.len(),
+        wrong[0]
+    );
+}
+
+fn multi_thread_runtime(workers: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 /// A root supervisor with an idle worker child, which can block its thread:
 /// a turn holds it for the given time or until `turn.release` is set, raises
 /// `turn.entered` as it begins and `turn.left` as it ends.
@@ -1554,78 +1455,6 @@ impl Actor for BlockableRoot {
     }
 }
 
-/// A shutdown whose root is unresponsive leaves its worker registered and
-/// running with nothing asked to stop it: the sweep holds it until the
-/// global deadline and then kills it while the root's turn still holds its
-/// thread; the idle worker obeys the `Kill` at once. The turn ends only when the test releases it, after the checks,
-/// so a sweep that left the worker to the root's own end would fail the
-/// bound by seconds. The root blocks its thread, so the test needs real
-/// parallelism.
-#[test]
-fn leftover_sweep_holds_a_leftover_nothing_stops_until_the_global_deadline_then_kills_it() {
-    const TIMEOUT: Duration = Duration::from_millis(1_500);
-    common::run_multi_thread_only(4, async {
-        let sys = ActorSystem::create(uname("unasked")).unwrap();
-        let turn = Arc::new(HeldTurn::default());
-        let releases = ReleasesTheTurn(turn.clone());
-        let root = BlockableRoot { turn: turn.clone() }
-            .spawn()
-            .named(uname("unasked-root"))
-            .on_system(&sys)
-            .supervisor()
-            .await
-            .unwrap();
-        assert!(wait_until(2_000, || sys.get::<Idle>("unasked-worker").is_some()).await);
-        let worker = sys.get::<Idle>("unasked-worker").unwrap();
-        root.notify(HELD_FOR).await.unwrap();
-        // The root is inside its blocked turn: it cannot take the request.
-        assert!(wait_until(2_000, || turn.entered.load(Ordering::SeqCst)).await);
-        let started = Instant::now();
-        let watched = worker.clone();
-        let seen = turn.clone();
-        let ended = tokio::spawn(async move {
-            watched.wait_stopped().await;
-            (started.elapsed(), seen.left.load(Ordering::SeqCst))
-        });
-        let report = tokio::time::timeout(
-            Duration::from_secs(10),
-            sys.shutdown_with(ShutdownPolicy {
-                timeout: TIMEOUT,
-                per_actor_timeout: Duration::from_millis(200),
-            }),
-        )
-        .await
-        .expect("shutdown must not hang");
-        let (ended, root_left) = tokio::time::timeout(HANG_BOUND, ended)
-            .await
-            .expect("the worker ends")
-            .unwrap();
-        assert!(
-            ended >= TIMEOUT,
-            "the sweep held the leftover until the global deadline: it ended at {ended:?}"
-        );
-        assert!(
-            !root_left,
-            "the leftover ended while the root's turn held its thread"
-        );
-        assert!(
-            ended < TIMEOUT + STALL_SLACK,
-            "the sweep killed the leftover at the global deadline: it ended at {ended:?}"
-        );
-        assert_eq!(report.swept.len(), 1, "{:?}", report.swept);
-        assert_eq!(&report.swept[0].0, worker.id());
-        assert!(
-            matches!(
-                report.swept[0].1.outcome,
-                StopOutcome::Killed | StopOutcome::Aborted
-            ),
-            "{:?}",
-            report.swept[0].1
-        );
-        drop(releases);
-    });
-}
-
 /// The global deadline's `Kill` and abort of a leftover do not depend on the
 /// shutdown future: a caller that drops it before the deadline still sees
 /// the leftover killed at the deadline. The future is polled once, which,
@@ -1672,6 +1501,197 @@ async fn a_dropped_shutdown_still_kills_a_leftover_at_the_global_deadline_body(p
         "the leftover ends one kill grace after the deadline: it ended at {ended:?}"
     );
     assert!(!tree.finished.load(Ordering::SeqCst));
+}
+
+async fn a_leftover_finishing_its_stop_inside_its_kill_grace_after_the_deadline_ends_killed_body() {
+    // `on_stopped` began when the root was killed and takes 1 s; the
+    // deadline comes 600 ms after the shutdown begins, so the stop ends about
+    // 400 ms into the leftover's 1 s kill grace.
+    let tree =
+        orphaned_subtree_with_grace(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)))
+            .await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        tree.sys.shutdown_with(ShutdownPolicy {
+            timeout: Duration::from_millis(600),
+            per_actor_timeout: Duration::from_millis(100),
+        }),
+    )
+    .await
+    .expect("shutdown must not hang");
+    assert!(
+        tree.finished.load(Ordering::SeqCst),
+        "the leftover's `on_stopped` ran to its end inside its kill grace: {:?}",
+        report.swept
+    );
+    assert_eq!(report.swept.len(), 1, "{:?}", report.swept);
+    assert_eq!(&report.swept[0].0, tree.child.id());
+    assert_eq!(
+        report.swept[0].1.outcome,
+        StopOutcome::Killed,
+        "{:?}",
+        report.swept[0].1
+    );
+}
+
+/// A worker that refuses every stop it may refuse, so its supervisor's
+/// teardown escalates it to `Kill` at the end of its window.
+#[derive(Default)]
+struct RefusesToStop;
+
+impl Actor for RefusesToStop {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        false
+    }
+}
+
+/// A worker whose `on_stopped` never ends.
+#[derive(Default)]
+struct NeverFinishesStopping;
+
+impl Actor for NeverFinishesStopping {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// A supervisor that starts a worker whose stop never finishes, then one
+/// that refuses its stop under a 200 ms window: its orderly teardown stops
+/// the second first, killing it at the window, and then waits on the first
+/// for ever.
+struct StopsTwoWorkers;
+
+impl Actor for StopsTwoWorkers {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(NeverFinishesStopping::default)
+            .named("never-finishes")
+            .shutdown(Shutdown::Infinity)
+            .await?;
+        ctx.spawn_child(RefusesToStop::default)
+            .named("refuses")
+            .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
+            .await?;
+        Ok(())
+    }
+}
+
+/// A root whose `Infinity` supervisor child is [`StopsTwoWorkers`].
+struct HoldsTwoWorkersBelow;
+
+impl Actor for HoldsTwoWorkersBelow {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(|| StopsTwoWorkers)
+            .named("middle")
+            .shutdown(Shutdown::Infinity)
+            .with_config(ActorConfig::default().supervisor())
+            .await?;
+        Ok(())
+    }
+}
+
+async fn a_leftover_killed_by_its_own_supervisor_before_the_deadline_reads_graceful_in_every_order_body(
+    paused: bool,
+) {
+    const ROUNDS: usize = 6;
+    const TIMEOUT: Duration = Duration::from_millis(800);
+    let mut swept_rounds = 0;
+    for round in 0..ROUNDS {
+        let sys = ActorSystem::create(uname("scan-order")).unwrap();
+        let root = HoldsTwoWorkersBelow
+            .spawn()
+            .named(uname("scan-order-root"))
+            .on_system(&sys)
+            .supervisor()
+            .await
+            .unwrap();
+        assert!(wait_until(2_000, || sys.get::<RefusesToStop>("refuses").is_some()).await);
+        let refuses = sys.get::<RefusesToStop>("refuses").unwrap();
+        root.stop(StopReason::Kill).await.unwrap();
+        root.wait_stopped().await;
+        let started = Instant::now();
+        let watched = refuses.clone();
+        let ended = tokio::spawn(async move {
+            watched.wait_stopped().await;
+            started.elapsed()
+        });
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            sys.shutdown_with(ShutdownPolicy {
+                timeout: TIMEOUT,
+                per_actor_timeout: Duration::from_millis(100),
+            }),
+        )
+        .await
+        .expect("shutdown must not hang");
+        let ended = ended.await.unwrap();
+        assert!(
+            ended < upper(paused, TIMEOUT - Duration::from_millis(200)),
+            "round {round}: the worker was killed by its supervisor well before the \
+             deadline: it ended at {ended:?}"
+        );
+        if ended >= TIMEOUT {
+            // The host delayed the worker's kill past the point where it is
+            // sure to precede the deadline (the deadline is no earlier than
+            // `started + TIMEOUT`, and the end was seen no earlier than it
+            // became final): not the case under test.
+            assert!(!paused, "round {round}: the worker ended at {ended:?}");
+            continue;
+        }
+        let Some((_, stop)) = report.swept.iter().find(|(id, _)| id == refuses.id()) else {
+            assert!(
+                !paused,
+                "round {round}: the worker is swept: {:?}",
+                report.swept
+            );
+            // Gone from the registry before the sweep looked.
+            assert!(!refuses.is_alive(), "round {round}: {:?}", report.swept);
+            continue;
+        };
+        swept_rounds += 1;
+        assert_eq!(
+            (stop.outcome, stop.reason.clone()),
+            (StopOutcome::Graceful, Some(StopReason::Kill)),
+            "round {round}: {:?}",
+            report.swept
+        );
+    }
+    assert!(
+        swept_rounds >= ROUNDS / 2,
+        "the worker was swept in {swept_rounds} of {ROUNDS} rounds"
+    );
 }
 
 /// Once a sweep has started, its deadline `Kill` and abort stand for a later
@@ -1736,102 +1756,102 @@ async fn a_later_shutdown_keeps_the_deadline_of_a_sweep_that_started_body(paused
     );
 }
 
-/// A later shutdown reports by the deadline of a sweep that started before
-/// it: the leftover, an orphan finishing a 1 s orderly stop inside its 1 s
-/// kill grace, is still stopping at the first call's 600 ms deadline, so the
-/// later 5 s call forces it there and reports it `Killed`, as a single
-/// 600 ms shutdown would, never `Graceful` by its own later deadline. The
-/// order survives a stall of the runtime of up to 400 ms before the calls and
-/// 600 ms after them, so no gap under 150 ms can break it; the runtime has
-/// one worker thread and a canary watches it
-/// from before the root is killed, and a run whose canary saw a gap of 150 ms
-/// or more is not the case under test and is run again, up to five times.
-#[test]
-fn a_later_shutdown_reports_by_the_deadline_of_a_sweep_that_started() {
-    common::run(1, async {
-        for round in 1..=5 {
-            let canary = Canary::start();
-            let tree =
-                killed_root_tree(Some(Duration::from_secs(1)), Some(Duration::from_secs(1))).await;
-            let mut first = Box::pin(tree.sys.shutdown_with(ShutdownPolicy {
-                timeout: Duration::from_millis(600),
-                per_actor_timeout: Duration::from_millis(100),
-            }));
-            let pending = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(first.as_mut().poll(cx).is_pending())
-            })
-            .await;
-            assert!(pending, "the first sweep waits on the leftover");
-            drop(first);
-            let report = tokio::time::timeout(
-                Duration::from_secs(10),
-                tree.sys.shutdown_with(ShutdownPolicy {
-                    timeout: Duration::from_secs(5),
-                    per_actor_timeout: Duration::from_millis(100),
-                }),
-            )
-            .await
-            .expect("shutdown must not hang");
-            let gap = canary.finish();
-            if gap >= WIDE_STALL_GAP {
-                assert!(round < 5, "five runs never had a steady runtime: {gap:?}");
+/// Polls `fut` once: a shutdown call with no root left reaches its final
+/// sweep's wait in that poll (the sweep has folded its deadline into the
+/// system's and scheduled its deadline entries), and returns `Pending`.
+async fn poll_once<F: Future + Unpin>(fut: &mut F) -> bool {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx).is_pending())
+    })
+    .await
+}
+
+/// Two shutdown calls of different timeouts (300 ms and 5 s), started in
+/// the given order, report one real orphan the same way while the end of its
+/// orderly stop moves around their shared deadline: the orphan's
+/// `on_stopped` ends 240 ms to 360 ms after its parent was killed, so its
+/// seal meets the deadline's `Kill` from the reaper and the force. The stops
+/// of one lattice step the end by 12 ms from `first_stop_ms`; at every stop
+/// both calls agree. Which side of the deadline a stop lands on is pinned on
+/// the paused clock by the test after the four below. A stop whose calls swept
+/// nothing (the host let the orphan finish before they began) is not compared,
+/// and at least half the stops must be. Multi-thread only: the
+/// two calls, the orphan and the reaper run in parallel.
+fn two_shutdown_calls_agree_around_the_deadline(long_first: bool, first_stop_ms: u64) {
+    common::run_multi_thread_only(4, async move {
+        let mut outcomes = Vec::new();
+        let mut stops = 0;
+        for stop_ms in (first_stop_ms..=360).step_by(12) {
+            stops += 1;
+            let (a, b, finished) = two_calls_on_an_orphan(long_first, stop_ms).await;
+            assert_eq!(
+                a.swept, b.swept,
+                "long_first={long_first} stop_ms={stop_ms}: one end, one report"
+            );
+            // A host that stalled the calls past the orphan's whole stop
+            // leaves nothing for either sweep to report; the other stops
+            // carry the race. An orphan still stopping is always reported.
+            if a.swept.is_empty() {
+                assert!(
+                    finished,
+                    "long_first={long_first} stop_ms={stop_ms}: a still-stopping orphan went unreported"
+                );
                 continue;
             }
-            assert_eq!(report.swept.len(), 1, "{:?}", report.swept);
-            assert_eq!(&report.swept[0].0, tree.child.id());
-            assert_eq!(
-                report.swept[0].1.outcome,
-                StopOutcome::Killed,
-                "{:?}",
-                report.swept[0].1
-            );
-            return;
+            assert_eq!(a.swept.len(), 1, "{:?}", a.swept);
+            outcomes.push(a.swept[0].1.outcome);
         }
+        // `Aborted`: the host held the orphan's stop past the abort that
+        // follows the deadline's `Kill` by its kill grace.
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                StopOutcome::Graceful | StopOutcome::Killed | StopOutcome::Aborted
+            )),
+            "a real orphan is reported by its own end, the deadline's Kill or the abort after it: {outcomes:?}"
+        );
+        assert!(
+            outcomes.len() * 2 >= stops,
+            "the two calls were compared on a swept orphan at {} of {stops} stops",
+            outcomes.len()
+        );
     });
 }
 
-/// Every leftover is reported once even when the sweep's own tasks fail: the
-/// caller's runtime has no timer, so each wait and each force panics, while
-/// the leftover runs on a runtime that has one. The leftover, whose wait
-/// failed, goes to the force and is reported, and the abort the force armed
-/// on the leftover's own runtime ends it. The test builds both runtimes
-/// itself.
-#[test]
-fn a_leftover_is_reported_once_when_the_sweep_s_tasks_fail() {
-    let actors = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let tree = actors.block_on(orphaned_subtree(None));
-    let caller = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let report = caller.block_on(tree.sys.shutdown_with(ShutdownPolicy {
+/// Runs a short (300 ms) and a long (5 s) shutdown call over one orphan
+/// whose orderly stop takes `stop_ms`, starting the call named by
+/// `long_first` first, and returns the short call's report, the long call's
+/// and whether the orphan's stop had finished when both calls returned.
+/// A host that stalled past the orphan's whole stop before the calls began
+/// leaves them an empty sweep, with the stop finished.
+async fn two_calls_on_an_orphan(
+    long_first: bool,
+    stop_ms: u64,
+) -> (ShutdownReport, ShutdownReport, bool) {
+    let short = ShutdownPolicy {
         timeout: Duration::from_millis(300),
         per_actor_timeout: Duration::from_millis(100),
-    }));
-    assert_eq!(report.swept.len(), 1, "{:?}", report.swept);
-    assert_eq!(&report.swept[0].0, tree.child.id());
-    // The failed force reports from the plane, as a forced end: the
-    // leftover still running then reads `Unresponsive`, and one that the
-    // force's `Kill` ended first (it had not yet begun its `on_stopped`)
-    // reads `Killed`; never `Graceful`.
-    let stop = &report.swept[0].1;
-    assert!(
-        matches!(
-            (stop.outcome, &stop.reason),
-            (StopOutcome::Unresponsive, None) | (StopOutcome::Killed, Some(StopReason::Kill))
-        ),
-        "{stop:?}"
-    );
-    let ended = actors.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), tree.child.wait_stopped()).await
-    });
-    assert!(
-        ended.is_ok(),
-        "the abort armed on its own runtime ends the leftover"
-    );
+    };
+    let long = ShutdownPolicy {
+        timeout: Duration::from_secs(5),
+        per_actor_timeout: Duration::from_millis(100),
+    };
+    let tree = killed_root_tree(
+        Some(Duration::from_millis(stop_ms)),
+        Some(ASSUMED_KILL_GRACE),
+    )
+    .await;
+    let mut a = Box::pin(tree.sys.shutdown_with(short));
+    let mut b = Box::pin(tree.sys.shutdown_with(long));
+    if long_first {
+        assert!(poll_once(&mut b).await, "the long call waits in its sweep");
+    } else {
+        assert!(poll_once(&mut a).await, "the short call waits in its sweep");
+    }
+    let (a, b) = tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(a, b) })
+        .await
+        .expect("shutdown must not hang");
+    (a, b, tree.finished.load(Ordering::SeqCst))
 }
 
 /// A completed shutdown leaves no deadline behind: after a shutdown that
@@ -2003,9 +2023,269 @@ fn a_late_sweep_still_gives_a_leftover_its_kill_grace_after_the_deadline_kill() 
     });
 }
 
+/// A supervisor child whose `on_stopped` blocks its thread for 4 s and
+/// raises `entered` as it begins.
+struct BlocksItsThreadWhileStopping {
+    entered: Arc<AtomicBool>,
+}
+
+impl Actor for BlocksItsThreadWhileStopping {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.entered.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(4_000));
+        Ok(())
+    }
+}
+
+/// A root whose supervisor child is [`BlocksItsThreadWhileStopping`].
+struct HoldsAThreadBlocker {
+    entered: Arc<AtomicBool>,
+}
+
+impl Actor for HoldsAThreadBlocker {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let entered = self.entered.clone();
+        ctx.spawn_child(move || BlocksItsThreadWhileStopping {
+            entered: entered.clone(),
+        })
+        .named("blocks")
+        .shutdown(Shutdown::Timeout(Duration::from_secs(10)))
+        .with_config(ActorConfig::default().supervisor())
+        .await?;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A dropped `shutdown_with` goes on in the system; a later `shutdown` completes it
 // ---------------------------------------------------------------------------
+
+/// Crashes on its first message.
+struct Crasher;
+
+impl Actor for Crasher {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Err(ActorError::user("crashed on command"))
+    }
+}
+
+/// A supervisor that spawns its one `Permanent` child on its first message
+/// and records the action of every child event it receives.
+struct ActionLogSupervisor {
+    child: String,
+    actions: Arc<Mutex<Vec<SupervisionAction>>>,
+}
+
+impl Actor for ActionLogSupervisor {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(|| Crasher)
+            .named(self.child.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.actions.lock().unwrap().push(event.action);
+        Ok(())
+    }
+}
+
+async fn dropped_shutdown_with_is_finished_by_a_later_shutdown_body(paused: bool) {
+    // The window the later `shutdown()` gives each root, read from the
+    // system's own policy.
+    const PER_ROOT: Duration = Duration::from_millis(400);
+    let sys = ActorSystem::create_with(
+        uname("dropped"),
+        SystemConfig {
+            shutdown_policy: ShutdownPolicy {
+                timeout: Duration::from_secs(30),
+                per_actor_timeout: PER_ROOT,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Registered first, so the shutdown reaches it last: a root the walk
+    // gets to only after the vetoing root's window.
+    let unreached_asked = Arc::new(AtomicUsize::new(0));
+    let unreached = CountingVeto {
+        asked: unreached_asked.clone(),
+        entered: Arc::new(Notify::new()),
+    }
+    .spawn()
+    .named(uname("unreached"))
+    .on_system(&sys)
+    .await
+    .unwrap();
+    let unreached_id = unreached.id().clone();
+
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let child = uname("crasher");
+    let supervisor = ActionLogSupervisor {
+        child: child.clone(),
+        actions: actions.clone(),
+    }
+    .spawn()
+    .named(uname("supervisor"))
+    .on_system(&sys)
+    .supervisor()
+    .await
+    .unwrap();
+    tokio::time::timeout(HANG_MARGIN, supervisor.send(()))
+        .await
+        .expect("the supervisor must answer")
+        .unwrap();
+
+    // Registered last, so the shutdown reaches it first. It vetoes every
+    // stoppable stop and signals when it is first asked.
+    let vetoing_entered = Arc::new(Notify::new());
+    let vetoing = CountingVeto {
+        asked: Arc::new(AtomicUsize::new(0)),
+        entered: vetoing_entered.clone(),
+    }
+    .spawn()
+    .named(uname("vetoing"))
+    .on_system(&sys)
+    .await
+    .unwrap();
+    let vetoing_id = vetoing.id().clone();
+
+    // The first shutdown has a window far longer than the test. It is
+    // dropped as soon as the vetoing root has been asked to stop; its walk
+    // goes on without it.
+    let began = Instant::now();
+    let mut first = Box::pin(sys.shutdown_with(ShutdownPolicy {
+        timeout: Duration::from_secs(60),
+        per_actor_timeout: Duration::from_secs(30),
+    }));
+    tokio::select! {
+        biased;
+        _ = vetoing_entered.notified() => {}
+        _ = &mut first => panic!("the first shutdown must still be waiting on the vetoing root"),
+    }
+    drop(first);
+
+    let refused = tokio::time::timeout(Duration::from_secs(10), async {
+        Idle.spawn().named(uname("late")).on_system(&sys).await
+    })
+    .await
+    .expect("a refused spawn must answer");
+    assert!(
+        matches!(refused, Err(SpawnError::SystemShuttingDown(_))),
+        "a spawn after a dropped shutdown must be refused"
+    );
+    assert!(
+        !sys.reactivate(),
+        "a system whose shutdown never completed must not reactivate"
+    );
+
+    // A crashed child cannot be restarted: its supervisor exhausts its
+    // budget and ends.
+    let crasher = sys
+        .get::<Crasher>(&child)
+        .expect("the child must be registered");
+    tokio::time::timeout(Duration::from_secs(10), crasher.notify(()))
+        .await
+        .expect("the crash message must be accepted")
+        .unwrap();
+    assert!(
+        wait_until(HANG_MARGIN.as_millis() as u64, || actions
+            .lock()
+            .unwrap()
+            .contains(&SupervisionAction::BudgetExhausted))
+        .await,
+        "the refused restarts must exhaust the supervisor's budget: {:?}",
+        actions.lock().unwrap()
+    );
+    tokio::time::timeout(HANG_MARGIN, supervisor.wait_stopped())
+        .await
+        .expect("the supervisor must end once its budget is exhausted");
+    assert!(
+        wait_until(HANG_MARGIN.as_millis() as u64, || !sys
+            .actor_ids()
+            .contains(supervisor.id()))
+        .await,
+        "the ended supervisor must leave the registry before the later shutdown"
+    );
+
+    // The walk waits out the vetoing root's window (the first call's 30 s
+    // `per_actor_timeout`, counted from the stop request, which is no earlier
+    // than `began`) before it asks the next root. So the other root has not
+    // been asked while fewer than 30 s have passed since `began`: the
+    // observation below is made first and counts only if the clock, read
+    // after it, is still inside that bound.
+    let asked_before_the_window_ended = unreached_asked.load(Ordering::SeqCst);
+    let status_before_the_window_ended = unreached.status();
+    if began.elapsed() < Duration::from_secs(30) {
+        assert_eq!(
+            asked_before_the_window_ended, 0,
+            "the walk waits out the vetoing root's window before the next root"
+        );
+        assert_eq!(status_before_the_window_ended, ActorStatus::Running);
+    }
+
+    // A later shutdown completes the job: it escalates both vetoing roots,
+    // the one the first walk is waiting on and the one after it, and the
+    // system returns to service.
+    let bound = upper(
+        paused,
+        (PER_ROOT + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE) * 2,
+    );
+    let report = tokio::time::timeout(bound, sys.shutdown())
+        .await
+        .expect("the later shutdown must finish within its bound");
+    let reported: Vec<ActorId> = report.outcomes.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        reported,
+        vec![vetoing_id, unreached_id],
+        "the later shutdown must stop both vetoing roots, newest first"
+    );
+    assert!(report.swept.is_empty(), "nothing is left to sweep");
+    assert!(!vetoing.is_alive(), "the vetoing root must be stopped");
+    assert!(!unreached.is_alive(), "the second root must be stopped");
+    assert!(
+        unreached_asked.load(Ordering::SeqCst) >= 1,
+        "the second root is asked to stop"
+    );
+    // The dropped call's walk is a shutdown in flight of its own, and
+    // `reactivate` is refused until every shutdown in flight has completed.
+    // It ends on its own tasks, once it finds both roots stopped, so the
+    // system becomes reactivatable some time after the later shutdown has
+    // returned: wait for that observable end.
+    assert!(
+        wait_until(HANG_MARGIN.as_millis() as u64, || sys.reactivate()).await,
+        "once the dropped call's walk has ended too, the system must be reactivatable"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // A parent window shorter than its children's stop budgets
@@ -2169,3 +2449,57 @@ async fn root_supervisor_with_a_default_window_child_is_escalated_at_system_shut
 // ---------------------------------------------------------------------------
 // A dropped `stop_within` is still escalated by the system
 // ---------------------------------------------------------------------------
+
+/// Vetoes every stoppable stop, counts how many times it was asked and
+/// signals `entered` each time.
+struct CountingVeto {
+    asked: Arc<AtomicUsize>,
+    entered: Arc<Notify>,
+}
+
+impl Actor for CountingVeto {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        false
+    }
+}
+
+/// Parks in a handler on `Block`, and records whether it was stopped with
+/// `StopReason::Graceful`.
+struct GatedActor {
+    graceful_stop: Arc<AtomicBool>,
+}
+
+enum GatedMsg {
+    Block(oneshot::Sender<()>, oneshot::Receiver<()>),
+}
+
+impl Actor for GatedActor {
+    type Message = GatedMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: GatedMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let GatedMsg::Block(entered, release) = msg;
+        let _ = entered.send(());
+        let _ = release.await;
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        reason: &StopReason,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.graceful_stop
+            .store(matches!(reason, StopReason::Graceful), Ordering::SeqCst);
+        Ok(())
+    }
+}

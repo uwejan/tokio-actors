@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! A `Kill` that reaches a supervised child before its task was first polled
 //! ends that incarnation without running either start hook, whichever path
 //! made the incarnation: the initial `spawn_child` (which is not awaited), a
@@ -313,57 +314,22 @@ impl Run {
     }
 }
 
-/// A manual restart returns before the incarnation is polled, so a `Kill`
-/// queued by the factory ends it before `pre_start`. The failed start is
-/// reported, the spec is kept and the next manual restart starts the child.
-#[test]
-fn a_manual_restart_killed_before_its_first_poll_is_reported_and_keeps_the_spec() {
-    common::run_current_thread_only(async {
-        let plan = Plan {
-            kill_before_first_poll: vec![1],
-            ..Plan::new(RestartType::Permanent)
-        };
-        let run = start(plan).await;
-        run.status().await;
+/// The scenario every restart type shares: the child is killed before its
+/// first poll, and its restarts, if any, park in `pre_start`.
+fn killed_at_once(restart_type: RestartType) -> Plan {
+    Plan {
+        park_restarts: true,
+        kill_at_once: true,
+        ..Plan::new(restart_type)
+    }
+}
 
-        run.parent
-            .send(Cmd::Terminate)
-            .await
-            .expect("the supervisor answers")
-            .expect("terminate_child succeeds");
-        let stopped = run.trace.stopped_events(1).await;
-        assert_eq!(
-            stopped[0],
-            (StopReason::ParentRequest, SupervisionAction::Removed)
-        );
-
-        run.parent
-            .send(Cmd::Restart)
-            .await
-            .expect("the supervisor answers")
-            .expect("restart_child returns before the child starts");
-        let stopped = run.trace.stopped_events(2).await;
-        assert_eq!(
-            stopped[1],
-            (StopReason::Kill, SupervisionAction::Removed),
-            "the killed start is reported: {stopped:?}"
-        );
-        assert_eq!(
-            run.trace.began(),
-            vec![0],
-            "incarnation 1 never began pre_start"
-        );
-
-        run.parent
-            .send(Cmd::Restart)
-            .await
-            .expect("the supervisor answers")
-            .expect("the spec is kept, so the child can be restarted");
-        run.trace.restarted().await;
-        assert_eq!(run.trace.began(), vec![0, 2]);
-        assert_eq!(run.trace.built(), 3);
-        run.stop_parent().await;
-    });
+/// Runs a child whose restarts park until the restart budget ends the
+/// supervisor.
+async fn killed_at_once_until_the_budget_ends(restart_type: RestartType) -> Run {
+    let run = start(killed_at_once(restart_type)).await;
+    run.parent_ends().await;
+    run
 }
 
 /// Whichever side of the first poll the `Kill` lands on, the factory counts

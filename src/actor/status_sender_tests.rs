@@ -13,15 +13,18 @@
 //! while suspended and on an abort before the first poll, and is closed once
 //! the task has ended.
 
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use crate::actor::context::ActorContext;
-use crate::actor::runtime::{spawn_actor, ActorConfig};
+use crate::actor::runtime::{spawn_actor, spawn_actor_parts, ActorConfig};
 use crate::actor::supervision::DEFAULT_KILL_GRACE;
 use crate::actor::Actor;
 use crate::error::ActorResult;
 use crate::system::ActorSystem;
-use crate::types::{ActorId, StopReason};
+use crate::types::{ActorId, StatusRx, StopReason};
 
 /// The longest a wait may take. It only limits how long a real hang takes to
 /// report.
@@ -81,7 +84,173 @@ async fn a_spawn_holds_four_senders() {
         .expect("the actor stops");
 }
 
+/// The test variant holds one more sender for its caller, and the plane stays
+/// open past the actor's own end while the caller holds it.
+async fn the_variant_that_keeps_a_sender_holds_five() {
+    let system = ActorSystem::create(unique("senders-five")).unwrap();
+    let (handle, join, kept, _subtree) = spawn_actor_parts(
+        ActorId::from(unique("five")),
+        Idle,
+        ActorConfig::default(),
+        None,
+        Some(system),
+        None,
+        true,
+        DEFAULT_KILL_GRACE,
+        None,
+    )
+    .expect("the actor spawns");
+    let plane = handle.status_rx();
+    assert_eq!(plane.sender_count(), 5, "the four and the caller's");
+    handle.stop(StopReason::Graceful).await.unwrap();
+    tokio::time::timeout(HANG, handle.wait_stopped())
+        .await
+        .expect("the actor stops");
+    // The task completes only after every drop of its end has run.
+    tokio::time::timeout(HANG, join)
+        .await
+        .expect("the task ends")
+        .expect("the task is not cancelled");
+    assert!(
+        plane.has_changed().is_ok(),
+        "the plane stays open while the caller holds its sender"
+    );
+    drop(kept);
+    assert!(
+        plane.has_changed().is_err(),
+        "the plane closes when the caller lets go of the last sender"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_spawn_holds_four_senders_current_thread() {
     a_spawn_holds_four_senders().await;
+}
+
+/// An actor's value: when it drops it records whether the plane reads as
+/// ended.
+struct Probe {
+    plane: Arc<OnceLock<StatusRx>>,
+    ended: Arc<Mutex<Option<bool>>>,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let ended = self
+            .plane
+            .get()
+            .is_some_and(|plane| plane.has_changed().is_err());
+        *self.ended.lock().unwrap() = Some(ended);
+    }
+}
+
+/// An actor with no timer and no stream, whose value is a [`Probe`]. It parks
+/// in `on_started` when asked to, so an abort lands while it is suspended.
+struct Bare {
+    _probe: Probe,
+    started: Option<oneshot::Sender<()>>,
+    park: bool,
+}
+
+impl Actor for Bare {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+        }
+        if self.park {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+/// A [`Bare`] actor spawned through `spawn_actor`, and what its value saw.
+struct BareRig {
+    handle: crate::actor::handle::ActorHandle<Bare>,
+    join: tokio::task::JoinHandle<StopReason>,
+    plane: Arc<OnceLock<StatusRx>>,
+    ended: Arc<Mutex<Option<bool>>>,
+    started: oneshot::Receiver<()>,
+}
+
+fn bare(park: bool) -> BareRig {
+    let system = ActorSystem::create(unique("senders-bare")).unwrap();
+    let plane = Arc::new(OnceLock::new());
+    let ended = Arc::new(Mutex::new(None));
+    let (started_tx, started) = oneshot::channel();
+    let (handle, join, _subtree) = spawn_actor(
+        ActorId::from(unique("bare")),
+        Bare {
+            _probe: Probe {
+                plane: plane.clone(),
+                ended: ended.clone(),
+            },
+            started: Some(started_tx),
+            park,
+        },
+        ActorConfig::default(),
+        None,
+        Some(system),
+        None,
+        true,
+        DEFAULT_KILL_GRACE,
+        None,
+    )
+    .expect("the actor spawns");
+    let _ = plane.set(handle.status_rx());
+    BareRig {
+        handle,
+        join,
+        plane,
+        ended,
+        started,
+    }
+}
+
+impl BareRig {
+    /// Waits for the task to end, however it ends: it completes only after
+    /// every drop of its end has run.
+    async fn task_end(self) -> (Option<bool>, bool) {
+        let _ = tokio::time::timeout(HANG, self.join)
+            .await
+            .expect("the task ends");
+        let saw = *self.ended.lock().unwrap();
+        let closed = self.plane.get().unwrap().has_changed().is_err();
+        (saw, closed)
+    }
+}
+
+/// On a return the value drops while the plane is open, and the plane is
+/// closed once the task has ended.
+async fn a_returning_actor_s_value_drops_while_the_plane_is_open() {
+    let mut rig = bare(false);
+    tokio::time::timeout(HANG, &mut rig.started)
+        .await
+        .expect("the actor starts")
+        .expect("the start is reported");
+    rig.handle.stop(StopReason::Graceful).await.unwrap();
+    let (saw, closed) = rig.task_end().await;
+    assert_eq!(saw, Some(false), "the value dropped after the plane closed");
+    assert!(closed, "the plane is closed once the task has ended");
+}
+
+/// On an abort while suspended the value drops while the plane is open, and
+/// the plane is closed once the task has ended.
+async fn a_suspended_actor_s_value_drops_while_the_plane_is_open() {
+    let mut rig = bare(true);
+    tokio::time::timeout(HANG, &mut rig.started)
+        .await
+        .expect("the actor starts")
+        .expect("the start is reported");
+    rig.join.abort();
+    let (saw, closed) = rig.task_end().await;
+    assert_eq!(saw, Some(false), "the value dropped after the plane closed");
+    assert!(closed, "the plane is closed once the task has ended");
 }

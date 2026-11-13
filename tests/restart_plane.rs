@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Behavioral suite for the restart plane: restarts run in a parent-owned
 //! `JoinSet<RestartOutcome>`, and the outcome value itself - not a message -
 //! carries either an adoptable fresh incarnation (with its own armed link
@@ -28,6 +29,7 @@
 //! - A factory panic inside the restart task surfaces as a typed failure and
 //!   charges the budget like any other crash.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -74,6 +76,19 @@ async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
+async fn wait_until<F: FnMut() -> bool>(timeout_ms: u64, mut pred: F) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if pred() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(POLL).await;
+    }
+}
+
 /// A fresh, dedicated [`ActorSystem`] per test - never the process-wide
 /// `ActorSystem::default()`. Every actor and its reaper task then live and
 /// die on exactly this one test's own runtime, with no risk of a concurrently
@@ -84,6 +99,10 @@ async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
 /// make that binding's lifetime an accident of test scheduling order).
 fn new_system() -> Arc<ActorSystem> {
     ActorSystem::create(uname("sys")).expect("system name must be unique")
+}
+
+fn alive_as<A: Actor>(sys: &ActorSystem, name: &str) -> bool {
+    sys.get::<A>(name).map(|h| h.is_alive()).unwrap_or(false)
 }
 
 /// Polls until `name` resolves in `sys` to a live handle. The bound only limits how long a real hang takes to report.
@@ -126,9 +145,30 @@ impl InstanceCounter {
         self.live.fetch_sub(1, Ordering::SeqCst);
     }
 
+    fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    fn max_live(&self) -> usize {
+        self.max_live.load(Ordering::SeqCst)
+    }
+
     fn constructions(&self) -> usize {
         self.constructions.load(Ordering::SeqCst)
     }
+}
+
+/// Background sampler catching a transient two-live spike the increment-site
+/// `fetch_max` alone might land between polls of.
+fn spawn_max_sampler(counter: &InstanceCounter) -> tokio::task::JoinHandle<()> {
+    let live = counter.live.clone();
+    let max_live = counter.max_live.clone();
+    tokio::spawn(async move {
+        loop {
+            max_live.fetch_max(live.load(Ordering::SeqCst), Ordering::SeqCst);
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
 }
 
 type EventLog = Arc<Mutex<Vec<ChildEvent>>>;
@@ -143,6 +183,170 @@ fn recorder() -> EventLog {
 // defaulting to zero once exhausted) - the knob every scenario below uses to
 // control exactly which restart is "the slow one".
 // ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+enum CMsg {
+    Crash,
+}
+
+struct Flex {
+    name: String,
+    counter: InstanceCounter,
+    delay: Duration,
+    /// Held in `pre_stop` before accepting a `Graceful`/`ParentRequest` stop:
+    /// lets a test control exactly how long this incarnation's own teardown
+    /// takes under `Shutdown::Timeout` (irrelevant under `Shutdown::Kill`,
+    /// which bypasses every callback).
+    teardown_delay: Duration,
+}
+
+impl Actor for Flex {
+    type Message = CMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: CMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            CMsg::Crash => panic!("{} crashed on command", self.name),
+        }
+    }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        if !self.delay.is_zero() {
+            sleep(self.delay).await;
+        }
+        Ok(())
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        if !self.teardown_delay.is_zero() {
+            sleep(self.teardown_delay).await;
+        }
+        true
+    }
+}
+
+impl Drop for Flex {
+    fn drop(&mut self) {
+        self.counter.on_drop();
+    }
+}
+
+/// One child's full spec for [`FlexSup`]: name, instance accounting, and the
+/// scripted per-construction `on_started` delay queue.
+struct Member {
+    name: String,
+    counter: InstanceCounter,
+    delays: Arc<Mutex<VecDeque<Duration>>>,
+    shutdown: Shutdown,
+    start_timeout: Option<Duration>,
+    teardown_delay: Duration,
+}
+
+impl Member {
+    fn new(name: String, counter: InstanceCounter, delays: Vec<Duration>) -> Self {
+        Self {
+            name,
+            counter,
+            delays: Arc::new(Mutex::new(delays.into())),
+            shutdown: Shutdown::Kill,
+            start_timeout: None,
+            teardown_delay: Duration::ZERO,
+        }
+    }
+
+    fn shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    fn start_timeout(mut self, dur: Duration) -> Self {
+        self.start_timeout = Some(dur);
+        self
+    }
+
+    fn teardown_delay(mut self, dur: Duration) -> Self {
+        self.teardown_delay = dur;
+        self
+    }
+}
+
+/// Supervisor spawning `members` (Vec order = start order) in `on_started`,
+/// exposing manual child-management commands, and recording every
+/// `ChildEvent` it receives.
+struct FlexSup {
+    members: Vec<Member>,
+    events: EventLog,
+}
+
+#[derive(Clone)]
+enum SupCmd {
+    StopChild(String),
+    TerminateChild(String),
+}
+
+#[derive(Debug)]
+enum SupReply {
+    Done(Result<StopChildOutcome, String>),
+}
+
+impl Actor for FlexSup {
+    type Message = SupCmd;
+    type Response = SupReply;
+
+    async fn handle(&mut self, msg: SupCmd, ctx: &mut ActorContext<Self>) -> ActorResult<SupReply> {
+        let res = match msg {
+            SupCmd::StopChild(name) => ctx.stop_child(name).await.map_err(|e| e.to_string()),
+            SupCmd::TerminateChild(name) => ctx
+                .terminate_child(name)
+                .await
+                .map(|()| StopChildOutcome::Stopped)
+                .map_err(|e| e.to_string()),
+        };
+        Ok(SupReply::Done(res))
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        for m in &self.members {
+            let name = m.name.clone();
+            let counter = m.counter.clone();
+            let delays = m.delays.clone();
+            let teardown_delay = m.teardown_delay;
+            let mut builder = ctx
+                .spawn_child(move || {
+                    let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
+                    counter.on_construct();
+                    Flex {
+                        name: name.clone(),
+                        counter: counter.clone(),
+                        delay,
+                        teardown_delay,
+                    }
+                })
+                .named(m.name.clone())
+                .restart_type(RestartType::Permanent)
+                .shutdown(m.shutdown);
+            if let Some(dur) = m.start_timeout {
+                builder = builder.start_timeout(dur);
+            }
+            builder.await?;
+        }
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+async fn op(sup: &ActorHandle<FlexSup>, cmd: SupCmd) -> Result<StopChildOutcome, String> {
+    let SupReply::Done(res) = sup.send(cmd).await.expect("supervisor must answer");
+    res
+}
 
 // ---------------------------------------------------------------------------
 // Item 5: parent killed mid-restart - no orphaned incarnation, name freed.
@@ -175,6 +379,66 @@ fn recorder() -> EventLog {
 // ---------------------------------------------------------------------------
 // Factory panic inside the restart task: typed failure, budget charged.
 // ---------------------------------------------------------------------------
+
+struct PanicOnce;
+
+#[derive(Clone)]
+enum PMsg {
+    Crash,
+}
+
+impl Actor for PanicOnce {
+    type Message = PMsg;
+    type Response = ();
+
+    async fn handle(&mut self, msg: PMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        match msg {
+            PMsg::Crash => panic!("crashed on command"),
+        }
+    }
+}
+
+struct FactorySup {
+    name: String,
+    calls: Arc<AtomicUsize>,
+    events: EventLog,
+}
+
+impl Actor for FactorySup {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let calls = self.calls.clone();
+        ctx.spawn_child(move || {
+            // The SECOND call (the first restart attempt) panics; every
+            // other call succeeds.
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 1 {
+                panic!("factory boom on restart");
+            }
+            PanicOnce
+        })
+        .named(self.name.clone())
+        .restart_type(RestartType::Permanent)
+        .shutdown(Shutdown::Kill)
+        .await?;
+        Ok(())
+    }
+
+    async fn on_child_stopped(
+        &mut self,
+        event: &ChildEvent,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // A start_timeout expiry on the restart path surfaces through the ordinary

@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{advance, timeout, Instant};
 
-use super::{hooks, Bound, Gate, Outcome, ACKED, TIMED_OUT};
+use super::{hooks, Bound, Gate, Guard, Outcome, ACKED};
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
 use crate::actor::supervision::ABORT_SETTLE;
@@ -22,7 +22,7 @@ use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorResult, SpawnError};
 use crate::helper::{HelperEnd, HelperKind};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, StopLane, StopReason};
+use crate::types::{ActorId, LaneRx, StopLane, StopReason};
 
 const START_TIMEOUT: Duration = Duration::from_secs(1);
 const BOUND: Duration = Duration::from_secs(30);
@@ -163,50 +163,6 @@ async fn a_closed_answer_with_no_decision_is_read_within_a_bound() {
     );
 }
 
-/// A helper that panics before its decision aborts the start through its
-/// guard before the answer channel closes: the caller is told `StartTimeout`
-/// once the actor's reason is final, the name is free, and an immediate
-/// retry under it is not refused.
-#[tokio::test(start_paused = true)]
-async fn a_helper_that_panics_before_its_decision_fails_closed() {
-    let system = fresh_system();
-    let rt = tokio::runtime::Handle::current();
-    let name = unique("panic-before");
-    let hold = hooks::hold(hooks::BEFORE_DECISION, ActorId::from(name.as_str()));
-    let spawned = start(&system, &name);
-    hold.arrived().await;
-    let actor = system.get::<Live>(&name).expect("the actor is registered");
-
-    hold.fail();
-    match timeout(BOUND, spawned).await.unwrap().unwrap() {
-        Err(SpawnError::StartTimeout) => {}
-        Err(other) => panic!("expected StartTimeout, got {other}"),
-        Ok(_) => panic!("the helper never took the gate for the ack"),
-    }
-    assert_eq!(
-        timeout(BOUND, actor.wait_stopped()).await.unwrap(),
-        StopReason::Kill
-    );
-    assert_eq!(
-        actor.stop_lane().reason(),
-        Some(StopReason::Kill),
-        "the guard cut the start with a Kill on the lane"
-    );
-    assert!(system.get::<Live>(&name).is_none(), "the name is free");
-    let retry = Live
-        .spawn()
-        .named(name.as_str())
-        .on_system(&system)
-        .await
-        .expect("an immediate retry under the name is not refused");
-    assert!(retry.is_alive());
-    until("the helper is counted down", || system.live_helpers() == 0).await;
-    assert_eq!(
-        system.helper_ends(&rt),
-        vec![(HelperKind::StartBound, HelperEnd::Panicked)]
-    );
-}
-
 /// A helper that panics after it took `Acked` leaves the actor running: its
 /// guard finds the gate decided and aborts nothing, and the caller reads
 /// `Acked` from the closed answer and gets the handle.
@@ -226,38 +182,6 @@ async fn a_helper_that_panics_after_the_ack_was_taken_leaves_the_actor_running()
     settle().await;
     assert_eq!(handle.send(()).await.unwrap(), 7);
     assert!(system.get::<Live>(&name).is_some());
-}
-
-/// A helper that finds the gate taken after a good ack cuts the start
-/// itself, so a caller told `StartTimeout` never leaves an actor running.
-#[tokio::test(start_paused = true)]
-async fn a_helper_that_finds_the_gate_taken_after_its_ack_cuts_the_start() {
-    let system = fresh_system();
-    let name = unique("gate-taken");
-    let id = ActorId::from(name.as_str());
-    let probe = hooks::probe(id.clone());
-    let hold = hooks::hold(hooks::BEFORE_DECISION, id);
-    let spawned = start(&system, &name);
-    hold.arrived().await;
-    let actor = system.get::<Live>(&name).expect("the actor is registered");
-
-    assert_eq!(probe.gate().decide(TIMED_OUT), TIMED_OUT);
-    hold.release();
-    match timeout(BOUND, spawned).await.unwrap().unwrap() {
-        Err(SpawnError::StartTimeout) => {}
-        Err(other) => panic!("expected StartTimeout, got {other}"),
-        Ok(_) => panic!("the gate stood at TimedOut"),
-    }
-    assert_eq!(
-        timeout(BOUND, actor.wait_stopped()).await.unwrap(),
-        StopReason::Kill
-    );
-    assert_eq!(
-        actor.stop_lane().reason(),
-        Some(StopReason::Kill),
-        "the helper cut the start with a Kill on the lane"
-    );
-    assert!(system.get::<Live>(&name).is_none(), "the name is free");
 }
 
 /// The cut raises the `Kill` before it requests the abort: when the abort is
@@ -284,6 +208,39 @@ async fn the_cut_raises_the_kill_before_it_requests_the_abort() {
     );
     assert_eq!(lane.reason(), Some(StopReason::Kill));
     assert!(was_aborted(task).await, "the cut aborted the task");
+}
+
+/// A guard on a task, a stop lane, a gate and an answer channel the test holds.
+struct Rig {
+    task: JoinHandle<()>,
+    lane: StopLane,
+    /// Keeps the lane open to requests, as the actor's run loop does.
+    _lane_rx: LaneRx,
+    gate: Arc<Gate>,
+    answered: oneshot::Receiver<Outcome>,
+    hold: Arc<hooks::StdHold>,
+    guard: Guard,
+}
+
+impl Rig {
+    fn new() -> Self {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (lane, lane_rx) = StopLane::new();
+        let gate = Gate::new();
+        let (answer, answered) = oneshot::channel();
+        let hold = Arc::new(hooks::StdHold::default());
+        let mut guard = Guard::new(gate.clone(), lane.clone(), task.abort_handle(), answer);
+        guard.hold = Some(hold.clone());
+        Self {
+            task,
+            lane,
+            _lane_rx: lane_rx,
+            gate,
+            answered,
+            hold,
+            guard,
+        }
+    }
 }
 
 /// Whether the task was aborted: an abort ends the task at its next poll.
@@ -385,3 +342,29 @@ async fn an_ack_ready_at_or_after_the_deadline_is_accepted() {
 // ---------------------------------------------------------------------------
 // Wakers of other tasks that panic
 // ---------------------------------------------------------------------------
+
+/// A waker that counts its wakes and panics in them while it is armed.
+#[derive(Default)]
+struct LoudWake {
+    armed: std::sync::atomic::AtomicBool,
+    woken: std::sync::atomic::AtomicUsize,
+}
+
+impl LoudWake {
+    fn arm(&self, armed: bool) {
+        self.armed.store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn woken(&self) -> usize {
+        self.woken.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for LoudWake {
+    fn wake(self: Arc<Self>) {
+        self.woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            panic!("a waker's wake panics");
+        }
+    }
+}

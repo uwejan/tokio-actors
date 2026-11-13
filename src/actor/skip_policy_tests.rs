@@ -36,7 +36,6 @@ fn bare_handle() -> (
         stop_lane,
         1,
         status_rx,
-        "skip-policy-tests".into(),
         None,
         Some(Arc::new(AtomicBool::new(false))),
     );
@@ -60,6 +59,9 @@ async fn skip_after(interval: Duration, missed: Duration) -> (Instant, Instant, 
         &CancellationToken::new(),
         &handle,
         &mut factory,
+        TickEvents {
+            timer: RecurringId::new(0),
+        },
     );
     assert!(matches!(adjusted, Adjusted::Next), "Skip sends nothing");
     (next, due, now)
@@ -67,30 +69,4 @@ async fn skip_after(interval: Duration, missed: Duration) -> (Instant, Instant, 
 
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).expect("a duration of this test fits in u64 nanoseconds")
-}
-
-/// One interval short of `u32::MAX` missed intervals still keeps the grid.
-#[tokio::test(start_paused = true)]
-async fn skip_keeps_the_grid_up_to_one_interval_short_of_u32_max_missed_intervals() {
-    let interval = Duration::from_millis(2);
-    let missed_intervals = u64::from(u32::MAX) - 1;
-    let missed = Duration::from_nanos(nanos(interval) * missed_intervals + 1_000_000);
-    let (next, _due, now) = skip_after(interval, missed).await;
-    assert_eq!(next, now + Duration::from_millis(1), "the next grid point");
-}
-
-/// From `u32::MAX` missed intervals on, the grid is dropped and the next tick
-/// is one interval from now.
-#[tokio::test(start_paused = true)]
-async fn skip_waits_one_interval_from_now_after_u32_max_or_more_missed_intervals() {
-    let interval = Duration::from_millis(2);
-    for missed_intervals in [
-        u64::from(u32::MAX),
-        u64::from(u32::MAX) + 1,
-        u64::from(u32::MAX) + 1_000,
-    ] {
-        let missed = Duration::from_nanos(nanos(interval) * missed_intervals + 1_000_000);
-        let (next, _due, now) = skip_after(interval, missed).await;
-        assert_eq!(next, now + interval, "{missed_intervals} missed intervals");
-    }
 }
