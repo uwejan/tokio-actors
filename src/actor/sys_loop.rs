@@ -7,7 +7,7 @@
 //! borrows both for the length of the call.
 
 use super::context::ActorContext;
-use super::subtree::{AbortRecord, SYS_SENSITIVE, SYS_SUSPENDED};
+use super::incarnation::{IncarnationRef, SYS_SENSITIVE, SYS_SUSPENDED};
 use super::sys::DebugEntry;
 use super::sys_debug::DebugState;
 use super::Actor;
@@ -15,12 +15,12 @@ use super::Actor;
 /// The bundle's state as one call sees it, borrowed from the context.
 #[derive(Debug)]
 pub(crate) struct LoopSys<'a> {
-    record: &'a AbortRecord,
+    record: &'a IncarnationRef,
     debug: &'a mut Option<Box<DebugState>>,
 }
 
 impl<'a> LoopSys<'a> {
-    pub(crate) fn new(record: &'a AbortRecord, debug: &'a mut Option<Box<DebugState>>) -> Self {
+    pub(crate) fn new(record: &'a IncarnationRef, debug: &'a mut Option<Box<DebugState>>) -> Self {
         Self { record, debug }
     }
 

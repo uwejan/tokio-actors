@@ -491,7 +491,7 @@ async fn a_helper_end_naming_an_actor_is_counted_in_its_events(helper: Helper) {
             actor.stop(StopReason::Graceful).await.unwrap();
             actor.wait_stopped().await;
             let (reply, _) = tokio::sync::oneshot::channel();
-            let _sender = slot.send(crate::types::SystemMessage::GetStatus(
+            let _sender = slot.send(crate::actor::envelope::SystemMessage::GetStatus(
                 crate::types::StatusRequest { reply, task: false },
             ));
             handle = None;

@@ -87,7 +87,7 @@ impl CouplingInfo {
     /// its own signal tables as it last recorded them, the monitors other
     /// actors hold on it and its group memberships. Leaf locks only, and no
     /// signal cell is made for an incarnation that has none.
-    pub(crate) fn of(record: &crate::actor::subtree::AbortRecord) -> Self {
+    pub(crate) fn of(record: &crate::actor::incarnation::IncarnationRef) -> Self {
         let [monitors, links, group_monitors] = record.coupling();
         Self {
             monitors: monitors as usize,

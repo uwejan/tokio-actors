@@ -16,8 +16,8 @@ use tokio::time::{sleep, timeout, Instant};
 use tokio_actors::telemetry::{EventKind, HookKind, KindSet, TelemetryEvent, TurnOutcome};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, ChildInfo,
-    RestartType, Shutdown, SpawnError, StopReason, SupervisionConfig, SupervisionError,
+    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, AutoShutdown, ChildEvent,
+    ChildInfo, RestartType, Shutdown, SpawnError, StopReason, SupervisionConfig, SupervisionError,
     SupervisorRef, SupervisorRefError,
 };
 
@@ -1422,5 +1422,66 @@ fn a_stuck_childs_verdict_goes_to_the_caller_or_ends_the_supervisor() {
                 }
             }
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// child_info_fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn child_info_fields() {
+    common::run(4, async {
+        let w = world_with(
+            ActorConfig::default().with_supervision(
+                SupervisionConfig::one_for_one().with_auto_shutdown(AutoShutdown::AnySignificant),
+            ),
+            false,
+        )
+        .await;
+        let name = w.name("spec");
+        let set = w
+            .sup
+            .start_child(
+                || Plain,
+                move |child| {
+                    child
+                        .named(name)
+                        .restart_type(RestartType::Transient)
+                        .significant(true)
+                        .kill_grace(Duration::from_secs(3))
+                        .start_timeout(Duration::from_secs(9))
+                },
+            )
+            .await
+            .expect("the child starts");
+        let plain = w
+            .sup
+            .start_child(|| Plain, |child| child)
+            .await
+            .expect("the child starts");
+
+        let spec = w.sup.get_childspec(set.id().clone()).await.expect("spec");
+        assert_eq!(spec.id, *set.id());
+        assert_eq!(spec.name, Some(w.name("spec")));
+        assert_eq!(spec.restart_type, RestartType::Transient);
+        assert!(spec.significant && spec.is_alive && !spec.is_supervisor);
+        assert_eq!(spec.kill_grace, Duration::from_secs(3));
+        assert_eq!(spec.start_timeout, Some(Duration::from_secs(9)));
+
+        let spec = w.sup.get_childspec(plain.id().clone()).await.expect("spec");
+        assert!(!spec.significant);
+        assert_eq!(spec.start_timeout, None);
+
+        let nobody = tokio_actors::ActorId::from("nobody");
+        let missing = w.sup.get_childspec(nobody.clone()).await.err();
+        let terminated = w.sup.terminate_child(nobody).await.err();
+        assert!(matches!(
+            missing,
+            Some(SupervisorRefError::Supervision(
+                SupervisionError::ChildNotFound(_)
+            ))
+        ));
+        assert_eq!(missing, terminated, "the error terminate_child gives");
     });
 }

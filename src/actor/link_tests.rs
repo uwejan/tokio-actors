@@ -10,24 +10,25 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 
+use super::incarnation::IncarnationRef;
 use super::link::{ExitPush, InboxItem, LinkState, PushResult};
-use super::subtree::AbortRecord;
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StopLane;
 use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult};
-use crate::types::{ActorId, ActorStatus, LinkExit, PeerRef, StopLane, StopReason};
+use crate::types::{ActorId, ActorStatus, LinkExit, PeerRef, StopReason};
 
 const BOUND: Duration = Duration::from_secs(10);
 
 /// A block of its own, with the lane that keeps it.
-fn block() -> (StopLane, AbortRecord) {
+fn block() -> (StopLane, IncarnationRef) {
     let (lane, rx) = StopLane::new();
     std::mem::forget(rx);
     let record = lane.abort_record().clone();
     (lane, record)
 }
 
-fn peer_of(record: &AbortRecord, name: &str) -> PeerRef {
+fn peer_of(record: &IncarnationRef, name: &str) -> PeerRef {
     PeerRef {
         actor_id: ActorId::from(name),
         incarnation: record.incarnation(),
@@ -35,7 +36,7 @@ fn peer_of(record: &AbortRecord, name: &str) -> PeerRef {
 }
 
 /// A link item from `from`, whose plane is `from`'s own.
-fn link_item(from: &AbortRecord, state: &Arc<LinkState>) -> InboxItem {
+fn link_item(from: &IncarnationRef, state: &Arc<LinkState>) -> InboxItem {
     let (_tx, plane) = from.status_channel();
     InboxItem::Link {
         state: state.clone(),

@@ -34,13 +34,18 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Instant};
 
+use crate::actor::envelope::{Envelope, SignalTag};
+use crate::actor::incarnation::{IncarnationRef, SubtreeWait, SubtreeWatch};
+use crate::actor::incarnation::{RaiseResult, StatusRx, StopLane};
 use crate::actor::mailbox::{self, MailTx};
 use crate::actor::panic::{
     contain_waker_panic, reserve_held, send_contained, try_reserve_held, WakeHold,
 };
 use crate::actor::runtime::saturating_deadline;
-use crate::actor::subtree::{AbortRecord, SubtreeWait, SubtreeWatch};
-use crate::actor::supervision::rules::{successor_wait_step, WaitAction};
+use crate::actor::supervision::model::{
+    SystemAction, SystemEnd, SystemLadder, SystemSeen, SystemStep,
+};
+use crate::actor::supervision::rules::{successor_wait_step, system_ladder_step, WaitAction};
 use crate::actor::supervision::{ABORT_SETTLE, DEFAULT_KILL_GRACE};
 use crate::actor::sys::Sys;
 use crate::actor::{Actor, ActorEnvelope};
@@ -54,8 +59,7 @@ use crate::system::{
 use crate::telemetry::wait_graph::{begin_wait, wait_wanted, WaitEdge};
 use crate::telemetry::{EventKind, RaiseOutcome, StopOrigin, TelemetryEvent};
 use crate::types::{
-    ActorId, ActorStatus, ActorStatusInfo, Envelope, Incarnation, RaiseResult, SignalTag, StatusRx,
-    StopLane, StopOutcome, StopReason, SubtreeEnd,
+    ActorId, ActorStatus, ActorStatusInfo, Incarnation, StopOutcome, StopReason, SubtreeEnd,
 };
 
 /// Queues the event for a stop request a caller made, after the lane
@@ -122,7 +126,7 @@ fn settled<R>(
 /// not use it.
 struct Edged<'a, F> {
     fut: Pin<&'a mut F>,
-    record: &'a AbortRecord,
+    record: &'a IncarnationRef,
     /// Set by the first `Pending`, whether or not an edge was recorded.
     parked: bool,
     edge: Option<WaitEdge<'a>>,
@@ -148,7 +152,7 @@ pub(crate) mod edge_probe {
 }
 
 impl<'a, F> Edged<'a, F> {
-    fn new(fut: Pin<&'a mut F>, record: &'a AbortRecord) -> Self {
+    fn new(fut: Pin<&'a mut F>, record: &'a IncarnationRef) -> Self {
         #[cfg(test)]
         edge_probe::note();
         Self {
@@ -190,6 +194,16 @@ impl<F: Future> Future for Edged<'_, F> {
 /// actor that has ended, one whose system has been freed included, is refused
 /// with `SendError::Closed`.
 pub struct ActorHandle<A: Actor> {
+    /// Every part of the handle, shared by all its clones behind one count:
+    /// a clone takes one reference and a drop gives one back. The mailbox
+    /// closes when the last handle, wherever it is held, lets the block go.
+    inner: Arc<HandleBlock<A>>,
+}
+
+/// What every clone of an actor's handle shares. The block holds the
+/// mailbox's sender, so the mailbox stays open while any handle holds the
+/// block and closes when the last one lets it go.
+struct HandleBlock<A: Actor> {
     id: ActorId,
     tx: MailTx<ActorEnvelope<A>>,
     /// Sender for the actor's priority lane. `None` on every actor spawned
@@ -234,10 +248,11 @@ impl LaneFlags {
 impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActorHandle")
-            .field("id", &self.id)
+            .field("id", &self.inner.id)
             .field(
                 "system",
                 &self
+                    .inner
                     .stop_lane
                     .abort_record()
                     .mode()
@@ -250,20 +265,14 @@ impl<A: Actor> std::fmt::Debug for ActorHandle<A> {
 impl<A: Actor> Clone for ActorHandle<A> {
     fn clone(&self) -> Self {
         Self {
-            id: self.id.clone(),
-            tx: self.tx.clone(),
-            priority_tx: self.priority_tx.clone(),
-            stop_lane: self.stop_lane.clone(),
-            mailbox_capacity: self.mailbox_capacity,
-            status_rx: self.status_rx.clone(),
-            lane_flags: self.lane_flags.clone(),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
 impl<A: Actor> PartialEq for ActorHandle<A> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.system_generation() == other.system_generation()
+        self.inner.id == other.inner.id && self.system_generation() == other.system_generation()
     }
 }
 
@@ -271,7 +280,7 @@ impl<A: Actor> Eq for ActorHandle<A> {}
 
 impl<A: Actor> std::hash::Hash for ActorHandle<A> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.inner.id.hash(state);
         self.system_generation().hash(state);
     }
 }
@@ -320,13 +329,15 @@ impl<A: Actor> ActorHandle<A> {
         lane_flags: Option<Arc<LaneFlags>>,
     ) -> Self {
         Self {
-            id,
-            tx,
-            priority_tx,
-            stop_lane,
-            mailbox_capacity,
-            status_rx,
-            lane_flags,
+            inner: Arc::new(HandleBlock {
+                id,
+                tx,
+                priority_tx,
+                stop_lane,
+                mailbox_capacity,
+                status_rx,
+                lane_flags,
+            }),
         }
     }
 
@@ -334,8 +345,8 @@ impl<A: Actor> ActorHandle<A> {
     /// the actor has none or leaves it to aliases.
     #[inline]
     fn open_lane(&self) -> Option<&mpsc::Sender<ActorEnvelope<A>>> {
-        let lane = self.priority_tx.as_ref()?;
-        match &self.lane_flags {
+        let lane = self.inner.priority_tx.as_ref()?;
+        match &self.inner.lane_flags {
             Some(flags) if flags.by_alias => None,
             _ => Some(lane),
         }
@@ -343,7 +354,7 @@ impl<A: Actor> ActorHandle<A> {
 
     /// The "lane full" warning flag, when the actor has a lane.
     fn lane_warned(&self) -> Option<&AtomicBool> {
-        self.lane_flags.as_deref().map(|flags| &flags.warned)
+        self.inner.lane_flags.as_deref().map(|flags| &flags.warned)
     }
 
     /// The `sys` calls of this actor: statistics, log, trace, installed
@@ -356,8 +367,8 @@ impl<A: Actor> ActorHandle<A> {
     /// The incarnation's abort record, which carries the bits of the `sys`
     /// bundle and the system channel the calls ride.
     #[allow(dead_code)]
-    pub(crate) fn sys_record(&self) -> &AbortRecord {
-        self.stop_lane.abort_record()
+    pub(crate) fn sys_record(&self) -> &IncarnationRef {
+        self.inner.stop_lane.abort_record()
     }
 
     /// The identity of the system this actor was spawned in: the address of
@@ -367,7 +378,7 @@ impl<A: Actor> ActorHandle<A> {
     /// Two handles are equal when they have the same id and the same
     /// system.
     pub(crate) fn system_generation(&self) -> u64 {
-        self.stop_lane.abort_record().system_identity()
+        self.inner.stop_lane.abort_record().system_identity()
     }
 
     /// The system this actor was spawned in, if it is still alive: `None`
@@ -375,20 +386,20 @@ impl<A: Actor> ActorHandle<A> {
     /// Resolved by identity, never by name, so a later system of the same
     /// name is never taken for it.
     pub(crate) fn system(&self) -> Option<Arc<ActorSystem>> {
-        self.stop_lane.abort_record().system()
+        self.inner.stop_lane.abort_record().system()
     }
 
     /// Returns a clone of this actor's stop lane sender (for wiring the
     /// supervision escalation ladder and the system registry's shutdown
     /// sweep without a mailbox round-trip).
     pub(crate) fn stop_lane(&self) -> StopLane {
-        self.stop_lane.clone()
+        self.inner.stop_lane.clone()
     }
 
     /// This actor's stop lane, borrowed: for the caller that only reads or
     /// narrows it and needs no clone of the lane, let alone of the handle.
     pub(crate) fn stop_lane_ref(&self) -> &StopLane {
-        &self.stop_lane
+        &self.inner.stop_lane
     }
 
     /// `Err(AskError::CallingSelf)` when the calling task is the task that
@@ -400,7 +411,7 @@ impl<A: Actor> ActorHandle<A> {
     /// incarnation and an ended incarnation never match.
     #[inline]
     fn refuse_self_call(&self) -> Result<(), AskError> {
-        if self.stop_lane.abort_record().is_self_call() {
+        if self.inner.stop_lane.abort_record().is_self_call() {
             return Err(AskError::CallingSelf);
         }
         Ok(())
@@ -409,19 +420,19 @@ impl<A: Actor> ActorHandle<A> {
     /// The identity fields of this actor's log statements.
     #[cfg(feature = "tracing")]
     pub(crate) fn log_fields(&self) -> crate::telemetry::LogFields<'static> {
-        crate::telemetry::log_fields(self.stop_lane.abort_record(), None)
+        crate::telemetry::log_fields(self.inner.stop_lane.abort_record(), None)
     }
 
     /// Returns a clone of the runtime status receiver (used by the system
     /// registry's shutdown cascade - see the module docs on the two
     /// observability planes).
     pub(crate) fn status_rx(&self) -> StatusRx {
-        self.status_rx.clone()
+        self.inner.status_rx.clone()
     }
 
     /// Returns the unique identifier of the actor.
     pub fn id(&self) -> &ActorId {
-        &self.id
+        &self.inner.id
     }
 
     /// Returns the [`Incarnation`] this handle reaches: the single run of the
@@ -453,42 +464,42 @@ impl<A: Actor> ActorHandle<A> {
     /// # }
     /// ```
     pub fn incarnation(&self) -> Incarnation {
-        self.status_rx.record().incarnation()
+        self.inner.status_rx.record().incarnation()
     }
 
     /// This incarnation as the owner of the drops its log lines name: its
     /// id, with the sensitivity its record carries.
     pub(crate) fn owner(&self) -> crate::actor::runtime::Owner {
-        crate::actor::runtime::Owner::of(&self.id, self.stop_lane.abort_record())
+        crate::actor::runtime::Owner::of(&self.inner.id, self.inner.stop_lane.abort_record())
     }
 
     /// The wait lists the actor's mailbox was made with.
     #[cfg(test)]
     pub(crate) fn mailbox_lanes(&self) -> usize {
-        self.tx.lane_count()
+        self.inner.tx.lane_count()
     }
 
     /// Returns the total capacity of the actor's mailbox.
     pub fn mailbox_capacity(&self) -> usize {
-        self.mailbox_capacity
+        self.inner.mailbox_capacity
     }
 
     /// Returns the number of mailbox slots in use: the messages queued plus
     /// the slots senders have reserved and not yet filled, so a slot handed to
     /// a waiting sender counts as in use from that moment.
     pub fn mailbox_len(&self) -> usize {
-        self.mailbox_capacity - self.tx.capacity()
+        self.inner.mailbox_capacity - self.inner.tx.capacity()
     }
 
     /// The senders parked on a full mailbox now.
     #[cfg(test)]
     pub(crate) fn mailbox_waiting(&self) -> usize {
-        self.tx.waiting()
+        self.inner.tx.waiting()
     }
 
     /// Returns the number of available slots in the mailbox.
     pub fn mailbox_available(&self) -> usize {
-        self.tx.capacity()
+        self.inner.tx.capacity()
     }
 
     /// Returns the priority lane's total capacity, or `0` if this actor has
@@ -500,7 +511,10 @@ impl<A: Actor> ActorHandle<A> {
     /// documented divergence from Erlang refers to: a plain Erlang process
     /// exposes only its total queue length, never a per-lane breakdown.
     pub fn priority_capacity(&self) -> usize {
-        self.priority_tx.as_ref().map_or(0, |tx| tx.max_capacity())
+        self.inner
+            .priority_tx
+            .as_ref()
+            .map_or(0, |tx| tx.max_capacity())
     }
 
     /// Returns the number of priority-lane slots in use: the messages queued
@@ -509,7 +523,8 @@ impl<A: Actor> ActorHandle<A> {
     /// normal mailbox, and vice versa: see
     /// [`mailbox_len`](Self::mailbox_len) for that counter.
     pub fn priority_len(&self) -> usize {
-        self.priority_tx
+        self.inner
+            .priority_tx
             .as_ref()
             .map_or(0, |tx| tx.max_capacity() - tx.capacity())
     }
@@ -549,7 +564,7 @@ impl<A: Actor> ActorHandle<A> {
     /// the end of the children's teardown, and `status()` keeps its own
     /// reading until the actor reaches `Stopped`.
     pub fn is_alive(&self) -> bool {
-        !self.tx.is_closed()
+        !self.inner.tx.is_closed()
     }
 
     /// Returns the actor's current lifecycle status.
@@ -572,7 +587,7 @@ impl<A: Actor> ActorHandle<A> {
     /// its status sender closing is the terminal signal instead, and this
     /// reports [`Stopped`](ActorStatus::Stopped) for that case too.
     pub fn status(&self) -> ActorStatus {
-        read_status(&self.status_rx)
+        read_status(&self.inner.status_rx)
     }
 
     /// Sends a message to the actor without waiting for a response (fire-and-forget).
@@ -607,8 +622,8 @@ impl<A: Actor> ActorHandle<A> {
     /// - `SendError::Full` if the call is made on the actor's own task and its
     ///   mailbox is full.
     pub async fn notify(&self, msg: A::Message) -> Result<(), SendError> {
-        let record = self.stop_lane.abort_record();
-        let mut reserve = pin!(self.tx.reserve());
+        let record = self.inner.stop_lane.abort_record();
+        let mut reserve = pin!(self.inner.tx.reserve());
         let wait = std::future::poll_fn(|cx| poll_cast_unit(reserve.as_mut(), cx, record));
         let permit = if wait_wanted(record) {
             Edged::new(pin!(wait), record).await
@@ -683,7 +698,8 @@ impl<A: Actor> ActorHandle<A> {
     /// - `TrySendError::Full` if the mailbox is full.
     /// - `TrySendError::Closed` if the actor has stopped.
     pub fn try_notify(&self, msg: A::Message) -> Result<(), TrySendError> {
-        self.tx
+        self.inner
+            .tx
             .try_send(Envelope::Message {
                 payload: msg,
                 responder: None,
@@ -701,19 +717,23 @@ impl<A: Actor> ActorHandle<A> {
     /// Nothing awaits between the reserve and the permit's send or drop, so a
     /// forwarder can decide at that instant whether its message is sent.
     pub(crate) async fn reserve_forward(&self) -> Option<ForwardPermit<'_, A>> {
-        self.tx.reserve().await.ok().map(ForwardPermit::Normal)
+        let tx = &self.inner.tx;
+        tx.reserve().await.ok().map(ForwardPermit::Normal)
     }
 
     /// As [`reserve_forward`](Self::reserve_forward) for a monitor's notice:
     /// on the priority lane when `priority` is set and the actor has one,
     /// otherwise on the normal mailbox.
     pub(crate) async fn reserve_signal(&self, priority: bool) -> Option<ForwardPermit<'_, A>> {
-        match (&self.priority_tx, priority) {
-            (Some(lane), true) => {
-                reserve_priority(lane, &self.id, None, self.stop_lane.abort_record())
-                    .await
-                    .map(|permit| ForwardPermit::Priority(permit, lane))
-            }
+        match (&self.inner.priority_tx, priority) {
+            (Some(lane), true) => reserve_priority(
+                lane,
+                &self.inner.id,
+                None,
+                self.inner.stop_lane.abort_record(),
+            )
+            .await
+            .map(|permit| ForwardPermit::Priority(permit, lane)),
             _ => self.reserve_forward().await,
         }
     }
@@ -726,8 +746,8 @@ impl<A: Actor> ActorHandle<A> {
         &'a self,
         lane: &'a mpsc::Sender<ActorEnvelope<A>>,
     ) -> Result<WakeHold<mpsc::Permit<'a, ActorEnvelope<A>>>, SendError> {
-        let record = self.stop_lane.abort_record();
-        match try_reserve_held("priority lane", Some(&self.id), lane) {
+        let record = self.inner.stop_lane.abort_record();
+        match try_reserve_held("priority lane", Some(&self.inner.id), lane) {
             Ok(permit) => {
                 lane_room(self.lane_warned());
                 return Ok(permit);
@@ -738,7 +758,7 @@ impl<A: Actor> ActorHandle<A> {
             }
             Err(mpsc::error::TrySendError::Full(())) => {}
         }
-        let wait = reserve_priority(lane, &self.id, self.lane_warned(), record);
+        let wait = reserve_priority(lane, &self.inner.id, self.lane_warned(), record);
         if wait_wanted(record) {
             Edged::new(pin!(wait), record).await
         } else {
@@ -756,14 +776,14 @@ impl<A: Actor> ActorHandle<A> {
         &self,
         priority: bool,
     ) -> Result<ForwardPermit<'_, A>, SendError> {
-        match (&self.priority_tx, priority) {
+        match (&self.inner.priority_tx, priority) {
             (Some(lane), true) => self
                 .reserve_lane_cast(lane)
                 .await
                 .map(|permit| ForwardPermit::Priority(permit, lane)),
             _ => {
-                let record = self.stop_lane.abort_record();
-                let mut reserve = pin!(self.tx.reserve());
+                let record = self.inner.stop_lane.abort_record();
+                let mut reserve = pin!(self.inner.tx.reserve());
                 std::future::poll_fn(|cx| poll_cast_unit(reserve.as_mut(), cx, record))
                     .await
                     .map(ForwardPermit::Normal)
@@ -778,14 +798,14 @@ impl<A: Actor> ActorHandle<A> {
         &self,
         priority: bool,
     ) -> Result<ForwardPermit<'_, A>, TrySendError> {
-        match (&self.priority_tx, priority) {
-            (Some(lane), true) => try_reserve_held("priority lane", Some(&self.id), lane)
+        match (&self.inner.priority_tx, priority) {
+            (Some(lane), true) => try_reserve_held("priority lane", Some(&self.inner.id), lane)
                 .map(|permit| ForwardPermit::Priority(permit, lane))
                 .map_err(|err| match err {
                     mpsc::error::TrySendError::Full(()) => TrySendError::Full,
                     mpsc::error::TrySendError::Closed(()) => TrySendError::Closed,
                 }),
-            _ => self.tx.try_reserve().map(ForwardPermit::Normal),
+            _ => self.inner.tx.try_reserve().map(ForwardPermit::Normal),
         }
     }
 
@@ -795,7 +815,8 @@ impl<A: Actor> ActorHandle<A> {
         &self,
         msg: A::Message,
     ) -> Result<(), mpsc::error::TrySendError<A::Message>> {
-        self.tx
+        self.inner
+            .tx
             .try_send(Envelope::Message {
                 payload: msg,
                 responder: None,
@@ -813,14 +834,14 @@ impl<A: Actor> ActorHandle<A> {
     /// True once the actor's mailbox is closed (see
     /// [`mailbox_close`](Self::mailbox_close)).
     pub(crate) fn mailbox_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.inner.tx.is_closed()
     }
 
     /// Completes once the actor's mailbox is closed: by its receiver's
     /// `close`, once `on_stopped` has returned, the initialization failed,
     /// or a `Kill` ended the run, or by the receiver's drop.
     pub(crate) async fn mailbox_close(&self) {
-        self.tx.closed().await;
+        self.inner.tx.closed().await;
     }
 
     /// Attempts to send a message on the priority lane without blocking.
@@ -874,6 +895,8 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     /// Sends a message and waits for a response (request-response).
+    ///
+    /// Kind: a call from outside, through the mailbox. See [`signals`](crate::signals).
     ///
     /// To answer later, as a deferred reply does in Erlang/OTP, put a
     /// `tokio::sync::oneshot::Sender` in the message and answer it from a later
@@ -936,12 +959,12 @@ impl<A: Actor> ActorHandle<A> {
     pub async fn send(&self, msg: A::Message) -> Result<A::Response, AskError> {
         self.refuse_self_call()?;
         let (tx, mut rx) = oneshot::channel();
-        let record = self.stop_lane.abort_record();
+        let record = self.inner.stop_lane.abort_record();
         let edged = wait_wanted(record);
         let permit = if edged {
-            Edged::new(pin!(self.tx.reserve()), record).await
+            Edged::new(pin!(self.inner.tx.reserve()), record).await
         } else {
-            self.tx.reserve().await
+            self.inner.tx.reserve().await
         }
         .map_err(|_| AskError::Closed)?;
         #[cfg(test)]
@@ -950,7 +973,7 @@ impl<A: Actor> ActorHandle<A> {
             payload: msg,
             responder: Some(tx),
         });
-        if queue_closed_after_push(|| self.tx.is_closed()) {
+        if queue_closed_after_push(|| self.inner.tx.is_closed()) {
             return self.answer_after_close(rx).await;
         }
 
@@ -994,7 +1017,7 @@ impl<A: Actor> ActorHandle<A> {
     /// runtime status plane, waiting until the reason is final (written at
     /// the actor's lane seal) or the plane closes.
     async fn response_dropped(&self) -> AskError {
-        let mut rx = self.status_rx.clone();
+        let mut rx = self.inner.status_rx.clone();
         AskError::ResponseDropped {
             reason: wait_final_reason(&mut rx).await,
         }
@@ -1076,17 +1099,22 @@ impl<A: Actor> ActorHandle<A> {
         };
         self.refuse_self_call()?;
         let (resp_tx, mut resp_rx) = oneshot::channel();
-        let record = self.stop_lane.abort_record();
+        let record = self.inner.stop_lane.abort_record();
         let edged = wait_wanted(record);
 
         let permit = if edged {
             Edged::new(
-                pin!(reserve_priority(tx, &self.id, self.lane_warned(), record)),
+                pin!(reserve_priority(
+                    tx,
+                    &self.inner.id,
+                    self.lane_warned(),
+                    record
+                )),
                 record,
             )
             .await
         } else {
-            reserve_priority(tx, &self.id, self.lane_warned(), record).await
+            reserve_priority(tx, &self.inner.id, self.lane_warned(), record).await
         }
         .ok_or(AskError::Closed)?
         .into_inner();
@@ -1117,6 +1145,8 @@ impl<A: Actor> ActorHandle<A> {
     /// Sends a message and waits for a response, bounded by a single deadline
     /// that spans both enqueueing the message and awaiting the reply. A timeout
     /// beyond 30 years is treated as 30 years.
+    ///
+    /// Kind: a call from outside, through the mailbox. See [`signals`](crate::signals).
     ///
     /// Mirrors `gen_server:call/3`: one clock for the whole request. The
     /// deadline is armed BEFORE the mailbox send, so a request parked on a
@@ -1178,7 +1208,7 @@ impl<A: Actor> ActorHandle<A> {
         let deadline = saturating_deadline(Instant::now(), timeout);
         let (tx, rx) = oneshot::channel();
 
-        let permit = match time::timeout_at(deadline, self.tx.reserve()).await {
+        let permit = match time::timeout_at(deadline, self.inner.tx.reserve()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(AskError::Closed),
             Err(_) => return Err(AskError::Timeout { enqueued: false }),
@@ -1189,13 +1219,13 @@ impl<A: Actor> ActorHandle<A> {
             payload: msg,
             responder: Some(tx),
         });
-        if queue_closed_after_push(|| self.tx.is_closed()) {
+        if queue_closed_after_push(|| self.inner.tx.is_closed()) {
             return time::timeout_at(deadline, self.answer_after_close(rx))
                 .await
                 .unwrap_or(Err(AskError::Timeout { enqueued: true }));
         }
 
-        let reply = time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+        let reply = time::timeout_at(deadline, async {
             match rx.await {
                 Ok(reply) => Ok(reply),
                 Err(_) => Err(self.response_dropped().await),
@@ -1300,7 +1330,12 @@ impl<A: Actor> ActorHandle<A> {
 
         let permit = match time::timeout_at(
             deadline,
-            reserve_priority(tx, &self.id, None, self.stop_lane.abort_record()),
+            reserve_priority(
+                tx,
+                &self.inner.id,
+                None,
+                self.inner.stop_lane.abort_record(),
+            ),
         )
         .await
         {
@@ -1320,7 +1355,7 @@ impl<A: Actor> ActorHandle<A> {
                 .unwrap_or(Err(AskError::Timeout { enqueued: true }));
         }
 
-        let reply = time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+        let reply = time::timeout_at(deadline, async {
             match resp_rx.await {
                 Ok(reply) => Ok(reply),
                 Err(_) => Err(self.response_dropped().await),
@@ -1407,6 +1442,45 @@ impl<A: Actor> ActorHandle<A> {
     /// `SendError::Closed`. [`ActorSystem::stop`](crate::system::ActorSystem::stop)
     /// and [`ActorSystem::kill`](crate::system::ActorSystem::kill) answer
     /// `NotFound` once the actor has left the registry.
+    ///
+    /// # Stopping after a delay
+    ///
+    /// A stop that is due later is a task of the application's own: it
+    /// sleeps on the runtime it owns and then stops, or sends to, the target
+    /// by its handle or id
+    /// ([`kill_by_id`](crate::system::ActorSystem::kill_by_id) for a kill).
+    /// A send to a target that has ended fails with `SendError::Closed`
+    /// and harms nothing.
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult, SendError, StopReason,
+    /// };
+    ///
+    /// struct Worker;
+    /// impl Actor for Worker {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// #[tokio::main(flavor = "current_thread", start_paused = true)]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let worker = Worker.spawn().await?;
+    ///     let target = worker.clone();
+    ///     tokio::spawn(async move {
+    ///         tokio::time::sleep(Duration::from_secs(30)).await;
+    ///         let _ = target.stop(StopReason::Graceful).await;
+    ///     });
+    ///     assert_eq!(worker.wait_stopped().await, StopReason::Graceful);
+    ///     assert!(matches!(worker.notify(()).await, Err(SendError::Closed)));
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn stop(&self, reason: StopReason) -> Result<(), SendError> {
         if matches!(reason, StopReason::Kill) {
             // The deadline, the raise and the backstop are one call: the
@@ -1414,13 +1488,10 @@ impl<A: Actor> ActorHandle<A> {
             let system = self.system();
             let raised = raise_kill_declared(
                 system.as_deref(),
-                KillKey::Id(&self.id),
-                &self.status_rx,
-                &self.stop_lane,
-                None,
-                None,
-                || {},
-                None,
+                KillKey::Id(&self.inner.id),
+                &self.inner.status_rx,
+                &self.inner.stop_lane,
+                crate::system::KillFrom::Plain,
             );
             // The shared raise queued the request's event.
             if raised.result == RaiseResult::Refused {
@@ -1428,7 +1499,7 @@ impl<A: Actor> ActorHandle<A> {
             }
             return Ok(());
         }
-        if crate::telemetry::engaged_for(self.stop_lane.abort_record(), None) {
+        if crate::telemetry::engaged_for(self.inner.stop_lane.abort_record(), None) {
             return self.stop_noted(reason);
         }
         if self.raise_request(reason) == RaiseResult::Refused {
@@ -1441,7 +1512,7 @@ impl<A: Actor> ActorHandle<A> {
     /// [`stop`](Self::stop) and its telemetry tail.
     #[inline(always)]
     fn raise_request(&self, reason: StopReason) -> RaiseResult {
-        self.stop_lane.try_raise(reason)
+        self.inner.stop_lane.try_raise(reason)
     }
 
     /// The tail of [`stop`](Self::stop) for a system that takes telemetry
@@ -1453,7 +1524,7 @@ impl<A: Actor> ActorHandle<A> {
         let raised = self.raise_request(reason);
         emit_stop_requested(
             None,
-            &self.stop_lane,
+            &self.inner.stop_lane,
             &kept,
             raised,
             StopOrigin::Requested,
@@ -1603,10 +1674,10 @@ impl<A: Actor> ActorHandle<A> {
         // An actor that does not take the request is answered first, as
         // `stop` answers it: that needs no timer. The timer check comes
         // next, and the raise, which changes state, after it.
-        if self.stop_lane.refuses(&reason) {
+        if self.inner.stop_lane.refuses(&reason) {
             emit_stop_requested(
                 None,
-                &self.stop_lane,
+                &self.inner.stop_lane,
                 &reason,
                 RaiseResult::Refused,
                 StopOrigin::Requested,
@@ -1618,7 +1689,7 @@ impl<A: Actor> ActorHandle<A> {
         let caller_runtime = Handle::current();
         // Every deadline of the call counts from this instant.
         let call = Instant::now();
-        let mut rx = self.status_rx.clone();
+        let mut rx = self.inner.status_rx.clone();
         let is_kill = matches!(reason, StopReason::Kill);
         // The incarnation's own kill grace, read while its registry entry
         // still holds it: the entry is freed before the actor publishes
@@ -1627,12 +1698,13 @@ impl<A: Actor> ActorHandle<A> {
         let system = self.system();
         let kill_grace = system
             .as_ref()
-            .and_then(|system| system.kill_target_for(&self.id, &self.status_rx))
+            .and_then(|system| system.kill_target_for(&self.inner.id, &self.inner.status_rx))
             .map_or(DEFAULT_KILL_GRACE, |(_, grace, _)| grace);
         let timing = (call, within, kill_grace);
         // A `Kill` queues its request event in the shared raise.
-        let kept = (!is_kill && crate::telemetry::engaged_for(self.stop_lane.abort_record(), None))
-            .then(|| reason.clone());
+        let kept = (!is_kill
+            && crate::telemetry::engaged_for(self.inner.stop_lane.abort_record(), None))
+        .then(|| reason.clone());
         // A call made from inside a task spawns the stop task before it
         // raises the first request, so the actor that the request wakes
         // keeps the worker's next-task slot and runs on the worker that
@@ -1649,8 +1721,8 @@ impl<A: Actor> ActorHandle<A> {
                 Some(spawn_ladder(
                     system,
                     &caller_runtime,
-                    &self.id,
-                    &self.stop_lane,
+                    &self.inner.id,
+                    &self.inner.stop_lane,
                     &rx,
                     (timing, in_task),
                     false,
@@ -1665,26 +1737,23 @@ impl<A: Actor> ActorHandle<A> {
         let first_request = FirstRequest(ladder.as_ref().map(|ladder| ladder.step.clone()));
         #[cfg(test)]
         if let Some(system) = &system {
-            system.run_ladder_hook(crate::system::LadderPoint::StopBeforeRaise, &self.id);
+            system.run_ladder_hook(crate::system::LadderPoint::StopBeforeRaise, &self.inner.id);
         }
         let raised = if is_kill {
             raise_kill_declared(
                 system.as_deref(),
-                KillKey::Id(&self.id),
-                &self.status_rx,
-                &self.stop_lane,
-                Some(within),
-                None,
-                || {},
-                None,
+                KillKey::Id(&self.inner.id),
+                &self.inner.status_rx,
+                &self.inner.stop_lane,
+                crate::system::KillFrom::Window(within),
             )
             .result
         } else {
-            self.stop_lane.try_raise(reason)
+            self.inner.stop_lane.try_raise(reason)
         };
         #[cfg(test)]
         if let Some(system) = &system {
-            system.run_ladder_hook(crate::system::LadderPoint::StopRaised, &self.id);
+            system.run_ladder_hook(crate::system::LadderPoint::StopRaised, &self.inner.id);
         }
         // The decision follows the raise with nothing awaited in between.
         if raised == RaiseResult::Refused {
@@ -1693,12 +1762,12 @@ impl<A: Actor> ActorHandle<A> {
             }
             #[cfg(test)]
             if let Some(system) = &system {
-                system.run_ladder_hook(crate::system::LadderPoint::StopDecided, &self.id);
+                system.run_ladder_hook(crate::system::LadderPoint::StopDecided, &self.inner.id);
             }
             if let Some(kept) = &kept {
                 emit_stop_requested(
                     system.as_deref(),
-                    &self.stop_lane,
+                    &self.inner.stop_lane,
                     kept,
                     raised,
                     StopOrigin::Requested,
@@ -1713,7 +1782,7 @@ impl<A: Actor> ActorHandle<A> {
             .is_some_and(|step| step.decide_accepted());
         #[cfg(test)]
         if let Some(system) = &system {
-            system.run_ladder_hook(crate::system::LadderPoint::StopDecided, &self.id);
+            system.run_ladder_hook(crate::system::LadderPoint::StopDecided, &self.inner.id);
         }
         if task_lost {
             // The stop task was lost before it could know the request was
@@ -1722,8 +1791,8 @@ impl<A: Actor> ActorHandle<A> {
             if let (Some(system), Some(ladder)) = (&system, &ladder) {
                 hand_off_steps(
                     system,
-                    &self.id,
-                    &self.stop_lane,
+                    &self.inner.id,
+                    &self.inner.stop_lane,
                     &rx,
                     &ladder.step,
                     (call, within),
@@ -1733,7 +1802,7 @@ impl<A: Actor> ActorHandle<A> {
         if let Some(kept) = &kept {
             emit_stop_requested(
                 system.as_deref(),
-                &self.stop_lane,
+                &self.inner.stop_lane,
                 kept,
                 raised,
                 StopOrigin::Requested,
@@ -1759,8 +1828,8 @@ impl<A: Actor> ActorHandle<A> {
             // the ladder runs in the caller's own future.
             let mut task = StopTask::new(
                 None,
-                self.id.clone(),
-                self.stop_lane.clone(),
+                self.inner.id.clone(),
+                self.inner.stop_lane.clone(),
                 rx,
                 Arc::new(StopStep::accepted()),
                 timing,
@@ -1775,8 +1844,8 @@ impl<A: Actor> ActorHandle<A> {
             spawn_ladder(
                 &system,
                 &caller_runtime,
-                &self.id,
-                &self.stop_lane,
+                &self.inner.id,
+                &self.inner.stop_lane,
                 &rx,
                 (timing, in_task),
                 true,
@@ -1790,13 +1859,10 @@ impl<A: Actor> ActorHandle<A> {
         if saturating_deadline(call, within) <= call {
             raise_kill_declared(
                 Some(&system),
-                KillKey::Id(&self.id),
+                KillKey::Id(&self.inner.id),
                 &rx,
-                &self.stop_lane,
-                None,
-                Some(&step),
-                || {},
-                None,
+                &self.inner.stop_lane,
+                crate::system::KillFrom::Step(&step),
             );
         }
 
@@ -1811,7 +1877,7 @@ impl<A: Actor> ActorHandle<A> {
                 Err(_) => {
                     closed_answer_outcome(
                         &system,
-                        &self.id,
+                        &self.inner.id,
                         &mut rx,
                         &step,
                         timing,
@@ -1856,7 +1922,8 @@ impl<A: Actor> ActorHandle<A> {
     pub async fn get_status(&self) -> Result<ActorStatusInfo, AskError> {
         self.refuse_self_call()?;
         let (tx, rx) = oneshot::channel();
-        self.stop_lane
+        self.inner
+            .stop_lane
             .abort_record()
             .submit_status(tx)
             .await
@@ -1910,7 +1977,7 @@ impl<A: Actor> ActorHandle<A> {
     /// returns when its task is next polled, not before. Poll it from a task
     /// whose waker does not panic.
     pub async fn wait_stopped(&self) -> StopReason {
-        let mut rx = self.status_rx.clone();
+        let mut rx = self.inner.status_rx.clone();
         wait_reason(&mut rx).await
     }
 
@@ -1923,7 +1990,7 @@ impl<A: Actor> ActorHandle<A> {
     /// Await it with
     /// [`SubtreeObserver::wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended).
     pub fn observe_subtree(&self) -> SubtreeObserver {
-        SubtreeObserver::new(self.status_rx.clone())
+        SubtreeObserver::new(self.inner.status_rx.clone())
     }
 }
 
@@ -2071,27 +2138,6 @@ impl SubtreeObserver {
             }
         }
     }
-}
-
-/// The last steps of every bounded stop: aborts the task when the registry
-/// still holds its abort handle, then waits the settle time. `requested` is
-/// what a `Stopped` the actor publishes reads as.
-async fn abort_and_settle(
-    system: Option<&ActorSystem>,
-    id: &ActorId,
-    lane: &StopLane,
-    rx: &mut StatusRx,
-    requested: StopOutcome,
-) -> StopOutcome {
-    if let Some(system) = system {
-        if let Some((Some(abort), _, _)) = system.kill_target_for(id, rx) {
-            lane.abort_record().abort(&abort);
-        }
-    }
-    if wait_terminal(rx, ABORT_SETTLE).await {
-        return terminal_outcome(rx, requested);
-    }
-    StopOutcome::Unresponsive
 }
 
 /// The instant at which the whole ladder of a call made at `call` is over:
@@ -2255,10 +2301,24 @@ impl StopTask {
         }
     }
 
+    /// Arms the `StopKillStored` point to run inside the next raise on this
+    /// thread, once the step cell counted the raiser and before the raise.
+    #[cfg(test)]
+    fn arm_stored_hook(&self) {
+        let (system, id) = (self.system.clone(), self.id.clone());
+        crate::system::run_once_before_the_next_kill_raise(move || {
+            if let Some(system) = system {
+                system.run_ladder_hook(crate::system::LadderPoint::StopKillStored, &id);
+            }
+        });
+    }
+
     /// Waits up to the window for a terminal status, raises `Kill` and arms
-    /// its backstop, waits the kill grace, then aborts and settles. A `Kill`
-    /// the lane refuses belongs to an actor already past its last read of
-    /// it: it ends with its own reason, and the outcome reads `Graceful`.
+    /// its backstop, waits the kill grace, then aborts and settles, each step
+    /// as [`system_ladder_step`] names it. A `Kill` the lane refuses belongs
+    /// to an actor already past its last read of it: it ends with its own
+    /// reason, and the outcome reads `Graceful`. The abort is issued when the
+    /// registry still holds the task's abort handle.
     async fn run(&mut self) -> StopOutcome {
         #[cfg(test)]
         self.hook(crate::system::LadderPoint::StopHelperStart);
@@ -2274,51 +2334,95 @@ impl StopTask {
                 () = time::sleep_until(window_end) => {}
             }
         }
-        if !self.step.first_request_accepted().await {
-            // The lane refused the call's first request: no step is owed.
-            self.done = true;
-            return StopOutcome::Graceful;
-        }
-        if wait_terminal_until(&mut self.rx, window_end).await {
-            self.done = true;
-            return terminal_outcome(&self.rx, self.step.requested().await);
-        }
-        #[cfg(test)]
-        self.hook(crate::system::LadderPoint::StopWithinKill);
-        #[cfg(test)]
-        let stored = || self.hook(crate::system::LadderPoint::StopKillStored);
-        #[cfg(not(test))]
-        let stored = || {};
-        // A call whose window had passed at the call took this step itself.
-        if !self.step.kill_started() {
-            raise_kill_declared(
-                self.system.as_deref(),
-                KillKey::Id(&self.id),
-                &self.rx,
-                &self.lane,
-                None,
-                Some(&self.step),
-                stored,
-                None,
-            );
-        }
-        #[cfg(test)]
-        self.hook(crate::system::LadderPoint::StopAfterKill);
-        let outcome = if wait_terminal(&mut self.rx, self.kill_grace).await {
-            terminal_outcome(&self.rx, self.step.requested().await)
-        } else {
-            let requested = self.step.requested().await;
-            abort_and_settle(
-                self.system.as_deref(),
-                &self.id,
-                &self.lane,
-                &mut self.rx,
-                requested,
-            )
-            .await
+        let ladder = SystemLadder::Bounded {
+            window_end: window_end.into_std(),
+            grace: self.kill_grace,
         };
-        self.done = true;
-        outcome
+        let accepted = self.step.first_request_accepted().await;
+        let mut now = Instant::now().into_std();
+        let begin = SystemSeen::Begin { accepted };
+        let (mut step, mut action) = system_ladder_step(ladder, SystemStep::Start, begin, now);
+        // The step the last decision was made at, and what a `Stopped` the
+        // actor publishes reads as, read before the abort.
+        let (mut from, mut requested) = (SystemStep::Start, None);
+        loop {
+            let seen = match action {
+                SystemAction::WaitUntil(until) => {
+                    let in_window = matches!(step, SystemStep::Window { .. });
+                    let ended = if in_window {
+                        wait_terminal_until(&mut self.rx, Instant::from_std(until)).await
+                    } else {
+                        wait_terminal(&mut self.rx, until.saturating_duration_since(now)).await
+                    };
+                    if ended {
+                        SystemSeen::Ended
+                    } else {
+                        #[cfg(test)]
+                        if in_window {
+                            self.hook(crate::system::LadderPoint::StopWithinKill);
+                        }
+                        // A call whose window had passed at the call took the
+                        // `Kill` step itself.
+                        SystemSeen::Passed {
+                            kill_started: in_window && self.step.kill_started(),
+                        }
+                    }
+                }
+                SystemAction::Kill { raise } => {
+                    if raise {
+                        #[cfg(test)]
+                        self.arm_stored_hook();
+                        raise_kill_declared(
+                            self.system.as_deref(),
+                            KillKey::Id(&self.id),
+                            &self.rx,
+                            &self.lane,
+                            crate::system::KillFrom::Step(&self.step),
+                        );
+                    }
+                    #[cfg(test)]
+                    self.hook(crate::system::LadderPoint::StopAfterKill);
+                    SystemSeen::Taken { raised: raise }
+                }
+                SystemAction::Abort => {
+                    requested = Some(self.step.requested().await);
+                    if let Some(system) = self.system.as_deref() {
+                        if let Some((Some(abort), _, _)) =
+                            system.kill_target_for(&self.id, &self.rx)
+                        {
+                            self.lane.abort_record().abort(&abort);
+                        }
+                    }
+                    SystemSeen::Taken { raised: false }
+                }
+                SystemAction::Finish(end) => {
+                    // An outcome the window gave owes no step from here on.
+                    if matches!(from, SystemStep::Start | SystemStep::Window { .. }) {
+                        self.done = true;
+                    }
+                    let outcome = match end {
+                        SystemEnd::Terminal { .. } => {
+                            let requested = match requested {
+                                Some(requested) => requested,
+                                None => self.step.requested().await,
+                            };
+                            terminal_outcome(&self.rx, requested)
+                        }
+                        SystemEnd::Refused => StopOutcome::Graceful,
+                        SystemEnd::Unresponsive => StopOutcome::Unresponsive,
+                        SystemEnd::Sweep { .. } => unreachable!("a bounded stop has no sweep"),
+                    };
+                    self.done = true;
+                    return outcome;
+                }
+                SystemAction::Request | SystemAction::WaitFloor { .. } | SystemAction::None => {
+                    unreachable!("a bounded stop takes no such step")
+                }
+            };
+            now = Instant::now().into_std();
+            from = step;
+            (step, action) = system_ladder_step(ladder, from, seen, now);
+        }
     }
 
     /// Sends the outcome to the caller, if it still waits.
@@ -2381,10 +2485,7 @@ fn hand_off_steps(
                         KillKey::Id(id),
                         rx,
                         lane,
-                        None,
-                        Some(step),
-                        || {},
-                        None,
+                        crate::system::KillFrom::Step(step),
                     );
                 }
                 return;
@@ -2404,10 +2505,7 @@ fn hand_off_steps(
                 KillKey::Id(id),
                 rx,
                 lane,
-                None,
-                Some(step),
-                || {},
-                None,
+                crate::system::KillFrom::Step(step),
             );
         }
     }
@@ -2451,7 +2549,7 @@ impl Drop for StopTask {
 fn poll_cast_unit<'a, T>(
     mut reserve: Pin<&mut mailbox::Reserve<'a, T>>,
     cx: &mut Context<'_>,
-    record: &AbortRecord,
+    record: &IncarnationRef,
 ) -> Poll<Result<mailbox::Permit<'a, T>, SendError>> {
     match reserve.as_mut().poll(cx) {
         Poll::Ready(result) => Poll::Ready(result.map_err(|_| SendError::Closed)),
@@ -2483,7 +2581,7 @@ async fn reserve_priority<'a, M>(
     lane: &'a mpsc::Sender<M>,
     owner: &ActorId,
     warned: Option<&AtomicBool>,
-    record: &AbortRecord,
+    record: &IncarnationRef,
 ) -> Option<WakeHold<mpsc::Permit<'a, M>>> {
     reserve_held("priority lane", Some(owner), lane, |full| {
         #[cfg(feature = "tracing")]

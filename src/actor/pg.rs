@@ -273,7 +273,7 @@ pub(crate) struct PgScopeInner {
     name: Arc<str>,
     system_name: Arc<str>,
     /// The telemetry state of the system the scope belongs to, which is the
-    /// system's identity (see `AbortRecord::spawned_in`): a handle of another
+    /// system's identity (see `IncarnationRef::spawned_in`): a handle of another
     /// system, one of the same name included, is foreign to the scope. The
     /// weak reference holds no strong count and keeps the allocation, so a
     /// system created after this one is gone never has the same address.

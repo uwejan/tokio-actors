@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use super::*;
+use crate::actor::incarnation::StopLane;
 use crate::actor::ActorEnvelope;
 use crate::error::ActorResult;
-use crate::types::StopLane;
 
 struct Sink;
 

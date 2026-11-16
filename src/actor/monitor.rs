@@ -24,16 +24,16 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::context::Released;
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::{ActorHandle, ForwardPermit};
+use crate::actor::incarnation::IncarnationRef;
+use crate::actor::incarnation::StatusRx;
 use crate::actor::panic::{catch_sync, payload_into_string};
 use crate::actor::runtime::{end_value, log_late_drop};
-use crate::actor::subtree::AbortRecord;
 use crate::actor::{Actor, ActorEnvelope};
 use crate::error::ActorError;
 use crate::system::{wait_final_reason, ActorSystem, MonitorKey, ResolvedTarget};
-use crate::types::{
-    ActorId, ActorStatus, Down, DownReason, Incarnation, MonitorId, SignalTag, StatusRx, StopReason,
-};
+use crate::types::{ActorId, ActorStatus, Down, DownReason, Incarnation, MonitorId, StopReason};
 
 /// The notice has not been made, sent or revoked.
 const PENDING: u8 = 0;
@@ -59,13 +59,13 @@ pub(crate) type MapFn<M> = dyn Fn(Down) -> M + Send + Sync + 'static;
 pub(crate) struct MonitorCount {
     /// The watched run's block; `None` for a monitor that never had a live
     /// run to count on.
-    record: Option<AbortRecord>,
+    record: Option<IncarnationRef>,
     released: AtomicBool,
 }
 
 impl MonitorCount {
     /// A count on `record`, which gains one watcher now.
-    fn on(record: AbortRecord) -> Self {
+    fn on(record: IncarnationRef) -> Self {
         record.add_monitored_by();
         Self {
             record: Some(record),
@@ -304,7 +304,7 @@ pub(crate) struct MonitorState<A: Actor> {
     stash: Vec<ActorEnvelope<A>>,
     /// The block of the actor that holds the state, set by the first monitor:
     /// the count of monitors is recorded there for a snapshot to read.
-    own: Option<crate::actor::subtree::AbortRecord>,
+    own: Option<crate::actor::incarnation::IncarnationRef>,
 }
 
 impl<A: Actor> Drop for MonitorState<A> {
@@ -360,7 +360,7 @@ impl<A: Actor> MonitorState<A> {
 
     /// Names the block of the actor that holds the state, where the count of
     /// monitors is recorded; the first call is kept.
-    pub(crate) fn bind(&mut self, own: &crate::actor::subtree::AbortRecord) {
+    pub(crate) fn bind(&mut self, own: &crate::actor::incarnation::IncarnationRef) {
         if self.own.is_none() {
             self.own = Some(own.clone());
         }
@@ -376,7 +376,7 @@ impl<A: Actor> MonitorState<A> {
     fn note_monitors(&self) {
         if let Some(own) = &self.own {
             own.set_coupling(
-                crate::actor::subtree::Coupling::Monitor,
+                crate::actor::incarnation::Coupling::Monitor,
                 u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
             );
         }
@@ -633,33 +633,75 @@ pub(crate) async fn monitor_forward<A: Actor>(
                 // owner is not failed for a monitor it has already released.
                 return Released::default();
             }
-            // Kept before the raise: a panic that lands after the watcher's
-            // message loop read its stop lane for the last time raises where
-            // no reader is left, and the stop reads the panic from the
-            // incarnation's record.
-            handle
-                .stop_lane_ref()
-                .abort_record()
-                .keep_map_panic(panic.clone());
-            shared.spend();
-            #[cfg(feature = "tracing")]
-            caught_log!(warn,
-                actor_id = %handle.id(),
-                panic = %handle.log_fields().panic_text(&panic),
-                "a monitor's map function panicked; the actor fails with that panic"
-            );
-            let _ = crate::system::raise_noted(
-                None,
-                handle.stop_lane_ref(),
-                StopReason::Failure(ActorError::Panic(panic.clone())),
-                crate::telemetry::StopOrigin::MapPanic,
-            );
+            fail_by_map(&handle, &panic, Some(&shared), MapSite::Monitor);
             Released {
                 run: Some(panic),
                 end: None,
             }
         }
     }
+}
+
+/// The signal whose map function panicked, for the log line.
+#[derive(Clone, Copy)]
+pub(crate) enum MapSite {
+    /// A peer monitor's map.
+    Monitor,
+    /// A link's trap map.
+    Trap,
+    /// A group monitor's map.
+    Group,
+}
+
+/// Fails the actor of `handle` with the panic of a signal map function. The
+/// panic is kept in the incarnation's record before the raise: a panic that
+/// lands after the actor's message loop read its stop lane for the last time
+/// raises where no reader is left, and the stop reads the panic from the
+/// record. `spend` is the signal's cell, spent right after the keep, for a
+/// caller that did not spend it before; the log line names `site`, at the
+/// target of the module the signal belongs to.
+pub(crate) fn fail_by_map<A: Actor>(
+    handle: &ActorHandle<A>,
+    panic: &str,
+    spend: Option<&MonitorShared>,
+    site: MapSite,
+) {
+    handle
+        .stop_lane_ref()
+        .abort_record()
+        .keep_map_panic(panic.to_owned());
+    if let Some(shared) = spend {
+        shared.spend();
+    }
+    #[cfg(feature = "tracing")]
+    match site {
+        MapSite::Monitor => caught_log!(warn,
+            target: "tokio_actors::actor::monitor",
+            actor_id = %handle.id(),
+            panic = %handle.log_fields().panic_text(panic),
+            "a monitor's map function panicked; the actor fails with that panic"
+        ),
+        MapSite::Trap => caught_log!(warn,
+            target: "tokio_actors::actor::link",
+            actor_id = %handle.id(),
+            panic = %handle.log_fields().panic_text(panic),
+            "a trap map panicked; the actor fails with that panic"
+        ),
+        MapSite::Group => caught_log!(warn,
+            target: "tokio_actors::actor::pg_monitor",
+            actor_id = %handle.id(),
+            panic = %handle.log_fields().panic_text(panic),
+            "a group monitor's map function panicked; the actor fails with that panic"
+        ),
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = site;
+    let _ = crate::system::raise_noted(
+        None,
+        handle.stop_lane_ref(),
+        StopReason::Failure(ActorError::Panic(panic.to_owned())),
+        crate::telemetry::StopOrigin::MapPanic,
+    );
 }
 
 /// Puts a notice whose cell was just taken in the queue the permit was
@@ -925,4 +967,38 @@ pub(crate) fn resolve_target<T: IntoMonitorTarget>(
     system: &ActorSystem,
 ) -> ResolvedTarget {
     sealed::Sealed::resolve(target, system).0
+}
+
+/// A monitor target named by a status plane instead of by an actor, for the
+/// pieces of the crate that watch a plane they were handed: the owner of a
+/// supervised event handler (watched by the manager) and the plane of a
+/// handler's slot (watched by the owner).
+pub(crate) struct PlaneTarget {
+    pub(crate) actor_id: ActorId,
+    pub(crate) incarnation: Option<Incarnation>,
+    pub(crate) plane: StatusRx,
+}
+
+impl sealed::Sealed for &PlaneTarget {
+    fn resolve(&self, _system: &ActorSystem) -> sealed::Resolved {
+        sealed::Resolved(ResolvedTarget {
+            actor_id: self.actor_id.clone(),
+            incarnation: self.incarnation,
+            status_rx: Some(self.plane.clone()),
+            lane: None,
+        })
+    }
+
+    fn route(&self) -> sealed::Route {
+        sealed::Route(ExitVia::Id)
+    }
+}
+
+/// A plane that no actor writes: its watchers read it as ended when its
+/// sender drops, which is a one-shot signal. The plane belongs to the system
+/// whose telemetry state is `mode` and takes an incarnation number of its own.
+pub(crate) fn signal_plane(
+    mode: Arc<crate::telemetry::Mode>,
+) -> (crate::actor::incarnation::status_cell::StatusTx, StatusRx) {
+    IncarnationRef::in_system(mode, Incarnation::mint()).status_channel()
 }

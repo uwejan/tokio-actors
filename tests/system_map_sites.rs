@@ -72,19 +72,19 @@ const ALLOWED: &[Allowed] = &[
         why: "a weak factory of a timer, not a system",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/owed.rs",
         line: ".and_then(|linked| linked.token.upgrade());",
         times: 1,
         why: "a subtree token, not a system",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/block.rs",
         line: "let token = self.shared.linked.get()?.token.upgrade()?;",
         times: 1,
         why: "a subtree token, not a system",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/signals.rs",
         line: "if let (Some(spec), Some(token)) = (linked.trap.as_deref(), linked.token.upgrade())",
         times: 1,
         why: "the trap budget of a worker reads its own subtree token, a token and not a system, under no guard of the map",

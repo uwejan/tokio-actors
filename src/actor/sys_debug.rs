@@ -12,8 +12,9 @@ use super::panic::{catch_sync, send_contained};
 use super::runtime::Owner;
 use super::sys::{clamp_log_capacity, DebugEntry, DebugEvent, DebugOptions, Install, Statistics};
 use super::sys_loop::LoopSys;
+use crate::actor::envelope::Reply;
 use crate::telemetry::handlers::drop_contained;
-use crate::types::{Reply, StopReason};
+use crate::types::StopReason;
 
 /// A function installed on the entries, with the id it was installed under.
 pub(crate) type Installed = (String, Box<dyn FnMut(&DebugEntry) -> Install + Send>);

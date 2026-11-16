@@ -92,13 +92,19 @@ struct Allowed {
 
 const ALLOWED: &[Allowed] = &[
     Allowed {
-        file: "actor/subtree.rs",
+        file: "telemetry/mode.rs",
+        line: r#"contain_waker_panic("", None, || self.zero.notify_waiters());"#,
+        times: 1,
+        why: "the wake of a wait for a system's live holds to reach zero, inside the catch",
+    },
+    Allowed {
+        file: "actor/incarnation/signals.rs",
         line: r#"contain_waker_panic("", None, || self.shared.signals.notify_waiters());"#,
         times: 1,
         why: "the one wake of the block's signals (stop lane, status plane), inside the catch",
     },
     Allowed {
-        file: "types/stop_lane.rs",
+        file: "actor/incarnation/stop_lane.rs",
         line: r#"contain_waker_panic("", None, move || waker.wake());"#,
         times: 1,
         why: "the one wake of the run loop's waker slot, inside the catch",
@@ -116,25 +122,25 @@ const ALLOWED: &[Allowed] = &[
         why: "the close notice, inside the catch; only crate forwarder tasks wait on it",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/subtree.rs",
         line: "contain_waker_panic(site, None, || self.changed.notify_waiters());",
         times: 1,
         why: "the one wake of the library's own subtree waits (a restart's, terminate_child's and spawn_child's), inside the catch; no user's waker parks on this list",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/subtree.rs",
         line: "contain_waker_panic(OBSERVERS, None, || self.observers.notify_waiters());",
         times: 1,
         why: "the one wake of the subtree observers' waits, after the library's, inside the catch",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/signals.rs",
         line: "self.shared.reader.wake();",
         times: 6,
         why: "the wake slot contains the wake of the run loop's waker itself",
     },
     Allowed {
-        file: "types/stop_lane.rs",
+        file: "actor/incarnation/stop_lane.rs",
         line: "self.aborted.reader().wake();",
         times: 1,
         why: "the wake slot contains the wake of the run loop's waker itself",
@@ -321,25 +327,25 @@ fn imports_a_permit_type(line: &str) -> bool {
 const SLOT_ALLOWED: &[Allowed] = &[
     Allowed {
         file: "actor/handle.rs",
-        line: r#"self.tx.reserve().await.ok().map(ForwardPermit::Normal)"#,
+        line: r#"tx.reserve().await.ok().map(ForwardPermit::Normal)"#,
         times: 1,
         why: "the normal mailbox is the library's own MailTx: its unit and its pending reserve give back through the mailbox, which wakes each waiter inside a catch",
     },
     Allowed {
         file: "actor/handle.rs",
-        line: r#"Edged::new(pin!(self.tx.reserve()), record).await"#,
+        line: r#"Edged::new(pin!(self.inner.tx.reserve()), record).await"#,
         times: 1,
         why: "the normal mailbox is the library's own MailTx: its unit and its pending reserve give back through the mailbox, which wakes each waiter inside a catch",
     },
     Allowed {
         file: "actor/handle.rs",
-        line: r#"self.tx.reserve().await"#,
+        line: r#"self.inner.tx.reserve().await"#,
         times: 1,
         why: "the normal mailbox is the library's own MailTx: its unit and its pending reserve give back through the mailbox, which wakes each waiter inside a catch",
     },
     Allowed {
         file: "actor/handle.rs",
-        line: r#"let mut reserve = pin!(self.tx.reserve());"#,
+        line: r#"let mut reserve = pin!(self.inner.tx.reserve());"#,
         times: 2,
         why: "the normal mailbox is the library's own MailTx: its unit and its pending reserve give back through the mailbox, which wakes each waiter inside a catch",
     },
@@ -351,7 +357,7 @@ const SLOT_ALLOWED: &[Allowed] = &[
     },
     Allowed {
         file: "actor/handle.rs",
-        line: r#"let permit = match time::timeout_at(deadline, self.tx.reserve()).await {"#,
+        line: r#"let permit = match time::timeout_at(deadline, self.inner.tx.reserve()).await {"#,
         times: 1,
         why: "the normal mailbox is the library's own MailTx: its unit and its pending reserve give back through the mailbox, which wakes each waiter inside a catch",
     },
@@ -369,7 +375,7 @@ const SLOT_ALLOWED: &[Allowed] = &[
     },
     Allowed {
         file: "actor/handle.rs",
-        line: r#"_ => self.tx.try_reserve().map(ForwardPermit::Normal),"#,
+        line: r#"_ => self.inner.tx.try_reserve().map(ForwardPermit::Normal),"#,
         times: 1,
         why: "the normal mailbox is the library's own MailTx: a unit taken without waiting gives back through the mailbox, which wakes each waiter inside a catch",
     },
@@ -500,20 +506,20 @@ const SLOT_ALLOWED: &[Allowed] = &[
         why: "the constant only: no semaphore is made or waited on",
     },
     Allowed {
-        file: "actor/subtree.rs",
-        line: r#".send(crate::types::SystemMessage::Supervise(Box::new(request)));"#,
+        file: "actor/incarnation/signals.rs",
+        line: r#".send(SystemMessage::Supervise(Box::new(request)));"#,
         times: 1,
         why: "a supervisor reference's request is pushed through the permit that reserve_held returned, with nothing between them; the push forgets the permit and wakes no sender (the system channel)",
     },
     Allowed {
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/signals.rs",
         line: r#"permit.into_inner().send(message);"#,
         times: 1,
         why: "a sys command is pushed through the permit that reserve_held returned, with nothing between them; the push forgets the permit and wakes no sender (the system channel)",
     },
     Allowed {
-        file: "actor/subtree.rs",
-        line: r#".send(crate::types::SystemMessage::GetStatus(request));"#,
+        file: "actor/incarnation/signals.rs",
+        line: r#"permit.into_inner().send(SystemMessage::GetStatus(request));"#,
         times: 1,
         why: "the status request is pushed through the permit that reserve_held returned, with nothing between them; the push forgets the permit and wakes no sender (the system channel)",
     },
@@ -540,6 +546,30 @@ const SLOT_ALLOWED: &[Allowed] = &[
         line: r#"report_tx.send(report);"#,
         times: 1,
         why: "the send of a one-shot channel's wrapper: it reserves nothing and parks no sender",
+    },
+    Allowed {
+        file: "statem.rs",
+        line: r#"if let Err(unsent) = log.send((number, Some(reply))) {"#,
+        times: 1,
+        why: "the harness log is an unbounded std channel with no slot and no waker, read by the test thread that owns the harness",
+    },
+    Allowed {
+        file: "statem.rs",
+        line: r#"let _ = log.send((number, None));"#,
+        times: 1,
+        why: "the harness log is an unbounded std channel with no slot and no waker, read by the test thread that owns the harness",
+    },
+    Allowed {
+        file: "statem.rs",
+        line: r#"match self.send(message).await {"#,
+        times: 1,
+        why: "a call goes through the handle's own send, whose slot and reply wait are the handle's, held where their drop is contained",
+    },
+    Allowed {
+        file: "statem.rs",
+        line: r#"match self.send_timeout(message, within).await {"#,
+        times: 1,
+        why: "a bounded call goes through the handle's own send_timeout, whose slot and reply wait are the handle's, held where their drop is contained",
     },
 ];
 

@@ -17,10 +17,17 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::actor::handle::{emit_stop_requested, ActorHandle, SubtreeObserver};
+use crate::actor::incarnation::{IncarnationRef, SubtreeHold};
+use crate::actor::incarnation::{RaiseResult, StatusRx, StatusTx, StopLane, TurnClock};
 use crate::actor::panic::{contain_waker_panic, send_contained};
 use crate::actor::runtime::{bounded_wait, saturating_deadline};
-use crate::actor::subtree::{AbortRecord, SubtreeHold};
-use crate::actor::supervision::{rules, ABORT_SETTLE};
+use crate::actor::supervision::model::{
+    SystemAction, SystemEnd, SystemLadder, SystemSeen, SystemStep,
+};
+use crate::actor::supervision::rules;
+use crate::actor::supervision::rules::system_ladder_step;
+#[cfg(test)]
+use crate::actor::supervision::ABORT_SETTLE;
 use crate::actor::Actor;
 use crate::error::{SendError, SpawnError};
 use crate::helper::HelperKind;
@@ -28,8 +35,7 @@ use crate::telemetry::{
     Delivery, EventKind, KillStepKind, MonitorConfig, MonitorError, MonitorSettings, TelemetryEvent,
 };
 use crate::types::{
-    ActorId, ActorStatus, Incarnation, RaiseResult, ShutdownReport, StatusRx, StatusTx, StopLane,
-    StopOutcome, StopReason, StopReport, TurnClock,
+    ActorId, ActorStatus, Incarnation, ShutdownReport, StopOutcome, StopReason, StopReport,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,8 +203,29 @@ impl SystemConfig {
 // Type-erased actor handle
 // ---------------------------------------------------------------------------
 
+/// The key of a registry entry: the actor's id. A named actor's id is its
+/// name, so the one map is read by id and by name alike; both borrows hash as
+/// the id does.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RegKey(ActorId);
+
+impl std::borrow::Borrow<ActorId> for RegKey {
+    fn borrow(&self) -> &ActorId {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for RegKey {
+    fn borrow(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 struct AnyActorHandle {
     type_id: TypeId,
+    /// Whether the actor was spawned under a name, which is then its id. Only
+    /// a named entry is found by a lookup by name.
+    named: bool,
     handle: Box<dyn StoredHandle>,
     /// Clone of the actor's stop lane. Enough on its own to signal a stop or
     /// kill without downcasting, and cheap to clone out of a `DashMap` `Ref`
@@ -215,9 +242,8 @@ struct AnyActorHandle {
     /// [`ActorSystem::stuck_actors`] without downcasting.
     turn_clock: TurnClock,
     /// The task's abort handle. `None` for the brief window between
-    /// registration (which happens before the task is spawned, so the
-    /// name-claim is visible pre-spawn) and the post-spawn `attach_abort`
-    /// call; treated as not-yet-abortable by a shutdown sweep that lands in
+    /// registration (which happens before the task is spawned, so the entry
+    /// is visible pre-spawn) and the post-spawn `attach_abort` call; treated as not-yet-abortable by a shutdown sweep that lands in
     /// that window.
     abort: Option<AbortHandle>,
     /// `None` for actors registered via the top-level `SpawnBuilder` path;
@@ -253,6 +279,8 @@ struct AnyActorHandle {
 /// What a snapshot copied out of one registry entry.
 struct Seen {
     id: ActorId,
+    /// Whether the entry was registered under a name, which is its id.
+    named: bool,
     seq: u64,
     /// The address of the incarnation's abort record.
     key: usize,
@@ -340,8 +368,15 @@ struct QuietPass {
 }
 
 /// What a registry entry tells about its incarnation: id, incarnation number,
-/// root flag, turn clock id and actor type name.
-type EntryFacts = (ActorId, u64, Option<(ActorId, u64)>, u64, &'static str);
+/// root flag, turn clock id, actor type name and whether it is named.
+type EntryFacts = (
+    ActorId,
+    u64,
+    Option<(ActorId, u64)>,
+    u64,
+    &'static str,
+    bool,
+);
 
 /// The numbers a snapshot reads from an actor's handle: its type name and the
 /// fill of its two lanes. Each is one or two atomic reads; nothing waits and
@@ -383,6 +418,7 @@ impl<A: Actor> StoredHandle for ActorHandle<A> {
 impl AnyActorHandle {
     fn new<A: Actor>(
         handle: &ActorHandle<A>,
+        named: bool,
         parent: Option<(ActorId, u64)>,
         registration_seq: u64,
         turn_clock: TurnClock,
@@ -391,6 +427,7 @@ impl AnyActorHandle {
     ) -> Self {
         Self {
             type_id: TypeId::of::<ActorHandle<A>>(),
+            named,
             handle: Box::new(handle.clone()),
             stop_lane: handle.stop_lane(),
             status_rx: handle.status_rx(),
@@ -434,7 +471,7 @@ impl AnyActorHandle {
 /// the event is built.
 #[inline]
 fn push_kill_step(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     step: KillStepKind,
     after: impl FnOnce() -> Option<Duration>,
@@ -449,13 +486,13 @@ fn push_kill_step(
 }
 
 /// Builds the `AbortFired` step of the incarnation behind `record`, to be
-/// queued by [`AbortRecord::abort`] under the record's lock for the abort that
+/// queued by [`IncarnationRef::abort`] under the record's lock for the abort that
 /// writes the record's first instant, so the step is queued once per
 /// incarnation whichever abort (the reaper's, a caller's force path, a
 /// ladder's, a start bound's) finds the task unfinished first. Takes no lock
 /// of the record, queues nothing, and builds nothing unless a sink takes the
 /// kind.
-pub(crate) fn stage_abort_fired(record: &AbortRecord) -> Option<crate::telemetry::Staged> {
+pub(crate) fn stage_abort_fired(record: &IncarnationRef) -> Option<crate::telemetry::Staged> {
     crate::telemetry::stage_about(record, None, EventKind::KillStep, |actor| {
         TelemetryEvent::KillStep {
             actor: actor.clone(),
@@ -528,48 +565,54 @@ fn raise_noted_engaged(
     result
 }
 
+/// Where a registry `Kill` comes from, which decides its deadline and how it
+/// is raised.
+pub(crate) enum KillFrom<'a> {
+    /// A plain `Kill`: the deadline is the entry's kill grace from now.
+    Plain,
+    /// A plain `Kill` whose deadline is this window from now.
+    Window(Duration),
+    /// The `Kill` step of a bounded stop, raised through the call's step
+    /// cell, which counts the raiser in flight first. The deadline is the
+    /// entry's kill grace from now.
+    Step(&'a StopStep),
+    /// A `Kill` raised on behalf of an exit signal's reason: the lane stores
+    /// it when it holds no `Kill` yet, and the actor ends with it in place of
+    /// `Kill`. The deadline is the entry's kill grace from now.
+    Caused(StopReason),
+}
+
 /// The one way a `Kill` is raised on an actor the registry holds. In this
 /// order, it declares the deadline of the `Kill` on the registry entry `key`
-/// names (`window` from now, or the entry's kill grace when `None`), raises
-/// the `Kill` on `lane`, and, when the raise is accepted, schedules the abort
-/// of the task through the reaper of the entry's own runtime. The entry is
-/// matched by `status_rx`, never by the id or name alone, so a later
-/// incarnation under the same id or name is neither declared on nor armed. An
-/// entry whose abort handle is not attached yet is armed by the attach, after
-/// the earliest deadline declared on it.
+/// names (the window of [`KillFrom::Window`] from now, otherwise the entry's
+/// kill grace), raises the `Kill` on `lane` as `from` says, and, when the
+/// raise is accepted, schedules the abort of the task through the reaper of
+/// the entry's own runtime. The entry is matched by `status_rx`, never by the
+/// id or name alone, so a later incarnation under the same id or name is
+/// neither declared on nor armed. An entry whose abort handle is not attached
+/// yet is armed by the attach, after the earliest deadline declared on it.
 ///
-/// With `step` the raise goes through the call's step cell, which counts the
-/// raiser in flight first; `between` runs after that and before the raise.
-/// Without `step`, `between` runs just before the raise. With no `system`
-/// (the caller found none) nothing is declared and nothing is armed: the
-/// `Kill` is still raised.
-///
-/// With a `cause` (and no `step`) the `Kill` is raised on behalf of that
-/// reason, an exit signal's: the lane stores it when it holds no `Kill` yet,
-/// and the actor ends with it in place of `Kill`. A bounded stop's step cell
-/// has no caused form.
+/// For [`KillFrom::Step`] the step cell counts the raiser in flight before
+/// the raise. With no `system` (the caller found none) nothing is declared
+/// and nothing is armed: the `Kill` is still raised.
 ///
 /// Never call it while holding a registry guard: the declaration takes a
 /// write lock on the same shard.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn raise_kill_declared(
     system: Option<&ActorSystem>,
     key: KillKey<'_>,
     status_rx: &StatusRx,
     lane: &StopLane,
-    window: Option<Duration>,
-    step: Option<&StopStep>,
-    between: impl FnOnce(),
-    cause: Option<StopReason>,
+    from: KillFrom<'_>,
 ) -> KillRaised {
-    debug_assert!(
-        cause.is_none() || step.is_none(),
-        "a caused Kill has no step cell form"
-    );
+    let window = match from {
+        KillFrom::Window(window) => Some(window),
+        KillFrom::Plain | KillFrom::Step(_) | KillFrom::Caused(_) => None,
+    };
     if let Some(system) = system {
         let declared = match key {
             KillKey::Id(id) => system.declare_kill(id, status_rx, window),
-            KillKey::Name(name) => system.declare_kill_by_name(name, status_rx, window),
+            KillKey::Name(name) => system.declare_kill(name, status_rx, window),
         };
         // The declaration has returned, so no registry guard is held.
         if declared {
@@ -583,15 +626,19 @@ pub(crate) fn raise_kill_declared(
     }
     // The event names the cause a `Kill` for an exit signal carries; it is
     // copied only for such a `Kill`, before the lane takes it.
-    let noted_cause = cause.clone();
-    let result = match step {
-        Some(step) => step.raise_kill(lane, between),
-        None => {
-            between();
-            match cause {
-                Some(cause) => lane.try_raise_kill_caused(cause),
-                None => lane.try_raise(StopReason::Kill),
-            }
+    let noted_cause = match &from {
+        KillFrom::Caused(cause) => Some(cause.clone()),
+        KillFrom::Plain | KillFrom::Window(_) | KillFrom::Step(_) => None,
+    };
+    let result = match from {
+        KillFrom::Step(step) => step.raise_shared(lane, between_declaration_and_raise),
+        KillFrom::Caused(cause) => {
+            between_declaration_and_raise();
+            lane.try_raise_kill_caused(cause)
+        }
+        KillFrom::Plain | KillFrom::Window(_) => {
+            between_declaration_and_raise();
+            lane.try_raise(StopReason::Kill)
         }
     };
     if result != RaiseResult::Refused {
@@ -616,6 +663,34 @@ pub(crate) fn raise_kill_declared(
     KillRaised { result, abort }
 }
 
+/// The point of [`raise_kill_declared`] after the declaration and before the
+/// raise (for [`KillFrom::Step`], after the step cell counted the raiser).
+/// Under test it runs the hook armed on this thread by
+/// [`run_once_before_the_next_kill_raise`]; otherwise nothing runs.
+#[inline(always)]
+fn between_declaration_and_raise() {
+    #[cfg(test)]
+    {
+        let hook = BEFORE_KILL_RAISE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_KILL_RAISE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms `hook` to run once on this thread, inside the next
+/// [`raise_kill_declared`], after its declaration and before its raise.
+#[cfg(test)]
+pub(crate) fn run_once_before_the_next_kill_raise(hook: impl FnOnce() + 'static) {
+    BEFORE_KILL_RAISE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 // ---------------------------------------------------------------------------
 // RegistryGuard - drop-based auto-unregister
 // ---------------------------------------------------------------------------
@@ -623,13 +698,11 @@ pub(crate) fn raise_kill_declared(
 pub(crate) struct RegistryGuard {
     system: Arc<ActorSystem>,
     id: ActorId,
-    name: Option<Arc<str>>,
     /// The registration this guard owns. Removal on drop is checked against
-    /// this sequence (see [`ActorSystem::unregister_by_id`]/
-    /// [`ActorSystem::unregister_by_name`]) so a stale teardown - one whose
-    /// guard is only dropping now, well after a fresh registration already
-    /// reused the same id/name - can never remove that newer registration
-    /// out from under it. `by_id` refuses a second live registration of an
+    /// this sequence (see [`ActorSystem::unregister_by_id`]) so a stale
+    /// teardown - one whose guard is only dropping now, well after a fresh
+    /// registration already reused the same id, which is a named actor's
+    /// name - can never remove that newer registration out from under it. `by_id` refuses a second live registration of an
     /// id, so the sequence check is defense for a stale guard.
     registration_seq: u64,
     /// A sender of the actor's status plane. Released after `drop`
@@ -643,16 +716,10 @@ pub(crate) struct RegistryGuard {
 }
 
 impl RegistryGuard {
-    pub(crate) fn new(
-        system: Arc<ActorSystem>,
-        id: ActorId,
-        name: Option<Arc<str>>,
-        registration_seq: u64,
-    ) -> Self {
+    pub(crate) fn new(system: Arc<ActorSystem>, id: ActorId, registration_seq: u64) -> Self {
         Self {
             system,
             id,
-            name,
             registration_seq,
             _status: None,
             _subtree: None,
@@ -705,9 +772,6 @@ impl Drop for RegistryGuard {
         }
         self.system
             .unregister_by_id(&self.id, self.registration_seq);
-        if let Some(name) = &self.name {
-            self.system.unregister_by_name(name, self.registration_seq);
-        }
         #[cfg(test)]
         crate::actor::runtime::end_hooks::run(
             crate::actor::runtime::end_hooks::NAME_FREED,
@@ -771,7 +835,7 @@ impl SystemPhase {
     }
 }
 
-/// Shard count of `ActorSystem::by_name` and `ActorSystem::by_id`.
+/// Shard count of `ActorSystem::by_id`.
 ///
 /// A `DashMap` grows one shard at a time: the shard that passes seven eighths
 /// of its table doubles it while holding its write lock, so every register,
@@ -783,13 +847,13 @@ impl SystemPhase {
 /// rehashes only that shard's entries, so a spawn that waits on a rehash waits
 /// for a small share of the table, never for the whole of a large one.
 /// Registration still goes through one shard's
-/// entry API, so the id and name uniqueness checks are unchanged. The count is
-/// a power of two, as `DashMap` requires.
+/// entry API, so the uniqueness check of an id, which is a named actor's name,
+/// is unchanged. The count is a power of two, as `DashMap` requires.
 const REGISTRY_SHARDS: usize = 256;
 
 /// An empty registry map with `REGISTRY_SHARDS` shards and no preallocated
 /// table. An idle `ActorSystem` holds the shard locks and empty shard tables
-/// of its two registry maps, a fixed cost at any CPU count.
+/// of its registry map, a fixed cost at any CPU count.
 fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
     DashMap::with_capacity_and_shard_amount(0, REGISTRY_SHARDS)
 }
@@ -835,8 +899,8 @@ fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
 /// first looked at, has nothing to wait for (a spawn refused for its mailbox
 /// capacity, its system or its name, a target that does not take the request,
 /// an id nothing holds) answers first,
-/// on any runtime, and a name taken between that look and the claim still
-/// panics on a runtime without the driver.
+/// on any runtime, and a name taken between that look and the registration
+/// still panics on a runtime without the driver.
 /// `shutdown_with` panics at its first wait on a root, after the system has
 /// entered shutdown.
 /// [`SubtreeObserver::wait_ended`](crate::actor::handle::SubtreeObserver::wait_ended)
@@ -850,8 +914,10 @@ fn registry_map<K: Eq + std::hash::Hash, V>() -> DashMap<K, V> {
 /// the process.
 pub struct ActorSystem {
     name: String,
-    by_name: DashMap<Arc<str>, AnyActorHandle>,
-    by_id: DashMap<ActorId, AnyActorHandle>,
+    /// One entry per registered actor, keyed by its id. A named actor's id is
+    /// its name, so a lookup by name reads this map too and finds only an
+    /// entry marked named.
+    by_id: DashMap<RegKey, AnyActorHandle>,
     shutdown_policy: ShutdownPolicy,
     /// The system's telemetry gate and sinks.
     telemetry: crate::telemetry::ModeOwner,
@@ -1061,7 +1127,6 @@ impl ActorSystem {
         telemetry.0.mark_bound();
         Self {
             name,
-            by_name: registry_map(),
             by_id: registry_map(),
             shutdown_policy,
             helpers: crate::helper::HelperSlots::new(telemetry.0.clone()),
@@ -1226,6 +1291,32 @@ impl ActorSystem {
         .map_err(|_| SpawnError::SystemNameTaken(name))
     }
 
+    /// Creates a new named system with the default configuration, as
+    /// [`create`](Self::create) does, for an application of its own: the
+    /// system counts the live subtree holds of its actors from its creation
+    /// (see [`live_holds`](Self::live_holds)).
+    pub(crate) fn create_owned(name: impl Into<String>) -> Result<Arc<ActorSystem>, SpawnError> {
+        let name = name.into();
+        Self::claim(name.clone(), |name| {
+            let system = Self::build(name, ShutdownPolicy::default(), None, false, false);
+            system.telemetry.0.holds.mark_counted();
+            system
+        })
+        .map_err(|_| SpawnError::SystemNameTaken(name))
+    }
+
+    /// The subtree holds of this system's actors that are alive, for a system
+    /// made by [`create_owned`](Self::create_owned); `0` for any other.
+    pub(crate) fn live_holds(&self) -> usize {
+        self.telemetry.0.holds.live_holds()
+    }
+
+    /// Resolves when [`live_holds`](Self::live_holds) reads zero. It reads no
+    /// clock; the caller bounds it.
+    pub(crate) async fn holds_released(&self) {
+        self.telemetry.0.holds.holds_released().await;
+    }
+
     /// Creates a new named system with custom configuration.
     ///
     /// The system's life in the map of named systems is the one
@@ -1293,20 +1384,31 @@ impl ActorSystem {
     /// A handle is bound to one incarnation of the actor: after a supervised
     /// restart the name resolves to the next incarnation's handle, so a
     /// caller that talks to a restartable actor looks it up by name for each
-    /// call rather than keeping a handle. The name stays registered to an
-    /// incarnation until its teardown ends, including the time after its
-    /// message loop ended, when the handle's
+    /// call rather than keeping a handle. A lookup finds an incarnation
+    /// until its registry entry is removed at the end of its teardown,
+    /// including the time after its message loop ended, when the handle's
     /// [`is_alive`](ActorHandle::is_alive) reads `false` and a send returns
     /// `Closed`; a caller that meets that window waits with
     /// [`wait_stopped`](ActorHandle::wait_stopped) on the handle it holds and
-    /// looks the name up again. A lookup right after a crashing request was
+    /// looks the name up again. The name is free from the removal of the
+    /// entry on, and a spawn under it succeeds from then; a spawn right after
+    /// a lookup found nothing can still answer [`SpawnError::NameTaken`] when
+    /// the name is held by an actor of another type or another spawn took it
+    /// first. A lookup right after a crashing request was
     /// answered (`AskError::Actor`) never finds that incarnation: the answer
     /// is sent once the name is free. A lookup that finds nothing while a
     /// supervisor restarts the actor reads as Erlang/OTP's `undefined` in the
     /// same window; retry after a short delay. For an actor that nothing
     /// restarts, `None` is final.
     pub fn get<A: Actor>(&self, name: &str) -> Option<ActorHandle<A>> {
-        self.by_name.get(name).and_then(|e| e.downcast::<A>())
+        self.by_name(name).and_then(|e| e.downcast::<A>())
+    }
+
+    /// The registry entry that holds `name`: the entry under the id `name`,
+    /// when it was registered under a name. One guard is held, and an
+    /// anonymous actor whose id reads as `name` is no such name.
+    fn by_name(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, RegKey, AnyActorHandle>> {
+        self.by_id.get(name).filter(|entry| entry.named)
     }
 
     /// Looks up an actor by [`ActorId`], returning a typed handle.
@@ -1352,6 +1454,47 @@ impl ActorSystem {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// # Names the application owns
+    ///
+    /// An application that wants to reach an actor by a name of its own keeps
+    /// the map itself, from its names to ids, and resolves through this call.
+    /// The map is typed and lives where the application wants it, and an id
+    /// whose actor has ended finds nothing.
+    ///
+    /// ```rust
+    /// use std::collections::HashMap;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorId, ActorResult, ActorSystem,
+    /// };
+    ///
+    /// #[derive(Default)]
+    /// struct Counter(i64);
+    /// impl Actor for Counter {
+    ///     type Message = i64;
+    ///     type Response = i64;
+    ///     async fn handle(&mut self, msg: i64, _ctx: &mut ActorContext<Self>) -> ActorResult<i64> {
+    ///         self.0 += msg;
+    ///         Ok(self.0)
+    ///     }
+    /// }
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let mut names: HashMap<&'static str, ActorId> = HashMap::new();
+    ///     let counter = Counter::default().spawn().await?;
+    ///     names.insert("tally", counter.id().clone());
+    ///
+    ///     let sys = ActorSystem::default();
+    ///     let found = sys
+    ///         .get_by_id::<Counter>(&names["tally"])
+    ///         .expect("the actor is registered");
+    ///     assert_eq!(found.send(2).await?, 2);
+    ///     assert!(sys.get_by_id::<Counter>(&ActorId::from("other")).is_none());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn get_by_id<A: Actor>(&self, id: &ActorId) -> Option<ActorHandle<A>> {
         self.by_id.get(id).and_then(|e| e.downcast::<A>())
     }
@@ -1375,7 +1518,7 @@ impl ActorSystem {
         // synchronous, but this keeps the same discipline as every other
         // method here).
         let lane = {
-            let entry = self.by_name.get(name).ok_or(SendError::NotFound)?;
+            let entry = self.by_name(name).ok_or(SendError::NotFound)?;
             entry.stop_lane.clone()
         };
         let raised = lane.try_raise(StopReason::Graceful);
@@ -1406,18 +1549,18 @@ impl ActorSystem {
     /// parked at an await is aborted after that grace. The abort is
     /// scheduled by the system: dropping this future never cancels it. While
     /// the actor is registered the `Kill` is accepted, including while it
-    /// runs `on_stopped` and while its children are being stopped. The name
-    /// leaves the registry once the actor's children are stopped (an actor
+    /// runs `on_stopped` and while its children are being stopped. The actor
+    /// leaves the registry once its children are stopped (an actor
     /// ending by `Kill` does not wait for them: as its links drop, a worker
     /// child that does not trap exit signals is raised `Kill` and a supervisor
     /// child or a worker that traps them `ParentKilled`, which can come after
-    /// the name has left), before its
-    /// stop lane is sealed and before its queued messages and its value are
-    /// dropped (an aborted actor's when its task ends); from then on this
-    /// answers `NotFound`. A `Kill` accepted after the actor left the
-    /// registry arms no abort: its one remaining await is the end of its
-    /// already aborted timer and stream tasks, which waits on their drops, so
-    /// its end never precedes theirs.
+    /// the actor has left), before its stop lane is sealed and before its
+    /// queued messages and its value are dropped (an aborted actor's when its
+    /// task ends). This answers `NotFound` from the removal of the actor's
+    /// registry entry on, and the name is free from the same instant. A `Kill` accepted after the actor left the registry
+    /// arms no abort: its one remaining await is the end of its already
+    /// aborted timer and stream tasks, which waits on their drops, so its end
+    /// never precedes theirs.
     ///
     /// # Errors
     /// - [`SendError::NotFound`] if no actor is registered under `name`,
@@ -1429,7 +1572,7 @@ impl ActorSystem {
     pub async fn kill(&self, name: &str) -> Result<(), SendError> {
         // Same guard-before-use discipline as `stop`.
         let (lane, status_rx) = {
-            let entry = self.by_name.get(name).ok_or(SendError::NotFound)?;
+            let entry = self.by_name(name).ok_or(SendError::NotFound)?;
             (entry.stop_lane.clone(), entry.status_rx.clone())
         };
         #[cfg(test)]
@@ -1441,10 +1584,7 @@ impl ActorSystem {
             KillKey::Name(name),
             &status_rx,
             &lane,
-            None,
-            None,
-            || {},
-            None,
+            KillFrom::Plain,
         );
         if raised.result == RaiseResult::Refused {
             return Err(SendError::Closed);
@@ -1454,7 +1594,11 @@ impl ActorSystem {
 
     /// Lists all registered actor names in this system.
     pub fn registered(&self) -> Vec<String> {
-        self.by_name.iter().map(|e| e.key().to_string()).collect()
+        self.by_id
+            .iter()
+            .filter(|e| e.named)
+            .map(|e| e.key().0.as_str().to_string())
+            .collect()
     }
 
     // - Visibility -----------------------------------------------------------
@@ -1470,8 +1614,44 @@ impl ActorSystem {
     /// [`observe_subtree`](Self::observe_subtree) before the kill. Erlang/OTP's
     /// `processes/0` lists every process of the
     /// node; here each system lists its own actors.
+    ///
+    /// # Counting actors
+    ///
+    /// The number of actors is the length of this list. The runtime the
+    /// application owns reports its own load through
+    /// [`tokio::runtime::RuntimeMetrics`], such as the number of workers and
+    /// of live tasks, so a statistics view is the two read together.
+    ///
+    /// ```rust
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult, ActorSystem,
+    /// };
+    ///
+    /// struct Worker;
+    /// impl Actor for Worker {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let _first = Worker.spawn().await?;
+    ///     let _second = Worker.spawn().await?;
+    ///
+    ///     let sys = ActorSystem::default();
+    ///     assert_eq!(sys.actor_ids().len(), 2);
+    ///     let metrics = tokio::runtime::Handle::current().metrics();
+    ///     assert!(metrics.num_workers() >= 1);
+    ///     assert!(metrics.num_alive_tasks() >= 2);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn actor_ids(&self) -> Vec<ActorId> {
-        self.by_id.iter().map(|e| e.key().clone()).collect()
+        self.by_id.iter().map(|e| e.key().0.clone()).collect()
     }
 
     /// Reads an actor's current status by id. Returns `None` if the id is
@@ -1569,8 +1749,7 @@ impl ActorSystem {
             ),
             MonitorKey::Name(name) => (
                 ActorId::from(name),
-                self.by_name
-                    .get(name)
+                self.by_name(name)
                     .map(|e| (e.status_rx.clone(), e.stop_lane.clone())),
             ),
         };
@@ -1717,10 +1896,7 @@ impl ActorSystem {
             KillKey::Id(id),
             &status_rx,
             &lane,
-            None,
-            None,
-            || {},
-            None,
+            KillFrom::Plain,
         );
         if raised.result == RaiseResult::Refused {
             return None;
@@ -1735,18 +1911,26 @@ impl ActorSystem {
     // - Internal registration (used by spawn path) --------------------------
 
     /// What registering `name` would answer right now for a system that is
-    /// not taking registrations or a name already taken, read without
-    /// claiming anything. The registration itself decides again.
+    /// not taking registrations or a key already held, read without
+    /// registering anything: the refusal the registration gives for that
+    /// occupant, [`SpawnError::NameTaken`] for a named one and
+    /// [`SpawnError::DuplicateChild`] for an anonymous one whose id reads as
+    /// `name`. The registration itself decides again.
     pub(crate) fn precheck_spawn(&self, name: Option<&str>) -> Result<(), SpawnError> {
         if SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) != SystemPhase::Active {
             return Err(SpawnError::SystemShuttingDown(self.name.clone()));
         }
         if let Some(n) = name {
-            if self.by_name.contains_key(n) {
-                return Err(SpawnError::NameTaken {
-                    name: n.to_string(),
-                    system: self.name.clone(),
-                });
+            let occupant = self.by_id.get(n).map(|entry| entry.named);
+            match occupant {
+                Some(true) => {
+                    return Err(SpawnError::NameTaken {
+                        name: n.to_string(),
+                        system: self.name.clone(),
+                    });
+                }
+                Some(false) => return Err(SpawnError::DuplicateChild(ActorId::from(n))),
+                None => {}
             }
         }
         Ok(())
@@ -1770,7 +1954,7 @@ impl ActorSystem {
     pub(crate) fn register_actor<A: Actor>(
         &self,
         id: &ActorId,
-        name: Option<&Arc<str>>,
+        named: bool,
         handle: &ActorHandle<A>,
         is_root: bool,
         turn_clock: TurnClock,
@@ -1783,7 +1967,7 @@ impl ActorSystem {
         // never guessed.
         let parent = (!is_root).then(|| (ActorId::from(""), crate::telemetry::UNKNOWN_INCARNATION));
         self.register_actor_as(
-            id, name, handle, parent, turn_clock, kill_grace, runtime, seq,
+            id, named, handle, parent, turn_clock, kill_grace, runtime, seq,
         )
     }
 
@@ -1792,12 +1976,17 @@ impl ActorSystem {
     /// registration's sequence: shutdown stops roots in reverse order of it,
     /// and a stale guard's removal is checked against it. `parent` is `None`
     /// for a root and the spawning supervisor's id and incarnation number for
-    /// a supervised child.
+    /// a supervised child. `named` says the actor was spawned under a name,
+    /// which is then its id.
+    ///
+    /// An id already held is refused: with [`SpawnError::NameTaken`] when this
+    /// registration and the occupant are both named, otherwise with
+    /// [`SpawnError::DuplicateChild`]. A refusal changes nothing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_actor_as<A: Actor>(
         &self,
         id: &ActorId,
-        name: Option<&Arc<str>>,
+        named: bool,
         handle: &ActorHandle<A>,
         parent: Option<(ActorId, u64)>,
         turn_clock: TurnClock,
@@ -1832,42 +2021,26 @@ impl ActorSystem {
             }
         }
 
-        if let Some(n) = name {
-            let entry = self.by_name.entry(Arc::clone(n));
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    return Err(SpawnError::NameTaken {
-                        name: n.to_string(),
-                        system: self.name.clone(),
-                    });
-                }
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(AnyActorHandle::new(
-                        handle,
-                        parent.clone(),
-                        seq,
-                        turn_clock.clone(),
-                        kill_grace,
-                        runtime.clone(),
-                    ));
-                }
-            }
-        }
-        match self.by_id.entry(id.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                // A second live registration of one id is refused. The name
-                // this call just claimed is released again, so the refusal
-                // leaves no trace behind.
-                if let Some(n) = name {
-                    self.unregister_by_name(n, seq);
-                }
-                return Err(SpawnError::DuplicateChild(id.clone()));
-            }
+        // One insert under the shard's write lock: a lookup by id or by name
+        // finds the whole entry or nothing, and a refusal inserts nothing.
+        let occupant = match self.by_id.entry(RegKey(id.clone())) {
+            dashmap::mapref::entry::Entry::Occupied(held) => Some(held.get().named),
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(AnyActorHandle::new(
-                    handle, parent, seq, turn_clock, kill_grace, runtime,
+                    handle, named, parent, seq, turn_clock, kill_grace, runtime,
                 ));
+                None
             }
+        };
+        match occupant {
+            Some(true) if named => {
+                return Err(SpawnError::NameTaken {
+                    name: id.as_str().to_string(),
+                    system: self.name.clone(),
+                });
+            }
+            Some(_) => return Err(SpawnError::DuplicateChild(id.clone())),
+            None => {}
         }
         drop(gate);
 
@@ -1894,12 +2067,6 @@ impl ActorSystem {
             .remove_if(id, |_, entry| entry.registration_seq == registration_seq);
     }
 
-    /// Same seq-checked removal as [`unregister_by_id`](Self::unregister_by_id), for `by_name`.
-    pub(crate) fn unregister_by_name(&self, name: &str, registration_seq: u64) {
-        self.by_name
-            .remove_if(name, |_, entry| entry.registration_seq == registration_seq);
-    }
-
     /// The identity of the incarnation behind `record`, the actor `id`,
     /// recorded now when its spawn recorded none: an incarnation spawned
     /// while no sink took events has an entry in the registry and nothing in
@@ -1914,7 +2081,7 @@ impl ActorSystem {
     /// returns, so the caller may push at once.
     pub(crate) fn resolve_identity(
         &self,
-        record: &AbortRecord,
+        record: &IncarnationRef,
         id: &ActorId,
     ) -> Option<Arc<crate::telemetry::Identity>> {
         let mode = self.telemetry_mode();
@@ -1925,12 +2092,9 @@ impl ActorSystem {
         if record.has_stopped() {
             return None;
         }
-        let (id, incarnation, parent, _clock, type_name) = self.entry_of_record(key, id)?;
-        let name = self
-            .by_name
-            .get(id.as_str())
-            .filter(|entry| entry.stop_lane.abort_record().key() == key)
-            .map(|entry| entry.key().clone());
+        let (id, incarnation, parent, _clock, type_name, named) = self.entry_of_record(key, id)?;
+        // A named actor's name is its id, read from the same entry.
+        let name = named.then(|| Arc::clone(id.shared()));
         let parent = match parent {
             None => None,
             Some((parent_id, parent_seq)) => {
@@ -1988,10 +2152,15 @@ impl ActorSystem {
         mode.bind_once(|| {
             #[cfg(test)]
             self.identity_walks.fetch_add(1, Ordering::Relaxed);
-            let rows: Vec<(ActorId, AbortRecord)> = self
+            let rows: Vec<(ActorId, IncarnationRef)> = self
                 .by_id
                 .iter()
-                .map(|entry| (entry.key().clone(), entry.stop_lane.abort_record().clone()))
+                .map(|entry| {
+                    (
+                        entry.key().0.clone(),
+                        entry.stop_lane.abort_record().clone(),
+                    )
+                })
                 .collect();
             for (id, record) in rows {
                 let _ = self.resolve_identity(&record, &id);
@@ -2005,8 +2174,8 @@ impl ActorSystem {
         self.identity_walks.load(Ordering::Relaxed)
     }
 
-    /// The id, incarnation number, supervisor, turn clock id and actor type
-    /// name of the registry entry under `id`, when its stop lane's record is
+    /// The id, incarnation number, supervisor, turn clock id, actor type name
+    /// and named flag of the registry entry under `id`, when its stop lane's record is
     /// at `key`. The registry guard is dropped before this returns.
     fn entry_of_record(&self, key: usize, id: &ActorId) -> Option<EntryFacts> {
         let entry = self.by_id.get(id)?;
@@ -2017,6 +2186,7 @@ impl ActorSystem {
                 entry.parent.clone(),
                 entry.turn_clock.id(),
                 entry.handle.mail_view().type_name,
+                entry.named,
             )
         })
     }
@@ -2116,10 +2286,10 @@ impl ActorSystem {
         slot.strong.take()
     }
 
-    /// Attaches the task's abort handle to the just-created registry entries.
+    /// Attaches the task's abort handle to the just-created registry entry.
     /// Called once, immediately after `handle.spawn(...)`: the `AbortHandle`
-    /// does not exist before then, so registration (the name-claim) and this
-    /// attach step are necessarily two steps, with a brief window between
+    /// does not exist before then, so registration (the entry's insert) and
+    /// this attach step are necessarily two steps, with a brief window between
     /// them where the entry's `abort` is `None` (see [`AnyActorHandle::abort`]).
     ///
     /// A `Kill` raised in that window found no abort handle to schedule: the
@@ -2131,18 +2301,13 @@ impl ActorSystem {
     /// [`raise_kill_declared`]), or after the entry's own kill
     /// grace when none did; a deadline already passed arms it at zero.
     ///
-    /// Only the entries of this spawn's own registration, `registration_seq`,
-    /// take the handle, each checked under the same entry lock as the write:
-    /// an entry a later registration made under the same id or name (after
-    /// this incarnation ended and freed them) keeps its own abort handle, and
-    /// no backstop is armed through it.
-    pub(crate) fn attach_abort(
-        &self,
-        id: &ActorId,
-        name: Option<&str>,
-        abort: AbortHandle,
-        registration_seq: u64,
-    ) {
+    /// Only the entry of this spawn's own registration, `registration_seq`,
+    /// takes the handle, checked under the same entry lock as the write: an
+    /// entry a later registration made under the same id (after this
+    /// incarnation ended and freed it) keeps its own abort handle, and no
+    /// backstop is armed through it. A named actor has this one entry too, so
+    /// a lookup by name reads the same handle.
+    pub(crate) fn attach_abort(&self, id: &ActorId, abort: AbortHandle, registration_seq: u64) {
         let mut armed_with: Option<(StopLane, Duration, Handle)> = None;
         if let Some(mut entry) = self.by_id.get_mut(id) {
             if entry.registration_seq == registration_seq {
@@ -2154,19 +2319,12 @@ impl ActorSystem {
                 ));
             }
         }
-        if let Some(name) = name {
-            if let Some(mut entry) = self.by_name.get_mut(name) {
-                if entry.registration_seq == registration_seq {
-                    entry.abort = Some(abort.clone());
-                }
-            }
-        }
         if let Some((lane, grace, runtime)) = armed_with {
             if matches!(lane.reason(), Some(StopReason::Kill)) {
-                // The deadlines are read after the lane: every raiser
+                // The deadline is read after the lane: every raiser
                 // declared its own before its raise, so the earliest of
-                // those whose `Kill` this read saw is among them.
-                let due = self.declared_kill_due(id, name, registration_seq);
+                // those whose `Kill` this read saw is in the entry.
+                let due = self.declared_kill_due(id, registration_seq);
                 let after = match due {
                     0 => grace,
                     due => Duration::from_nanos(due.saturating_sub(self.kill_clock())),
@@ -2177,21 +2335,12 @@ impl ActorSystem {
     }
 
     /// The earliest `Kill` deadline declared on the registration
-    /// `registration_seq` under `id` or `name`, `0` when none was.
-    fn declared_kill_due(&self, id: &ActorId, name: Option<&str>, registration_seq: u64) -> u64 {
-        let by_id = self
-            .by_id
+    /// `registration_seq` under `id`, `0` when none was.
+    fn declared_kill_due(&self, id: &ActorId, registration_seq: u64) -> u64 {
+        self.by_id
             .get(id)
             .filter(|entry| entry.registration_seq == registration_seq)
-            .map_or(0, |entry| entry.kill_due);
-        let by_name = name
-            .and_then(|name| self.by_name.get(name))
-            .filter(|entry| entry.registration_seq == registration_seq)
-            .map_or(0, |entry| entry.kill_due);
-        match (by_id, by_name) {
-            (0, due) | (due, 0) => due,
-            (a, b) => a.min(b),
-        }
+            .map_or(0, |entry| entry.kill_due)
     }
 
     /// Nanoseconds from the system's epoch to now, at least `1` so that `0`
@@ -2214,40 +2363,35 @@ impl ActorSystem {
     /// raises: an attach that finds the `Kill` raised then reads every
     /// deadline declared before that raise. The entry is matched by its
     /// status plane, never by the id alone, and nothing else runs under the
-    /// shard's lock.
-    fn declare_kill(&self, id: &ActorId, status_rx: &StatusRx, window: Option<Duration>) -> bool {
-        let now = self.kill_clock();
-        let mut declared = false;
-        if let Some(mut entry) = self.by_id.get_mut(id) {
-            if entry.status_rx.same_channel(status_rx) {
-                entry.declare_kill(now, window);
-                declared = true;
-            }
-        }
+    /// shard's lock. `key` is the id, or the name a raiser found its target
+    /// by, which is the same key: the status plane decides either way.
+    fn declare_kill<Q>(&self, key: &Q, status_rx: &StatusRx, window: Option<Duration>) -> bool
+    where
+        RegKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let declared = self.declare_on(key, status_rx, window);
         #[cfg(test)]
         self.run_after_kill_declaration();
         declared
     }
 
-    /// [`declare_kill`](Self::declare_kill) for a raiser that found its target
-    /// by name.
-    fn declare_kill_by_name(
-        &self,
-        name: &str,
-        status_rx: &StatusRx,
-        window: Option<Duration>,
-    ) -> bool {
+    /// Declares on the entry under `key` when it is the incarnation of
+    /// `status_rx`, under that one shard's lock and nothing else.
+    fn declare_on<Q>(&self, key: &Q, status_rx: &StatusRx, window: Option<Duration>) -> bool
+    where
+        RegKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let now = self.kill_clock();
-        let mut declared = false;
-        if let Some(mut entry) = self.by_name.get_mut(name) {
-            if entry.status_rx.same_channel(status_rx) {
-                entry.declare_kill(now, window);
-                declared = true;
-            }
+        let Some(mut entry) = self.by_id.get_mut(key) else {
+            return false;
+        };
+        if !entry.status_rx.same_channel(status_rx) {
+            return false;
         }
-        #[cfg(test)]
-        self.run_after_kill_declaration();
-        declared
+        entry.declare_kill(now, window);
+        true
     }
 
     /// Schedules the abort of a task whose actor was just sent `Kill`: the
@@ -2265,7 +2409,7 @@ impl ActorSystem {
     pub(crate) fn arm_kill_backstop(
         &self,
         abort: AbortHandle,
-        record: &AbortRecord,
+        record: &IncarnationRef,
         grace: Duration,
         rt: &Handle,
     ) {
@@ -2293,18 +2437,12 @@ impl ActorSystem {
         &self,
         key: KillKey<'_>,
         raised_on: &StatusRx,
-        record: &AbortRecord,
+        record: &IncarnationRef,
         window: Option<Duration>,
     ) -> Option<AbortHandle> {
         let (abort, grace, runtime) = match key {
-            KillKey::Id(id) => self.kill_target_for(id, raised_on)?,
-            KillKey::Name(name) => {
-                let entry = self.by_name.get(name)?;
-                if !entry.status_rx.same_channel(raised_on) {
-                    return None;
-                }
-                (entry.abort.clone(), entry.kill_grace, entry.runtime.clone())
-            }
+            KillKey::Id(id) => self.kill_target_at(id, raised_on)?,
+            KillKey::Name(name) => self.kill_target_at(name, raised_on)?,
         };
         if let Some(abort) = &abort {
             self.arm_kill_backstop(abort.clone(), record, window.unwrap_or(grace), &runtime);
@@ -2425,7 +2563,22 @@ impl ActorSystem {
         id: &ActorId,
         status_rx: &StatusRx,
     ) -> Option<(Option<AbortHandle>, Duration, Handle)> {
-        let entry = self.by_id.get(id)?;
+        self.kill_target_at(id, status_rx)
+    }
+
+    /// [`kill_target_for`](Self::kill_target_for) for the entry under `key`,
+    /// an id or the name it was found by: one guard, dropped before this
+    /// returns, and the entry matched by its status plane.
+    fn kill_target_at<Q>(
+        &self,
+        key: &Q,
+        status_rx: &StatusRx,
+    ) -> Option<(Option<AbortHandle>, Duration, Handle)>
+    where
+        RegKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let entry = self.by_id.get(key)?;
         if !entry.status_rx.same_channel(status_rx) {
             return None;
         }
@@ -2723,7 +2876,8 @@ impl ActorSystem {
                 value.reason.is_some()
             };
             seen.push(Seen {
-                id: entry.key().clone(),
+                id: entry.key().0.clone(),
+                named: entry.named,
                 seq: entry.registration_seq,
                 key: record.key(),
                 token: record.token_addr(),
@@ -2738,21 +2892,11 @@ impl ActorSystem {
                     } else {
                         None
                     },
-                    suspended: record.sys_bits() & crate::actor::subtree::SYS_SUSPENDED != 0,
+                    suspended: record.sys_bits() & crate::actor::incarnation::SYS_SUSPENDED != 0,
                     coupling: crate::telemetry::CouplingInfo::of(record),
                 }),
             });
         }
-        // Named actors are found in the second map, after the first walk, so
-        // every actor the first walk saw is there unless its name was freed.
-        // Each name is kept with the registration number of the entry that
-        // holds it, never by a record address alone: a freed address can be
-        // reused by a new actor before the rows are built.
-        let mut names: HashMap<u64, Arc<str>> = HashMap::new();
-        for entry in &self.by_name {
-            names.insert(entry.registration_seq, entry.key().clone());
-        }
-
         #[cfg(test)]
         {
             let hook = self.after_snapshot_walk.lock().unwrap().take();
@@ -2799,10 +2943,7 @@ impl ActorSystem {
             };
             records.push(ActorRecord {
                 actor,
-                name: names
-                    .get(&seen[at].seq)
-                    .filter(|name| name.as_ref() == seen[at].id.as_str())
-                    .map(|name| name.to_string()),
+                name: seen[at].named.then(|| seen[at].id.as_str().to_string()),
                 status: live.status,
                 type_name: live.mail.type_name,
                 label: identity
@@ -3125,7 +3266,7 @@ impl ActorSystem {
             .iter()
             .filter_map(|e| {
                 let (_, elapsed) = e.turn_clock.snapshot()?;
-                (elapsed > threshold).then(|| (e.key().clone(), elapsed))
+                (elapsed > threshold).then(|| (e.key().0.clone(), elapsed))
             })
             .collect();
         stuck.sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
@@ -3625,9 +3766,9 @@ impl ActorSystem {
                     ));
                 }
                 SweepTarget {
-                    id: e.key().clone(),
+                    id: e.key().0.clone(),
                     snapshot: RootSnapshot {
-                        id: e.key().clone(),
+                        id: e.key().0.clone(),
                         registration_seq: e.registration_seq,
                         status_rx: e.status_rx.clone(),
                         kill_grace: e.kill_grace,
@@ -3764,6 +3905,95 @@ impl ActorSystem {
         outcomes
     }
 
+    /// Stops one root, the incarnation whose plane is `status_rx`, exactly as
+    /// the shutdown walk stops a root: through [`stop_roots`](Self::stop_roots)
+    /// under this system's stored policy, so a `ParentRequest` its `pre_stop`
+    /// may veto until the per-root timeout, then `Kill`, then an abort, and
+    /// the force sweep once the policy's global deadline passes. The system's
+    /// phase is not touched. `None` when the registry holds no root of that
+    /// incarnation: it has ended or is ending, or it is a supervised child.
+    pub(crate) async fn stop_one_root(
+        &self,
+        id: &ActorId,
+        status_rx: &StatusRx,
+    ) -> Option<StopReport> {
+        let root = self.root_of(id, status_rx)?;
+        let policy = self.shutdown_policy.clone();
+        let deadline = saturating_deadline(Instant::now(), policy.timeout);
+        self.stop_roots(&[root], policy.per_actor_timeout, deadline)
+            .await
+            .pop()
+            .map(|(_, report)| report)
+    }
+
+    /// The abort handle, the kill grace and the runtime of the incarnation
+    /// whose plane is `status_rx`, when the registry holds it under `id` as a
+    /// root, an actor with no supervisor. The handle is `None` until the spawn
+    /// attached it.
+    pub(crate) fn root_task(
+        &self,
+        id: &ActorId,
+        status_rx: &StatusRx,
+    ) -> Option<(Option<AbortHandle>, Duration, Handle)> {
+        self.by_id
+            .get(id)
+            .filter(|e| e.parent.is_none() && e.status_rx.same_channel(status_rx))
+            .map(|e| (e.abort.clone(), e.kill_grace, e.runtime.clone()))
+    }
+
+    /// Raises `Kill` on the root incarnation whose plane is `status_rx`
+    /// through the registry's declaring raise, so the reaper aborts the task
+    /// after its kill grace with no caller left to wait. Returns whether the
+    /// lane took it; a root that has left the registry takes nothing.
+    pub(crate) fn kill_root(&self, id: &ActorId, status_rx: &StatusRx) -> bool {
+        let Some(lane) = self
+            .by_id
+            .get(id)
+            .filter(|e| e.parent.is_none() && e.status_rx.same_channel(status_rx))
+            .map(|e| e.stop_lane.clone())
+        else {
+            return false;
+        };
+        raise_kill_declared(
+            Some(self),
+            KillKey::Id(id),
+            status_rx,
+            &lane,
+            KillFrom::Plain,
+        )
+        .result
+            != RaiseResult::Refused
+    }
+
+    /// Whether no actor is registered in the system.
+    pub(crate) fn holds_no_actor(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    /// Whether the system is `Active`, the one phase that takes registrations.
+    pub(crate) fn is_active(&self) -> bool {
+        SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) == SystemPhase::Active
+    }
+
+    /// Whether the system is `Defunct`: a shutdown completed and none is in
+    /// flight.
+    pub(crate) fn is_defunct(&self) -> bool {
+        SystemPhase::from_u8(self.phase.load(Ordering::Acquire)) == SystemPhase::Defunct
+    }
+
+    fn root_of(&self, id: &ActorId, status_rx: &StatusRx) -> Option<RootSnapshot> {
+        self.by_id
+            .get(id)
+            .filter(|e| e.parent.is_none() && e.status_rx.same_channel(status_rx))
+            .map(|e| RootSnapshot {
+                id: e.key().0.clone(),
+                registration_seq: e.registration_seq,
+                status_rx: e.status_rx.clone(),
+                kill_grace: e.kill_grace,
+                record: e.stop_lane.abort_record().clone(),
+            })
+    }
+
     /// Snapshots every currently-registered ROOT actor's id, registration
     /// sequence, a clone of its status receiver and its kill grace. The
     /// snapshot is independent of the registry entry from this point on: the
@@ -3774,7 +4004,7 @@ impl ActorSystem {
             .iter()
             .filter(|e| e.parent.is_none())
             .map(|e| RootSnapshot {
-                id: e.key().clone(),
+                id: e.key().0.clone(),
                 registration_seq: e.registration_seq,
                 status_rx: e.status_rx.clone(),
                 kill_grace: e.kill_grace,
@@ -3803,49 +4033,80 @@ impl ActorSystem {
     ) -> Result<StopReport, bool> {
         let id = &root.id;
         let mut status_rx = root.status_rx.clone();
-
-        // Step 1: ParentRequest (vetoable via pre_stop).
-        #[cfg(test)]
-        self.run_ladder_hook(LadderPoint::Stop, id);
-        self.send_stop(id, &status_rx, StopReason::ParentRequest);
-        if wait_terminal(&mut status_rx, time_left(deadline).min(per_actor_timeout)).await {
-            return Ok(terminal_report(&status_rx, StopOutcome::Graceful));
-        }
-        if Instant::now() >= deadline {
-            return Err(false);
-        }
-
-        // Step 2: Kill (unvetoable, but still only observed cooperatively -
-        // an actor stuck inside a callback never reaches the select! that
-        // would see it). The system schedules the abort when it raises the
-        // Kill, so a walk cut short from here on still ends in one.
-        #[cfg(test)]
-        self.run_ladder_hook(LadderPoint::Kill, id);
-        let kill_raised = self.raise_kill(id, &status_rx);
-        let requested = if kill_raised {
-            StopOutcome::Killed
-        } else {
-            StopOutcome::Graceful
+        let ladder = SystemLadder::Walk {
+            deadline: deadline.into_std(),
+            per_actor: per_actor_timeout,
+            grace: root.kill_grace,
         };
-        if wait_terminal(&mut status_rx, time_left(deadline).min(root.kill_grace)).await {
-            return Ok(terminal_report(&status_rx, requested));
+        let mut now = Instant::now().into_std();
+        let begin = SystemSeen::Begin { accepted: true };
+        let (mut step, mut action) = system_ladder_step(ladder, SystemStep::Start, begin, now);
+        loop {
+            let seen = match action {
+                // Step 1: ParentRequest (vetoable via pre_stop).
+                SystemAction::Request => {
+                    #[cfg(test)]
+                    self.run_ladder_hook(LadderPoint::Stop, id);
+                    self.send_stop(id, &status_rx, StopReason::ParentRequest);
+                    SystemSeen::Taken { raised: false }
+                }
+                // Step 2: Kill (unvetoable, but still only observed
+                // cooperatively - an actor stuck inside a callback never
+                // reaches the select! that would see it). The system
+                // schedules the abort when it raises the Kill, so a walk cut
+                // short from here on still ends in one.
+                SystemAction::Kill { raise } => {
+                    #[cfg(test)]
+                    self.run_ladder_hook(LadderPoint::Kill, id);
+                    let kill_raised = raise && self.kill_registered(id, &status_rx);
+                    SystemSeen::Taken {
+                        raised: kill_raised,
+                    }
+                }
+                // Step 3: abort() - the last resort for an actor that never
+                // yielded back to the run loop (so Kill was never even
+                // observed).
+                SystemAction::Abort => {
+                    #[cfg(test)]
+                    self.run_ladder_hook(LadderPoint::Abort, id);
+                    self.abort_by_id(id, &status_rx);
+                    SystemSeen::Taken { raised: false }
+                }
+                SystemAction::WaitUntil(until) => {
+                    let bound = until.saturating_duration_since(now);
+                    if wait_terminal(&mut status_rx, bound).await {
+                        SystemSeen::Ended
+                    } else {
+                        SystemSeen::Passed {
+                            kill_started: false,
+                        }
+                    }
+                }
+                SystemAction::Finish(end) => {
+                    return match end {
+                        SystemEnd::Terminal { killed } => {
+                            let requested = if killed {
+                                StopOutcome::Killed
+                            } else {
+                                StopOutcome::Graceful
+                            };
+                            Ok(terminal_report(&status_rx, requested))
+                        }
+                        // Nothing left to hand off to: the concurrent sweep
+                        // would do exactly what steps 2-3 just did. A
+                        // genuinely non-yielding task.
+                        SystemEnd::Unresponsive => Ok(unresponsive()),
+                        SystemEnd::Sweep { kill_raised } => Err(kill_raised),
+                        SystemEnd::Refused => unreachable!("a walk's request is never refused"),
+                    };
+                }
+                SystemAction::WaitFloor { .. } | SystemAction::None => {
+                    unreachable!("a walk takes no such step")
+                }
+            };
+            now = Instant::now().into_std();
+            (step, action) = system_ladder_step(ladder, step, seen, now);
         }
-        if Instant::now() >= deadline {
-            return Err(kill_raised);
-        }
-
-        // Step 3: abort() - the last resort for an actor that never yielded
-        // back to the run loop (so Kill was never even observed).
-        #[cfg(test)]
-        self.run_ladder_hook(LadderPoint::Abort, id);
-        self.abort_by_id(id, &status_rx);
-        if wait_terminal(&mut status_rx, time_left(deadline).min(ABORT_SETTLE)).await {
-            return Ok(terminal_report(&status_rx, requested));
-        }
-
-        // Nothing left to hand off to: the concurrent sweep would do exactly
-        // what steps 2-3 just did. A genuinely non-yielding task.
-        Ok(unresponsive())
     }
 
     /// Force-stops a batch CONCURRENTLY: `Kill` -> grace -> `abort()` ->
@@ -3923,10 +4184,7 @@ impl ActorSystem {
                 KillKey::Id(&id),
                 &status_rx,
                 &lane,
-                None,
-                None,
-                || {},
-                None,
+                KillFrom::Plain,
             );
             let took = raised_kill.result != RaiseResult::Refused;
             let raised = took || kill_raised;
@@ -3999,7 +4257,7 @@ impl ActorSystem {
     /// Returns whether the `Kill` was raised: it is not when the registry does
     /// not hold that incarnation under `id` (it left, or a later incarnation
     /// holds the id) or its lane refuses the request.
-    fn raise_kill(&self, id: &ActorId, status_rx: &StatusRx) -> bool {
+    fn kill_registered(&self, id: &ActorId, status_rx: &StatusRx) -> bool {
         let Some(lane) = self
             .by_id
             .get(id)
@@ -4015,10 +4273,7 @@ impl ActorSystem {
             KillKey::Id(id),
             status_rx,
             &lane,
-            None,
-            None,
-            || {},
-            None,
+            KillFrom::Plain,
         )
         .result
             != RaiseResult::Refused
@@ -4092,7 +4347,7 @@ struct StuckTurn {
     seq: u64,
     token: u64,
     elapsed: Duration,
-    record: crate::actor::subtree::AbortRecord,
+    record: crate::actor::incarnation::IncarnationRef,
 }
 
 impl StuckTurn {
@@ -4117,7 +4372,7 @@ fn stuck_turns(system: &ActorSystem, threshold: Duration) -> Vec<StuckTurn> {
         .filter_map(|e| {
             let (token, elapsed) = e.turn_clock.snapshot()?;
             (elapsed > threshold).then(|| StuckTurn {
-                id: e.key().clone(),
+                id: e.key().0.clone(),
                 seq: e.registration_seq,
                 token,
                 elapsed,
@@ -4442,7 +4697,7 @@ impl ActorSystem {
         let pass = state.pass;
         // Collected under the registry guards; the identities are resolved
         // and the events pushed after the last guard is gone.
-        let mut entered: Vec<(u64, ActorId, AbortRecord, usize, usize)> = Vec::new();
+        let mut entered: Vec<(u64, ActorId, IncarnationRef, usize, usize)> = Vec::new();
         let mut left: Vec<(u64, Alarm, usize)> = Vec::new();
         let mut long: Vec<(u64, usize)> = Vec::new();
         for entry in &self.by_id {
@@ -4463,7 +4718,7 @@ impl ActorSystem {
             if edge {
                 entered.push((
                     seq,
-                    entry.key().clone(),
+                    entry.key().0.clone(),
                     entry.stop_lane.abort_record().clone(),
                     view.mailbox_len,
                     view.mailbox_capacity,
@@ -4779,12 +5034,7 @@ struct RootSnapshot {
     kill_grace: Duration,
     /// The incarnation's abort record: a leftover whose registry entry is
     /// already freed is judged by the abort the reaper issues against it.
-    record: AbortRecord,
-}
-
-/// Time remaining until `deadline`, floored at zero.
-fn time_left(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
+    record: IncarnationRef,
 }
 
 /// Reads an actor's status from its status channel, treating a closed
@@ -5143,7 +5393,7 @@ impl StopStep {
     /// raise on a `Killed` cell). A share is held only inside this
     /// synchronous function, which awaits nothing, so every share is matched
     /// by the store or the give-back, a panic included.
-    fn raise_kill(&self, lane: &StopLane, between: impl FnOnce()) -> RaiseResult {
+    fn raise_shared(&self, lane: &StopLane, between: impl FnOnce()) -> RaiseResult {
         let mut seen = self.0.load(Ordering::SeqCst);
         let took_a_share = loop {
             if seen == Self::KILLED {
@@ -5258,7 +5508,7 @@ thread_local! {
 }
 
 /// Arms `hook` to run once on this thread, right after the next
-/// [`StopStep::raise_kill`] raise and before its share is settled.
+/// [`StopStep::raise_shared`] raise and before its share is settled.
 #[cfg(test)]
 pub(crate) fn run_once_after_the_next_raise(hook: impl FnOnce() + 'static) {
     AFTER_RAISE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
@@ -5279,26 +5529,58 @@ fn run_after_raise() {
 async fn force_stop(
     mut status_rx: StatusRx,
     abort: Option<AbortHandle>,
-    record: AbortRecord,
+    record: IncarnationRef,
     kill_grace: Duration,
     requested: StopOutcome,
 ) -> StopReport {
-    if wait_terminal(&mut status_rx, kill_grace).await {
-        return terminal_report(&status_rx, requested);
+    let ladder = SystemLadder::Force { grace: kill_grace };
+    let mut now = Instant::now().into_std();
+    let begin = SystemSeen::Begin { accepted: true };
+    let (mut step, mut action) = system_ladder_step(ladder, SystemStep::Start, begin, now);
+    let ended_or_passed = |ended| {
+        if ended {
+            SystemSeen::Ended
+        } else {
+            SystemSeen::Passed {
+                kill_started: false,
+            }
+        }
+    };
+    loop {
+        let seen = match action {
+            SystemAction::WaitUntil(until) => {
+                let bound = until.saturating_duration_since(now);
+                ended_or_passed(wait_terminal(&mut status_rx, bound).await)
+            }
+            SystemAction::Abort => {
+                if let Some(abort) = &abort {
+                    record.abort(abort);
+                }
+                SystemSeen::Taken { raised: false }
+            }
+            // Without an abort of its own the force follows the one the
+            // reaper issues: no verdict before that abort plus the settle
+            // time. A wait for an owed abort is capped by the force's whole
+            // budget once more.
+            SystemAction::WaitFloor { budget, cap } => {
+                ended_or_passed(wait_end_or_floor(&mut status_rx, Some(&record), budget, cap).await)
+            }
+            SystemAction::Finish(end) => {
+                return match end {
+                    SystemEnd::Terminal { .. } => terminal_report(&status_rx, requested),
+                    SystemEnd::Unresponsive => unresponsive(),
+                    SystemEnd::Refused | SystemEnd::Sweep { .. } => {
+                        unreachable!("a force stop is neither refused nor swept")
+                    }
+                };
+            }
+            SystemAction::Request | SystemAction::Kill { .. } | SystemAction::None => {
+                unreachable!("a force stop takes no such step")
+            }
+        };
+        now = Instant::now().into_std();
+        (step, action) = system_ladder_step(ladder, step, seen, now);
     }
-
-    if let Some(abort) = &abort {
-        record.abort(abort);
-    }
-    // Without an abort of its own the force follows the one the reaper
-    // issues: no verdict before that abort plus the settle time. A wait for
-    // an owed abort is capped by the force's whole budget once more.
-    let cap = kill_grace.saturating_add(ABORT_SETTLE);
-    if wait_end_or_floor(&mut status_rx, Some(&record), ABORT_SETTLE, cap).await {
-        return terminal_report(&status_rx, requested);
-    }
-
-    unresponsive()
 }
 
 /// Waits for `status_rx` to reach a terminal state, counting `budget` from
@@ -5316,7 +5598,7 @@ async fn force_stop(
 /// at the budget's deadline exactly.
 pub(crate) async fn wait_end_or_floor(
     status_rx: &mut StatusRx,
-    record: Option<&AbortRecord>,
+    record: Option<&IncarnationRef>,
     budget: Duration,
     cap: Duration,
 ) -> bool {
@@ -5324,7 +5606,7 @@ pub(crate) async fn wait_end_or_floor(
     let cap = bounded_wait(cap);
     let budget_at = saturating_deadline(Instant::now(), budget);
     let floor = || {
-        let (aborted_at, owed) = record.map_or((None, false), AbortRecord::view);
+        let (aborted_at, owed) = record.map_or((None, false), IncarnationRef::view);
         Instant::from_std(rules::verdict_floor(
             budget_at.into_std(),
             cap,
@@ -5336,7 +5618,7 @@ pub(crate) async fn wait_end_or_floor(
         // Created before the record is read below (a `Notified` is woken by
         // every `notify_waiters` after its creation), so a record
         // written after that read wakes this pass.
-        let mut recorded = std::pin::pin!(record.map(AbortRecord::recorded));
+        let mut recorded = std::pin::pin!(record.map(IncarnationRef::recorded));
         if let Some(notified) = recorded.as_mut().as_pin_mut() {
             notified.enable();
         }
@@ -5415,7 +5697,7 @@ pub(crate) struct ReaperEntry {
     /// The target's abort record: owed from the moment the entry exists
     /// (nothing is owed to a task that already finished), written when the
     /// entry aborts the task.
-    record: AbortRecord,
+    record: IncarnationRef,
     /// The step cell of the bounded stop whose ladder this entry carries on:
     /// the first stage writes it in the step that raises the `Kill`.
     step: Option<Arc<StopStep>>,
@@ -5423,7 +5705,7 @@ pub(crate) struct ReaperEntry {
 }
 
 impl ReaperEntry {
-    pub(crate) fn new(deadline: Instant, abort: AbortHandle, record: AbortRecord) -> Self {
+    pub(crate) fn new(deadline: Instant, abort: AbortHandle, record: IncarnationRef) -> Self {
         record.owe_for(&abort);
         push_kill_step(&record, None, KillStepKind::AbortArmed, || {
             step_deadline_in(deadline)
@@ -5491,7 +5773,7 @@ impl ReaperEntry {
                 // second read of the lane: a seal between the raise and a
                 // later read would hide a `Kill` the lane accepted.
                 let result = match &self.step {
-                    Some(step) => step.raise_kill(&lane, || {}),
+                    Some(step) => step.raise_shared(&lane, || {}),
                     None => lane.try_raise(StopReason::Kill),
                 };
                 if result != RaiseResult::Refused {
@@ -5659,7 +5941,7 @@ mod sweep_identity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::StatusValue;
+    use crate::actor::incarnation::StatusValue;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc;
 
@@ -5704,21 +5986,47 @@ mod tests {
         )
     }
 
-    // Both registry maps are built with the same shard count, whatever CPUs
-    // the process may use: a table growth then rehashes a small slice of the
+    // The registry map is built with the same shard count whatever CPUs the
+    // process may use: a table growth then rehashes a small slice of the
     // entries instead of a quarter or a sixteenth of them. The literal bound
     // keeps the count itself from being lowered without this test noticing.
     #[tokio::test]
     async fn registry_maps_keep_the_shard_count_on_any_cpu_set() {
         let sys = ActorSystem::create(format!("shards-{}", uuid::Uuid::new_v4())).unwrap();
-        for (map, shards) in [
-            ("by_name", sys.by_name.shards().len()),
-            ("by_id", sys.by_id.shards().len()),
-        ] {
-            assert_eq!(shards, REGISTRY_SHARDS, "{map} shard count");
-            assert!(shards >= 256, "{map} has only {shards} shards");
-        }
+        let shards = sys.by_id.shards().len();
+        assert_eq!(shards, REGISTRY_SHARDS, "by_id shard count");
+        assert!(shards >= 256, "by_id has only {shards} shards");
         assert_eq!(registry_map::<u8, u8>().shards().len(), REGISTRY_SHARDS);
+    }
+
+    /// Holds its `on_stopped` until released, so a lookup can run while the
+    /// actor ends.
+    struct HeldEnd {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Actor for HeldEnd {
+        type Message = ();
+        type Response = ();
+
+        async fn handle(
+            &mut self,
+            _msg: (),
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            Ok(())
+        }
+
+        async fn on_stopped(
+            &mut self,
+            _reason: &StopReason,
+            _ctx: &mut crate::actor::context::ActorContext<Self>,
+        ) -> crate::error::ActorResult<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
     }
 
     // The longest single insert while a map takes `keys` one by one, each
@@ -5821,24 +6129,32 @@ mod tests {
         let entry = ReaperEntry::new(
             Instant::now() + Duration::from_secs(30),
             child.abort_handle(),
-            AbortRecord::new(),
+            IncarnationRef::new(),
         );
         drop(entry);
         assert!(ended(child).await.unwrap_err().is_cancelled());
 
         let child = tokio::spawn(std::future::pending::<()>());
-        let entry = ReaperEntry::new(Instant::now(), child.abort_handle(), AbortRecord::new());
+        let entry = ReaperEntry::new(Instant::now(), child.abort_handle(), IncarnationRef::new());
         entry.fire();
         assert!(ended(child).await.unwrap_err().is_cancelled());
 
         let done = tokio::spawn(async {});
         let abort = done.abort_handle();
         done.await.unwrap();
-        drop(ReaperEntry::new(Instant::now(), abort, AbortRecord::new()));
+        drop(ReaperEntry::new(
+            Instant::now(),
+            abort,
+            IncarnationRef::new(),
+        ));
     }
 
     /// A task that never ends on its own, with a lane to raise on.
-    fn parked_with_a_lane() -> (tokio::task::JoinHandle<()>, StopLane, crate::types::LaneRx) {
+    fn parked_with_a_lane() -> (
+        tokio::task::JoinHandle<()>,
+        StopLane,
+        crate::actor::incarnation::LaneRx,
+    ) {
         let (lane, lane_rx) = StopLane::new();
         (tokio::spawn(std::future::pending::<()>()), lane, lane_rx)
     }
@@ -6080,10 +6396,11 @@ mod tests {
     fn a_registry_entry_costs_at_most_eight_bytes_for_its_kill_deadline() {
         use std::mem::size_of;
         let without_deadline = size_of::<TypeId>()
+            + size_of::<bool>()
             + size_of::<Box<dyn Any + Send + Sync>>()
             + size_of::<StopLane>()
             + size_of::<StatusRx>()
-            + size_of::<crate::types::TurnClock>()
+            + size_of::<crate::actor::incarnation::TurnClock>()
             + size_of::<Option<AbortHandle>>()
             + size_of::<Option<(ActorId, u64)>>()
             + size_of::<u64>()
@@ -6261,7 +6578,7 @@ mod tests {
         let seq = sys
             .register_actor::<Dummy>(
                 &id,
-                Some(&Arc::from(name.as_str())),
+                true,
                 &handle,
                 true,
                 TurnClock::default(),
@@ -6275,9 +6592,9 @@ mod tests {
         });
         let abort = task.abort_handle();
         let hook_sys = sys.clone();
-        let (hook_id, hook_name) = (id.clone(), name.clone());
+        let hook_id = id.clone();
         *sys.after_kill_lookup.lock().unwrap() = Some(Arc::new(move || {
-            hook_sys.attach_abort(&hook_id, Some(&hook_name), abort.clone(), seq);
+            hook_sys.attach_abort(&hook_id, abort.clone(), seq);
         }));
         (sys, name, id, task)
     }
@@ -6312,7 +6629,7 @@ mod tests {
         let seq = sys
             .register_actor::<Dummy>(
                 &id,
-                None,
+                false,
                 &handle,
                 true,
                 TurnClock::default(),
@@ -6324,7 +6641,7 @@ mod tests {
             let _owned = (status_tx, stop_rx);
             std::future::pending::<()>().await;
         });
-        sys.attach_abort(&id, None, task.abort_handle(), seq);
+        sys.attach_abort(&id, task.abort_handle(), seq);
         task
     }
 
@@ -6370,16 +6687,15 @@ mod tests {
 
     // - A Kill arms the incarnation it was raised on, and only it -------------
 
-    /// Registers an incarnation under `id` (and `name`): a live lane and
+    /// Registers an incarnation under `id` (as its name when `named`): a live lane and
     /// status plane owned by a pending task that also holds the registration
     /// guard, so the task's end unregisters it. Its abort handle is stored.
     fn register_incarnation(
         sys: &Arc<ActorSystem>,
         id: &ActorId,
-        name: Option<&str>,
+        named: bool,
         grace: Duration,
     ) -> (u64, tokio::task::JoinHandle<()>) {
-        let shared: Option<Arc<str>> = name.map(Arc::from);
         let (tx, _rx) = crate::actor::mailbox::test_channel(1);
         let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
@@ -6395,7 +6711,7 @@ mod tests {
         let seq = sys
             .register_actor::<Dummy>(
                 id,
-                shared.as_ref(),
+                named,
                 &handle,
                 true,
                 TurnClock::default(),
@@ -6403,12 +6719,12 @@ mod tests {
                 Handle::current(),
             )
             .unwrap();
-        let guard = RegistryGuard::new(sys.clone(), id.clone(), shared, seq);
+        let guard = RegistryGuard::new(sys.clone(), id.clone(), seq);
         let task = tokio::spawn(async move {
             let _owned = (status_tx, stop_rx, guard);
             std::future::pending::<()>().await;
         });
-        sys.attach_abort(id, name, task.abort_handle(), seq);
+        sys.attach_abort(id, task.abort_handle(), seq);
         (seq, task)
     }
 
@@ -6427,21 +6743,18 @@ mod tests {
         let sys = ActorSystem::create(format!("successor-{}", uuid::Uuid::new_v4())).unwrap();
         let name = format!("successor-target-{}", uuid::Uuid::new_v4());
         let id = ActorId::from(name.clone());
-        let (seq, old) = register_incarnation(&sys, &id, Some(&name), SLOW_GRACE);
+        let (seq, old) = register_incarnation(&sys, &id, true, SLOW_GRACE);
         let successor: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
         {
-            let (hook_sys, hook_id, hook_name, slot) =
-                (sys.clone(), id.clone(), name.clone(), successor.clone());
+            let (hook_sys, hook_id, slot) = (sys.clone(), id.clone(), successor.clone());
             *sys.after_kill_raise.lock().unwrap() = Some(Arc::new(move || {
                 hook_sys.unregister_by_id(&hook_id, seq);
-                hook_sys.unregister_by_name(&hook_name, seq);
                 // A shutdown refuses registrations; the successor stands for
                 // the next incarnation of the same id.
                 let phase = hook_sys
                     .phase
                     .swap(SystemPhase::Active.as_u8(), Ordering::SeqCst);
-                let (_, task) =
-                    register_incarnation(&hook_sys, &hook_id, Some(&hook_name), HOOK_GRACE);
+                let (_, task) = register_incarnation(&hook_sys, &hook_id, true, HOOK_GRACE);
                 hook_sys.phase.store(phase, Ordering::SeqCst);
                 *slot.lock().unwrap() = Some(task);
             }));
@@ -6515,18 +6828,10 @@ mod tests {
             ActorId::from("sweep-parked"),
         );
         // Registered first, so it is stopped last and swept as a straggler.
-        let (_seq, aborted_task) = register_incarnation(
-            &sys,
-            &aborted_id,
-            Some("sweep-aborted"),
-            Duration::from_millis(40),
-        );
-        let (_seq, parked_task) = register_incarnation(
-            &sys,
-            &parked_id,
-            Some("sweep-parked"),
-            Duration::from_millis(100),
-        );
+        let (_seq, aborted_task) =
+            register_incarnation(&sys, &aborted_id, true, Duration::from_millis(40));
+        let (_seq, parked_task) =
+            register_incarnation(&sys, &parked_id, true, Duration::from_millis(100));
         let shutdown = {
             let sys = sys.clone();
             tokio::spawn(async move {
@@ -6573,8 +6878,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_attach_leaves_the_new_registration_s_abort_its_own() {
         let sys = ActorSystem::create(format!("stale-attach-{}", uuid::Uuid::new_v4())).unwrap();
-        let id = ActorId::from("stale-attach-id");
         let name = "stale-attach-name";
+        let id = ActorId::from(name);
         let register = |sys: &Arc<ActorSystem>| {
             let (tx, _rx) = crate::actor::mailbox::test_channel(1);
             let (_status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
@@ -6591,7 +6896,7 @@ mod tests {
             let seq = sys
                 .register_actor::<Dummy>(
                     &id,
-                    Some(&Arc::from(name)),
+                    true,
                     &handle,
                     true,
                     TurnClock::default(),
@@ -6601,27 +6906,25 @@ mod tests {
                 .unwrap();
             (seq, stop_lane)
         };
-        // The first incarnation registers, and its entries are freed before
-        // its attach runs.
+        // The first incarnation registers, and its entry is freed before its
+        // attach runs.
         let (old_seq, _old_lane) = register(&sys);
         sys.unregister_by_id(&id, old_seq);
-        sys.unregister_by_name(name, old_seq);
-        // A later spawn registers the same id and name and attaches its own
-        // abort; its lane then holds a `Kill`.
+        // A later spawn registers the same name and attaches its own abort;
+        // its lane then holds a `Kill`.
         let (new_seq, new_lane) = register(&sys);
         let new_task = tokio::spawn(std::future::pending::<()>());
-        sys.attach_abort(&id, Some(name), new_task.abort_handle(), new_seq);
+        sys.attach_abort(&id, new_task.abort_handle(), new_seq);
         new_lane.raise(StopReason::Kill);
         let arms = sys.backstop_arms.load(Ordering::SeqCst);
         let old_task = tokio::spawn(std::future::pending::<()>());
-        sys.attach_abort(&id, Some(name), old_task.abort_handle(), old_seq);
+        sys.attach_abort(&id, old_task.abort_handle(), old_seq);
         let by_id = sys
             .by_id
             .get(&id)
             .and_then(|entry| entry.abort.as_ref().map(|a| a.id()));
         let by_name = sys
-            .by_name
-            .get(name)
+            .by_name(name)
             .and_then(|entry| entry.abort.as_ref().map(|a| a.id()));
         assert_eq!(
             by_id,
@@ -7019,7 +7322,7 @@ mod tests {
             let seq = sys
                 .register_actor::<Dummy>(
                     id,
-                    None,
+                    false,
                     &handle,
                     is_root,
                     TurnClock::default(),
@@ -7028,12 +7331,12 @@ mod tests {
                 )
                 .unwrap();
             sys.phase.store(phase, Ordering::SeqCst);
-            let guard = RegistryGuard::new(sys.clone(), id.clone(), None, seq);
+            let guard = RegistryGuard::new(sys.clone(), id.clone(), seq);
             let task = tokio::spawn(async move {
                 let _owned = stop_rx;
                 std::future::pending::<()>().await;
             });
-            sys.attach_abort(id, None, task.abort_handle(), seq);
+            sys.attach_abort(id, task.abort_handle(), seq);
             Arc::new(Scripted {
                 id: id.clone(),
                 handle,
@@ -8009,20 +8312,20 @@ mod tests {
         );
         let seq = sys.register_actor::<Dummy>(
             id,
-            None,
+            false,
             &handle,
             true,
             TurnClock::default(),
             LONG_GRACE,
             rt.clone(),
         )?;
-        let guard = RegistryGuard::new(sys.clone(), id.clone(), None, seq);
+        let guard = RegistryGuard::new(sys.clone(), id.clone(), seq);
         let task = rt.spawn(async move {
             let _ = stop_rx.changed().await;
             drop(guard);
             StatusValue::write_reason(&status_tx, crate::types::StopReason::Graceful, true);
         });
-        sys.attach_abort(id, None, task.abort_handle(), seq);
+        sys.attach_abort(id, task.abort_handle(), seq);
         Ok(())
     }
 
@@ -8725,8 +9028,8 @@ mod tests {
     /// finished takes no mark at all.
     mod finished_task {
         use super::*;
-        use crate::actor::subtree::SubtreeLink;
-        use crate::types::StopLane;
+        use crate::actor::incarnation::StopLane;
+        use crate::actor::incarnation::SubtreeLink;
         use tokio::task::JoinHandle;
 
         const WINDOW: Duration = Duration::from_millis(400);

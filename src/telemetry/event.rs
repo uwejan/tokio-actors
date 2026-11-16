@@ -156,9 +156,9 @@ pub enum RaiseOutcome {
     Refused,
 }
 
-impl From<crate::types::RaiseResult> for RaiseOutcome {
-    fn from(result: crate::types::RaiseResult) -> Self {
-        use crate::types::RaiseResult;
+impl From<crate::actor::incarnation::RaiseResult> for RaiseOutcome {
+    fn from(result: crate::actor::incarnation::RaiseResult) -> Self {
+        use crate::actor::incarnation::RaiseResult;
         match result {
             RaiseResult::Recorded => Self::Recorded,
             RaiseResult::Superseded => Self::Superseded,
@@ -190,7 +190,10 @@ pub enum KillStepKind {
     /// The abort was armed. It is reported when the system arms the backstop
     /// of the raised `Kill`, which it does while the actor is still
     /// registered: an actor that ended before that has no abort to arm, and
-    /// its kill shows `Declared` and `Raised` only.
+    /// its kill shows `Declared` and `Raised` only. Also reported when an
+    /// application's stop or end arms the abort of a top that had already left
+    /// the registry with its plane not terminal, which raises no `Kill`: that
+    /// kill shows `AbortArmed`, then perhaps `AbortFired`, only.
     AbortArmed,
     /// The task was aborted. It is reported once per incarnation, by the
     /// first abort that found the task unfinished, whether the reaper's at its
@@ -222,6 +225,9 @@ pub enum HelperKind {
     /// Waits for the end of a child a `SupervisorRef` asked its supervisor
     /// to terminate, and answers the caller.
     SupervisorReply,
+    /// Runs a start or stop sequence of an application or the wind-down of
+    /// its controller.
+    Application,
 }
 
 impl From<crate::helper::HelperKind> for HelperKind {
@@ -237,6 +243,7 @@ impl From<crate::helper::HelperKind> for HelperKind {
             K::Pump => Self::Pump,
             K::Monitor => Self::Monitor,
             K::SupervisorReply => Self::SupervisorReply,
+            K::Application => Self::Application,
         }
     }
 }

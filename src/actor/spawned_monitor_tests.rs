@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use super::monitor::{monitor_forward, new_entry, new_spawned_entry};
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{StatusTx, StopLane};
 use crate::actor::mailbox::test_channel;
 use crate::actor::Actor;
 use crate::error::ActorResult;
 use crate::system::ResolvedTarget;
-use crate::types::{
-    ActorId, ActorStatus, Down, DownReason, MonitorId, StatusTx, StatusValue, StopLane, StopReason,
-};
+use crate::types::{ActorId, ActorStatus, Down, DownReason, MonitorId, StopReason};
 
 struct Sink;
 

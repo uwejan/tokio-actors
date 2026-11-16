@@ -25,19 +25,22 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::context::{ActorContext, Released};
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::{ActorHandle, ForwardPermit};
-use crate::actor::monitor::{peek_final, resolve_target, IntoMonitorTarget, MonitorShared};
+use crate::actor::incarnation::{Coupling, IncarnationRef};
+use crate::actor::incarnation::{StatusRx, StopLane};
+use crate::actor::monitor::{
+    fail_by_map, peek_final, resolve_target, IntoMonitorTarget, MapSite, MonitorShared,
+};
 use crate::actor::panic::{catch_sync, payload_into_string};
 use crate::actor::runtime::{end_value, log_late_drop};
-use crate::actor::subtree::{AbortRecord, Coupling};
 use crate::actor::Actor;
 use crate::error::{ActorError, LinkError};
 use crate::system::{
     raise_kill_declared, wait_final_reason, ActorSystem, KillKey, KillRaised, ResolvedTarget,
 };
 use crate::types::{
-    ActorId, ActorStatus, DownReason, Incarnation, LinkExit, MonitorId, PeerRef, SignalTag,
-    StatusRx, StopLane, StopReason,
+    ActorId, ActorStatus, DownReason, Incarnation, LinkExit, MonitorId, PeerRef, StopReason,
 };
 
 /// The link is in force.
@@ -175,7 +178,7 @@ pub(crate) enum ExitPush {
 /// took it out of the inbox until its delivery takes a mailbox slot or ends
 /// without one. Dropping it gives the count back on every path: the task
 /// that carries it ending, aborted or dropped with its runtime included.
-pub(crate) struct ExitSlot(AbortRecord);
+pub(crate) struct ExitSlot(IncarnationRef);
 
 impl Drop for ExitSlot {
     fn drop(&mut self) {
@@ -351,7 +354,7 @@ pub(crate) struct Unlinked {
     /// True when the cancel was in time: no exit will be acted on.
     pub(crate) cancelled: bool,
     /// The other end's block, to tell it, when the cancel was in time.
-    partner: Option<AbortRecord>,
+    partner: Option<IncarnationRef>,
     state: Arc<LinkState>,
 }
 
@@ -365,7 +368,7 @@ pub(crate) struct LinkTable {
     linked: usize,
     /// The block of the actor that holds the table, set by the first insert:
     /// the count of links is recorded there for a snapshot to read.
-    own: Option<AbortRecord>,
+    own: Option<IncarnationRef>,
 }
 
 impl LinkTable {
@@ -391,7 +394,7 @@ impl LinkTable {
 
     /// Names the block of the actor that holds the table, where the count of
     /// links is recorded; the first call is kept.
-    fn bind(&mut self, own: &AbortRecord) {
+    fn bind(&mut self, own: &IncarnationRef) {
         if self.own.is_none() {
             self.own = Some(own.clone());
         }
@@ -543,7 +546,7 @@ impl LinkTable {
 /// holds this link's state, so a later link between the same two runs is
 /// never taken for this one.
 struct LinkEnd {
-    lower: Option<AbortRecord>,
+    lower: Option<IncarnationRef>,
     own: Incarnation,
     peer: Option<Incarnation>,
     state: Arc<LinkState>,
@@ -627,10 +630,7 @@ pub(crate) fn raise_caused(
         key,
         status_rx,
         lane,
-        None,
-        None,
-        || {},
-        Some(cause),
+        crate::system::KillFrom::Caused(cause),
     )
 }
 
@@ -769,27 +769,8 @@ pub(crate) async fn link_forward<A: Actor>(
             if shared.take() {
                 shared.spend();
                 if state.fire() {
-                    // Kept before the raise, as a monitor's map panic is: a
-                    // panic that lands after the owner's message loop read
-                    // its stop lane for the last time raises where no
-                    // reader is left, and the stop reads the panic from the
-                    // incarnation's record.
-                    handle
-                        .stop_lane_ref()
-                        .abort_record()
-                        .keep_map_panic(panic.clone());
-                    #[cfg(feature = "tracing")]
-                    caught_log!(warn,
-                        actor_id = %handle.id(),
-                        panic = %handle.log_fields().panic_text(&panic),
-                        "a trap map panicked; the actor fails with that panic"
-                    );
-                    let _ = crate::system::raise_noted(
-                        None,
-                        handle.stop_lane_ref(),
-                        StopReason::Failure(ActorError::Panic(panic.clone())),
-                        crate::telemetry::StopOrigin::MapPanic,
-                    );
+                    // The cell is spent above, before the state fires.
+                    fail_by_map(&handle, &panic, None, MapSite::Trap);
                 }
             }
             Released {
@@ -852,7 +833,7 @@ struct Spec {
     /// See [`LinkEntry::late`].
     late: bool,
     /// The block that holds the pair of a link to a live run.
-    lower: Option<AbortRecord>,
+    lower: Option<IncarnationRef>,
     /// See [`LinkTask::slot`].
     slot: Option<ExitSlot>,
 }

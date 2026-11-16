@@ -15,14 +15,14 @@ use tokio::time::{sleep, Instant};
 use super::{ActorRef, EventKind, KindSet, RaiseOutcome, TelemetryEvent, TestSinkGuard};
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::IncarnationRef;
+use crate::actor::incarnation::StopLane;
 use crate::actor::supervision::slot::{await_cell, CellOutcome, Verdicts};
 use crate::actor::supervision::OwnStop;
 use crate::actor::supervision::{slot_pair_for, SupervisionConfig};
 use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult, SpawnError};
 use crate::system::{read_status, ActorSystem};
-use crate::types::StopLane;
 use crate::types::{ActorId, ActorStatus, RestartType, Shutdown, StopReason, SupervisionAction};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -36,7 +36,7 @@ type Events = Vec<TelemetryEvent<'static>>;
 fn publish_lane(
     io: &crate::actor::supervision::SlotIo,
     system: &Arc<ActorSystem>,
-) -> (AbortRecord, Box<dyn std::any::Any>) {
+) -> (IncarnationRef, Box<dyn std::any::Any>) {
     let (lane, rx) = StopLane::new();
     lane.abort_record().set_system(system);
     let (tx, status) = lane.abort_record().status_channel();

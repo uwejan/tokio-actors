@@ -69,6 +69,6 @@ impl Actor for Tagged {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-const RUN_FUTURE_U32: usize = 1344;
+const RUN_FUTURE_U32: usize = 1200;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-const RUN_FUTURE_ENUM: usize = 1344;
+const RUN_FUTURE_ENUM: usize = 1200;

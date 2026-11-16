@@ -10,9 +10,9 @@ pub type ActorResult<T> = Result<T, ActorError>;
 /// Errors returned from user-defined actor logic.
 ///
 /// `User` is reserved for actor-authored errors (see [`ActorError::user`]).
-/// `Timer`, `Stream`, and `Supervision` carry their source error
-/// structurally - matchable as `ActorError::Timer(TimerError::NotFound)` and
-/// so on via `?` - instead of collapsing it into a display string. A failed
+/// `Timer` and `Supervision` carry their source error
+/// structurally - matchable as `ActorError::Timer(TimerError::ZeroInterval)`
+/// and so on via `?` - instead of collapsing it into a display string. A failed
 /// call to another actor converts with `?` too: an [`AskError`] or a
 /// [`SendError`] becomes [`User`](ActorError::User) with the error's text, so
 /// this actor's exit reads as its own failure and not as the other actor's.
@@ -24,15 +24,15 @@ pub enum ActorError {
     /// The actor panicked during execution.
     #[error("actor panicked: {0}")]
     Panic(String),
+    /// The actor took a call and dropped its return address without a reply.
+    #[error("the call was dropped without a reply")]
+    NoReply,
     /// A spawn error occurred.
     #[error(transparent)]
     Spawn(#[from] SpawnError),
     /// A timer operation failed.
     #[error(transparent)]
     Timer(#[from] TimerError),
-    /// A stream operation failed.
-    #[error(transparent)]
-    Stream(#[from] StreamError),
     /// A supervision operation failed.
     #[error(transparent)]
     Supervision(#[from] SupervisionError),
@@ -191,7 +191,8 @@ pub enum AskError {
         /// Why the actor stopped.
         reason: StopReason,
     },
-    /// The actor's handler returned an error or panicked.
+    /// The actor's handler returned an error or panicked, or dropped the
+    /// call's return address without a reply ([`ActorError::NoReply`]).
     #[error("actor returned error: {0}")]
     Actor(ActorError),
     /// The caller-supplied deadline elapsed before a response arrived.
@@ -350,21 +351,10 @@ pub enum SpawnError {
 /// Errors emitted by the timer subsystem.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TimerError {
-    /// The specified timer ID was not found (already fired or cancelled).
-    #[error("timer id not found")]
-    NotFound,
     /// A recurring interval of zero would fire without bound and can never
     /// be caught up, so it is rejected when the timer is registered.
     #[error("recurring interval must be greater than zero")]
     ZeroInterval,
-}
-
-/// Errors emitted by the stream subsystem.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum StreamError {
-    /// The specified stream ID was not found (already finished or cancelled).
-    #[error("stream id not found")]
-    NotFound,
 }
 
 /// Errors emitted by the monitor subsystem.

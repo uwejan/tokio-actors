@@ -14,9 +14,10 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StatusValue;
 use crate::actor::ActorExt;
 use crate::error::ActorResult;
-use crate::types::{StatusValue, StopOutcome};
+use crate::types::StopOutcome;
 
 /// The longest a wait may take. It only limits how long a real hang takes to
 /// report; a slow host must not read as one.
@@ -63,7 +64,7 @@ impl Leftover {
         let seq = sys
             .register_actor::<Idle>(
                 id,
-                None,
+                false,
                 &handle,
                 false,
                 TurnClock::default(),
@@ -71,12 +72,12 @@ impl Leftover {
                 Handle::current(),
             )
             .unwrap();
-        let guard = RegistryGuard::new(sys.clone(), id.clone(), None, seq);
+        let guard = RegistryGuard::new(sys.clone(), id.clone(), seq);
         let task = tokio::spawn(async move {
             let _owned = (stop_rx, status_tx, guard);
             std::future::pending::<()>().await;
         });
-        sys.attach_abort(id, None, task.abort_handle(), seq);
+        sys.attach_abort(id, task.abort_handle(), seq);
         Leftover {
             lane: stop_lane,
             task,

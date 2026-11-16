@@ -425,9 +425,9 @@ impl<'a> LogFields<'a> {
     #[inline]
     pub(crate) fn released(
         ident: Option<Arc<Identity>>,
-        record: &AbortRecord,
+        record: &IncarnationRef,
     ) -> LogFields<'static> {
-        let sensitive = record.sys_bits() & crate::actor::subtree::SYS_SENSITIVE != 0;
+        let sensitive = record.sys_bits() & crate::actor::incarnation::SYS_SENSITIVE != 0;
         match ident {
             None => LogFields::of_sensitive(sensitive),
             Some(ident) => Self::released_named(ident, record, sensitive),
@@ -439,7 +439,7 @@ impl<'a> LogFields<'a> {
     #[inline(never)]
     fn released_named(
         ident: Arc<Identity>,
-        record: &AbortRecord,
+        record: &IncarnationRef,
         sensitive: bool,
     ) -> LogFields<'static> {
         let system = record
@@ -525,7 +525,7 @@ impl<'a> LogFields<'a> {
 
 use super::event::{EventKind, TelemetryEvent};
 use super::mode::Mode;
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::IncarnationRef;
 use crate::system::ActorSystem;
 
 /// Runs `f` with the mode of the system an incarnation belongs to, when that
@@ -534,7 +534,7 @@ use crate::system::ActorSystem;
 /// incarnation's record holds.
 #[inline]
 pub(crate) fn with_mode<R>(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     f: impl FnOnce(&Arc<Mode>) -> R,
 ) -> Option<R> {
@@ -547,7 +547,7 @@ pub(crate) fn with_mode<R>(
 
 /// Whether the incarnation's system takes events or holds an identity.
 #[inline]
-pub(crate) fn engaged_for(record: &AbortRecord, system: Option<&ActorSystem>) -> bool {
+pub(crate) fn engaged_for(record: &IncarnationRef, system: Option<&ActorSystem>) -> bool {
     with_mode(record, system, |_| ()).is_some()
 }
 
@@ -563,7 +563,7 @@ pub(crate) fn engaged_for(record: &AbortRecord, system: Option<&ActorSystem>) ->
 /// returns.
 pub(crate) fn identity_for(
     mode: &Mode,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     hint: Option<&ActorId>,
 ) -> Option<Arc<Identity>> {
@@ -596,7 +596,7 @@ pub(crate) fn identity_for(
 /// table before the push, so no lock is held across it.
 #[inline]
 pub(crate) fn push_about(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     kind: EventKind,
     build: impl FnOnce(&ActorRef) -> TelemetryEvent<'static>,
@@ -626,7 +626,7 @@ pub(crate) fn push_about(
 /// death is owed from the child's end whatever the order. A child whose end
 /// the flag did not record (its end ran while turn tracking was off) is
 /// found ended by its status plane: a final reason is written, or `Stopped`.
-pub(crate) fn death_claim(supervisor: &AbortRecord, incarnation: u64, child: &AbortRecord) {
+pub(crate) fn death_claim(supervisor: &IncarnationRef, incarnation: u64, child: &IncarnationRef) {
     if let Some(identity) = tracked_identity(supervisor) {
         let ended = child.has_ended() || child.has_stopped() || child.has_final_reason();
         identity.death_claim(incarnation, ended);
@@ -639,7 +639,7 @@ pub(crate) fn death_claim(supervisor: &AbortRecord, incarnation: u64, child: &Ab
 
 /// A runner landed the death of `incarnation` for the supervisor whose record
 /// is `supervisor`; see [`Identity::death_landed`].
-pub(crate) fn death_landed(supervisor: &AbortRecord, incarnation: u64) {
+pub(crate) fn death_landed(supervisor: &IncarnationRef, incarnation: u64) {
     if let Some(identity) = tracked_identity(supervisor) {
         identity.death_landed(incarnation);
     }
@@ -647,7 +647,7 @@ pub(crate) fn death_landed(supervisor: &AbortRecord, incarnation: u64) {
 
 /// The supervisor whose record is `supervisor` decided on the death of
 /// `incarnation`; see [`Identity::death_decided`].
-pub(crate) fn death_decided(supervisor: &AbortRecord, incarnation: u64) {
+pub(crate) fn death_decided(supervisor: &IncarnationRef, incarnation: u64) {
     if let Some(identity) = recorded_identity(supervisor) {
         identity.death_decided(incarnation);
     }
@@ -657,7 +657,7 @@ pub(crate) fn death_decided(supervisor: &AbortRecord, incarnation: u64) {
 /// flight (`open`) or over; see [`Identity::group_pending`]. Raising resolves
 /// the identity only while the system tracks turns; lowering finds it if the
 /// table holds one.
-pub(crate) fn group_pending(supervisor: &AbortRecord, open: bool) {
+pub(crate) fn group_pending(supervisor: &IncarnationRef, open: bool) {
     let identity = if open {
         tracked_identity(supervisor)
     } else {
@@ -670,7 +670,7 @@ pub(crate) fn group_pending(supervisor: &AbortRecord, open: bool) {
 
 /// The identity of the incarnation behind `record`, resolved when needed,
 /// while its system tracks turns; `None` otherwise.
-fn tracked_identity(record: &AbortRecord) -> Option<Arc<Identity>> {
+fn tracked_identity(record: &IncarnationRef) -> Option<Arc<Identity>> {
     let mode = record.mode()?;
     if mode.word() & super::mode::CTL_TRACK_TURNS == 0 {
         return None;
@@ -680,7 +680,7 @@ fn tracked_identity(record: &AbortRecord) -> Option<Arc<Identity>> {
 
 /// The identity of the incarnation behind `record` if the table holds one;
 /// nothing is resolved and nothing is read while the system is not engaged.
-fn recorded_identity(record: &AbortRecord) -> Option<Arc<Identity>> {
+fn recorded_identity(record: &IncarnationRef) -> Option<Arc<Identity>> {
     with_mode(record, None, |mode| mode.find(record.key())).flatten()
 }
 
@@ -718,7 +718,7 @@ impl Staged {
 /// when no sink takes `kind`.
 #[inline]
 pub(crate) fn stage_about(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     kind: EventKind,
     build: impl FnOnce(&ActorRef) -> TelemetryEvent<'static>,
@@ -743,7 +743,7 @@ pub(crate) fn stage_about(
 /// Whether a sink takes events of `kind` in the incarnation's system.
 #[inline]
 pub(crate) fn armed_for(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     kind: EventKind,
 ) -> bool {
@@ -763,7 +763,7 @@ pub(crate) fn armed_for(
 /// found, so a later event takes no lock and clones nothing.
 #[inline]
 pub(crate) fn emit_hot(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     cache: &mut HotCache,
     kind: EventKind,
@@ -802,7 +802,7 @@ pub(crate) fn emit_hot(
 /// records) when the spawn recorded none, so an actor that sets no label
 /// holds nothing for it.
 pub(crate) fn set_label(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     system: Option<&ActorSystem>,
     id: &ActorId,
     label: Arc<str>,
@@ -822,7 +822,7 @@ pub(crate) fn set_label(
 /// registry gives for the live actor `id` (see [`identity_for`]), or, for one
 /// the registry does not hold, its id read as a root with the unknown
 /// incarnation number.
-pub(crate) fn supervisor_ref(mode: &Mode, record: &AbortRecord, id: &ActorId) -> ActorRef {
+pub(crate) fn supervisor_ref(mode: &Mode, record: &IncarnationRef, id: &ActorId) -> ActorRef {
     match identity_for(mode, record, None, Some(id)) {
         Some(identity) => identity.actor().clone(),
         None => ActorRef::new_root(id.clone(), UNKNOWN_INCARNATION),
@@ -834,7 +834,7 @@ pub(crate) fn supervisor_ref(mode: &Mode, record: &AbortRecord, id: &ActorId) ->
 /// count covers it; `None` for a supervisor the registry does not hold.
 pub(crate) fn supervisor_of(
     mode: &Mode,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     id: &ActorId,
 ) -> (ActorRef, Option<Arc<Identity>>) {
     match identity_for(mode, record, None, Some(id)) {
@@ -863,7 +863,10 @@ pub(crate) fn push_for(
 /// The identity fields of the incarnation behind `record` for a log
 /// statement: empty when none is recorded.
 #[cfg(feature = "tracing")]
-pub(crate) fn log_fields(record: &AbortRecord, system: Option<&ActorSystem>) -> LogFields<'static> {
+pub(crate) fn log_fields(
+    record: &IncarnationRef,
+    system: Option<&ActorSystem>,
+) -> LogFields<'static> {
     let found = with_mode(record, system, |mode| {
         mode.find(record.key())
             .map(|ident| (ident, mode.system().map(|system| system.name().to_string())))
@@ -872,11 +875,11 @@ pub(crate) fn log_fields(record: &AbortRecord, system: Option<&ActorSystem>) -> 
     match found {
         Some((ident, name)) => LogFields {
             system: name.map(std::borrow::Cow::Owned),
-            sensitive: record.sys_bits() & crate::actor::subtree::SYS_SENSITIVE != 0,
+            sensitive: record.sys_bits() & crate::actor::incarnation::SYS_SENSITIVE != 0,
             ident: Some(ident),
         },
-        None => {
-            LogFields::of_sensitive(record.sys_bits() & crate::actor::subtree::SYS_SENSITIVE != 0)
-        }
+        None => LogFields::of_sensitive(
+            record.sys_bits() & crate::actor::incarnation::SYS_SENSITIVE != 0,
+        ),
     }
 }

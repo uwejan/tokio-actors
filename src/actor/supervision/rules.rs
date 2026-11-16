@@ -6,13 +6,13 @@
 
 use std::time::{Duration, Instant};
 
-use crate::actor::runtime::FAR_FUTURE;
-use crate::actor::supervision::{
-    AutoShutdown, ChildLifecycle, DownPending, ManualStop, Origin, ABORT_SETTLE,
+use crate::actor::supervision::model::{
+    AutoShutdown, BudgetCharge, BudgetState, ChildLifecycle, DownPending, GuardFirst, GuardRest,
+    ManualStop, Origin, RestartDecision, StrategyScope, SystemAction, SystemEnd, SystemLadder,
+    SystemSeen, SystemStep, VerdictAct, VerdictSeen, ABORT_SETTLE, FAR_FUTURE,
 };
 use crate::types::{
-    ActorId, LaneState, RaiseResult, RestartStrategy, RestartType, Shutdown, StopReason,
-    StopSeverity, SupervisionAction,
+    ActorId, RestartStrategy, RestartType, Shutdown, StopReason, SupervisionAction,
 };
 
 /// A request a stop raises on an incarnation's lane.
@@ -1299,6 +1299,155 @@ pub(crate) fn fired_stop(inherited: InheritedStop, kill_stored: bool) -> Inherit
     }
 }
 
+/// The first step of a firing link guard. `trapping` is the child's trap
+/// flag, read once when the guard fires, and `worker_shutdown` the
+/// `Shutdown` a trapping worker is stopped within. A worker that traps gets
+/// the orderly stop of a supervisor child; every orderly stop raises
+/// `ParentKilled` first.
+pub(crate) fn guard_first(
+    spawn_time: InheritedStop,
+    trapping: bool,
+    worker_shutdown: Shutdown,
+) -> GuardFirst {
+    let if_trapping = match spawn_time {
+        InheritedStop::Kill { grace } if trapping => {
+            inherited_stop_if_trapping(false, worker_shutdown, grace)
+        }
+        _ => None,
+    };
+    let stop = guard_stop(spawn_time, if_trapping, trapping);
+    GuardFirst {
+        stop,
+        parent_killed: matches!(stop, InheritedStop::Orderly { .. }),
+    }
+}
+
+/// Whether the rest of a firing link guard raises `Kill` itself, from the
+/// lane as it reads after the first raise: the raise comes before the guard
+/// reads the instant its abort is counted from.
+pub(crate) fn guard_raises_kill(first: GuardFirst, lane_has_kill: bool) -> bool {
+    matches!(
+        fired_stop(first.stop, lane_has_kill),
+        InheritedStop::Kill { .. }
+    )
+}
+
+/// The rest of a firing link guard, from the lane as it reads after the
+/// first raise and the instant `now` read after the guard's own `Kill`
+/// raise, when it makes one (see [`guard_raises_kill`]): a `Kill` on the lane
+/// turns an orderly stop into a kill. A kill raises `Kill` now and aborts its
+/// grace later; a bounded orderly stop has the reaper raise `Kill` when its
+/// window ends and abort a grace after that; an unbounded one has no entry.
+pub(crate) fn guard_rest(first: GuardFirst, lane_has_kill: bool, now: Instant) -> GuardRest {
+    match fired_stop(first.stop, lane_has_kill) {
+        InheritedStop::Kill { grace } => GuardRest::Kill {
+            abort_at: deadline_after(now, grace),
+        },
+        InheritedStop::Orderly { window: None, .. } => GuardRest::Unforced,
+        InheritedStop::Orderly {
+            window: Some(window),
+            grace,
+        } => {
+            let kill_at = deadline_after(now, window);
+            GuardRest::Staged {
+                kill_at,
+                abort_at: deadline_after(kill_at, grace),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The restart decision, the budget and the strategy scope
+// ---------------------------------------------------------------------------
+
+/// Whether a child's end leads to a restart, by its restart type: a
+/// `Permanent` child always, a `Transient` child only after an abnormal end
+/// (OTP: `normal`, `shutdown` and `{shutdown, Term}` are clean, so are
+/// `Graceful`, `ParentRequest`, `ParentKilled` and `Shutdown` here; `Kill`,
+/// OTP's `killed`, is abnormal), a `Temporary` child never.
+pub(crate) fn restart_decision(restart_type: RestartType, reason: &StopReason) -> RestartDecision {
+    let restart = match restart_type {
+        RestartType::Permanent => true,
+        RestartType::Transient => !reason.is_normal(),
+        RestartType::Temporary => false,
+    };
+    if restart {
+        RestartDecision::Restart
+    } else {
+        RestartDecision::Remove
+    }
+}
+
+/// One charge against the sliding-window budget at `now`. The charges
+/// strictly older than `now - window` leave the window (one exactly at the
+/// cutoff still counts, as in OTP's period check); the charge is accepted
+/// when fewer than `max_restarts` remain, and only an accepted charge is
+/// recorded. A `max_restarts` of 0 refuses every charge. A window wider than
+/// the clock's past prunes nothing.
+pub(crate) fn budget_check(state: &mut BudgetState, now: Instant) -> BudgetCharge {
+    if let Some(cutoff) = now.checked_sub(state.window) {
+        while state.charges.front().is_some_and(|front| *front < cutoff) {
+            state.charges.pop_front();
+        }
+    }
+    let accepted = state.charges.len() < state.max_restarts as usize;
+    if accepted {
+        state.charges.push_back(now);
+    }
+    BudgetCharge {
+        accepted,
+        used: u32::try_from(state.charges.len()).unwrap_or(u32::MAX),
+        max: state.max_restarts,
+        window: state.window,
+    }
+}
+
+/// What a strategy restarts: one child under `OneForOne` and
+/// `SimpleOneForOne`, the group commit under `OneForAll` and `RestForOne`.
+pub(crate) fn strategy_scope(strategy: RestartStrategy) -> StrategyScope {
+    match strategy {
+        RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => StrategyScope::One,
+        RestartStrategy::OneForAll | RestartStrategy::RestForOne => StrategyScope::Group,
+    }
+}
+
+/// Whether a strategy keeps its children as a pool of one factory:
+/// `SimpleOneForOne`.
+pub(crate) fn is_pool(strategy: RestartStrategy) -> bool {
+    strategy == RestartStrategy::SimpleOneForOne
+}
+
+/// Whether a child's spec is removed once its end is settled instead of
+/// kept: a pool child, and a `Temporary` child.
+pub(crate) fn spec_prunable(strategy: RestartStrategy, restart_type: RestartType) -> bool {
+    is_pool(strategy) || restart_type == RestartType::Temporary
+}
+
+/// Whether a supervisor's teardown stops its children all at once instead
+/// of walking them one at a time: a pool's (`SimpleOneForOne`) children have
+/// no order between them.
+pub(crate) fn teardown_at_once(strategy: RestartStrategy) -> bool {
+    is_pool(strategy)
+}
+
+/// Whether a strategy's group restart leaves the children before the failed
+/// one outside the group: `RestForOne`.
+pub(crate) fn leaves_earlier_outside(strategy: RestartStrategy) -> bool {
+    strategy == RestartStrategy::RestForOne
+}
+
+/// Whether a pending group restart covers a child: every child under
+/// `OneForAll`, a child not left outside by the first plan under
+/// `RestForOne`, none under the one-child strategies.
+pub(crate) fn group_covers(strategy: RestartStrategy, left_outside: bool) -> bool {
+    match strategy {
+        RestartStrategy::OneForAll => true,
+        RestartStrategy::RestForOne => !left_outside,
+        RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => false,
+    }
+}
+
 /// The bound of a wait on a subtree that carries `below_nanos` of budget
 /// beneath its root: that budget plus the settle time as scheduling slack.
 /// Unbounded (`None`) only while a supervisor child with an unbounded orderly
@@ -1360,6 +1509,163 @@ pub(crate) fn verdict_floor(
         settled
     };
     held.min(deadline_after(deadline_after(budget_at, cap), ABORT_SETTLE))
+}
+
+// ---------------------------------------------------------------------------
+// The system's stop ladders and the verdict waits
+// ---------------------------------------------------------------------------
+
+/// The one decision procedure of the stop ladders the system runs on one
+/// actor: the bounded stop's task, one root of the shutdown walk, and the
+/// force stop. The owner reads the clock once per event, after the step it
+/// took or the wait it ended, and passes it as `now`; every deadline is
+/// counted from that instant.
+///
+/// A bounded stop whose first request was refused owes nothing. Otherwise
+/// its window runs to its fixed end; the walk raises `ParentRequest` and
+/// waits `per_actor`. A window that passes takes the `Kill` step (the
+/// bounded stop raises it only when its call has not taken that step), then
+/// the kill grace runs, then the abort, then the settle time, after which
+/// the target is unresponsive. The force stop starts in the kill grace, its
+/// caller having raised the `Kill`, and settles under the verdict floor.
+/// Every wait of the walk also ends at its deadline, and a walk past its
+/// deadline when the window or the kill grace passed hands the root to the
+/// force sweep. A terminal status ends any wait.
+pub(crate) fn system_ladder_step(
+    ladder: SystemLadder,
+    step: SystemStep,
+    seen: SystemSeen,
+    now: Instant,
+) -> (SystemStep, SystemAction) {
+    let grace = match ladder {
+        SystemLadder::Bounded { grace, .. }
+        | SystemLadder::Walk { grace, .. }
+        | SystemLadder::Force { grace } => grace,
+    };
+    let until = |after: Duration| match ladder {
+        SystemLadder::Walk { deadline, .. } => deadline.min(deadline_after(now, after)),
+        _ => deadline_after(now, after),
+    };
+    let past_deadline = matches!(ladder, SystemLadder::Walk { deadline, .. } if now >= deadline);
+    let finish = |end| (SystemStep::Over, SystemAction::Finish(end));
+    let wait = |step: SystemStep, at: Instant| (step, SystemAction::WaitUntil(at));
+    match (step, seen) {
+        (SystemStep::Start, SystemSeen::Begin { accepted }) => match ladder {
+            SystemLadder::Bounded { .. } if !accepted => finish(SystemEnd::Refused),
+            SystemLadder::Bounded { window_end, .. } => {
+                wait(SystemStep::Window { until: window_end }, window_end)
+            }
+            SystemLadder::Walk { .. } => (SystemStep::Requesting, SystemAction::Request),
+            SystemLadder::Force { .. } => {
+                let at = until(grace);
+                wait(
+                    SystemStep::KillGrace {
+                        until: at,
+                        raised: false,
+                    },
+                    at,
+                )
+            }
+        },
+        (SystemStep::Requesting, SystemSeen::Taken { .. }) => match ladder {
+            SystemLadder::Walk { per_actor, .. } => {
+                let at = until(per_actor);
+                wait(SystemStep::Window { until: at }, at)
+            }
+            _ => (step, SystemAction::None),
+        },
+        (SystemStep::Window { .. }, SystemSeen::Ended) => {
+            finish(SystemEnd::Terminal { killed: false })
+        }
+        (SystemStep::Window { .. }, SystemSeen::Passed { .. }) if past_deadline => {
+            finish(SystemEnd::Sweep { kill_raised: false })
+        }
+        (SystemStep::Window { .. }, SystemSeen::Passed { kill_started }) => (
+            SystemStep::Killing,
+            SystemAction::Kill {
+                raise: !kill_started,
+            },
+        ),
+        (SystemStep::Killing, SystemSeen::Taken { raised }) => {
+            let at = until(grace);
+            wait(SystemStep::KillGrace { until: at, raised }, at)
+        }
+        (SystemStep::KillGrace { raised, .. }, SystemSeen::Ended)
+        | (SystemStep::Settle { raised, .. }, SystemSeen::Ended) => {
+            finish(SystemEnd::Terminal { killed: raised })
+        }
+        (SystemStep::KillGrace { raised, .. }, SystemSeen::Passed { .. }) if past_deadline => {
+            finish(SystemEnd::Sweep {
+                kill_raised: raised,
+            })
+        }
+        (SystemStep::KillGrace { raised, .. }, SystemSeen::Passed { .. }) => {
+            (SystemStep::Aborting { raised }, SystemAction::Abort)
+        }
+        (SystemStep::Aborting { raised }, SystemSeen::Taken { .. }) => match ladder {
+            SystemLadder::Force { .. } => (
+                SystemStep::Settle {
+                    until: None,
+                    raised,
+                },
+                SystemAction::WaitFloor {
+                    budget: ABORT_SETTLE,
+                    cap: grace.saturating_add(ABORT_SETTLE),
+                },
+            ),
+            _ => {
+                let at = until(ABORT_SETTLE);
+                wait(
+                    SystemStep::Settle {
+                        until: Some(at),
+                        raised,
+                    },
+                    at,
+                )
+            }
+        },
+        (SystemStep::Settle { .. }, SystemSeen::Passed { .. }) => finish(SystemEnd::Unresponsive),
+        (step, _) => (step, SystemAction::None),
+    }
+}
+
+/// The one decision procedure of the waits that can give the Unresponsive
+/// verdict: a lost runner's end, a cell whose executor is gone, a restart
+/// attempt's wait on the previous subtree and a handler's wait on a stopped
+/// child's subtree. The clock is read by the floor wait and the subtree wait
+/// the owner runs; this function takes what they found.
+///
+/// A closed cell whose plane is not ended and whose verdict is already set
+/// returns the verdict at once; otherwise both floor waits run. An end found
+/// first is the fate; a lost runner's wait past the floor records the
+/// verdict and waits on for the end, a closed cell's records it and returns
+/// it. The subtree waits decide by [`successor_wait_step`], with no order
+/// for a handler's wait.
+pub(crate) fn verdict_wait_step(seen: VerdictSeen) -> VerdictAct {
+    let subtree = |gone, order, expired| match successor_wait_step(gone, order, expired) {
+        WaitAction::Keep => VerdictAct::Keep,
+        WaitAction::Proceed => VerdictAct::Proceed,
+        WaitAction::Cancel => VerdictAct::Cancel,
+        WaitAction::Escalate => VerdictAct::Escalate,
+    };
+    match seen {
+        VerdictSeen::CellOpened {
+            ended: false,
+            flag_set: true,
+        } => VerdictAct::Unresponsive { write: false },
+        VerdictSeen::CellOpened { .. } => VerdictAct::WaitFloor,
+        VerdictSeen::CellFloor { ended: true } | VerdictSeen::LostFloor { ended: true } => {
+            VerdictAct::Fate
+        }
+        VerdictSeen::CellFloor { ended: false } => VerdictAct::Unresponsive { write: true },
+        VerdictSeen::LostFloor { ended: false } => VerdictAct::VerdictThenEnd,
+        VerdictSeen::Predecessor {
+            gone,
+            order,
+            expired,
+        } => subtree(gone, order, expired),
+        VerdictSeen::Subtree { gone, expired } => subtree(gone, false, expired),
+    }
 }
 
 #[cfg(test)]
@@ -2067,40 +2373,6 @@ pub(crate) fn teardown_end_is_orderly(
 // The stop lane
 // ---------------------------------------------------------------------------
 
-/// How the stop lane answers a request: what it reports to the caller,
-/// whether the request replaces the stored reason, and whether the lane's
-/// generation moves (waking the actor to observe it).
-///
-/// The lane refuses everything once it is sealed, everything but `Kill` once
-/// it is open to `Kill` only, and every request when `receiver_gone` (the
-/// actor's task has dropped the receiving half). A request of strictly
-/// lower severity than the stored one is superseded and changes nothing.
-/// Anything else is recorded and bumps the generation; a request of strictly
-/// higher severity, or of equal severity and at least the stored rank
-/// (`ParentRequest` over `Shutdown` over `Graceful`, `Failure` over
-/// `ParentKilled` over `Cancelled`, the newer of two equals), also replaces
-/// the stored reason.
-pub(crate) fn lane_accept(
-    state: &LaneState,
-    new: &StopReason,
-    receiver_gone: bool,
-) -> (RaiseResult, bool, bool) {
-    let kill_only_refuses = state.kill_only && !matches!(new, StopReason::Kill);
-    if receiver_gone || state.sealed || kill_only_refuses {
-        return (RaiseResult::Refused, false, false);
-    }
-    let Some(stored) = state.reason.as_ref() else {
-        return (RaiseResult::Recorded, true, true);
-    };
-    let (new_severity, stored_severity) = (StopSeverity::of(new), StopSeverity::of(stored));
-    if new_severity < stored_severity {
-        return (RaiseResult::Superseded, false, false);
-    }
-    let store =
-        new_severity > stored_severity || StopSeverity::rank(new) >= StopSeverity::rank(stored);
-    (RaiseResult::Recorded, store, true)
-}
-
 /// What an actor's start does when it reads its lane between two hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InitStep {
@@ -2245,6 +2517,13 @@ pub(crate) fn unreported_verdict<'a>(
         .map(|(id, _)| id.clone())
 }
 
+/// The fixed generator the seeded sequences below share with the
+/// integration tests.
+#[cfg(any(test, doctest))]
+#[allow(unreachable_pub)]
+#[path = "../../../tests/common/seeded.rs"]
+mod seeded;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2254,6 +2533,50 @@ mod tests {
     }
 
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// One seeded sequence as it runs: what its owners did and when.
+    struct Run {
+        base: Instant,
+        grace: Duration,
+        ended: Option<Instant>,
+        aborted: Option<Instant>,
+        kill_due: Option<Instant>,
+        verdicts: u32,
+        log: Vec<String>,
+    }
+    impl Run {
+        fn fail(&self, what: &str) -> ! {
+            panic!("{what}\n{}", self.log.join("\n"))
+        }
+        fn act(&mut self, now: Instant, what: &str, action: LadderAction) {
+            self.log
+                .push(format!("{:?} {what} -> {action:?}", now - self.base));
+            match action {
+                LadderAction::Raise(_) | LadderAction::Abort if self.ended.is_some() => {
+                    self.fail("a step after the task's end raised or aborted")
+                }
+                LadderAction::Raise(Signal::Kill) => {
+                    let due = deadline_after(now, self.grace);
+                    self.kill_due = Some(self.kill_due.map_or(due, |d| d.min(due)));
+                }
+                LadderAction::Abort => {
+                    self.aborted.get_or_insert(now);
+                }
+                LadderAction::WriteVerdict => {
+                    self.verdicts += 1;
+                    let settled = self.aborted.map(|at| deadline_after(at, ABORT_SETTLE));
+                    if self.verdicts > 1 || settled.is_none_or(|at| now < at) {
+                        self.fail("a verdict twice or before the abort's grace");
+                    }
+                }
+                _ => {}
+            }
+            let unanswered = self.aborted.is_none() && self.ended.is_none();
+            if self.kill_due.is_some_and(|due| now > due) && unanswered {
+                self.fail("an accepted Kill outlived its grace without an abort or an end");
+            }
+        }
+    }
 
     /// A child that closed its acknowledgment fails the strict start unless
     /// the supervisor ended it: its entry is gone, another incarnation holds

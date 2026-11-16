@@ -14,12 +14,13 @@
 //!   automatic restart, debug for a `spawn_child` or `restart_child` that
 //!   succeeds (supervisor.erl `progress` reports).
 
-use crate::actor::subtree::{AbortRecord, SYS_SENSITIVE};
+use crate::actor::incarnation::TurnClock;
+use crate::actor::incarnation::{IncarnationRef, SYS_SENSITIVE};
 use crate::actor::sys::DebugEntry;
 #[cfg(feature = "tracing")]
 use crate::actor::sys::DebugEvent;
 use crate::actor::Actor;
-use crate::types::{ActorId, RestartType, StopReason, TurnClock};
+use crate::types::{ActorId, RestartType, StopReason};
 
 /// The target of a crash report.
 #[allow(dead_code)]
@@ -56,7 +57,7 @@ pub(crate) fn crash_reported(reason: &StopReason) -> bool {
 pub(crate) fn crash_text<A: Actor>(
     actor: Option<&A>,
     reason: &StopReason,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     ring: Option<&[DebugEntry]>,
     clock: &TurnClock,
 ) -> Option<CrashText> {
@@ -71,7 +72,7 @@ pub(crate) fn crash_text<A: Actor>(
 #[inline(never)]
 fn crash_text_reported<A: Actor>(
     actor: Option<&A>,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     ring: Option<&[DebugEntry]>,
     clock: &TurnClock,
 ) -> Option<CrashText> {

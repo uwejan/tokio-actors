@@ -186,15 +186,17 @@ const DENY_FNS: &[(&str, &str)] = &[
     ("system.rs", "raise_kill_declared"),
     ("system.rs", "raise_noted_engaged"),
     ("system.rs", "declare_kill"),
-    ("system.rs", "declare_kill_by_name"),
     ("system.rs", "concurrent_force_sweep"),
 ];
 
 /// Files in which no dispatch call may appear at all.
 const DENY_FILES: &[&str] = &[
     "helper.rs",
-    "actor/subtree.rs",
-    "types/stop_lane.rs",
+    "actor/incarnation/block.rs",
+    "actor/incarnation/owed.rs",
+    "actor/incarnation/signals.rs",
+    "actor/incarnation/subtree.rs",
+    "actor/incarnation/stop_lane.rs",
     "actor/mailbox.rs",
 ];
 
@@ -228,7 +230,7 @@ const RAISE_FNS: &[(&str, &str, &str)] = &[
     ("system.rs", "fire", "emits"),
     (
         "system.rs",
-        "raise_kill",
+        "raise_shared",
         "the step cell's own raise; its callers `raise_kill_declared` and `fire` queue the events",
     ),
 ];
@@ -243,16 +245,23 @@ const ABORT_CALLS: &[&str] = &[".abort()", "JoinHandle::abort(", "AbortHandle::a
 /// under the record's lock, ahead of every event the task's end raises), so
 /// the one allowed site is that function.
 const ABORT_FNS: &[(&str, &str, &str)] = &[(
-    "actor/subtree.rs",
+    "actor/incarnation/owed.rs",
     "abort",
     "the record's abort: the one place that aborts an incarnation's task",
 )];
 
 /// The lane's own file.
-const LANE_FILE: &str = "types/stop_lane.rs";
+const LANE_FILE: &str = "actor/incarnation/stop_lane.rs";
 
 /// Files in which no synchronous emit may appear at all.
-const NO_SYNC_FILES: &[&str] = &["helper.rs", "actor/subtree.rs", "types/stop_lane.rs"];
+const NO_SYNC_FILES: &[&str] = &[
+    "helper.rs",
+    "actor/incarnation/block.rs",
+    "actor/incarnation/owed.rs",
+    "actor/incarnation/signals.rs",
+    "actor/incarnation/subtree.rs",
+    "actor/incarnation/stop_lane.rs",
+];
 
 /// The calls of the dispatch function: a method call or a path call.
 const DISPATCH_CALLS: &[&str] = &[".dispatch(", "::dispatch("];
@@ -328,7 +337,7 @@ const HOT_SYNC_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "actor/runtime.rs",
-        "run_actor",
+        "run_loop",
         "the actor's own run loop where a run ends: the same task and the same waiters as dispatch, and nothing the crate must publish is owed at that point",
     ),
 ];
@@ -396,6 +405,12 @@ const HELPER_SPAWN_SITES: &[(&str, &str, &str, &str)] = &[
         "system_monitor",
         "Some",
         "the monitor's helper works for the actor the monitor reports to",
+    ),
+    (
+        "application.rs",
+        "app_helper",
+        "Some",
+        "an application's start or stop sequence, its controller's wind-down and a shutdown handed on for a lost sequence work for the controller: each end is counted among the controller's events, through the controller's record",
     ),
     (
         "actor/supervisor_ref.rs",
@@ -707,7 +722,7 @@ fn violations(sources: &BTreeMap<String, String>) -> BTreeSet<String> {
             } else {
                 found.insert(format!(
                     "{file}: fn `{name}` aborts a task itself \
-                     (route it through AbortRecord::abort)"
+                     (route it through IncarnationRef::abort)"
                 ));
             }
         }
@@ -1034,17 +1049,17 @@ const ROWS: &[Row] = &[
     },
     Row {
         name: "the record's abort loses its abort",
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/owed.rs",
         find: Some("        task.abort();\n    }\n\n    /// Records `now`"),
         with: "    }\n\n    /// Records `now`",
-        expect: &["actor/subtree.rs", "abort list names `abort`"],
+        expect: &["actor/incarnation/owed.rs", "abort list names `abort`"],
     },
     Row {
         name: "dispatch from the stop lane",
-        file: "types/stop_lane.rs",
+        file: "actor/incarnation/stop_lane.rs",
         find: None,
         with: "fn raise_again(block: &Block) { block.dispatch(kind, || event); }",
-        expect: &["types/stop_lane.rs"],
+        expect: &["actor/incarnation/stop_lane.rs"],
     },
     Row {
         name: "dispatch from the run loop's end, before the init ack",
@@ -1153,10 +1168,10 @@ const ROWS: &[Row] = &[
     },
     Row {
         name: "a listed function in a file where no emit may appear",
-        file: "types/stop_lane.rs",
+        file: "actor/incarnation/stop_lane.rs",
         find: None,
         with: "fn dispatch(b: &Block) { b.emit_slow(kind, || event); }",
-        expect: &["types/stop_lane.rs", "fn `dispatch`", "owes the crate a step"],
+        expect: &["actor/incarnation/stop_lane.rs", "fn `dispatch`", "owes the crate a step"],
     },
     Row {
         name: "a locked emit from a helper's end",
@@ -1167,10 +1182,10 @@ const ROWS: &[Row] = &[
     },
     Row {
         name: "a cached emit from the subtree",
-        file: "actor/subtree.rs",
+        file: "actor/incarnation/subtree.rs",
         find: None,
         with: "fn release_inline(b: &Block) { b.emit_hot(cache, kind, || event); }",
-        expect: &["actor/subtree.rs", "fn `release_inline`"],
+        expect: &["actor/incarnation/subtree.rs", "fn `release_inline`"],
     },
     Row {
         name: "a locked emit from the reaper's fire",
@@ -1182,9 +1197,9 @@ const ROWS: &[Row] = &[
     Row {
         name: "a listed site that no longer exists",
         file: "actor/runtime.rs",
-        find: Some("async fn run_actor<A: Actor>("),
-        with: "async fn run_actoq<A: Actor>(",
-        expect: &["actor/runtime.rs", "`run_actor`, which is not there"],
+        find: Some("async fn run_loop<A: Actor>("),
+        with: "async fn run_looq<A: Actor>(",
+        expect: &["actor/runtime.rs", "`run_loop`, which is not there"],
     },
     Row {
         name: "a cached emit from the timer's next-tick function",

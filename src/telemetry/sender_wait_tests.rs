@@ -15,8 +15,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::{EventKind, HelperEnd, HelperKind, Identity, KindSet, TelemetryEvent, WaitOutcome};
+use crate::actor::incarnation::IncarnationRef;
 use crate::actor::mailbox::{channel, Closed, MailRx, MailTx, Permit, Reserve, MAILBOX_LANES};
-use crate::actor::subtree::AbortRecord;
 use crate::system::ActorSystem;
 use crate::types::ActorId;
 
@@ -73,7 +73,7 @@ impl Rig {
     fn new(capacity: usize, armed: bool) -> Self {
         let sys = ActorSystem::create(unique()).unwrap();
         let mode = sys.telemetry_mode();
-        let record = AbortRecord::in_system(mode.clone(), crate::types::Incarnation::mint());
+        let record = IncarnationRef::in_system(mode.clone(), crate::types::Incarnation::mint());
         mode.bind(
             record.key(),
             Arc::new(Identity::new(ActorId::from("owner"), 1, None, None, None)),

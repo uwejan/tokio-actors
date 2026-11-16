@@ -6,14 +6,97 @@
 //! its workers in `on_started`. A worker is named (a second one under the same
 //! name is refused while the first lives) or anonymous (a count of live
 //! instances shows an overlap). The first `Sub` incarnation puts its workers
-//! inside a long turn, so they are still alive when the `Sub` is killed.
+//! inside a turn the test holds, so they are still alive when the `Sub` is
+//! killed: an awaiting turn ends at the abort of the worker's kill grace or
+//! when the test opens its gate, and a turn that blocks its thread ends only
+//! when the test opens its gate.
 //!
-//! Every outcome a test awaits is bounded, and the order of events is read
-//! from one timeline the actors append to, never from head-start sleeps.
+//! Every outcome a test awaits is a handshake on the probe, bounded only by a
+//! hang detector, and the order of events is read from one timeline the
+//! actors append to. A check that nothing more happened runs after a barrier:
+//! the root is stopped gracefully and awaited, so a late event shows as an
+//! extra report, an extra build or a reason other than `Graceful`.
 
 use super::*;
 
+use std::future::Future;
+use std::sync::Condvar;
+use std::task::Poll;
+
+use tokio::sync::Notify;
 use tokio_actors::{ActorStatus, SpawnError};
+
+// ---------------------------------------------------------------------------
+// Hang bounds and gates
+// ---------------------------------------------------------------------------
+
+/// Awaits `fut`; the bound only turns a real hang into a failure.
+async fn bounded<T>(what: &str, fut: impl Future<Output = T>) -> T {
+    match timeout(Duration::from_secs(60), fut).await {
+        Ok(value) => value,
+        Err(_) => panic!("hung waiting for: {what}"),
+    }
+}
+
+/// Polls `fut` once and drops it: a call abandoned right after its first
+/// poll, which commits it.
+async fn poll_once<F: Future>(fut: F) {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        let _ = fut.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+}
+
+/// A gate an awaiting task waits on until the test opens it. It stays open.
+#[derive(Default)]
+struct Gate {
+    open: AtomicBool,
+    opened: Notify,
+}
+
+impl Gate {
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let opened = self.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if self.open.load(Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// A gate a turn blocks its thread on until the test opens it. It stays
+/// open; a thread never released ends its wait after a minute.
+#[derive(Default)]
+struct ThreadGate {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl ThreadGate {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    fn block(&self) {
+        let open = self.open.lock().unwrap();
+        let _ = self
+            .opened
+            .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+            .unwrap();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The timeline and the counters
@@ -30,15 +113,12 @@ struct Probe {
     p_started: AtomicUsize,
     /// Plain children (`a` and `q`) built.
     q_built: AtomicUsize,
-    /// A held worker's turn ends when the test says so.
-    release: tokio::sync::Notify,
-    /// Set by the test to end every blocked turn before its length.
-    unblock: AtomicBool,
-    /// Set by the test to end the root's held handler.
-    top_release: AtomicBool,
-    /// How long dropping a worker value takes, in milliseconds. Zero reads as
-    /// the default of 60. A worker whose turn an abort cut drops at once.
-    drop_ms: AtomicU64,
+    /// Ends every held worker turn.
+    release: Gate,
+    /// Ends every worker turn that blocks its thread.
+    unblock: ThreadGate,
+    /// Ends the root's held handler or callback.
+    top_gate: Gate,
     /// Errors of a worker spawn inside `Sub::on_started`.
     spawn_errs: Mutex<Vec<String>>,
     /// Events in the order they happened.
@@ -48,11 +128,31 @@ struct Probe {
     reports: Mutex<Vec<(String, String, SupervisionAction, ActorStatus)>>,
     /// The reason the root stopped with.
     top_stopped: Mutex<Option<String>>,
+    /// Woken after every change a test waits for.
+    changed: Notify,
 }
 
 impl Probe {
     fn note(&self, line: impl Into<String>) {
         self.timeline.lock().unwrap().push(line.into());
+        self.changed.notify_waiters();
+    }
+
+    /// Waits until `pred` holds. Every change a predicate reads wakes the
+    /// waiter, which registers before it checks, so no change is missed.
+    async fn wait_for(&self, what: &str, pred: impl Fn(&Probe) -> bool) {
+        bounded(what, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if pred(self) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
     }
 
     /// The position of the first timeline line that starts with `prefix`.
@@ -71,6 +171,17 @@ impl Probe {
             .iter()
             .find(|l| l.starts_with(prefix))
             .cloned()
+    }
+
+    /// The timeline lines that start with `prefix`, in order.
+    fn all(&self, prefix: &str) -> Vec<String> {
+        self.timeline
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 
     fn lines(&self) -> Vec<String> {
@@ -117,9 +228,6 @@ impl Probe {
 struct Worker {
     probe: Arc<Probe>,
     id: usize,
-    /// Set while a turn runs: still set at the drop when an abort cut the
-    /// turn.
-    in_turn: bool,
 }
 
 impl Worker {
@@ -127,25 +235,15 @@ impl Worker {
         let id = probe.w_built.fetch_add(1, Ordering::SeqCst) + 1;
         let live = probe.w_live.fetch_add(1, Ordering::SeqCst) + 1;
         probe.w_max.fetch_max(live, Ordering::SeqCst);
-        Self {
-            probe,
-            id,
-            in_turn: false,
-        }
+        probe.changed.notify_waiters();
+        Self { probe, id }
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        // A slow drop: a successor that starts as soon as the subtree reads
-        // as ended, but before this value is gone, shows as two live workers.
-        // A worker whose turn an abort cut drops at once: a wait gives an
-        // aborted actor the settle time to end before its verdict, and the
-        // end must land inside it however late the host runs the drop.
-        let ms = self.probe.drop_ms.load(Ordering::SeqCst);
-        if !self.in_turn {
-            std::thread::sleep(Duration::from_millis(if ms == 0 { 60 } else { ms }));
-        }
+        // The value is counted live until its drop: a successor built before
+        // this point shows as one live worker too many.
         self.probe.w_live.fetch_sub(1, Ordering::SeqCst);
         self.probe.note(format!("w_dropped:{}", self.id));
     }
@@ -153,13 +251,12 @@ impl Drop for Worker {
 
 #[derive(Clone)]
 enum WMsg {
-    /// A turn that awaits for this many milliseconds.
-    Busy(u64),
-    /// A turn that blocks its thread for this many milliseconds, or until
-    /// the test sets the probe's `unblock`.
-    Block(u64),
-    /// A turn that awaits until the test releases it.
+    /// A turn that awaits until the test opens the probe's `release`; an
+    /// abort cuts it.
     Held,
+    /// A turn that blocks its thread until the test opens the probe's
+    /// `unblock`; no abort can cut it.
+    Block,
 }
 
 impl Actor for Worker {
@@ -168,20 +265,10 @@ impl Actor for Worker {
 
     async fn handle(&mut self, msg: WMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.probe.note(format!("w_turn_started:{}", self.id));
-        self.in_turn = true;
         match msg {
-            WMsg::Busy(ms) => sleep(Duration::from_millis(ms)).await,
-            WMsg::Block(ms) => {
-                let until = std::time::Instant::now() + Duration::from_millis(ms);
-                while !self.probe.unblock.load(Ordering::SeqCst)
-                    && std::time::Instant::now() < until
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-            WMsg::Held => self.probe.release.notified().await,
+            WMsg::Held => self.probe.release.wait().await,
+            WMsg::Block => self.probe.unblock.block(),
         }
-        self.in_turn = false;
         self.probe.note(format!("w_turn_ended:{}", self.id));
         Ok(())
     }
@@ -199,17 +286,15 @@ struct SubSetup {
     w_shutdown: Option<Shutdown>,
     /// Anonymous workers.
     anon: usize,
-    /// The first incarnation's workers take one turn of this length (an
+    /// The first incarnation's workers take a turn the test holds (an
     /// awaiting turn, or one that blocks the thread).
-    busy_ms: u64,
-    block_ms: u64,
-    /// The first incarnation's workers take a turn that the test ends.
     held: bool,
+    block: bool,
     /// Every incarnation's workers take that turn, not only the first's.
     busy_all: bool,
-    /// `pre_stop` vetoes every request, or takes this long first.
+    /// `pre_stop` vetoes every request, or never returns.
     veto_stop: bool,
-    slow_pre_stop_ms: u64,
+    hang_pre_stop: bool,
     /// The incarnation with this number hangs in `on_started` after it
     /// spawned its workers.
     hang_on_build: Option<usize>,
@@ -247,14 +332,11 @@ impl Sub {
         match builder.await {
             Ok(handle) => {
                 let turn = self.seq == 1 || self.setup.busy_all;
-                if turn && self.setup.busy_ms > 0 {
-                    let _ = handle.notify(WMsg::Busy(self.setup.busy_ms)).await;
-                }
                 if turn && self.setup.held {
                     let _ = handle.notify(WMsg::Held).await;
                 }
-                if turn && self.setup.block_ms > 0 {
-                    let _ = handle.notify(WMsg::Block(self.setup.block_ms)).await;
+                if turn && self.setup.block {
+                    let _ = handle.notify(WMsg::Block).await;
                 }
                 Ok(())
             }
@@ -288,15 +370,16 @@ impl Actor for Sub {
         self.probe.p_started.fetch_add(1, Ordering::SeqCst);
         self.probe.note(format!("p_started:{}", self.seq));
         if self.setup.hang_on_build == Some(self.seq) {
-            sleep(Duration::from_secs(3600)).await;
+            std::future::pending::<()>().await;
         }
         self.probe.note(format!("p_ready:{}", self.seq));
         Ok(())
     }
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        if self.setup.slow_pre_stop_ms > 0 {
-            sleep(Duration::from_millis(self.setup.slow_pre_stop_ms)).await;
+        self.probe.note(format!("p_pre_stop:{}", self.seq));
+        if self.setup.hang_pre_stop {
+            std::future::pending::<()>().await;
         }
         !self.setup.veto_stop
     }
@@ -343,6 +426,10 @@ struct TopSetup {
     q_name: Option<String>,
     /// A report of this child makes the root spawn `Sub` again under its id.
     respawn_on: Option<String>,
+    /// A `RestartInitiated` report of this child kills `q` from inside the
+    /// callback, waits until it reads `Stopped`, then holds the callback
+    /// until the test opens the probe's `top_gate`.
+    hold_in_report_of: Option<String>,
     sys: Option<Arc<ActorSystem>>,
 }
 
@@ -356,10 +443,12 @@ enum TopMsg {
     Setup,
     /// `stop_child(P)`.
     StopP,
-    /// `terminate_child(P)`, logged with its answer, its duration and the
-    /// number of live workers when it returned.
+    /// `terminate_child(P)`, logged before the call with the number of live
+    /// workers, and after it with its answer, the number of live workers
+    /// and P's entry.
     TerminateP,
-    /// `terminate_child(P)` abandoned 20 ms after its commit.
+    /// `terminate_child(P)` abandoned right after its first poll, which
+    /// commits it.
     TerminateAbandoned,
     /// `delete_child(P)` and a same-id `spawn_child(P)`.
     DeleteSpawn,
@@ -368,20 +457,18 @@ enum TopMsg {
     /// `stop_child(P)` and a same-id spawn in one handler.
     StopSpawn,
     /// Kills the plain child `q` from inside the handler, waits until it
-    /// reads `Stopped`, then holds the handler for this many milliseconds.
-    KillQThenHold(u64),
-    /// Kills `q` the same way, then holds the handler until the test sets
-    /// the probe's `top_release` (for at most `GATE_CAP`).
+    /// reads `Stopped`, then holds the handler until the test opens the
+    /// probe's `top_gate`.
     KillQThenHoldUntilReleased,
 }
 
-/// Sets the probe's `top_release` when dropped, so the root's held handler
+/// Opens the probe's `top_gate` when dropped, so the root's held handler
 /// ends however the test ends.
 struct ReleasesTheTop(Arc<Probe>);
 
 impl Drop for ReleasesTheTop {
     fn drop(&mut self) {
-        self.0.top_release.store(true, Ordering::SeqCst);
+        self.0.top_gate.open();
     }
 }
 
@@ -419,6 +506,18 @@ impl Top {
             None => "absent".to_string(),
         }
     }
+
+    /// Kills `q`, waits until it reads `Stopped`, then holds until the test
+    /// opens the probe's `top_gate`.
+    async fn kill_q_then_hold(&self) {
+        let sys = self.setup.sys.clone().expect("the system");
+        let q_name = self.setup.q_name.clone().expect("a plain child q");
+        let q = sys.get::<Plain>(&q_name).expect("q runs");
+        sys.kill(&q_name).await.expect("kill q");
+        bounded("q to read Stopped", q.wait_stopped()).await;
+        self.probe.note("q_stopped");
+        bounded("the test to release the root", self.probe.top_gate.wait()).await;
+    }
 }
 
 impl Actor for Top {
@@ -436,80 +535,51 @@ impl Actor for Top {
                 if let Some(name) = self.setup.q_name.clone() {
                     self.spawn_plain(ctx, &name).await?;
                 }
+                self.probe.note("setup_done");
             }
             TopMsg::StopP => {
-                let t = Instant::now();
                 let r = ctx.stop_child(p_name).await;
-                self.probe
-                    .note(format!("stop_child:{r:?} in {:?}", t.elapsed()));
+                self.probe.note(format!("stop_child:{r:?}"));
             }
             TopMsg::TerminateP => {
-                let t = Instant::now();
+                self.probe
+                    .note(format!("terminate_begin live={}", self.probe.live()));
                 let r = ctx.terminate_child(p_name).await;
-                let elapsed = t.elapsed();
                 self.probe.note(format!(
-                    "terminate:{r:?} micros={} live={} {}",
-                    elapsed.as_micros(),
+                    "terminate:{r:?} live={} {}",
                     self.probe.live(),
                     self.live_children(ctx)
                 ));
             }
             TopMsg::TerminateAbandoned => {
-                let _ = timeout(Duration::ZERO, ctx.terminate_child(p_name)).await;
+                poll_once(ctx.terminate_child(p_name)).await;
                 self.probe.note("terminate_abandoned");
             }
             TopMsg::DeleteSpawn => {
                 let deleted = ctx.delete_child(p_name);
-                let t = Instant::now();
                 let spawned = self.spawn_p(ctx).await;
                 self.probe.note(format!(
-                    "delete:{deleted:?} spawn:{spawned:?} micros={} live={}",
-                    t.elapsed().as_micros(),
+                    "delete:{deleted:?} spawn:{spawned:?} live={}",
                     self.probe.live()
                 ));
             }
             TopMsg::Cycle => {
-                let t = Instant::now();
                 let terminated = ctx.terminate_child(p_name.clone()).await;
                 let live = self.probe.live();
                 let deleted = ctx.delete_child(p_name);
                 let spawned = self.spawn_p(ctx).await;
                 self.probe.note(format!(
                     "cycle terminate:{terminated:?} live_after_terminate={live} \
-                     delete:{deleted:?} spawn:{spawned:?} in {:?}",
-                    t.elapsed()
+                     delete:{deleted:?} spawn:{spawned:?}"
                 ));
             }
             TopMsg::StopSpawn => {
                 let stopped = ctx.stop_child(p_name).await;
-                let t = Instant::now();
                 let spawned = self.spawn_p(ctx).await;
-                self.probe.note(format!(
-                    "stop_spawn stop:{stopped:?} spawn:{spawned:?} in {:?}",
-                    t.elapsed()
-                ));
+                self.probe
+                    .note(format!("stop_spawn stop:{stopped:?} spawn:{spawned:?}"));
             }
-            TopMsg::KillQThenHold(ms) => {
-                let sys = self.setup.sys.clone().expect("the system");
-                let q_name = self.setup.q_name.clone().expect("a plain child q");
-                let q = sys.get::<Plain>(&q_name).expect("q runs");
-                sys.kill(&q_name).await.expect("kill q");
-                within(BOUND, "q to read Stopped", q.wait_stopped()).await;
-                self.probe.note("q_stopped");
-                sleep(Duration::from_millis(ms)).await;
-            }
-            TopMsg::KillQThenHoldUntilReleased => {
-                let sys = self.setup.sys.clone().expect("the system");
-                let q_name = self.setup.q_name.clone().expect("a plain child q");
-                let q = sys.get::<Plain>(&q_name).expect("q runs");
-                sys.kill(&q_name).await.expect("kill q");
-                within(BOUND, "q to read Stopped", q.wait_stopped()).await;
-                self.probe.note("q_stopped");
-                let cap = Instant::now() + GATE_CAP;
-                while !self.probe.top_release.load(Ordering::SeqCst) && Instant::now() < cap {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            }
+            TopMsg::KillQThenHoldUntilReleased => self.kill_q_then_hold().await,
         }
         Ok(())
     }
@@ -529,13 +599,17 @@ impl Actor for Top {
         self.probe.note(format!("report:{name}:{:?}", ev.action));
         if self.setup.respawn_on.as_deref() == Some(name.as_str()) {
             let before = self.probe.built_p();
-            let t = Instant::now();
             let spawned = self.spawn_p(ctx).await;
             self.probe.note(format!(
-                "respawn_in_report spawn:{spawned:?} micros={} built_delta={}",
-                t.elapsed().as_micros(),
-                self.probe.built_p() - before
+                "respawn_in_report spawn:{spawned:?} built_delta={} live={}",
+                self.probe.built_p() - before,
+                self.probe.live()
             ));
+        }
+        if self.setup.hold_in_report_of.as_deref() == Some(name.as_str())
+            && ev.action == SupervisionAction::RestartInitiated
+        {
+            self.kill_q_then_hold().await;
         }
         Ok(())
     }
@@ -577,6 +651,7 @@ fn setup(shutdown: Shutdown, sub: SubSetup) -> TopSetup {
         a_name: None,
         q_name: None,
         respawn_on: None,
+        hold_in_report_of: None,
         sys: None,
     }
 }
@@ -593,51 +668,18 @@ fn one_restart() -> SupervisionConfig {
     SupervisionConfig::one_for_one().max_restarts(1, Duration::from_secs(60))
 }
 
-/// The bound of a wait on a subtree whose one worker has the default kill
-/// grace: the worker's budget (its grace and the settle time) and the slack of
-/// one more settle time.
-const WORKER_BOUND: Duration = Duration::from_millis(
-    ASSUMED_KILL_GRACE.as_millis() as u64 + 2 * ASSUMED_ABORT_SETTLE.as_millis() as u64,
-);
+/// A worker kill grace no test outlives: the worker's held turn ends only
+/// when the test opens its gate, never by the abort.
+const HELD_GRACE: Duration = Duration::from_secs(60);
 
-/// How far past its bound a wait may end before the test fails: loose
-/// enough for a host that stalls its threads, and far short of the
-/// `LONG_BLOCK` turn a wait that outlived its bound would end with.
-const BOUND_SLACK: Duration = STALL_SLACK;
-
-/// The blocked turn of the tests that time a wait at its bound: it holds its
-/// thread far longer than the bound and the slack, and the test ends it once
-/// its checks are done.
-const LONG_BLOCK_MS: u64 = 15_000;
-
-/// Sets the probe's `unblock` when dropped, so a blocked turn ends however
+/// Opens the probe's `unblock` when dropped, so a blocked turn ends however
 /// the test ends.
 struct Unblocks(Arc<Probe>);
 
 impl Drop for Unblocks {
     fn drop(&mut self) {
-        self.0.unblock.store(true, Ordering::SeqCst);
+        self.0.unblock.open();
     }
-}
-
-/// The duration a timeline line recorded as `micros=N`.
-fn recorded(line: &str) -> Duration {
-    let micros: u64 = line
-        .split("micros=")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .expect("a recorded duration");
-    Duration::from_micros(micros)
-}
-
-/// Asserts that a wait ended at its bound: not before it, and within the
-/// slack after it.
-fn assert_at_the_bound(waited: Duration, what: &str) {
-    assert!(
-        waited >= WORKER_BOUND && waited < WORKER_BOUND + BOUND_SLACK,
-        "{what} ended after {waited:?}, its bound is {WORKER_BOUND:?}"
-    );
 }
 
 async fn start(config: SupervisionConfig, mut top_setup: TopSetup) -> World {
@@ -658,12 +700,12 @@ async fn start(config: SupervisionConfig, mut top_setup: TopSetup) -> World {
     .await
     .unwrap();
     top.notify(TopMsg::Setup).await.unwrap();
-    let observed = probe.clone();
-    wait_until(BOUND, "the first workers to be built", move || {
-        observed.w_built.load(Ordering::SeqCst) >= expected_workers
-            && observed.p_started.load(Ordering::SeqCst) >= 1
-    })
-    .await;
+    probe
+        .wait_for("the first workers to be built", move |p| {
+            p.w_built.load(Ordering::SeqCst) >= expected_workers
+                && p.p_started.load(Ordering::SeqCst) >= 1
+        })
+        .await;
     #[cfg(feature = "tracing")]
     let p_first = sys
         .snapshot()
@@ -689,22 +731,58 @@ impl World {
     }
 
     async fn wait_line(&self, what: &str, prefix: &'static str) -> String {
-        let probe = self.probe.clone();
-        wait_until(BOUND, what, move || probe.starts_with(prefix).is_some()).await;
+        self.probe
+            .wait_for(what, move |p| p.starts_with(prefix).is_some())
+            .await;
         self.probe.starts_with(prefix).unwrap()
     }
 
+    /// Waits until `n` lines start with `prefix` and returns the last.
+    async fn wait_nth_line(&self, what: &str, prefix: &'static str, n: usize) -> String {
+        self.probe
+            .wait_for(what, move |p| p.all(prefix).len() >= n)
+            .await;
+        self.probe.all(prefix).swap_remove(n - 1)
+    }
+
+    /// Waits until `n` workers are inside their first turn.
+    async fn wait_turns(&self, n: usize) {
+        self.probe
+            .wait_for("the workers' turns", move |p| {
+                p.all("w_turn_started:").len() >= n
+            })
+            .await;
+    }
+
     async fn wait_started(&self, n: usize) {
-        let probe = self.probe.clone();
-        wait_until(BOUND, "the supervisor child to start again", move || {
-            probe.p_started.load(Ordering::SeqCst) >= n
-        })
-        .await;
+        self.probe
+            .wait_for("the supervisor child to start again", move |p| {
+                p.p_started.load(Ordering::SeqCst) >= n
+            })
+            .await;
     }
 
     async fn wait_no_workers(&self) {
-        let probe = self.probe.clone();
-        wait_until(BOUND, "every old worker to end", move || probe.live() == 0).await;
+        self.probe
+            .wait_for("every old worker to end", |p| p.live() == 0)
+            .await;
+    }
+
+    /// Opens every held turn, stops the root gracefully and waits until it
+    /// stopped: an event still pending at the root shows afterwards as a
+    /// final report, and a root that stopped on its own as another reason.
+    async fn barrier(&self) {
+        self.probe.release.open();
+        self.probe.unblock.open();
+        let _ = self.top.stop(StopReason::Graceful).await;
+        bounded("the root to stop", self.top.wait_stopped()).await;
+        let reason = self.probe.top_stopped.lock().unwrap().clone();
+        assert_eq!(
+            reason.as_deref(),
+            Some("Graceful"),
+            "the root ran until the barrier: {:?}",
+            self.probe.lines()
+        );
     }
 
     fn top_running(&self) -> bool {
@@ -732,6 +810,21 @@ impl World {
             self.probe.lines()
         );
     }
+
+    /// No report reached the root's final deliveries: nothing was pending
+    /// at the barrier.
+    fn assert_nothing_pending_at_the_barrier(&self) {
+        assert!(
+            self.probe
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, _, action, _)| *action != SupervisionAction::SupervisorStopping),
+            "{:?}",
+            self.probe.lines()
+        );
+    }
 }
 
 /// The five ways the supervisor child is ended while its worker is mid-turn.
@@ -744,12 +837,12 @@ enum KillPath {
     /// A sibling crash in a `OneForAll` group whose stop kills the child
     /// (policy `Kill`).
     GroupKillPolicy,
-    /// The same, with a window the child's slow `pre_stop` outlives, so the
-    /// group's own ladder escalates to `Kill`.
+    /// The same, with a window the child's `pre_stop`, which never returns,
+    /// outlives, so the group's own ladder escalates to `Kill`.
     GroupTimeoutEscalated,
-    /// The escalated path with a worker under `Kill`, a long grace and a long
-    /// turn, so it outlives the child by the whole grace: only a budget
-    /// derived from that grace covers it.
+    /// The escalated path with a worker under `Kill` and a long grace, so it
+    /// outlives the child by the whole grace: only a budget derived from
+    /// that grace covers it.
     GroupTimeoutEscalatedLongGrace,
     /// `stop_child` on a child under policy `Kill`.
     BounceKillPolicy,
@@ -762,10 +855,10 @@ async fn kill_path_scenario(path: KillPath) {
     );
     let long_grace = matches!(path, KillPath::GroupTimeoutEscalatedLongGrace);
     let sub = named_worker(SubSetup {
-        busy_ms: if long_grace { 1000 } else { 300 },
+        held: true,
         w_shutdown: long_grace.then_some(Shutdown::Kill),
         w_grace: long_grace.then_some(Duration::from_millis(500)),
-        slow_pre_stop_ms: if escalated { 200 } else { 0 },
+        hang_pre_stop: escalated,
         ..SubSetup::default()
     });
     let shutdown = match path {
@@ -792,7 +885,9 @@ async fn kill_path_scenario(path: KillPath) {
         one_restart()
     };
     let world = start(config, top_setup).await;
-    // The worker is inside its first turn.
+    // The worker is inside its first turn, which only the abort of its
+    // grace ends.
+    world.wait_turns(1).await;
     match path {
         KillPath::ByName => world.sys.kill(&world.p_name).await.unwrap(),
         KillPath::ById => {
@@ -808,12 +903,19 @@ async fn kill_path_scenario(path: KillPath) {
         KillPath::BounceKillPolicy => world.send(TopMsg::StopP).await,
     }
     world.wait_started(2).await;
-    sleep(QUIET).await;
     assert!(world.top_running(), "{path:?}: {:?}", world.probe.lines());
+    world.barrier().await;
     world.assert_no_collision();
     world.assert_no_budget_exhaustion();
+    world.assert_nothing_pending_at_the_barrier();
     assert_eq!(
         world.probe.p_started.load(Ordering::SeqCst),
+        2,
+        "{path:?}: {:?}",
+        world.probe.lines()
+    );
+    assert_eq!(
+        world.probe.built_p(),
         2,
         "{path:?}: {:?}",
         world.probe.lines()
@@ -826,27 +928,26 @@ async fn kill_path_scenario(path: KillPath) {
 // ---------------------------------------------------------------------------
 
 /// The worker's turn blocks its thread until the test ends it: the
-/// restart's wait expires at its bound (the worker's kill grace plus the
-/// settle time, plus the slack), and the grandparent stops with
-/// `ChildUnresponsive` while the turn still runs.
+/// restart's wait expires at its bound, and the grandparent stops with
+/// `ChildUnresponsive` while the turn still runs. The bound's value is the
+/// rule table's; this scenario pins that the verdict arrives and that no
+/// new incarnation is built beside the live worker.
 async fn expiry_scenario(w_shutdown: Option<Shutdown>) {
     let sub = named_worker(SubSetup {
-        block_ms: LONG_BLOCK_MS,
+        block: true,
         w_shutdown,
         ..SubSetup::default()
     });
     let world = start(one_restart(), setup(Shutdown::default(), sub)).await;
     let unblocks = Unblocks(world.probe.clone());
-    let started = Instant::now();
+    world.wait_turns(1).await;
     world.sys.kill(&world.p_name).await.unwrap();
-    within(BOUND, "the grandparent to stop", world.top.wait_stopped()).await;
-    let elapsed = started.elapsed();
+    bounded("the grandparent to stop", world.top.wait_stopped()).await;
     assert!(
         world.probe.at("w_turn_ended").is_none(),
         "the verdict came while the turn ran: {:?}",
         world.probe.lines()
     );
-    assert_at_the_bound(elapsed, "the successor wait");
     let reason = world.probe.top_stopped.lock().unwrap().clone().unwrap();
     assert!(
         reason.contains("ChildUnresponsive") && reason.contains(&world.p_name),
@@ -866,11 +967,11 @@ async fn expiry_scenario(w_shutdown: Option<Shutdown>) {
 mod same_id_spawn_child_never_starts_beside_a_retired_subtree {
     use super::*;
 
-    /// The child's worker: a long turn and a long kill grace, so it outlives
+    /// The child's worker: a held turn and a long kill grace, so it outlives
     /// the child's own end by a clear margin.
     fn long_lived_worker() -> SubSetup {
         named_worker(SubSetup {
-            busy_ms: 800,
+            held: true,
             w_grace: Some(Duration::from_millis(1500)),
             ..SubSetup::default()
         })
@@ -900,10 +1001,9 @@ mod each_subtree_verdict_logs_once {
     use super::*;
 
     /// The warnings naming the world's supervisor child (the child field is
-    /// matched whole), after the loops that could still write one have
-    /// settled.
-    async fn warnings_of(world: &World, logged: &Mutex<Vec<String>>) -> Vec<String> {
-        sleep(QUIET).await;
+    /// matched whole). A verdict's warning is written before the wait that
+    /// reached it returns, so a caller reads it after that return.
+    fn warnings_of(world: &World, logged: &Mutex<Vec<String>>) -> Vec<String> {
         let lines = logged.lock().unwrap().clone();
         let mine = warnings::naming(&lines, &world.p_name);
         for line in &mine {
@@ -933,9 +1033,17 @@ mod each_subtree_verdict_logs_once {
         mine
     }
 
+    /// Stops the root gracefully, the worker still blocked, and waits until
+    /// it stopped: no loop of the tree is left to write a later warning
+    /// about the incarnation.
+    async fn stop_the_root(world: &World) {
+        let _ = world.top.stop(StopReason::Graceful).await;
+        bounded("the root to stop", world.top.wait_stopped()).await;
+    }
+
     fn blocked_worker() -> SubSetup {
         named_worker(SubSetup {
-            block_ms: 2500,
+            block: true,
             ..SubSetup::default()
         })
     }

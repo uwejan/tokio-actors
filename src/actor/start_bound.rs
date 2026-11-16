@@ -42,6 +42,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StopLane;
 use crate::actor::panic::{catch_callback, contain_waker_panic, send_contained};
 use crate::actor::runtime::saturating_deadline;
 use crate::actor::supervision::ABORT_SETTLE;
@@ -49,7 +50,7 @@ use crate::actor::{closed_ack_error, Actor};
 use crate::error::{ActorError, SpawnError};
 use crate::helper::{HelperKind, HelperOwner};
 use crate::system::{raise_noted, wait_final_reason, ActorSystem};
-use crate::types::{ActorId, StopLane, StopReason};
+use crate::types::{ActorId, StopReason};
 
 /// The state of the gate before anyone decided.
 const ARMED: u8 = 0;

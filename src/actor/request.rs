@@ -23,13 +23,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::context::Released;
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::ActorHandle;
 use crate::actor::monitor::{put_notice, MonitorShared};
 use crate::actor::panic::{catch_sync, payload_into_string};
 use crate::actor::runtime::{end_value, log_late_drop};
 use crate::actor::Actor;
 use crate::error::ActorError;
-use crate::types::{MonitorId, RequestId, RequestReply, SignalTag, StopReason};
+use crate::types::{MonitorId, RequestId, RequestReply, StopReason};
 
 /// One request in its asker's table.
 pub(crate) struct RequestEntry {

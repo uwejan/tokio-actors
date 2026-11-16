@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout, Instant};
 
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StatusRx;
 use crate::actor::runtime::own_unwind_tests::{panic_at_the_end_of, Gate, OpensOnDrop, SlowDrop};
 use crate::actor::runtime::{spawn_actor, ActorConfig};
 use crate::actor::supervision::{
@@ -24,8 +25,8 @@ use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult, SupervisionError};
 use crate::system::read_status;
 use crate::types::{
-    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartType, Shutdown, StatusRx,
-    StopReason, StreamEvent, SupervisionAction,
+    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartType, Shutdown, StopReason,
+    StreamEvent, SupervisionAction,
 };
 
 static UNIQ: AtomicUsize = AtomicUsize::new(0);

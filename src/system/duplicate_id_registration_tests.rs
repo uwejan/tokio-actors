@@ -1,8 +1,8 @@
-//! A registration refused because its id is already registered leaves nothing
-//! behind: the name it claimed an instant earlier is given back, and the
-//! registration that holds the id is untouched. The public spawn paths refuse
-//! a duplicate id before they reach the registry, so these tests drive the
-//! registry's own check with handles built by hand.
+//! A registration refused because its id, which is a named actor's name, is
+//! already registered leaves nothing behind, and the registration that holds
+//! the id is untouched. The public spawn paths refuse a held name before they
+//! reach the registry, so these tests drive the registry's own check with
+//! handles built by hand.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -12,10 +12,12 @@ use tokio::runtime::Handle;
 
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{StatusTx, StopLane, TurnClock};
 use crate::actor::Actor;
 use crate::error::{ActorResult, SpawnError};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, ActorStatus, StatusTx, StatusValue, StopLane, TurnClock};
+use crate::types::{ActorId, ActorStatus};
 
 #[derive(Default)]
 struct Idle;
@@ -33,7 +35,7 @@ impl Actor for Idle {
 struct Keep {
     _mailbox: crate::actor::mailbox::MailRx<crate::actor::ActorEnvelope<Idle>>,
     _status: StatusTx,
-    _lane: crate::types::LaneRx,
+    _lane: crate::actor::incarnation::LaneRx,
 }
 
 fn handle_for(id: &ActorId) -> (ActorHandle<Idle>, Keep) {
@@ -62,13 +64,12 @@ fn handle_for(id: &ActorId) -> (ActorHandle<Idle>, Keep) {
 fn register(
     sys: &ActorSystem,
     id: &ActorId,
-    name: Option<&str>,
+    named: bool,
     handle: &ActorHandle<Idle>,
 ) -> Result<u64, SpawnError> {
-    let name: Option<Arc<str>> = name.map(Arc::from);
     sys.register_actor::<Idle>(
         id,
-        name.as_ref(),
+        named,
         handle,
         false,
         TurnClock::default(),

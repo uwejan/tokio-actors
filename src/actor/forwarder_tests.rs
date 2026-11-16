@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use tokio::time::Instant;
+use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -23,14 +24,14 @@ use super::{
     Adjusted, ForwarderKind, MessageFactory, PanicSlot, RecurringId, Released, StreamRegistration,
     TickEvents,
 };
+use crate::actor::envelope::Envelope;
 use crate::actor::handle::ActorHandle;
-use crate::actor::subtree::SubtreeHold;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::SubtreeHold;
+use crate::actor::incarnation::{StatusTx, StopLane, TurnClock};
 use crate::actor::{Actor, ActorEnvelope};
 use crate::error::{ActorError, ActorResult};
-use crate::types::{
-    ActorId, ActorStatus, Envelope, MissPolicy, StatusTx, StatusValue, StopLane, StreamEvent,
-    TurnClock,
-};
+use crate::types::{ActorId, ActorStatus, MissPolicy, StreamEvent};
 
 /// Records its drop, then panics.
 struct Bomb(Arc<AtomicBool>);
@@ -414,15 +415,23 @@ fn ticking(
     })
 }
 
-/// Waits, by observation, until the factory was called `n` times. The bound only limits how long a real hang takes to report.
-async fn until_called(ticks: &Ticks, n: usize) {
+/// Waits, by observation, until `done` holds. The bound only limits how long a real hang takes to report.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(60), async {
-        while ticks.calls.load(Ordering::SeqCst) < n {
+        while !done() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
-    .expect("the factory is called");
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// Waits until the factory was called `n` times.
+async fn until_called(ticks: &Ticks, n: usize) {
+    until("the factory is called", || {
+        ticks.calls.load(Ordering::SeqCst) >= n
+    })
+    .await;
 }
 
 /// A recurring timer whose tick waits on a full mailbox is cancelled: the
@@ -603,13 +612,46 @@ async fn a_one_shot_whose_claim_was_lost_never_sends() {
     assert_eq!(drops.load(Ordering::SeqCst), 1, "the message dropped once");
 }
 
+/// An item that counts its drops.
+struct Held(u32, Arc<AtomicUsize>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl From<StreamEvent<Held>> for Option<Held> {
+    fn from(event: StreamEvent<Held>) -> Self {
+        match event {
+            StreamEvent::Data(item) => Some(item),
+            StreamEvent::Finished => None,
+        }
+    }
+}
+
+struct Counter;
+
+impl Actor for Counter {
+    type Message = Option<Held>;
+    type Response = ();
+
+    async fn handle(
+        &mut self,
+        _msg: Option<Held>,
+        _ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
 /// A context on a bare mailbox, for driving the end of its forwarders by
 /// hand.
-fn bare_context() -> (
-    ActorContext<Sink>,
-    crate::actor::mailbox::MailRx<ActorEnvelope<Sink>>,
+fn bare_context<A: Actor>() -> (
+    ActorContext<A>,
+    crate::actor::mailbox::MailRx<ActorEnvelope<A>>,
 ) {
-    let (handle, rx) = handle_of::<Sink>();
+    let (handle, rx) = handle_of::<A>();
     let (status_tx, _status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
     let ctx = ActorContext::new(
         ActorId::from("forwarder-end"),

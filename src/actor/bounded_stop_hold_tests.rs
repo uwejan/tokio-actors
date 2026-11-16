@@ -11,11 +11,11 @@ use tokio::runtime::Handle;
 
 use super::*;
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{StatusTx, StopLane, TurnClock};
 use crate::error::ActorResult;
 use crate::system::ActorSystem;
-use crate::types::{
-    ActorId, ActorStatus, StatusTx, StatusValue, StopLane, StopOutcome, StopReason, TurnClock,
-};
+use crate::types::{ActorId, ActorStatus, StopOutcome, StopReason};
 
 #[derive(Default)]
 struct Idle;
@@ -48,7 +48,7 @@ fn registered_handle(sys: &Arc<ActorSystem>, id: &str) -> (ActorHandle<Idle>, im
     );
     sys.register_actor::<Idle>(
         &id,
-        None,
+        false,
         &handle,
         true,
         TurnClock::default(),

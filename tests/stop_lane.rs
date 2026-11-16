@@ -316,6 +316,10 @@ fn escalation_ladder_contains_no_awaited_stop_sends() {
         ),
         ("src/system.rs", include_str!("../src/system.rs")),
         ("src/types/mod.rs", include_str!("../src/types/mod.rs")),
+        (
+            "src/actor/envelope.rs",
+            include_str!("../src/actor/envelope.rs"),
+        ),
     ];
     for (path, src) in sources {
         assert!(
@@ -338,268 +342,101 @@ fn production_text(src: &str) -> String {
     text
 }
 
+/// The files that raise or could raise on a stop lane, with the number of
+/// `.raise(`, `try_raise(` and Kill calls (the step cell's `.raise_shared(`
+/// and `.kill_registered(`) each production text may hold. Every count is
+/// an allowed site:
+///
+/// - context.rs: none. The actor's own stop (`ctx.stop`) refuses `Kill`
+///   before it raises, and raises through `raise_noted`.
+/// - handle.rs: the two non-Kill raises of `stop` and `stop_within`.
+/// - start_bound.rs, supervision.rs, slot.rs, link.rs, monitor.rs,
+///   request.rs and pg_monitor.rs: none. The cut of a start that timed
+///   out, the child link guard, `raise_first`, `raise_owing`, the orderly
+///   stop of a slot and the failure of an actor whose trap map, monitor
+///   map, request map or group monitor map panicked raise through
+///   `raise_noted`, which queues the request's event and a `Kill`'s
+///   `Raised` step; they hold the abort handle or the record themselves,
+///   so no registry entry is involved and no deadline is declared. A
+///   link's `Kill` on its owner goes through the declaring function
+///   (`raise_caused`), which the scan does not count.
+/// - system.rs: `try_raise(` is the graceful stop by name, the shared
+///   function, the step cell's own raise, the reaper entry (it holds the
+///   abort handle itself) and the two raises of `raise_noted`;
+///   the Kill calls are the step cell's raise in the reaper entry and in
+///   the shared function, and the call of `kill_registered`, the private
+///   by-id helper that calls the shared function. The events of each raise
+///   are pinned by `tests/telemetry_sites.rs`.
+const SCANNED: &[(&str, [usize; 3])] = &[
+    ("actor/alias.rs", [0, 0, 0]),
+    ("actor/context.rs", [0, 0, 0]),
+    ("actor/handle.rs", [0, 2, 0]),
+    ("actor/link.rs", [0, 0, 0]),
+    ("actor/mailbox.rs", [0, 0, 0]),
+    ("actor/mod.rs", [0, 0, 0]),
+    ("actor/monitor.rs", [0, 0, 0]),
+    ("actor/panic.rs", [0, 0, 0]),
+    ("actor/pg.rs", [0, 0, 0]),
+    ("actor/pg_monitor.rs", [0, 0, 0]),
+    ("actor/request.rs", [0, 0, 0]),
+    ("actor/runtime.rs", [0, 0, 0]),
+    ("actor/start_bound.rs", [0, 0, 0]),
+    ("actor/incarnation/block.rs", [0, 0, 0]),
+    ("actor/incarnation/owed.rs", [0, 0, 0]),
+    ("actor/incarnation/signals.rs", [0, 0, 0]),
+    ("actor/incarnation/subtree.rs", [0, 0, 0]),
+    ("actor/supervision.rs", [0, 0, 0]),
+    ("actor/supervision/model.rs", [0, 0, 0]),
+    ("actor/supervision/rules.rs", [0, 0, 0]),
+    ("actor/supervision/slot.rs", [0, 0, 0]),
+    ("actor/supervisor_ref.rs", [0, 0, 0]),
+    ("actor/task_key.rs", [0, 0, 0]),
+    ("actor/turn.rs", [0, 0, 0]),
+    ("application.rs", [0, 0, 0]),
+    ("behavior.rs", [0, 0, 0]),
+    ("error.rs", [0, 0, 0]),
+    ("event.rs", [0, 0, 0]),
+    ("helper.rs", [0, 0, 0]),
+    ("lib.rs", [0, 0, 0]),
+    ("signals.rs", [0, 0, 0]),
+    ("statem.rs", [0, 0, 0]),
+    ("system.rs", [0, 6, 3]),
+    ("time_probe.rs", [0, 0, 0]),
+    ("types/mod.rs", [0, 0, 0]),
+    ("actor/envelope.rs", [0, 0, 0]),
+    ("actor/incarnation/mod.rs", [0, 0, 0]),
+    ("actor/incarnation/status_cell.rs", [0, 0, 0]),
+    ("actor/incarnation/turn_clock.rs", [0, 0, 0]),
+    ("telemetry/actor_ref.rs", [0, 0, 0]),
+    ("telemetry/identity.rs", [0, 0, 0]),
+    ("telemetry/event.rs", [0, 0, 0]),
+    ("telemetry/handlers.rs", [0, 0, 0]),
+    ("telemetry/mod.rs", [0, 0, 0]),
+    ("telemetry/mode.rs", [0, 0, 0]),
+    ("telemetry/pump.rs", [0, 0, 0]),
+    ("telemetry/sinks.rs", [0, 0, 0]),
+    ("telemetry/hot.rs", [0, 0, 0]),
+    ("telemetry/record.rs", [0, 0, 0]),
+    ("telemetry/span.rs", [0, 0, 0]),
+    ("telemetry/token.rs", [0, 0, 0]),
+    ("telemetry/wait_graph.rs", [0, 0, 0]),
+    ("actor/sys.rs", [0, 0, 0]),
+    ("actor/sys_debug.rs", [0, 0, 0]),
+    ("actor/sys_loop.rs", [0, 0, 0]),
+    ("actor/sys_serve.rs", [0, 0, 0]),
+    ("actor/sys_state.rs", [0, 0, 0]),
+    ("actor/sys_suspend.rs", [0, 0, 0]),
+    ("telemetry/monitor.rs", [0, 0, 0]),
+    ("telemetry/reports.rs", [0, 0, 0]),
+    ("telemetry/subscription.rs", [0, 0, 0]),
+];
+
 #[test]
 fn every_registry_kill_raise_goes_through_the_declaring_function() {
-    // The files that raise or could raise on a stop lane, with the number of
-    // `.raise(`, `try_raise(` and `.raise_kill(` calls each production text may
-    // hold. Every count is an allowed site:
-    //
-    // - context.rs: none. The actor's own stop (`ctx.stop`) refuses `Kill`
-    //   before it raises, and raises through `raise_noted`.
-    // - handle.rs: the two non-Kill raises of `stop` and `stop_within`.
-    // - start_bound.rs, supervision.rs, slot.rs, link.rs, monitor.rs,
-    //   request.rs and pg_monitor.rs: none. The cut of a start that timed
-    //   out, the child link guard, `raise_first`, `raise_owing`, the orderly
-    //   stop of a slot and the failure of an actor whose trap map, monitor
-    //   map, request map or group monitor map panicked raise through
-    //   `raise_noted`, which queues the request's event and a `Kill`'s
-    //   `Raised` step; they hold the abort handle or the record themselves,
-    //   so no registry entry is involved and no deadline is declared. A
-    //   link's `Kill` on its owner goes through the declaring function
-    //   (`raise_caused`), which the scan does not count.
-    // - system.rs: `try_raise(` is the graceful stop by name, the shared
-    //   function, the step cell's own raise, the reaper entry (it holds the
-    //   abort handle itself) and the two raises of `raise_noted`;
-    //   `.raise_kill(` is the reaper entry, the shared function and the
-    //   private by-id helper that calls the shared function. The events of
-    //   each raise are pinned by `tests/telemetry_sites.rs`.
-    let scanned: &[(&str, &str, [usize; 3])] = &[
-        (
-            "actor/alias.rs",
-            include_str!("../src/actor/alias.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/context.rs",
-            include_str!("../src/actor/context.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/handle.rs",
-            include_str!("../src/actor/handle.rs"),
-            [0, 2, 0],
-        ),
-        (
-            "actor/link.rs",
-            include_str!("../src/actor/link.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/mailbox.rs",
-            include_str!("../src/actor/mailbox.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/mod.rs",
-            include_str!("../src/actor/mod.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/monitor.rs",
-            include_str!("../src/actor/monitor.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/panic.rs",
-            include_str!("../src/actor/panic.rs"),
-            [0, 0, 0],
-        ),
-        ("actor/pg.rs", include_str!("../src/actor/pg.rs"), [0, 0, 0]),
-        (
-            "actor/pg_monitor.rs",
-            include_str!("../src/actor/pg_monitor.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/request.rs",
-            include_str!("../src/actor/request.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/runtime.rs",
-            include_str!("../src/actor/runtime.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/start_bound.rs",
-            include_str!("../src/actor/start_bound.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/subtree.rs",
-            include_str!("../src/actor/subtree.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/supervision.rs",
-            include_str!("../src/actor/supervision.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/supervision/rules.rs",
-            include_str!("../src/actor/supervision/rules.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/supervision/slot.rs",
-            include_str!("../src/actor/supervision/slot.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/supervisor_ref.rs",
-            include_str!("../src/actor/supervisor_ref.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/task_key.rs",
-            include_str!("../src/actor/task_key.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/turn.rs",
-            include_str!("../src/actor/turn.rs"),
-            [0, 0, 0],
-        ),
-        ("behavior.rs", include_str!("../src/behavior.rs"), [0, 0, 0]),
-        ("error.rs", include_str!("../src/error.rs"), [0, 0, 0]),
-        ("helper.rs", include_str!("../src/helper.rs"), [0, 0, 0]),
-        ("lib.rs", include_str!("../src/lib.rs"), [0, 0, 0]),
-        ("system.rs", include_str!("../src/system.rs"), [0, 6, 3]),
-        (
-            "time_probe.rs",
-            include_str!("../src/time_probe.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "types/mod.rs",
-            include_str!("../src/types/mod.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "types/status_cell.rs",
-            include_str!("../src/types/status_cell.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "types/turn_clock.rs",
-            include_str!("../src/types/turn_clock.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/actor_ref.rs",
-            include_str!("../src/telemetry/actor_ref.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/identity.rs",
-            include_str!("../src/telemetry/identity.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/event.rs",
-            include_str!("../src/telemetry/event.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/handlers.rs",
-            include_str!("../src/telemetry/handlers.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/mod.rs",
-            include_str!("../src/telemetry/mod.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/mode.rs",
-            include_str!("../src/telemetry/mode.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/pump.rs",
-            include_str!("../src/telemetry/pump.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/sinks.rs",
-            include_str!("../src/telemetry/sinks.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/hot.rs",
-            include_str!("../src/telemetry/hot.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/record.rs",
-            include_str!("../src/telemetry/record.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/span.rs",
-            include_str!("../src/telemetry/span.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/token.rs",
-            include_str!("../src/telemetry/token.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/wait_graph.rs",
-            include_str!("../src/telemetry/wait_graph.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys.rs",
-            include_str!("../src/actor/sys.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys_debug.rs",
-            include_str!("../src/actor/sys_debug.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys_loop.rs",
-            include_str!("../src/actor/sys_loop.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys_serve.rs",
-            include_str!("../src/actor/sys_serve.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys_state.rs",
-            include_str!("../src/actor/sys_state.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "actor/sys_suspend.rs",
-            include_str!("../src/actor/sys_suspend.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/monitor.rs",
-            include_str!("../src/telemetry/monitor.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/reports.rs",
-            include_str!("../src/telemetry/reports.rs"),
-            [0, 0, 0],
-        ),
-        (
-            "telemetry/subscription.rs",
-            include_str!("../src/telemetry/subscription.rs"),
-            [0, 0, 0],
-        ),
-    ];
     // The lane itself defines the raise; the files that exist only under
     // `cfg(test)` do not ship, and are found from the declarations that bring
     // them in.
-    let lane_implementation = "types/stop_lane.rs";
+    let lane_implementation = "actor/incarnation/stop_lane.rs";
 
     // A new source file must be classified here before it passes.
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -614,9 +451,9 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         .filter(|path| !test_only.contains(*path))
         .cloned()
         .collect();
-    let mut known: Vec<String> = scanned
+    let mut known: Vec<String> = SCANNED
         .iter()
-        .map(|(path, _, _)| (*path).to_string())
+        .map(|(path, _)| (*path).to_string())
         .collect();
     known.push(lane_implementation.to_string());
     known.sort();
@@ -625,21 +462,21 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         "a source file is not classified for the Kill raiser scan"
     );
 
-    for (path, src, [raise, try_raise, raise_kill]) in scanned {
-        let text = production_text(src);
+    for (path, [raise, try_raise, raise_shared]) in SCANNED {
+        let text = production_text(&sources[*path]);
         assert_eq!(
             [
                 text.matches(".raise(").count(),
                 text.matches("try_raise(").count(),
-                text.matches(".raise_kill(").count(),
+                text.matches(".raise_shared(").count() + text.matches(".kill_registered(").count(),
             ],
-            [*raise, *try_raise, *raise_kill],
+            [*raise, *try_raise, *raise_shared],
             "{path}: a raiser was added or removed; a registry Kill goes through \
              raise_kill_declared, and any other raise needs a reason at its site"
         );
     }
 
-    let handle = production_text(include_str!("../src/actor/handle.rs"));
+    let handle = production_text(&sources["actor/handle.rs"]);
     assert!(
         !handle.contains("try_raise(StopReason::Kill")
             && !handle.contains(".raise(StopReason::Kill"),
@@ -649,7 +486,7 @@ fn every_registry_kill_raise_goes_through_the_declaring_function() {
         !handle.contains("declare_kill("),
         "handle.rs declares a Kill deadline itself"
     );
-    let system = production_text(include_str!("../src/system.rs"));
+    let system = production_text(&sources["system.rs"]);
     assert_eq!(
         system.matches("try_raise(StopReason::Kill)").count(),
         3,

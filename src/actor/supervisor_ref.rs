@@ -22,11 +22,14 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::actor::context::{ActorContext, ChildSpawnBuilder, JoinTicket};
+use crate::actor::envelope::SuperviseRequest;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::turn_clock::{outcome_plain, push_turn};
+use crate::actor::incarnation::IncarnationRef;
+use crate::actor::incarnation::StopLane;
 use crate::actor::panic::{
     catch_hook_t, catch_sync, payload_into_string, send_contained, AnswerHold,
 };
-use crate::actor::subtree::AbortRecord;
 use crate::actor::supervision::{
     await_cell, await_subtree, rules, CellOutcome, ManualStop, Predecessor,
 };
@@ -35,8 +38,7 @@ use crate::error::{ActorError, SupervisionError, SupervisorRefError};
 use crate::helper::HelperKind;
 use crate::telemetry::HookKind;
 use crate::time_probe::runtime_has_timers;
-use crate::types::turn_clock::{outcome_plain, push_turn};
-use crate::types::{ActorId, ChildCounts, ChildInfo, StopLane, StopReason, SuperviseRequest};
+use crate::types::{ActorId, ChildCounts, ChildInfo, StopReason};
 
 /// A reference to a supervisor of type `S`, with the calls of Erlang/OTP's
 /// `supervisor` module.
@@ -345,6 +347,92 @@ impl<S: Actor> SupervisorRef<S> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # A subsystem under a supervisor
+    ///
+    /// A task that is not an actor joins the tree by a small actor that
+    /// owns it: `on_started` spawns the task, which tells the actor when it
+    /// ends, and `handle` turns that end into an `Err`, so the supervisor
+    /// restarts the bridge by its policy, and `on_stopped` aborts the task.
+    ///
+    /// ```rust
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::sync::Arc;
+    /// use tokio::sync::mpsc;
+    /// use tokio::task::JoinHandle;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorError, ActorResult, StopReason, SupervisorRef,
+    /// };
+    ///
+    /// struct Ended;
+    ///
+    /// struct Bridge {
+    ///     run: usize,
+    ///     started: mpsc::UnboundedSender<usize>,
+    ///     task: Option<JoinHandle<()>>,
+    /// }
+    ///
+    /// impl Actor for Bridge {
+    ///     type Message = Ended;
+    ///     type Response = ();
+    ///
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         let me = ctx.self_handle();
+    ///         let ends = self.run == 0;
+    ///         self.task = Some(tokio::spawn(async move {
+    ///             // The subsystem: the first run ends at once, later runs go on.
+    ///             if !ends {
+    ///                 std::future::pending::<()>().await;
+    ///             }
+    ///             let _ = me.notify(Ended).await;
+    ///         }));
+    ///         let _ = self.started.send(self.run);
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn handle(&mut self, _: Ended, _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Err(ActorError::User("the subsystem ended".into()))
+    ///     }
+    ///
+    ///     async fn on_stopped(&mut self, _: &StopReason, _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         if let Some(task) = self.task.take() {
+    ///             task.abort();
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// struct Boss;
+    /// impl Actor for Boss {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let boss = Boss.spawn().named("sref-bridge-doc").supervisor().await?;
+    /// let sup = SupervisorRef::of(&boss);
+    /// let (started, mut starts) = mpsc::unbounded_channel();
+    /// let runs = Arc::new(AtomicUsize::new(0));
+    /// sup.start_child(
+    ///     move || Bridge {
+    ///         run: runs.fetch_add(1, Ordering::SeqCst),
+    ///         started: started.clone(),
+    ///         task: None,
+    ///     },
+    ///     |child| child.named("sref-bridge-doc-bridge"),
+    /// )
+    /// .await?;
+    /// assert_eq!(starts.recv().await, Some(0));
+    /// // The subsystem ended, the bridge failed, and the supervisor started it again.
+    /// assert_eq!(starts.recv().await, Some(1));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn start_child<C, F, G>(
         &self,
         factory: F,
@@ -429,10 +517,12 @@ impl<S: Actor> SupervisorRef<S> {
     /// - [`SupervisorRefError::CallingSelf`] and [`SupervisorRefError::Gone`]
     ///   as for every call; [`SupervisorRefError::Timeout`] and
     ///   [`SupervisorRefError::NoTimeDriver`] when the reference has a bound
-    ///   (see [`timeout`](Self::timeout)). The supervisor ending before the child's end was
-    ///   seen is `Gone`; once the child's end was seen, the stop completed and
-    ///   the answer is `Ok` even if the supervisor ended before it finished
-    ///   the classification.
+    ///   (see [`timeout`](Self::timeout)). A supervisor that ended before it
+    ///   took the request answers `Gone`, and so does a reply helper lost with
+    ///   its runtime. Once the supervisor has committed the stop, the answer is
+    ///   `Ok` when the child and its subtree have ended, even if the
+    ///   supervisor ended before the child's end was seen or before it
+    ///   finished the classification.
     /// - [`SupervisorRefError::Supervision`] with the error
     ///   `terminate_child` has: [`SupervisionError::NotASupervisor`],
     ///   [`SupervisionError::ChildNotFound`],
@@ -659,6 +749,74 @@ impl<S: Actor> SupervisorRef<S> {
             .map_err(SupervisorRefError::Supervision)
     }
 
+    /// Reads the spec of one child as a [`ChildInfo`], the counterpart of
+    /// Erlang/OTP's `supervisor:get_childspec/2`: the child's restart type,
+    /// shutdown, significance, kill grace and start bound, with its name and
+    /// the state the call finds it in; the start function stays with the
+    /// supervisor as the child's factory and is not returned. A child of a
+    /// [`SimpleOneForOne`](crate::RestartStrategy::SimpleOneForOne) pool is
+    /// named by its id like any other, and one that ended and was removed
+    /// answers as a missing child.
+    ///
+    /// # Errors
+    /// - [`SupervisorRefError::CallingSelf`] and [`SupervisorRefError::Gone`]
+    ///   as for every call; [`SupervisorRefError::Timeout`] and
+    ///   [`SupervisorRefError::NoTimeDriver`] when the reference has a bound
+    ///   (see [`timeout`](Self::timeout)).
+    /// - [`SupervisorRefError::Supervision`] with the error `terminate_child`
+    ///   has for a missing id, [`SupervisionError::ChildNotFound`], and
+    ///   [`SupervisionError::NotASupervisor`] for an actor with no
+    ///   supervision configured.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tokio_actors::{
+    ///     actor::{context::ActorContext, Actor, ActorExt},
+    ///     ActorResult, SupervisorRef,
+    /// };
+    ///
+    /// struct Worker;
+    /// impl Actor for Worker {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// struct Boss;
+    /// impl Actor for Boss {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let boss = Boss.spawn().named("sref-spec-doc").supervisor().await?;
+    /// let sup = SupervisorRef::of(&boss);
+    /// let worker = sup
+    ///     .start_child(|| Worker, |child| child.named("sref-spec-doc-worker"))
+    ///     .await?;
+    /// let spec = sup.get_childspec(worker.id().clone()).await?;
+    /// assert!(!spec.significant);
+    /// assert_eq!(spec.start_timeout, None::<Duration>);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_childspec(
+        &self,
+        child: impl Into<ActorId>,
+    ) -> Result<ChildInfo, SupervisorRefError> {
+        let child = child.into();
+        self.bounded(self.ask(|reply| SuperviseRequest::Spec { child, reply }))
+            .await?
+            .map_err(SupervisorRefError::Supervision)
+    }
+
     /// Counts the supervisor's children, as Erlang/OTP's
     /// `supervisor:count_children/1` does: the specs, the active children
     /// (those with an incarnation alive; a child being restarted is not
@@ -739,6 +897,13 @@ pub(crate) async fn serve<S: Actor>(
             ctx.supervision_ref()
                 .map(|sup| sup.children_info())
                 .ok_or(SupervisionError::NotASupervisor)
+        }),
+        SuperviseRequest::Spec { child, reply } => answer(ctx, reply, |ctx| {
+            let sup = ctx
+                .supervision_ref()
+                .ok_or(SupervisionError::NotASupervisor)?;
+            sup.child_info(&child)
+                .ok_or(SupervisionError::ChildNotFound(child))
         }),
         SuperviseRequest::Count { reply } => answer(ctx, reply, |ctx| {
             ctx.supervision_ref()
@@ -857,7 +1022,7 @@ struct TerminateWait {
     child: ActorId,
     ticket: Option<JoinTicket>,
     predecessor: Option<Predecessor>,
-    record: AbortRecord,
+    record: IncarnationRef,
     reply: AnswerHold<Result<(), SupervisorRefError>>,
     /// The answer is the child's Unresponsive verdict.
     verdict: bool,

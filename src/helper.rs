@@ -9,7 +9,11 @@
 //! walk. Three further tasks hold no obligation: the reply of a supervisor
 //! reference's `terminate_child`, which waits for the child's end because the
 //! supervisor classifies and reports the end by itself, the telemetry pump, and
-//! the delivery of the system monitor's reports. A system
+//! the delivery of the system monitor's reports. The tasks of an application
+//! controller (each start or stop sequence, and the controller's wind-down)
+//! hold the only copy of their steps too: each hands what it still owes back
+//! to the controller when it ends early, and the controller runs it again or
+//! hands it on. A system
 //! keeps one slot for each runtime its helpers run on. The
 //! slot sees every helper start and every helper end, whichever way it ends:
 //!
@@ -45,8 +49,8 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::{Handle, Id};
 use tokio::task::JoinHandle;
 
+use crate::actor::incarnation::IncarnationRef;
 use crate::actor::panic::{catch_callback, payload_into_string};
-use crate::actor::subtree::AbortRecord;
 use crate::telemetry::{EventKind, Mode, TelemetryEvent};
 use crate::types::ActorId;
 
@@ -76,6 +80,9 @@ pub(crate) enum HelperKind {
     /// Delivers the system monitor's reports to its actor.
     #[allow(dead_code)]
     Monitor,
+    /// Works for an application controller: a start or stop sequence, the
+    /// wind-down, or the wait on an own system's shutdown that an end began.
+    Application,
 }
 
 impl HelperKind {
@@ -91,6 +98,7 @@ impl HelperKind {
             Self::SupervisorReply => "supervisor reply",
             Self::Pump => "telemetry pump",
             Self::Monitor => "system monitor",
+            Self::Application => "application",
         }
     }
 }
@@ -103,11 +111,11 @@ impl HelperKind {
 #[derive(Debug)]
 pub(crate) struct HelperOwner {
     id: ActorId,
-    record: Option<AbortRecord>,
+    record: Option<IncarnationRef>,
 }
 
 impl HelperOwner {
-    pub(crate) fn new(id: ActorId, record: Option<AbortRecord>) -> Self {
+    pub(crate) fn new(id: ActorId, record: Option<IncarnationRef>) -> Self {
         Self { id, record }
     }
 }

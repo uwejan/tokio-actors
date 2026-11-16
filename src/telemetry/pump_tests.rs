@@ -19,12 +19,13 @@ use super::pump::{Pump, PUMP_CAPACITY};
 use super::TestSinkGuard;
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::IncarnationRef;
+use crate::actor::incarnation::StopLane;
 use crate::actor::{Actor, ActorExt};
 use crate::error::ActorResult;
 use crate::helper::{HelperEnd as InnerEnd, HelperKind as InnerKind};
 use crate::system::{ActorSystem, ReaperEntry};
-use crate::types::{ActorId, StopLane, StopReason};
+use crate::types::{ActorId, StopReason};
 
 /// The longest a scenario may take. It only limits how long a real hang takes
 /// to report; a slow host must not read as one.
@@ -101,7 +102,7 @@ fn system() -> Arc<ActorSystem> {
 
 /// Gives `record` an identity on `sys`'s mode and names `sys` as its system,
 /// as a spawn made while a sink took events does.
-fn bind_block(sys: &Arc<ActorSystem>, id: &ActorId, record: &AbortRecord) {
+fn bind_block(sys: &Arc<ActorSystem>, id: &ActorId, record: &IncarnationRef) {
     record.set_system(sys);
     sys.telemetry_mode().bind(
         record.key(),
@@ -429,7 +430,7 @@ fn the_helper_starts_on_the_first_event_and_ends_when_the_pump_closes() {
 
 /// The abort of a task is reported by the abort that finds it unfinished
 /// first, once per incarnation, whichever caller issues it: the reaper's and a
-/// caller's own force path both end in `AbortRecord::abort`. The aborts are
+/// caller's own force path both end in `IncarnationRef::abort`. The aborts are
 /// issued back to back on a current-thread runtime, so the task cannot end
 /// between them and the second abort is the loser of a real race.
 #[test]
@@ -514,7 +515,7 @@ impl Drop for EndOnDrop {
 /// window: a loser that is not held by the lock ends the task inside it, and
 /// the winner then pushes after the end.
 async fn a_losing_abort_waits_for_the_step() {
-    use crate::actor::subtree::test_hook;
+    use crate::actor::incarnation::subtree::test_hook;
     let sys = system();
     let mode = sys.telemetry_mode().clone();
     let sink = mode.collect(KindSet::all());

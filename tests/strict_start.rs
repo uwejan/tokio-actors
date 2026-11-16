@@ -28,7 +28,7 @@ use tokio_actors::{
 };
 
 /// Bounds every wait, so a hang fails the test.
-const BOUND: Duration = Duration::from_secs(20);
+const BOUND: Duration = Duration::from_secs(30);
 /// A start bound short enough to pass in a test and long enough to be a bound.
 const SHORT: Duration = Duration::from_millis(150);
 

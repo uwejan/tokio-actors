@@ -13,11 +13,12 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::actor::context::ActorContext;
+use crate::actor::envelope::{Envelope, SystemMessage};
 use crate::actor::runtime::{self, ActorConfig};
 use crate::error::{ActorResult, AskError};
 use crate::helper::{HelperEnd, HelperKind};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, Envelope, StatusRequest, StopReason, SystemMessage};
+use crate::types::{ActorId, StatusRequest, StopReason};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 const BOUND: Duration = Duration::from_secs(5);
@@ -230,7 +231,7 @@ async fn late_value_dropped(lane: Lane, abort: bool) -> bool {
             timeout(BOUND, reply_rx).await.is_ok()
         }
         Lane::Mailbox => {
-            let permit = handle.tx.reserve().await.unwrap();
+            let permit = handle.inner.tx.reserve().await.unwrap();
             end(&handle, abort, &mut join).await;
             let (reply_tx, reply_rx) = oneshot::channel();
             permit.send(Envelope::Message {
@@ -241,6 +242,7 @@ async fn late_value_dropped(lane: Lane, abort: bool) -> bool {
         }
         Lane::Priority => {
             let permit = handle
+                .inner
                 .priority_tx
                 .as_ref()
                 .unwrap()
@@ -400,6 +402,7 @@ async fn a_panicking_late_drop_is_logged_with_the_owner() {
         let _sender = match lane {
             Lane::Priority => {
                 let reserved = handle
+                    .inner
                     .priority_tx
                     .as_ref()
                     .unwrap()
@@ -414,7 +417,7 @@ async fn a_panicking_late_drop_is_logged_with_the_owner() {
                 None
             }
             _ => {
-                let reserved = handle.tx.clone().reserve_owned().await.unwrap();
+                let reserved = handle.inner.tx.clone().reserve_owned().await.unwrap();
                 end(&handle, false, &mut join).await;
                 Some(reserved.send(Envelope::Message {
                     payload: Msg::Bomb(Bomb),
@@ -572,7 +575,7 @@ async fn concurrent_pushers(repeats: usize) {
         let (handle, mut join, _entered) = spawn_park_in(Some(system.clone()));
         let mut permits = Vec::new();
         for _ in 0..PUSHERS {
-            permits.push(handle.tx.clone().reserve_owned().await.unwrap());
+            permits.push(handle.inner.tx.clone().reserve_owned().await.unwrap());
         }
         let ender = {
             let handle = handle.clone();
@@ -1098,8 +1101,9 @@ mod held_teardown {
                     rt_handle.block_on(async {
                         ender.stop(StopReason::Graceful).await.unwrap();
                         let waited = timeout(BOUND, async {
-                            while !(ender.tx.is_closed()
+                            while !(ender.inner.tx.is_closed()
                                 && ender
+                                    .inner
                                     .priority_tx
                                     .as_ref()
                                     .is_none_or(|lane| lane.is_closed()))
@@ -1147,7 +1151,7 @@ mod held_teardown {
                 first.is_pending(),
                 "{form:?}: answered before the reason was final"
             );
-            assert!(held.handle.status_rx.borrow().reason.is_none());
+            assert!(held.handle.inner.status_rx.borrow().reason.is_none());
             if kill_meanwhile {
                 held.handle.stop(StopReason::Kill).await.ok();
             }

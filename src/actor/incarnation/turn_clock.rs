@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::actor::incarnation::IncarnationRef;
 use crate::actor::panic::PanicPayload;
-use crate::actor::subtree::AbortRecord;
 use crate::telemetry::{
     push_about, EventKind, HookKind, Mode, TelemetryEvent, TurnOutcome, CTL_DEADLOCK,
     CTL_TRACK_TURNS, CTL_WATCHDOG,
@@ -382,7 +382,7 @@ pub(crate) fn outcome_plain<T>(result: &Result<T, PanicPayload>) -> TurnOutcome 
 /// each of which still owes the actor a step.
 #[inline]
 pub(crate) fn push_turn(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     mode: TurnMode,
     took: Option<Duration>,
     hook: HookKind,
@@ -403,7 +403,7 @@ pub(crate) fn push_turn(
 
 /// Queues the `RunFinished` event of the run still open when the loop exits,
 /// which the stop sequence follows.
-pub(crate) fn push_run(record: &AbortRecord, takes: u32, started: std::time::Instant) {
+pub(crate) fn push_run(record: &IncarnationRef, takes: u32, started: std::time::Instant) {
     push_about(record, None, EventKind::RunFinished, |actor| {
         TelemetryEvent::RunFinished {
             actor: std::borrow::Cow::Owned(actor.clone()),

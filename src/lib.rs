@@ -140,9 +140,13 @@ macro_rules! caught_log {
 }
 
 pub mod actor;
+pub mod application;
 pub mod behavior;
 pub mod error;
+pub mod event;
 mod helper;
+pub mod signals;
+pub mod statem;
 pub mod system;
 pub mod telemetry;
 mod time_probe;
@@ -166,8 +170,8 @@ pub use actor::{
 pub use behavior::{Behavior, BehaviorActor, BehaviorContext, Next};
 pub use error::{
     ActorError, ActorResult, AliasError, AskError, ExitError, LinkError, MonitorError, PgError,
-    RequestError, SendError, SpawnError, StopError, StreamError, SupervisionError,
-    SupervisorRefError, TimerError, TrySendError,
+    RequestError, SendError, SpawnError, StopError, SupervisionError, SupervisorRefError,
+    TimerError, TrySendError,
 };
 pub use system::{ActorSystem, ShutdownPolicy, SystemConfig};
 pub use types::{

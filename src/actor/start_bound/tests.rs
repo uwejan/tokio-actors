@@ -17,12 +17,13 @@ use tokio::time::{advance, timeout, Instant};
 use super::{hooks, Bound, Gate, Guard, Outcome, ACKED};
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::{LaneRx, StopLane};
 use crate::actor::supervision::ABORT_SETTLE;
 use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorResult, SpawnError};
 use crate::helper::{HelperEnd, HelperKind};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, LaneRx, StopLane, StopReason};
+use crate::types::{ActorId, StopReason};
 
 const START_TIMEOUT: Duration = Duration::from_secs(1);
 const BOUND: Duration = Duration::from_secs(30);
@@ -194,7 +195,7 @@ async fn the_cut_raises_the_kill_before_it_requests_the_abort() {
     let held_at_the_abort = Arc::new(std::sync::Mutex::new(None));
     {
         let (lane, held_at_the_abort) = (lane.clone(), held_at_the_abort.clone());
-        crate::actor::subtree::test_hook::arm_after_write(move || {
+        crate::actor::incarnation::subtree::test_hook::arm_after_write(move || {
             *held_at_the_abort.lock().unwrap() = Some(lane.reason());
         });
     }

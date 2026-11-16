@@ -65,23 +65,15 @@ async fn the_deadline_is_declared_before_the_kill_is_raised(raiser: Raiser) {
         .expect("the actor starts");
     let seen: Arc<Mutex<Option<AtDeclaration>>> = Arc::new(Mutex::new(None));
     {
-        let (hook_sys, lane, id, hook_name, hook_seen) = (
+        let (hook_sys, lane, id, hook_seen) = (
             sys.clone(),
             handle.stop_lane(),
             handle.id().clone(),
-            name.clone(),
             seen.clone(),
         );
         sys.set_after_kill_declaration_hook(move || {
-            let due = match raiser {
-                Raiser::KillByName => hook_sys
-                    .by_name
-                    .get(hook_name.as_str())
-                    .map_or(0, |entry| entry.kill_due),
-                Raiser::KillById | Raiser::StopWithinKill => {
-                    hook_sys.by_id.get(&id).map_or(0, |entry| entry.kill_due)
-                }
-            };
+            // A named actor has one entry, so every raiser declares on it.
+            let due = hook_sys.by_id.get(&id).map_or(0, |entry| entry.kill_due);
             *hook_seen.lock().unwrap() = Some(AtDeclaration {
                 due,
                 kill_raised: lane.reason() == Some(StopReason::Kill),

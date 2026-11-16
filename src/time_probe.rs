@@ -76,14 +76,15 @@ use std::collections::HashMap;
 use std::future::Future;
 #[cfg(panic = "unwind")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
-#[cfg(panic = "unwind")]
 use std::pin::pin;
 #[cfg(panic = "unwind")]
 use std::sync::atomic::Ordering;
 #[cfg(panic = "unwind")]
 use std::sync::{Mutex, OnceLock};
+#[cfg(all(panic = "unwind", test))]
+use std::task::Poll;
 #[cfg(panic = "unwind")]
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Waker};
 #[cfg(panic = "unwind")]
 use std::time::Duration;
 
@@ -196,13 +197,13 @@ pub(crate) enum TimerState {
 /// caller that has spent its budget in the current poll still reads the
 /// answer instead of a `Pending` that the budget forced. The task of a live
 /// runtime is left to run and its handle is dropped.
-#[cfg(panic = "unwind")]
-fn runtime_is_shut_down(rt: &Handle) -> bool {
+pub(crate) fn runtime_is_shut_down(rt: &Handle) -> bool {
+    use std::future::Future as _;
     let mut join = pin!(tokio::task::unconstrained(rt.spawn(async {})));
-    let mut cx = Context::from_waker(Waker::noop());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     matches!(
         join.as_mut().poll(&mut cx),
-        Poll::Ready(Err(error)) if error.is_cancelled()
+        std::task::Poll::Ready(Err(error)) if error.is_cancelled()
     )
 }
 
@@ -454,6 +455,33 @@ mod tests {
         assert!(!runtime_is_shut_down(yes.handle()));
         assert!(!runtime_is_shut_down(no.handle()));
         assert!(runtime_is_shut_down(&ended));
+    }
+
+    #[test]
+    fn the_shut_down_check_is_not_cut_short_by_a_spent_budget() {
+        let _serial = serial_table();
+        let host = with_timers();
+        let ended = shut_down_with_timers();
+        host.block_on(async {
+            // Spend the budget of this poll: Tokio answers `Pending` for a
+            // channel that holds values.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+            for _ in 0..1000 {
+                tx.send(0).unwrap();
+            }
+            std::future::poll_fn(|cx| {
+                while rx.poll_recv(cx).is_ready() {}
+                Poll::Ready(())
+            })
+            .await;
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(rx.poll_recv(&mut cx).is_pending(), "the budget is spent");
+            // The cancelled task of an ended runtime is held back by it too.
+            let mut plain = pin!(ended.spawn(async {}));
+            assert!(plain.as_mut().poll(&mut cx).is_pending());
+            assert!(runtime_is_shut_down(&ended));
+            assert!(!runtime_is_shut_down(&Handle::current()));
+        });
     }
 
     thread_local! {

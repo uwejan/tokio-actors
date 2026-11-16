@@ -22,11 +22,13 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::timeout;
 use tokio::time::{sleep_until, Instant};
 
+use crate::actor::incarnation::{IncarnationRef, SubtreeWait, SubtreeWatch};
+use crate::actor::incarnation::{RaiseResult, StatusRx, StopLane, StopSeverity};
 use crate::actor::panic::payload_into_string;
 use crate::actor::runtime::{bounded_wait, saturating_deadline};
-use crate::actor::subtree::{AbortRecord, SubtreeWait, SubtreeWatch};
+use crate::actor::supervision::model::{VerdictAct, VerdictSeen};
 use crate::actor::supervision::rules::{
-    attempt_step, first_signal, kill_grace_from, ladder_step, own_budget, successor_wait_step,
+    attempt_step, first_signal, kill_grace_from, ladder_step, own_budget, verdict_wait_step,
     AttemptAction, AttemptEvent, AttemptLadder, AttemptReport, AttemptStage, AttemptView,
     LadderAction, LadderEvent, LadderStep, TaskState, WaitAction,
 };
@@ -35,10 +37,7 @@ use crate::error::{ActorError, SpawnError};
 use crate::system::wait_end_or_floor;
 use crate::system::{raise_noted, read_status};
 use crate::telemetry::{ActorRef, AttemptOutcome, EventKind, TelemetryEvent};
-use crate::types::{
-    ActorId, ActorStatus, ChildFate, RaiseResult, Shutdown, StatusRx, StopLane, StopReason,
-    StopSeverity,
-};
+use crate::types::{ActorId, ActorStatus, ChildFate, Shutdown, StopReason};
 
 /// A stop decision written to one incarnation's executor. Level-triggered: it
 /// persists, so an executor that starts after it was written still honors it
@@ -234,17 +233,17 @@ impl VerdictFlag {
 
     /// As [`set`](Self::set), naming the incarnation's abort record, through
     /// which the verdict's event finds its system.
-    pub(crate) fn set_for(&self, record: Option<&AbortRecord>) -> bool {
+    pub(crate) fn set_for(&self, record: Option<&IncarnationRef>) -> bool {
         self.record(LADDER_VERDICT, record)
     }
 
     /// Records the verdict of a wait for the incarnation's subtree that
     /// outlived its bound, unless the verdict was recorded already.
-    pub(crate) fn set_for_subtree(&self, record: Option<&AbortRecord>) -> bool {
+    pub(crate) fn set_for_subtree(&self, record: Option<&IncarnationRef>) -> bool {
         self.record(SUBTREE_VERDICT, record)
     }
 
-    fn record(&self, cause: &'static str, record: Option<&AbortRecord>) -> bool {
+    fn record(&self, cause: &'static str, record: Option<&IncarnationRef>) -> bool {
         let first = !self.cell.set.swap(true, Ordering::SeqCst);
         if first {
             log_verdict(self.verdicts.supervisor.get(), &self.key, cause);
@@ -291,7 +290,7 @@ impl VerdictFlag {
     /// held. A flag without a key, or a writer without the incarnation's
     /// record, names no incarnation and reports nothing. The supervisor is the
     /// child's recorded parent, or its id read as a root.
-    fn report_verdict(&self, cause: &'static str, record: Option<&AbortRecord>) {
+    fn report_verdict(&self, cause: &'static str, record: Option<&IncarnationRef>) {
         let (Some(record), Some((child, incarnation)), Some(supervisor)) =
             (record, self.key.as_ref(), self.verdicts.supervisor.get())
         else {
@@ -372,7 +371,7 @@ pub(crate) struct Predecessor {
     /// whether or not a sink takes events then, so a sink armed afterwards
     /// still receives the Unresponsive event, which finds its system through
     /// it. `None` for a predecessor with no published incarnation.
-    record: Option<AbortRecord>,
+    record: Option<IncarnationRef>,
 }
 
 impl Predecessor {
@@ -383,7 +382,7 @@ impl Predecessor {
 
     /// The incarnation's abort record, if it was published.
     #[cfg(test)]
-    pub(crate) fn record(&self) -> Option<&AbortRecord> {
+    pub(crate) fn record(&self) -> Option<&IncarnationRef> {
         self.record.as_ref()
     }
 
@@ -503,7 +502,7 @@ impl SlotIo {
     #[cfg(feature = "tracing")]
     fn sensitive(&self) -> bool {
         self.cell_tx.borrow().lane.as_ref().is_some_and(|lane| {
-            lane.abort_record().sys_bits() & crate::actor::subtree::SYS_SENSITIVE != 0
+            lane.abort_record().sys_bits() & crate::actor::incarnation::SYS_SENSITIVE != 0
         })
     }
 
@@ -864,7 +863,7 @@ pub(crate) struct LostEnd {
     own: OwnStop,
     /// The incarnation's abort record: the verdict waits for the abort that
     /// could end it.
-    record: Option<AbortRecord>,
+    record: Option<IncarnationRef>,
 }
 
 /// How long a wait on an incarnation whose runner failed lasts before the
@@ -900,12 +899,16 @@ impl LostEnd {
     pub(crate) async fn wait(mut self) -> StopReason {
         let bound = lost_end_bound(self.own);
         let ended = wait_end_or_floor(&mut self.status, self.record.as_ref(), bound, bound).await;
-        if !ended {
-            self.lost.set_for(self.record.as_ref());
-            let _ = self
-                .status
-                .wait_for(|value| value.status == ActorStatus::Stopped)
-                .await;
+        match verdict_wait_step(VerdictSeen::LostFloor { ended }) {
+            VerdictAct::Fate => {}
+            VerdictAct::VerdictThenEnd => {
+                self.lost.set_for(self.record.as_ref());
+                let _ = self
+                    .status
+                    .wait_for(|value| value.status == ActorStatus::Stopped)
+                    .await;
+            }
+            _ => unreachable!("a lost runner's floor wait ends in a fate or a verdict"),
         }
         if let Some(record) = &self.record {
             record.task_ended();
@@ -988,27 +991,39 @@ async fn closed_cell(watch: &CellWatch, incarnation: u64) -> CellOutcome {
     };
     // A plane closed without `Stopped` reads as ended, as every reader of
     // the plane reads it: its task ended and nothing is left to publish.
-    let ended_now = read_status(&status) == ActorStatus::Stopped;
-    if !ended_now && watch.lost.is_set() {
-        return CellOutcome::Unresponsive;
-    }
+    let opened = VerdictSeen::CellOpened {
+        ended: read_status(&status) == ActorStatus::Stopped,
+        flag_set: watch.lost.is_set(),
+    };
     let bound = lost_end_bound(last.own.unwrap_or_default());
     let record = last.lane.as_ref().map(StopLane::abort_record);
-    let ended = wait_end_or_floor(&mut status, record, bound, bound).await;
-    if ended {
-        if let Some(record) = record {
-            record.task_ended();
+    let mut act = verdict_wait_step(opened);
+    loop {
+        match act {
+            VerdictAct::WaitFloor => {
+                let ended = wait_end_or_floor(&mut status, record, bound, bound).await;
+                act = verdict_wait_step(VerdictSeen::CellFloor { ended });
+            }
+            VerdictAct::Fate => {
+                if let Some(record) = record {
+                    record.task_ended();
+                }
+                // The reason the plane carries: the one written at the
+                // incarnation's seal, or `Kill` for a plane closed without one.
+                let reason = status.reason_or_kill();
+                return CellOutcome::Fate(ChildFate {
+                    reason,
+                    incarnation,
+                });
+            }
+            VerdictAct::Unresponsive { write } => {
+                if write {
+                    watch.lost.set_for(record);
+                }
+                return CellOutcome::Unresponsive;
+            }
+            _ => unreachable!("a closed cell's wait ends in a fate or a verdict"),
         }
-        // The reason the plane carries: the one written at the incarnation's
-        // seal, or `Kill` for a plane closed without one.
-        let reason = status.reason_or_kill();
-        CellOutcome::Fate(ChildFate {
-            reason,
-            incarnation,
-        })
-    } else {
-        watch.lost.set_for(record);
-        CellOutcome::Unresponsive
     }
 }
 
@@ -1234,7 +1249,8 @@ pub(crate) fn cancelled_before_factory(io: &mut SlotIo) -> bool {
 /// The wait is bounded by the budget the subtree carries (unbounded only
 /// while an unbounded supervisor child lives below it), honors a stop order
 /// or the cancel flag at every moment, and returns the decision of
-/// [`successor_wait_step`]: `Proceed`, `Cancel` or `Escalate`. A cancel is
+/// [`successor_wait_step`](crate::actor::supervision::rules::successor_wait_step):
+/// `Proceed`, `Cancel` or `Escalate`. A cancel is
 /// recorded in the cell, so a wait on the cell reads it; an `Escalate`
 /// records the previous incarnation's Unresponsive verdict.
 pub(crate) async fn await_predecessor(
@@ -1250,20 +1266,25 @@ pub(crate) async fn await_predecessor(
         // Level-triggered: an order or the cancel flag written before the
         // wait began, or while it ran, is read here.
         let ordered = io.cancel_or_order();
-        match successor_wait_step(wait.gone(), ordered, wait.expired()) {
-            WaitAction::Keep => {}
-            decided => {
-                match decided {
-                    WaitAction::Cancel => io.mark_cancelled(),
-                    WaitAction::Escalate => {
-                        predecessor
-                            .verdict
-                            .set_for_subtree(predecessor.record.as_ref());
-                    }
-                    WaitAction::Proceed | WaitAction::Keep => {}
-                }
-                return decided;
+        let seen = VerdictSeen::Predecessor {
+            gone: wait.gone(),
+            order: ordered,
+            expired: wait.expired(),
+        };
+        match verdict_wait_step(seen) {
+            VerdictAct::Keep => {}
+            VerdictAct::Proceed => return WaitAction::Proceed,
+            VerdictAct::Cancel => {
+                io.mark_cancelled();
+                return WaitAction::Cancel;
             }
+            VerdictAct::Escalate => {
+                predecessor
+                    .verdict
+                    .set_for_subtree(predecessor.record.as_ref());
+                return WaitAction::Escalate;
+            }
+            _ => unreachable!("a subtree wait keeps waiting or decides"),
         }
         tokio::select! {
             biased;
@@ -1289,15 +1310,20 @@ pub(crate) async fn await_predecessor(
 pub(crate) async fn await_subtree(predecessor: &Predecessor) -> WaitAction {
     let mut wait = SubtreeWait::new(&predecessor.subtree);
     loop {
-        match successor_wait_step(wait.gone(), false, wait.expired()) {
-            WaitAction::Keep => wait.changed().await,
-            WaitAction::Escalate => {
+        let seen = VerdictSeen::Subtree {
+            gone: wait.gone(),
+            expired: wait.expired(),
+        };
+        match verdict_wait_step(seen) {
+            VerdictAct::Keep => wait.changed().await,
+            VerdictAct::Proceed => return WaitAction::Proceed,
+            VerdictAct::Escalate => {
                 predecessor
                     .verdict
                     .set_for_subtree(predecessor.record.as_ref());
                 return WaitAction::Escalate;
             }
-            decided => return decided,
+            _ => unreachable!("a handler's subtree wait has no order to cancel it"),
         }
     }
 }
@@ -1305,9 +1331,10 @@ pub(crate) async fn await_subtree(predecessor: &Predecessor) -> WaitAction {
 #[cfg(test)]
 mod lost_end_cap_tests {
     use super::*;
+    use crate::actor::incarnation::StatusTx;
+    use crate::actor::incarnation::StatusValue;
     use crate::actor::runtime::FAR_FUTURE;
     use crate::actor::supervision::ABORT_SETTLE;
-    use crate::types::{StatusTx, StatusValue};
 
     #[test]
     fn the_lost_end_bound_is_the_kill_grace_plus_the_settle_time() {
@@ -1400,7 +1427,7 @@ mod lost_end_cap_tests {
 /// the event reads the count without the attempt.
 pub(crate) struct AttemptTicket {
     flight: InFlight,
-    record: AbortRecord,
+    record: IncarnationRef,
     /// Read when the attempt starts, only if its event is taken then.
     born: Option<Instant>,
     /// The child and incarnation of the attempt once a supervisor stored the
@@ -1431,7 +1458,7 @@ impl AttemptTicket {
     /// carries `record`, when its system takes events, holds identities or
     /// tracks turns; `None` otherwise (two relaxed loads and one more).
     pub(crate) fn begin(
-        record: &AbortRecord,
+        record: &IncarnationRef,
         system: Option<&crate::system::ActorSystem>,
         supervisor: &ActorId,
     ) -> Option<Self> {
@@ -1990,7 +2017,7 @@ mod tests {
     /// order on a slot whose status plane already read `Stopped`.
     #[test]
     fn an_order_written_after_the_end_is_not_before_it() {
-        use crate::types::StatusValue;
+        use crate::actor::incarnation::StatusValue;
         enum Case {
             NoOrder,
             Live,
@@ -2037,12 +2064,12 @@ mod tests {
     /// written after the end.
     #[test]
     fn an_order_whose_own_raise_ends_the_child_is_before_the_end() {
-        use crate::types::StatusValue;
+        use crate::actor::incarnation::StatusValue;
         use std::future::Future;
         use std::sync::Arc;
         use std::task::{Context, Poll, Wake, Waker};
 
-        struct EndsTheChild(crate::types::status_cell::StatusTx);
+        struct EndsTheChild(crate::actor::incarnation::status_cell::StatusTx);
         impl Wake for EndsTheChild {
             fn wake(self: Arc<Self>) {
                 self.wake_by_ref();
@@ -2099,14 +2126,16 @@ mod tests {
     use tokio::task::JoinSet;
 
     use super::*;
+    use crate::actor::incarnation::StatusTx;
+    use crate::actor::incarnation::StatusValue;
+    use crate::actor::incarnation::{SubtreeHold, SubtreeLink};
     use crate::actor::runtime::spawn_runner;
-    use crate::actor::subtree::{SubtreeHold, SubtreeLink};
     use crate::actor::supervision::{
         ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState, DeathOutcome, Origin,
         SupervisionConfig, SupervisionState, TaskPlane, ABORT_SETTLE,
     };
     use crate::system::ActorSystem;
-    use crate::types::{ActorId, RestartType, StatusTx, StatusValue};
+    use crate::types::{ActorId, RestartType};
 
     fn dummy_system() -> Arc<ActorSystem> {
         ActorSystem::create(format!("slot-test-{}", uuid::Uuid::new_v4())).unwrap()
@@ -3746,7 +3775,7 @@ mod tests {
         use std::sync::Mutex;
 
         use super::*;
-        use crate::actor::subtree::SubtreeLink;
+        use crate::actor::incarnation::SubtreeLink;
         use crate::actor::supervision::rules::own_budget;
         use crate::actor::supervision::ABORT_SETTLE;
         use crate::system::ReaperEntry;
@@ -3910,7 +3939,7 @@ mod tests {
 
             /// The worker's link guard, with a zero kill grace: its drop
             /// owes the worker's abort and issues it at once.
-            struct OweOnDrop(AbortRecord, tokio::task::AbortHandle);
+            struct OweOnDrop(IncarnationRef, tokio::task::AbortHandle);
 
             impl Drop for OweOnDrop {
                 fn drop(&mut self) {
@@ -3936,7 +3965,7 @@ mod tests {
                 while valid < VALID_ROUNDS && attempts < MOST_ROUNDS {
                     attempts += 1;
                     let root = SubtreeHold::new(None);
-                    let p_rec = AbortRecord::new();
+                    let p_rec = IncarnationRef::new();
                     let p = SubtreeHold::with_record(
                         Some(SubtreeLink {
                             parent: root.token(),
@@ -3947,7 +3976,7 @@ mod tests {
                         }),
                         p_rec.clone(),
                     );
-                    let g_rec = AbortRecord::new();
+                    let g_rec = IncarnationRef::new();
                     let g = SubtreeHold::with_record(
                         Some(SubtreeLink {
                             parent: p.token(),
@@ -4049,7 +4078,7 @@ mod tests {
         /// A task that obeys the first `Kill` it reads, `OBEY` later, and
         /// publishes `Stopped` when it ends if `publish_stopped` says so.
         fn obeying(
-            mut lane_rx: crate::types::LaneRx,
+            mut lane_rx: crate::actor::incarnation::LaneRx,
             status_tx: StatusTx,
             publish_stopped: bool,
         ) -> JoinHandle<StopReason> {

@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::monitor::{new_entry, put_notice};
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{StatusRx, StatusTx, StopLane};
 use crate::actor::mailbox::{test_channel, MailRx, QueueRx};
 use crate::actor::{Actor, ActorEnvelope};
 use crate::error::ActorResult;
 use crate::system::ResolvedTarget;
-use crate::types::{
-    ActorId, ActorStatus, Down, DownReason, MonitorId, SignalTag, StatusRx, StatusTx, StatusValue,
-    StopLane, StopReason,
-};
+use crate::types::{ActorId, ActorStatus, Down, DownReason, MonitorId, StopReason};
 
 struct Sink;
 

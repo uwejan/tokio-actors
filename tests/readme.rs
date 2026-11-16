@@ -38,7 +38,7 @@ mod common;
 
 const README: &str = include_str!("../README.md");
 const SOURCE: &str = include_str!("readme.rs");
-const README_RUST_BLOCKS: usize = 22;
+const README_RUST_BLOCKS: usize = 25;
 const MIRROR_MARKER: &str = "// ----- the mirrored blocks and their stubs follow -----";
 
 /// README lines paired with the spelling the mirror uses for them.
@@ -269,8 +269,12 @@ async fn name_free(sys: &tokio_actors::ActorSystem, name: &str) {
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
+    application::{AppRoot, Application, Applications, StartError},
+    event::{EventHandler, EventManager, EventManagerRef, Handled},
+    statem::{StateMachine, StatemActor, StatemContext, StatemEvent, Transition},
     ActorConfig, ActorError, ActorHandle, ActorResult, ActorStatus, ActorSystem, AskError,
-    Shutdown, SpawnError, StopOutcome, StopReason, StreamEvent, SupervisionConfig, TrySendError,
+    RestartType, Shutdown, SpawnError, StopOutcome, StopReason, StreamEvent, SupervisionConfig,
+    TrySendError,
 };
 
 /// The `my_actor` / `MyActor` of the README: a unit actor that echoes.
@@ -1287,6 +1291,143 @@ fn core_concepts_priority_lane() {
         h.stop(StopReason::Graceful).await?;
         h.wait_stopped().await;
         name_free(&ActorSystem::default(), "worker-1").await;
+        Ok(())
+    });
+}
+
+// Core Concepts: State Machines, Event Managers, Applications
+
+/// The machine of the README's state machine: it holds the code.
+struct Lock {
+    code: u32,
+}
+
+#[derive(Clone, PartialEq)]
+enum Door {
+    Locked,
+    Open,
+}
+
+impl StateMachine for Lock {
+    type State = Door;
+    type Event = u32;
+    type Call = ();
+    type Reply = bool;
+    type TimerName = ();
+    fn handle_event(
+        &mut self,
+        state: &Door,
+        event: StatemEvent<Self>,
+        cx: &mut StatemContext<'_, Self>,
+    ) -> Transition<Door> {
+        match (state, event) {
+            (Door::Locked, StatemEvent::Cast(code)) if code == self.code => {
+                cx.state_timeout(Duration::from_millis(50), 0);
+                Transition::Next(Door::Open)
+            }
+            (Door::Open, StatemEvent::StateTimeout(_)) => Transition::Next(Door::Locked),
+            (state, StatemEvent::Call((), from)) => {
+                cx.reply(from, *state == Door::Open);
+                Transition::Keep
+            }
+            _ => Transition::Keep,
+        }
+    }
+}
+
+/// README: "### State Machines".
+#[test]
+fn core_concepts_state_machines() {
+    run_paused_block(async {
+        let door = StatemActor::new(Lock { code: 1234 }, Door::Locked)
+            .spawn()
+            .await?;
+        assert!(!door.call(()).await?, "a locked door stays locked");
+        door.cast(1234).await?;
+        assert!(door.call(()).await?, "the code opens it");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!door.call(()).await?, "the state time-out locks it again");
+        Ok(())
+    });
+}
+
+struct Count(u32);
+
+impl EventHandler for Count {
+    type Event = String;
+    type Call = ();
+    type Reply = u32;
+
+    fn handle_event(&mut self, _alarm: &String) -> Handled {
+        self.0 += 1;
+        Handled::Keep
+    }
+
+    fn handle_call(&mut self, _: ()) -> (Handled, Option<u32>) {
+        (Handled::Keep, Some(self.0))
+    }
+}
+
+/// README: "### Event Managers".
+#[test]
+fn core_concepts_event_managers() {
+    run_block(async {
+        let manager = EventManager::<String, (), u32>::new().spawn().await?;
+        let alarms = EventManagerRef::of(&manager);
+        let counter = alarms.add_handler(Count(0)).await?;
+        alarms.sync_notify("door forced".to_string()).await?;
+        assert_eq!(alarms.call(counter, ()).await?, 1);
+        Ok(())
+    });
+}
+
+/// The top supervisor of the README's application: it spawns two workers.
+struct Top;
+
+impl Actor for Top {
+    type Message = ();
+    type Response = ();
+
+    async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(|| MyActor).named("worker-a").await?;
+        ctx.spawn_child(|| MyActor).named("worker-b").await?;
+        Ok(())
+    }
+}
+
+struct Shop;
+
+impl Application for Shop {
+    fn name(&self) -> &str {
+        "shop"
+    }
+
+    async fn start(&mut self, system: &Arc<ActorSystem>) -> Result<AppRoot, StartError> {
+        let top = Top
+            .spawn()
+            .on_system(system)
+            .named("top")
+            .with_supervision(SupervisionConfig::one_for_one())
+            .await?;
+        Ok(AppRoot::of(&top))
+    }
+}
+
+/// README: "### Applications".
+#[test]
+fn core_concepts_applications() {
+    run_block(async {
+        let apps = Applications::spawn().await?;
+        apps.load(Shop).await?;
+        apps.start("shop", RestartType::Permanent).await?;
+        let system = ActorSystem::get_named("shop").expect("an own system");
+        assert_eq!(system.snapshot().len(), 3, "the top and its two workers");
+        let rows = apps.shutdown().await?;
+        assert!(matches!(rows.as_slice(), [(name, Some(stop))] if name == "shop" && !stop.held));
         Ok(())
     });
 }

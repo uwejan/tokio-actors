@@ -154,6 +154,8 @@ impl Actor for Worker {
 struct Spec {
     name: String,
     runtime: Option<Handle>,
+    /// Asks for a significant child.
+    significant: bool,
     /// Counts every call of the factory.
     built: Arc<AtomicUsize>,
 }
@@ -163,6 +165,7 @@ impl Spec {
         Self {
             name: unique(base),
             runtime,
+            significant: false,
             built: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -196,6 +199,9 @@ fn attempt<A: Actor>(ctx: &mut ActorContext<A>, spec: &Spec) -> Attempt {
             Worker
         })
         .named(spec.name.clone());
+    if spec.significant {
+        builder = builder.significant(true);
+    }
     if let Some(runtime) = &spec.runtime {
         builder = builder.on_runtime(runtime);
     }
@@ -431,3 +437,65 @@ fn a_runtime_without_the_driver_panics_before_the_factory_runs() {
 // ---------------------------------------------------------------------------
 // The refusals come first
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_spawn_under_a_taken_name_is_refused_before_the_entry_check() {
+    let _hook = CountingHook::install();
+    let bare = without_driver();
+    let good = with_driver();
+    let bare_handle = bare.handle().clone();
+    let good_handle = good.handle().clone();
+    common::run(2, async move {
+        let sup = supervisor(&Default::default()).await;
+        let first = Spec::new("taken", Some(good_handle));
+        let (answer, _) = spawn_via(&sup, &first).await;
+        assert_eq!(answer, Ok(()));
+        until("the first child", || {
+            ActorSystem::default().get::<Worker>(&first.name).is_some()
+        })
+        .await;
+
+        let again = Spec {
+            runtime: Some(bare_handle.clone()),
+            ..first.clone()
+        };
+        let attempted = attempt_via(&sup, &again).await;
+        assert_eq!(attempted.panic, None, "the refusal comes first");
+        assert_eq!(
+            attempted.answer,
+            Some(Err(SpawnError::DuplicateChild(first.name.as_str().into())))
+        );
+        assert_eq!(
+            first.built.load(Ordering::SeqCst),
+            1,
+            "no second factory call"
+        );
+
+        // A significant child under a supervisor that shuts down on none is refused first as well.
+        let invalid = Spec {
+            significant: true,
+            ..Spec::new("invalid", Some(bare_handle.clone()))
+        };
+        let attempted = attempt_via(&sup, &invalid).await;
+        assert_eq!(attempted.panic, None, "the refusal comes first");
+        assert!(
+            matches!(
+                attempted.answer,
+                Some(Err(SpawnError::InvalidSupervision(_)))
+            ),
+            "{:?}",
+            attempted.answer
+        );
+        assert_eq!(invalid.built.load(Ordering::SeqCst), 0, "no factory call");
+
+        // The check is still live for a name nobody holds.
+        let fresh = Spec::new("fresh", Some(bare_handle));
+        let attempted = attempt_via(&sup, &fresh).await;
+        let text = attempted.panic.expect("the call panics");
+        assert!(text.contains("enable_time"), "{text}");
+        assert_eq!(fresh.built.load(Ordering::SeqCst), 0);
+        finish(sup).await;
+    });
+    end_runtime(bare);
+    end_runtime(good);
+}

@@ -53,7 +53,7 @@ impl std::future::Future for ReadsTwice {
 /// put back all the same.
 #[tokio::test(flavor = "current_thread")]
 async fn the_record_is_put_back_when_the_poll_unwinds() {
-    let record = AbortRecord::new();
+    let record = IncarnationRef::new();
     let join = tokio::spawn(MarkedRun::new(
         TaskMarker::default(),
         record.incarnation(),
@@ -83,8 +83,8 @@ async fn the_record_is_put_back_when_the_poll_unwinds() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_nested_poll_puts_the_outer_record_back() {
     tokio::spawn(async {
-        let outer = AbortRecord::new();
-        let inner = AbortRecord::new();
+        let outer = IncarnationRef::new();
+        let inner = IncarnationRef::new();
         let _outer_scope = PollScope::enter(outer.incarnation(), tokio::task::try_id());
         let outer_record = current_for_test();
         assert_eq!(outer_record, record_of(outer.incarnation()));
@@ -110,7 +110,7 @@ async fn a_nested_poll_puts_the_outer_record_back() {
 /// itself is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_task_polled_inside_the_poll_under_its_own_id_is_not_it() {
-    let record = AbortRecord::new();
+    let record = IncarnationRef::new();
     let incarnation = record.incarnation();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(MarkedRun::new(
@@ -144,7 +144,7 @@ async fn a_task_polled_inside_the_poll_under_its_own_id_is_not_it() {
 
 /// Dropped state of the future that checks the key while it drops.
 struct ChecksOnDrop {
-    record: AbortRecord,
+    record: IncarnationRef,
     seen: Arc<Mutex<Option<bool>>>,
 }
 
@@ -170,7 +170,7 @@ fn a_future_dropped_before_it_ends_drops_its_state_in_the_record() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let record = AbortRecord::new();
+        let record = IncarnationRef::new();
         let seen = Arc::new(Mutex::new(None));
         let held = ChecksOnDrop {
             record: record.clone(),

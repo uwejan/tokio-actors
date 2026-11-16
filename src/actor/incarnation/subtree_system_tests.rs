@@ -12,12 +12,13 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use super::*;
-use crate::types::{ActorId, ActorStatusInfo, StatusRequest, SystemMessage};
+use crate::actor::envelope::SystemMessage;
+use crate::types::{ActorId, ActorStatusInfo, StatusRequest};
 
 const BOUND: Duration = Duration::from_secs(5);
 
-fn new_plane() -> (AbortRecord, SystemPlane) {
-    let record = AbortRecord::new();
+fn new_plane() -> (IncarnationRef, SystemPlane) {
+    let record = IncarnationRef::new();
     let system = crate::system::ActorSystem::create(format!("plane-{}", uuid::Uuid::new_v4()))
         .expect("a fresh system");
     let plane = SystemPlane::new(
@@ -30,7 +31,7 @@ fn new_plane() -> (AbortRecord, SystemPlane) {
 
 /// Polls `submit_status` once: whether the request was queued without
 /// waiting. A request that has to wait is dropped, so it queues nothing.
-fn submit_now(record: &AbortRecord, reply: oneshot::Sender<Box<ActorStatusInfo>>) -> bool {
+fn submit_now(record: &IncarnationRef, reply: oneshot::Sender<Box<ActorStatusInfo>>) -> bool {
     let mut cx = Context::from_waker(Waker::noop());
     let mut submit = std::pin::pin!(record.submit_status(reply));
     matches!(submit.as_mut().poll(&mut cx), Poll::Ready(Ok(())))
@@ -72,7 +73,7 @@ fn a_command_behind_a_held_status_request_leaves_the_request_first() {
     let (status, _requester) = marked();
     assert!(submit_now(&record, status), "the status request is held");
     let (reply, _caller) = oneshot::channel();
-    let command = crate::types::SysCommand::Probe(Default::default(), reply);
+    let command = crate::actor::envelope::SysCommand::Probe(Default::default(), reply);
     let mut cx = Context::from_waker(Waker::noop());
     let mut submit = std::pin::pin!(record.submit_sys(command));
     assert!(matches!(submit.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
@@ -121,7 +122,7 @@ fn the_plane_queues_sixty_four_in_steady_state() {
 /// receiver keeps the requester alive.
 fn submit_as(
     rt: &tokio::runtime::Runtime,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     task: bool,
 ) -> oneshot::Receiver<Box<ActorStatusInfo>> {
     let (reply, requester) = marked();
@@ -186,7 +187,9 @@ impl std::task::Wake for LoudWake {
 
 /// Queues a status request whose requester has polled for the reply with a
 /// waker that panics when it is woken.
-fn loud_request(record: &AbortRecord) -> (Arc<LoudWake>, oneshot::Receiver<Box<ActorStatusInfo>>) {
+fn loud_request(
+    record: &IncarnationRef,
+) -> (Arc<LoudWake>, oneshot::Receiver<Box<ActorStatusInfo>>) {
     let loud = Arc::new(LoudWake::default());
     let (reply, mut requester) = marked();
     assert!(submit_now(record, reply), "the plane has room");
@@ -253,7 +256,7 @@ impl Wake for CountingWake {
 type Submit = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
 
 /// Parks a `submit_status` on the full plane, polled once with `wake`.
-fn park_submit(record: &AbortRecord, wake: &Arc<CountingWake>) -> Submit {
+fn park_submit(record: &IncarnationRef, wake: &Arc<CountingWake>) -> Submit {
     let record = record.clone();
     let (reply, _requester) = marked();
     let mut parked: Submit = Box::pin(async move { record.submit_status(reply).await });
@@ -271,16 +274,21 @@ fn park_submit(record: &AbortRecord, wake: &Arc<CountingWake>) -> Submit {
 
 /// A `sys` command whose caller is gone reads closed; one whose caller is
 /// kept reads open.
-fn sys_command(keep: bool) -> (crate::types::SysCommand, Option<oneshot::Receiver<()>>) {
+fn sys_command(
+    keep: bool,
+) -> (
+    crate::actor::envelope::SysCommand,
+    Option<oneshot::Receiver<()>>,
+) {
     let (reply, caller) = oneshot::channel();
     (
-        crate::types::SysCommand::Probe(Default::default(), reply),
+        crate::actor::envelope::SysCommand::Probe(Default::default(), reply),
         keep.then_some(caller),
     )
 }
 
 /// Polls `submit_sys` once: whether the command was queued without waiting.
-fn submit_sys_now(record: &AbortRecord) -> bool {
+fn submit_sys_now(record: &IncarnationRef) -> bool {
     let (command, _caller) = sys_command(false);
     let mut cx = Context::from_waker(Waker::noop());
     let mut submit = std::pin::pin!(record.submit_sys(command));
@@ -289,7 +297,7 @@ fn submit_sys_now(record: &AbortRecord) -> bool {
 
 /// Parks a `submit_sys` on the full plane, polled once with `wake`.
 fn park_submit_sys(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     wake: &Arc<CountingWake>,
 ) -> (Submit, oneshot::Receiver<()>) {
     let record = record.clone();
@@ -314,7 +322,7 @@ fn sys_callers_gone(plane: &mut SystemPlane) -> Vec<bool> {
     let mut gone = Vec::new();
     while let Poll::Ready(Some(SystemMessage::Sys(command))) = plane.poll_recv(&mut cx) {
         match *command {
-            crate::types::SysCommand::Probe(_, reply) => gone.push(reply.is_closed()),
+            crate::actor::envelope::SysCommand::Probe(_, reply) => gone.push(reply.is_closed()),
             _ => unreachable!("only probes are queued"),
         }
     }

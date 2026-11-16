@@ -141,6 +141,8 @@ enum Msg {
     Ping,
     /// Parks at the gate (`park_forever`: never opened).
     Park,
+    /// Raises `Kill` on itself through its own handle, then awaits for good.
+    SelfKill,
     /// Fails, which stops the instance.
     Crash,
     /// Blocks the thread inside `handle` while the probe's `block_held` is
@@ -192,10 +194,15 @@ impl Actor for Worker {
         true
     }
 
-    async fn handle(&mut self, msg: Msg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    async fn handle(&mut self, msg: Msg, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         match msg {
             Msg::Ping => {
                 self.probe.pings.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            Msg::SelfKill => {
+                ctx.self_handle().stop(StopReason::Kill).await.unwrap();
+                std::future::pending::<()>().await;
                 Ok(())
             }
             Msg::Park => {
@@ -383,6 +390,13 @@ async fn runs_then_is_aborted(
 // The grace of a root
 // ---------------------------------------------------------------------------
 
+#[test]
+fn kill_grace_set_on_a_root_delays_its_abort_paused() {
+    // The same body on the paused clock, where the abort lands on its exact
+    // instant: this variant pins the precise bound.
+    common::run_paused(kill_grace_set_on_a_root_delays_its_abort_body(true));
+}
+
 async fn kill_grace_set_on_a_root_delays_its_abort_body(paused: bool) {
     let sys = ActorSystem::create(uname("root-grace")).unwrap();
     let probe = Arc::new(Probe::default());
@@ -390,11 +404,21 @@ async fn kill_grace_set_on_a_root_delays_its_abort_body(paused: bool) {
     let grace = Duration::from_millis(600);
     let handle = spawn_root(&sys, &name, &probe, Some(grace)).await;
     park(&handle, &probe).await;
+    // A handler that raises `Kill` on itself and then awaits is aborted at that await, after the same grace.
+    let own = spawn_root(
+        &sys,
+        &uname("own"),
+        &Arc::new(Probe::default()),
+        Some(grace),
+    )
+    .await;
 
     let killed_at = Instant::now();
     sys.kill(&name).await.expect("the kill is accepted");
+    own.notify(Msg::SelfKill).await.unwrap();
     assert!(sys.get::<Worker>(&name).is_some(), "still registered");
     runs_then_is_aborted(&handle, killed_at, grace, paused).await;
+    runs_then_is_aborted(&own, killed_at, grace, paused).await;
 }
 
 async fn default_kill_grace_applies_when_none_is_set_body(paused: bool) {
@@ -1020,6 +1044,11 @@ fn edge_of_range_never_panics(edge: Edge, roots: bool) {
             "no path overflowed an instant with an edge-of-range grace"
         );
     });
+}
+
+#[test]
+fn edge_of_range_kill_grace_never_panics() {
+    edge_of_range_never_panics(Edge::Max, false);
 }
 
 // ---------------------------------------------------------------------------

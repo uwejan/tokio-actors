@@ -20,13 +20,15 @@ use tokio::time::{sleep, timeout};
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorConfig, ActorHandle, ActorResult, ActorSystem, Down, GroupChange, MonitorId, PeerRef,
-    PgScope,
+    PgScope, StopReason,
 };
 
 mod common;
 
 const BOUND: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_millis(300);
+/// Rounds a scenario may take to show the schedule it asserts.
+const ROUNDS: usize = 20;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -83,10 +85,11 @@ enum W {
     DemonitorFlush(MonitorId),
     /// Holds the turn until the gate has a permit.
     Hold(Arc<Semaphore>),
-    /// Holds the turn the same way, then revokes the monitor in the same
+    /// Gives the first gate a permit when its turn begins, holds the turn
+    /// until the second gate has one, then revokes the monitor in the same
     /// turn, so every change that reached the mailbox meanwhile is queued
     /// when it does; answers what the revoke returned.
-    HoldThenRevoke(Arc<Semaphore>, MonitorId, bool),
+    HoldThenRevoke(Arc<Semaphore>, Arc<Semaphore>, MonitorId, bool),
     Change(GroupChange),
     Down(Down),
 }
@@ -149,7 +152,8 @@ impl Actor for Watcher {
                 let _ = gate.acquire().await;
                 Reply::Unit
             }
-            W::HoldThenRevoke(gate, id, flush) => {
+            W::HoldThenRevoke(entered, gate, id, flush) => {
+                entered.add_permits(1);
                 let _ = gate.acquire().await;
                 Reply::Flag(if flush {
                     ctx.demonitor_flush(id)
@@ -377,18 +381,36 @@ fn demonitor_keeps_them() {
     });
 }
 
-async fn revoke_with_changes_queued(flush: bool) {
-    let system = system(if flush { "flush" } else { "keep" });
+/// A watcher with its own system, log and three members.
+struct Round {
+    system: Arc<ActorSystem>,
+    scope: PgScope,
+    w: ActorHandle<Watcher>,
+    log: Log,
+    members: [ActorHandle<Member>; 3],
+}
+
+/// Ends every actor of a round and waits for each to be gone.
+async fn tear_down(round: Round) {
+    for m in &round.members {
+        m.stop(StopReason::Graceful).await.unwrap();
+        m.wait_stopped().await;
+    }
+    round.w.stop(StopReason::Graceful).await.unwrap();
+    round.w.wait_stopped().await;
+}
+
+fn joins(event: &Ev, who: &ActorHandle<Member>) -> bool {
+    matches!(event, Ev::Change(GroupChange::Join { members, .. }) if *members == vec![peer(who)])
+}
+
+/// A revoke with nothing queued is in time and says so; a revoked id, or one
+/// the watcher never made, is not a monitor.
+async fn revoke_in_time(flush: bool) {
+    let system = system(if flush { "flush-idle" } else { "keep-idle" });
     let scope = system.pg();
     let (w, mut log) = watcher(&system, 64).await;
-    let (a, b, c, later) = (
-        member(&system).await,
-        member(&system).await,
-        member(&system).await,
-        member(&system).await,
-    );
-
-    // Nothing queued: the revoke is in time, and says so.
+    let later = member(&system).await;
     let (idle, _) = group_monitor(&w, &scope, "g").await;
     let reply = if flush {
         w.send(W::DemonitorFlush(idle)).await.unwrap()
@@ -396,24 +418,40 @@ async fn revoke_with_changes_queued(flush: bool) {
         w.send(W::Demonitor(idle)).await.unwrap()
     };
     assert!(matches!(reply, Reply::Flag(true)), "{reply:?}");
-    // A revoked id, or one the watcher never made, is not a monitor.
     assert!(matches!(
         w.send(W::Demonitor(idle)).await.unwrap(),
         Reply::Flag(false)
     ));
     scope.join("g", &later).unwrap();
     assert_quiet(&mut log).await;
-    scope.leave("g", &later).unwrap();
+}
 
-    // Three changes queued in the watcher's mailbox when it revokes.
+/// One round of three changes queued in a watcher's mailbox when it revokes.
+/// The group task holds one change between its reservation and its landing,
+/// so the revoke can close the monitor before the last join lands: the kept
+/// changes are then the joins of the first two members, and the round is
+/// handed back with `true` before any assert it would fail.
+async fn changes_queued_round(flush: bool) -> (Round, bool) {
+    let system = system(if flush { "flush" } else { "keep" });
+    let scope = system.pg();
+    let (w, mut log) = watcher(&system, 64).await;
+    let members = [
+        member(&system).await,
+        member(&system).await,
+        member(&system).await,
+    ];
     let (id, _) = group_monitor(&w, &scope, "g").await;
+    let entered = Arc::new(Semaphore::new(0));
     let gate = Arc::new(Semaphore::new(0));
     let revoke = {
-        let (w, gate) = (w.clone(), gate.clone());
-        tokio::spawn(async move { w.send(W::HoldThenRevoke(gate, id, flush)).await })
+        let (w, entered, gate) = (w.clone(), entered.clone(), gate.clone());
+        tokio::spawn(async move { w.send(W::HoldThenRevoke(entered, gate, id, flush)).await })
     };
-    sleep(Duration::from_millis(40)).await;
-    for member in [&a, &b, &c] {
+    within("the revoking turn begins", entered.acquire())
+        .await
+        .unwrap()
+        .forget();
+    for member in &members {
         scope.join("g", member).unwrap();
     }
     within("the changes reach the mailbox", async {
@@ -424,20 +462,61 @@ async fn revoke_with_changes_queued(flush: bool) {
     .await;
     gate.add_permits(1);
     let reply = revoke.await.unwrap().unwrap();
+    let told = if flush {
+        drain(&mut log).await
+    } else {
+        collect_until(&mut log, "the kept changes", |seen| seen.len() >= 2).await
+    };
+    let lost_last =
+        !flush && told.len() == 2 && joins(&told[0], &members[0]) && joins(&told[1], &members[1]);
+    let round = Round {
+        system,
+        scope,
+        w,
+        log,
+        members,
+    };
+    if lost_last {
+        return (round, true);
+    }
     assert!(
         matches!(reply, Reply::Flag(false)),
         "changes were queued: {reply:?}"
     );
-    let told = if flush {
-        drain(&mut log).await
-    } else {
-        collect_until(&mut log, "the three kept changes", |seen| seen.len() >= 3).await
-    };
     if flush {
         assert!(told.is_empty(), "flushed changes were delivered: {told:?}");
     } else {
         assert_eq!(told.len(), 3, "the queued changes were kept: {told:?}");
     }
+    (round, false)
+}
+
+async fn revoke_with_changes_queued(flush: bool) {
+    revoke_in_time(flush).await;
+
+    let mut accepted = None;
+    for _ in 0..ROUNDS {
+        let (round, lost_last) = changes_queued_round(flush).await;
+        if !lost_last {
+            accepted = Some(round);
+            break;
+        }
+        assert!(
+            tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread,
+            "the last kept change was lost on one thread"
+        );
+        tear_down(round).await;
+    }
+    let Round {
+        system,
+        scope,
+        w,
+        mut log,
+        members: [a, b, _c],
+    } = accepted
+        .expect("no round kept the last queued change: the third join was lost in every round");
+    let later = member(&system).await;
 
     // Nothing after the revoke, in either case.
     scope.join("g", &later).unwrap();

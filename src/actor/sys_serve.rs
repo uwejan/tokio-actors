@@ -11,7 +11,9 @@ use super::sys_debug;
 use super::sys_state;
 use super::sys_suspend;
 use super::Actor;
-use crate::types::{ActorId, StopReason, SysCommand, TurnClock};
+use crate::actor::envelope::SysCommand;
+use crate::actor::incarnation::TurnClock;
+use crate::types::{ActorId, StopReason};
 
 /// Serves `command` on the actor's task, between two turns. The bundle's
 /// state (the suspension bit and the debug state) is reached through

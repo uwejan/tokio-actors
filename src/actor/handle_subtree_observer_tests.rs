@@ -11,9 +11,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::SubtreeObserver;
+use crate::actor::incarnation::StatusTx;
+use crate::actor::incarnation::{IncarnationRef, SubtreeHold, SubtreeLink};
 use crate::actor::runtime::publish_stopped;
-use crate::actor::subtree::{AbortRecord, SubtreeHold, SubtreeLink};
-use crate::types::StatusTx;
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -30,7 +30,7 @@ struct Rig {
 impl Rig {
     /// An actor whose hold exists when the observer is built.
     fn new() -> Self {
-        let record = AbortRecord::new();
+        let record = IncarnationRef::new();
         let (status, rx) = record.status_channel();
         let hold = SubtreeHold::with_record(None, record);
         Self {

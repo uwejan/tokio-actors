@@ -8,7 +8,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use super::StopStep;
-use crate::types::{RaiseResult, StopLane, StopOutcome};
+use crate::actor::incarnation::{RaiseResult, StopLane};
+use crate::types::StopOutcome;
 
 /// The second raiser takes a share while the first is in flight and is
 /// refused after the first was accepted; the refusal leaves the `Killed`
@@ -23,7 +24,7 @@ fn a_refused_second_raiser_does_not_erase_the_killed_step() {
     let a = {
         let (lane, step) = (lane.clone(), step.clone());
         std::thread::spawn(move || {
-            step.raise_kill(&lane, || {
+            step.raise_shared(&lane, || {
                 a_swapped_tx.send(()).unwrap();
                 b_swapped_rx.recv().unwrap();
             })
@@ -33,7 +34,7 @@ fn a_refused_second_raiser_does_not_erase_the_killed_step() {
         let (lane, step) = (lane.clone(), step.clone());
         std::thread::spawn(move || {
             a_swapped_rx.recv().unwrap();
-            step.raise_kill(&lane, || {
+            step.raise_shared(&lane, || {
                 b_swapped_tx.send(()).unwrap();
                 sealed_rx.recv().unwrap();
             })
@@ -94,7 +95,7 @@ impl HeldRaiser {
                 }
             };
             super::run_once_after_the_next_raise(hook);
-            step.raise_kill(&lane, || {
+            step.raise_shared(&lane, || {
                 reached_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
             })

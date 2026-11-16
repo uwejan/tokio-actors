@@ -9,25 +9,76 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use super::*;
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{StatusTx, StopLane, TurnClock};
 use crate::actor::ActorExt;
 use crate::error::ActorResult;
 use crate::helper::{HelperEnd, HelperKind};
 use crate::system::{ActorSystem, LadderPoint};
-use crate::types::{
-    ActorId, ActorStatus, StatusTx, StatusValue, StopLane, StopOutcome, StopReason, TurnClock,
-};
+use crate::types::{ActorId, ActorStatus, StopOutcome, StopReason};
 
-/// How long a wait that must complete may take before its test reports a
-/// hang: the bound only limits how long a real hang takes to report. No test
-/// asserts a timing relation against it.
-const BOUND: Duration = Duration::from_secs(60);
+// Every wall-clock bound below only limits how long a real hang takes to
+// report; no test asserts a timing relation against it. A timing relation is
+// read on a paused clock, where every instant is virtual.
 
 /// Scheduling rounds of a one-thread runtime that an awaited step is given.
 const ROUNDS: usize = 1000;
+
+/// A gate a ladder hook blocks its thread on until the test, or another
+/// hook, opens it.
+#[derive(Default)]
+struct Latch {
+    open: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Latch {
+    fn open(&self) {
+        *self.open.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.opened.notify_all();
+    }
+
+    /// Blocks the calling thread until the latch is open.
+    fn wait(&self) {
+        let open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = self
+            .opened
+            .wait_timeout_while(open, Duration::from_secs(60), |open| !*open);
+    }
+}
+
+/// Says when it is dropped. Held by a target's task, its drop says that the
+/// abort has landed. As the payload a lost stop task panics with, its drop
+/// says that the loss has been handled: the helper drops the payload after
+/// the task's own future, whose drop hands the lost steps over.
+struct DropSignal(Arc<Notify>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// Waits for `notify`; the bound only reports a hang.
+async fn notified(notify: &Notify, what: &str) {
+    tokio::time::timeout(Duration::from_secs(60), notify.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// A channel the ladder hook reports each answered stop task on. A stop task
+/// answers as the last step of its run, so on a one-thread runtime the end
+/// of the task is recorded in the same poll, before the test runs again.
+async fn answered(rx: &mut mpsc::UnboundedReceiver<()>, what: &str) {
+    tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+        .expect("the hook holds the sender");
+}
 
 #[derive(Default)]
 struct Idle;
@@ -55,8 +106,8 @@ fn poll_once<F: std::future::Future + ?Sized>(call: std::pin::Pin<&mut F>) -> bo
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_taken_before_the_abort_handle_is_attached_still_escalates() {
     let sys = ActorSystem::create(format!("stop-before-attach-{}", uuid::Uuid::new_v4())).unwrap();
-    let id = ActorId::from("stop-before-attach-id");
     let name = "stop-before-attach-name";
+    let id = ActorId::from(name);
     let (tx, _rx) = crate::actor::mailbox::test_channel(1);
     let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
     let (stop_lane, stop_rx) = StopLane::new();
@@ -73,7 +124,7 @@ async fn a_stop_taken_before_the_abort_handle_is_attached_still_escalates() {
     let seq = sys
         .register_actor::<Idle>(
             &id,
-            Some(&Arc::from(name)),
+            true,
             &registered,
             true,
             TurnClock::default(),
@@ -84,6 +135,15 @@ async fn a_stop_taken_before_the_abort_handle_is_attached_still_escalates() {
     let handle = sys
         .get_by_id::<Idle>(&id)
         .expect("the registry lookup finds the actor");
+    let raised = Arc::new(Notify::new());
+    {
+        let raised = raised.clone();
+        sys.set_ladder_hook(move |point, _id| {
+            if point == LadderPoint::StopAfterKill {
+                raised.notify_one();
+            }
+        });
+    }
 
     let call = tokio::spawn(async move {
         handle
@@ -92,25 +152,21 @@ async fn a_stop_taken_before_the_abort_handle_is_attached_still_escalates() {
     });
 
     // The stop task has raised its `Kill` while the entry holds no abort.
-    tokio::time::timeout(BOUND, async {
-        while !matches!(stop_lane.reason(), Some(StopReason::Kill)) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("the stop task raised its Kill");
+    notified(&raised, "the stop task raised its Kill").await;
+    assert_eq!(stop_lane.reason(), Some(StopReason::Kill));
 
     let task = tokio::spawn(async move {
         let _owned = (status_tx, stop_rx);
         std::future::pending::<()>().await;
     });
-    sys.attach_abort(&id, Some(name), task.abort_handle(), seq);
+    sys.attach_abort(&id, task.abort_handle(), seq);
 
-    let ended = tokio::time::timeout(BOUND, task)
+    let ended = tokio::time::timeout(Duration::from_secs(60), task)
         .await
         .expect("the attach armed the backstop, which aborted the task");
     assert!(ended.unwrap_err().is_cancelled());
-    let outcome = tokio::time::timeout(BOUND, call)
+    sys.clear_ladder_hook();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), call)
         .await
         .expect("the call returns")
         .unwrap()
@@ -196,16 +252,16 @@ impl Actor for Quitter {
     }
 }
 
-/// The stop task of a pending call holds no sender of the mailbox, so the
+/// The stop task of a pending call holds no handle of the actor, so the
 /// handles of users are the only ones that keep the actor's mailbox open: the
-/// number of senders is the same before the call, while it pends, and after
-/// it is dropped.
+/// handle block, which holds the mailbox's sender, has the same number of
+/// holders before the call and while it pends, and the mailbox has the same
+/// number of senders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_call_holds_no_sender_of_the_mailbox() {
     let sys = ActorSystem::create(unique("no-handle-in-the-task")).unwrap();
     let id = ActorId::from("no-handle-in-the-task-id");
     let (tx, _rx) = crate::actor::mailbox::test_channel(1);
-    let senders = tx.clone();
     let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
     let (stop_lane, _stop_rx) = StopLane::new();
     let registered = ActorHandle::<Idle>::new(
@@ -219,7 +275,7 @@ async fn a_pending_call_holds_no_sender_of_the_mailbox() {
     );
     sys.register_actor::<Idle>(
         &id,
-        None,
+        false,
         &registered,
         true,
         TurnClock::default(),
@@ -227,7 +283,8 @@ async fn a_pending_call_holds_no_sender_of_the_mailbox() {
         Handle::current(),
     )
     .unwrap();
-    let before = senders.strong_count();
+    let before = Arc::strong_count(&registered.inner);
+    let senders = registered.inner.tx.strong_count();
 
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let mut call =
@@ -235,8 +292,13 @@ async fn a_pending_call_holds_no_sender_of_the_mailbox() {
     assert!(std::future::Future::poll(call.as_mut(), &mut cx).is_pending());
     assert_eq!(sys.live_helpers(), 1, "the call spawned its stop task");
     assert_eq!(
-        senders.strong_count(),
+        Arc::strong_count(&registered.inner),
         before,
+        "the stop task of a pending call holds a handle of the actor"
+    );
+    assert_eq!(
+        registered.inner.tx.strong_count(),
+        senders,
         "the stop task of a pending call holds a sender of the mailbox"
     );
     drop(call);
@@ -247,21 +309,27 @@ async fn a_pending_call_holds_no_sender_of_the_mailbox() {
 // The stop task of a call that needs none of its steps
 // ---------------------------------------------------------------------------
 
-async fn until(what: &str, mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(BOUND, async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+/// Installs a hook on `sys` that reports each answered stop task on the
+/// returned channel.
+fn report_answers(sys: &ActorSystem) -> mpsc::UnboundedReceiver<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    sys.set_ladder_hook(move |point, _id| {
+        if point == LadderPoint::StopAnswered {
+            let _ = tx.send(());
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{what}"));
+    });
+    rx
 }
 
 /// A call that returns gives its stop task back at once, not when its
-/// window ends, whether it is made inside a task or outside every task.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// window ends, whether it is made inside a task or outside every task. The
+/// window outlasts the bound on the wait for the tasks' answers, and the
+/// runtime has one thread, so each task's end is recorded when its answer is
+/// reported.
+#[tokio::test]
 async fn a_call_that_returns_gives_its_stop_task_back() {
     let sys = ActorSystem::create(unique("returns")).unwrap();
+    let mut answers = report_answers(&sys);
     let inside = Idle.spawn().on_system(&sys).await.unwrap();
     let outside = Idle.spawn().on_system(&sys).await.unwrap();
     let from_a_task = tokio::spawn(async move {
@@ -278,7 +346,10 @@ async fn a_call_that_returns_gives_its_stop_task_back() {
         .await
         .expect("the request is accepted");
     assert_eq!(from_the_test, StopOutcome::Graceful);
-    until("the stop tasks ended", || sys.live_helpers() == 0).await;
+    answered(&mut answers, "the first stop task ended").await;
+    answered(&mut answers, "the second stop task ended").await;
+    sys.clear_ladder_hook();
+    assert_eq!(sys.live_helpers(), 0, "the stop tasks ended");
     assert_eq!(
         sys.helper_ends(&Handle::current()),
         vec![
@@ -293,20 +364,22 @@ async fn a_call_that_returns_gives_its_stop_task_back() {
 // ---------------------------------------------------------------------------
 
 /// Handles a message by waiting on a future that never completes: a wedge
-/// an abort cuts at its `.await`, though a `Kill` is never read in it.
-struct Hang;
+/// an abort cuts at its `.await`, though a `Kill` is never read in it. It
+/// says when it has entered the turn.
+struct Hang(Arc<Notify>);
 
 impl Actor for Hang {
     type Message = ();
     type Response = ();
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.0.notify_one();
         std::future::pending::<()>().await;
         Ok(())
     }
 }
 
-/// An actor whose `pre_stop` sleeps and counts how often it started.
+/// An actor whose `pre_stop` never returns and counts how often it started.
 struct SleepyStop(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Actor for SleepyStop {
@@ -319,8 +392,7 @@ impl Actor for SleepyStop {
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
         self.0.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-        true
+        std::future::pending::<bool>().await
     }
 }
 
@@ -349,7 +421,7 @@ async fn a_window_that_has_passed_at_the_call_takes_the_kill_at_the_call() {
 // ---------------------------------------------------------------------------
 
 /// A registered actor whose task exists but whose abort handle is not
-/// attached yet.
+/// attached yet. The task never ends by itself and says when it is dropped.
 struct Target {
     sys: Arc<ActorSystem>,
     handle: ActorHandle<Idle>,
@@ -357,13 +429,14 @@ struct Target {
     name: String,
     seq: u64,
     task: tokio::task::JoinHandle<()>,
+    dropped: Arc<Notify>,
 }
 
 impl Target {
     fn new(kill_grace: Duration) -> Self {
         let sys = ActorSystem::create(unique("unattached")).unwrap();
-        let id = ActorId::from(unique("unattached-id").as_str());
         let name = unique("unattached-name");
+        let id = ActorId::from(name.as_str());
         let (tx, _rx) = crate::actor::mailbox::test_channel(1);
         let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
@@ -379,7 +452,7 @@ impl Target {
         let seq = sys
             .register_actor::<Idle>(
                 &id,
-                Some(&Arc::from(name.as_str())),
+                true,
                 &registered,
                 true,
                 TurnClock::default(),
@@ -388,8 +461,10 @@ impl Target {
             )
             .unwrap();
         let handle = sys.get_by_id::<Idle>(&id).unwrap();
+        let dropped = Arc::new(Notify::new());
+        let signal = DropSignal(dropped.clone());
         let task = tokio::spawn(async move {
-            let _owned = (status_tx, stop_rx);
+            let _owned = (status_tx, stop_rx, signal);
             std::future::pending::<()>().await;
         });
         Self {
@@ -399,41 +474,20 @@ impl Target {
             name,
             seq,
             task,
+            dropped,
         }
     }
 
     fn attach(&self) {
-        self.sys.attach_abort(
-            &self.id,
-            Some(&self.name),
-            self.task.abort_handle(),
-            self.seq,
-        );
+        self.sys
+            .attach_abort(&self.id, self.task.abort_handle(), self.seq);
     }
 
-    /// Waits until the task is finished and returns how long that took from
-    /// `since`.
-    async fn finished_after(&self, since: std::time::Instant) -> Duration {
-        tokio::time::timeout(BOUND, async {
-            while !self.task.is_finished() {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .expect("the target was aborted");
-        since.elapsed()
-    }
-
-    /// The same wait on a paused clock: the time it took is virtual, the
-    /// declared deadline's distance from `since`.
-    async fn finished_after_paused(&self, since: tokio::time::Instant) -> Duration {
-        tokio::time::timeout(BOUND, async {
-            while !self.task.is_finished() {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .expect("the target was aborted");
+    /// Waits until the abort has dropped the task and returns how long that
+    /// took from `since`. Used on a paused clock, where the time is virtual:
+    /// the declared deadline's distance from `since`.
+    async fn aborted_after(&self, since: tokio::time::Instant) -> Duration {
+        notified(&self.dropped, "the target was aborted").await;
         since.elapsed()
     }
 }
@@ -467,18 +521,11 @@ fn held(kill_grace: Duration) -> Held {
     }
 }
 
-/// Flags the hook sets as the ladder passes its points.
+/// Latches the hook opens as the ladder passes its points.
 #[derive(Default)]
 struct Passed {
-    lost: AtomicBool,
-    decided: AtomicBool,
-}
-
-fn spin_until(flag: &AtomicBool) {
-    let end = std::time::Instant::now() + Duration::from_secs(5);
-    while !flag.load(Ordering::SeqCst) && std::time::Instant::now() < end {
-        std::thread::yield_now();
-    }
+    lost: Latch,
+    decided: Latch,
 }
 
 /// How the stop task of a call made inside a task is lost, relative to the
@@ -502,21 +549,23 @@ async fn lost_task_call(
 ) {
     let mut held = held(Duration::from_millis(100));
     let passed = Arc::new(Passed::default());
+    let loss_handled = Arc::new(Notify::new());
     {
-        let (passed, lane) = (passed.clone(), held.lane.clone());
+        let (passed, lane, loss_handled) =
+            (passed.clone(), held.lane.clone(), loss_handled.clone());
         held.sys.set_ladder_hook(move |point, _id| match point {
             LadderPoint::StopBeforeRaise if refuse => lane.close_to_non_kill(),
             LadderPoint::StopHelperStart => {
                 if lost_at == LostAt::AfterTheDecision {
-                    spin_until(&passed.decided);
+                    passed.decided.wait();
                 }
-                panic!("stop task lost");
+                std::panic::panic_any(DropSignal(loss_handled.clone()));
             }
-            LadderPoint::StopHelperLost => passed.lost.store(true, Ordering::SeqCst),
+            LadderPoint::StopHelperLost => passed.lost.open(),
             LadderPoint::StopRaised if lost_at == LostAt::BeforeTheDecision => {
-                spin_until(&passed.lost);
+                passed.lost.wait();
             }
-            LadderPoint::StopDecided => passed.decided.store(true, Ordering::SeqCst),
+            LadderPoint::StopDecided => passed.decided.open(),
             _ => {}
         });
     }
@@ -529,8 +578,9 @@ async fn lost_task_call(
     })
     .await
     .unwrap();
-    // The window and the grace have passed twice over.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The caller hands its steps over before it returns, and the lost task
+    // before its payload is dropped: after both, nothing more is fed.
+    notified(&loss_handled, "the loss was handled").await;
     held.sys.clear_ladder_hook();
     let mut fed = 0;
     while held.feed.try_recv().is_ok() {
@@ -548,14 +598,17 @@ async fn lost_task_call(
 async fn a_lost_tasks_hand_off_declares_its_grace_before_its_kill() {
     const GRACE: Duration = Duration::from_millis(150);
     const LONG_WINDOW: Duration = Duration::from_secs(4);
-    let target = Arc::new(Target::new(GRACE));
+    let target = Target::new(GRACE);
     let fired = Arc::new(AtomicBool::new(false));
+    let handed_off = Arc::new(Notify::new());
     {
-        let fired = fired.clone();
-        target.sys.set_ladder_hook(move |point, _id| {
-            if point == LadderPoint::StopHelperStart && !fired.swap(true, Ordering::SeqCst) {
-                panic!("stop task lost");
+        let (fired, handed_off) = (fired.clone(), handed_off.clone());
+        target.sys.set_ladder_hook(move |point, _id| match point {
+            LadderPoint::StopHelperStart if !fired.swap(true, Ordering::SeqCst) => {
+                panic!("stop task lost")
             }
+            LadderPoint::StopHelperLost => handed_off.notify_one(),
+            _ => {}
         });
     }
     let h1 = target.handle.clone();
@@ -563,29 +616,21 @@ async fn a_lost_tasks_hand_off_declares_its_grace_before_its_kill() {
         h1.stop_within(StopReason::Graceful, Duration::from_millis(10))
             .await
     });
-    // The hand-off raises its Kill when the task is lost. Only the paused
-    // clock's bound ends this wait, and it ends it only if nothing else can
-    // run, so the Kill was never raised.
-    tokio::time::timeout(BOUND, async {
-        while target.handle.stop_lane().reason() != Some(StopReason::Kill) {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("hand-off raised Kill");
+    // The lost task's hand-off raises its Kill, then reports the loss. Only
+    // the paused clock's bound ends this wait, and it ends it only if nothing
+    // else can run, so the loss was never handled.
+    notified(&handed_off, "the lost task handed its steps over").await;
+    assert_eq!(
+        target.handle.stop_lane().reason(),
+        Some(StopReason::Kill),
+        "hand-off raised Kill"
+    );
     let raised = tokio::time::Instant::now();
     let h2 = target.handle.clone();
     let mut second = Box::pin(async move { h2.stop_within(StopReason::Kill, LONG_WINDOW).await });
     poll_once(second.as_mut());
     target.attach();
-    tokio::time::timeout(BOUND, async {
-        while !target.task.is_finished() {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the target was aborted");
-    let took = raised.elapsed();
+    let took = target.aborted_after(raised).await;
     assert!(
         took < LONG_WINDOW / 2,
         "aborted {took:?} after the Kill, grace was {GRACE:?}"

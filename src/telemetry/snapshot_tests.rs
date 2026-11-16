@@ -89,7 +89,7 @@ impl Actor for Watcher {
 /// them; each count follows a change.
 #[test]
 fn a_snapshot_row_shows_the_coupling_counts_of_the_block() {
-    use crate::actor::subtree::Coupling;
+    use crate::actor::incarnation::Coupling;
     use crate::telemetry::ActorRecord;
 
     both_flavors(|| async {

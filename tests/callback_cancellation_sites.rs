@@ -18,14 +18,14 @@ const ABORT_SITES: &[(&str, usize, &str)] = &[
         "the bounded stop's last step: the abort after the kill window",
     ),
     (
+        "actor/incarnation/owed.rs",
+        1,
+        "the abort record: the one `task.abort()` every other site goes through",
+    ),
+    (
         "actor/start_bound.rs",
         1,
         "the start bound's cut, after the Kill it raises on the lane: at the deadline, and when its bound panics before it decides",
-    ),
-    (
-        "actor/subtree.rs",
-        1,
-        "the abort record: the one `task.abort()` every other site goes through",
     ),
     (
         "actor/supervision/slot.rs",
@@ -84,7 +84,7 @@ fn an_actor_task_is_aborted_only_at_the_classified_sites() {
     );
     assert_eq!(
         bare_aborts,
-        vec!["actor/subtree.rs".to_string()],
+        vec!["actor/incarnation/owed.rs".to_string()],
         "a task is aborted directly outside the abort record"
     );
     assert_eq!(

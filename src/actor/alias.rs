@@ -277,6 +277,8 @@ impl<A: Actor> Alias<A> {
     /// Sends `msg` without waiting for a reply, waiting while the mailbox is
     /// full.
     ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
+    ///
     /// The slot is reserved before the alias is checked, so a send that waits
     /// for room and finds the alias ended meanwhile drops its message and
     /// returns [`AliasError::Inactive`]. A message accepted before the owner
@@ -329,6 +331,8 @@ impl<A: Actor> Alias<A> {
 
     /// As [`notify`](Self::notify), without waiting for room.
     ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
+    ///
     /// `Ok` means the queue accepted the message, not that it will be
     /// handled: one accepted while the owner runs its final deliveries or
     /// `on_stopped`, or as its end closes the queue after the check, is
@@ -380,6 +384,8 @@ impl<A: Actor> Alias<A> {
     /// Sends `msg` on the priority lane when the alias was made with
     /// [`AliasOptions::priority`] and the actor has a lane, and on the
     /// ordinary mailbox otherwise, waiting while the queue is full.
+    ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
     ///
     /// A message on the lane is received ahead of every ordinary message
     /// still queued, as for
@@ -443,6 +449,8 @@ impl<A: Actor> Alias<A> {
 
     /// As [`notify_priority`](Self::notify_priority), without waiting for
     /// room.
+    ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
     ///
     /// `Ok` means the queue accepted the message, not that it will be
     /// handled: one accepted while the owner runs its final deliveries or

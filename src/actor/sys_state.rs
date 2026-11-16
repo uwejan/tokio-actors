@@ -15,17 +15,18 @@ use std::ops::ControlFlow;
 use tokio::sync::oneshot;
 
 use super::context::ActorContext;
+use super::incarnation::{IncarnationRef, SYS_ALLOW_STATE, SYS_SENSITIVE};
 use super::panic::{catch_sync, payload_into_string, send_contained, AnswerHold};
 use super::runtime::build_status_info;
-use super::subtree::{AbortRecord, SYS_ALLOW_STATE, SYS_SENSITIVE};
 use super::sys::SysError;
 use super::sys_loop::is_suspended;
 use super::Actor;
+use crate::actor::incarnation::turn_clock::{outcome_plain, push_turn};
+use crate::actor::incarnation::TurnClock;
 use crate::error::ActorError;
 use crate::telemetry::handlers::drop_contained;
 use crate::telemetry::HookKind;
-use crate::types::turn_clock::{outcome_plain, push_turn};
-use crate::types::{ActorStatusInfo, StopReason, TurnClock};
+use crate::types::{ActorStatusInfo, StopReason};
 
 /// What `get_status` shows as the state of an actor whose `format_status`
 /// panicked.
@@ -62,7 +63,7 @@ pub(crate) type StateRequest = Box<dyn StateOp>;
 
 /// Whether the actor of `record` allows its value to be reached: not when
 /// it is sensitive, and only when it was spawned with state access.
-pub(crate) fn state_access(record: &AbortRecord) -> Result<(), SysError> {
+pub(crate) fn state_access(record: &IncarnationRef) -> Result<(), SysError> {
     let bits = record.sys_bits();
     if bits & SYS_SENSITIVE != 0 {
         Err(SysError::Sensitive)
@@ -251,7 +252,7 @@ pub(crate) fn status_info<A: Actor>(
 pub(crate) fn format_status_safely<A: Actor>(
     actor: &A,
     sensitive: bool,
-    record: &AbortRecord,
+    record: &IncarnationRef,
     clock: &TurnClock,
 ) -> Option<String> {
     if sensitive {
@@ -305,11 +306,13 @@ mod tests {
     use super::{run, InspectOp, ReplaceOp, StateOp};
     use crate::actor::context::ActorContext;
     use crate::actor::handle::ActorHandle;
-    use crate::actor::subtree::SubtreeHold;
+    use crate::actor::incarnation::StatusValue;
+    use crate::actor::incarnation::SubtreeHold;
+    use crate::actor::incarnation::{StatusTx, StopLane, TurnClock};
     use crate::actor::sys::SysError;
     use crate::actor::Actor;
     use crate::error::ActorResult;
-    use crate::types::{ActorId, ActorStatus, StatusTx, StatusValue, StopLane, TurnClock};
+    use crate::types::{ActorId, ActorStatus};
 
     struct Holder;
 

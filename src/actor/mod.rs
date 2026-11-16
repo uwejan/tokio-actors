@@ -6,10 +6,12 @@ pub(crate) mod alias;
 mod alias_tests;
 /// Actor execution context.
 pub mod context;
+pub(crate) mod envelope;
 /// Actor handle for external communication.
 pub mod handle;
 #[cfg(test)]
 mod idle_tests;
+pub(crate) mod incarnation;
 #[cfg(test)]
 mod late_map_panic_tests;
 /// Links and the trap flag.
@@ -44,7 +46,6 @@ mod spawned_monitor_tests;
 /// The start bound of a spawn, owned by the system.
 mod start_bound;
 /// Subtree tokens: the end of an actor and of everything it spawned.
-pub(crate) mod subtree;
 /// Supervision configuration and child management.
 pub mod supervision;
 /// A typed reference to a supervisor, for managing its children from outside.
@@ -78,10 +79,11 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+use crate::actor::envelope::Envelope;
 use crate::error::{ActorResult, SpawnError};
 use crate::system::ActorSystem;
 use crate::telemetry::Birth;
-use crate::types::{ActorId, ChildEvent, Down, Envelope, MonitorId, StopReason};
+use crate::types::{ActorId, ChildEvent, Down, MonitorId, StopReason};
 use context::ActorContext;
 use monitor::MapFn;
 use runtime::ActorConfig;
@@ -319,6 +321,54 @@ use sys::{DebugOptions, SysOptions};
 ///         Ok(())
 ///     }
 /// }
+/// ```
+///
+/// # Per-actor state
+///
+/// An actor keeps its state in its own fields, which only its task reaches,
+/// so a handler needs no per-process key-value store: a field is the store,
+/// typed, and a `HashMap` field holds keys chosen at run time. The example
+/// has the put, get and erase of Erlang's process dictionary, each answering
+/// the previous value.
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult};
+///
+/// enum Dict {
+///     Put(String, u32),
+///     Get(String),
+///     Erase(String),
+/// }
+///
+/// #[derive(Default)]
+/// struct Dictionary {
+///     entries: HashMap<String, u32>,
+/// }
+///
+/// impl Actor for Dictionary {
+///     type Message = Dict;
+///     type Response = Option<u32>;
+///
+///     async fn handle(&mut self, msg: Dict, _ctx: &mut ActorContext<Self>) -> ActorResult<Option<u32>> {
+///         Ok(match msg {
+///             Dict::Put(key, value) => self.entries.insert(key, value),
+///             Dict::Get(key) => self.entries.get(&key).copied(),
+///             Dict::Erase(key) => self.entries.remove(&key),
+///         })
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let dict = Dictionary::default().spawn().await?;
+/// assert_eq!(dict.send(Dict::Put("k".into(), 1)).await?, None);
+/// assert_eq!(dict.send(Dict::Put("k".into(), 2)).await?, Some(1));
+/// assert_eq!(dict.send(Dict::Get("k".into())).await?, Some(2));
+/// assert_eq!(dict.send(Dict::Erase("k".into())).await?, Some(2));
+/// assert_eq!(dict.send(Dict::Get("k".into())).await?, None);
+/// # Ok(())
+/// # }
 /// ```
 pub trait Actor: Sized + Send + 'static {
     /// The type of message this actor receives.
@@ -793,7 +843,8 @@ impl<A: Actor> SpawnBuilder<A> {
     /// it. A spawn that is refused for a zero mailbox
     /// capacity, a system that is shutting down or a name already taken is
     /// answered with that error first, on any runtime; a name taken between
-    /// that look and the claim still panics on a runtime without the driver.
+    /// that look and the registration still panics on a runtime without the
+    /// driver.
     /// With no runtime current the spawn returns [`SpawnError::MissingRuntime`]
     /// as any spawn does. A caller polled by a foreign executor whose runtime
     /// has ended before the system answered is answered, with a runtime that

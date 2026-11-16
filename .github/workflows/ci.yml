@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  LINT_TOOLCHAIN: 1.99.1
 
 jobs:
   test:
@@ -257,8 +258,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
           components: clippy
 
       - name: Run clippy
@@ -291,7 +293,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
 
       - name: Build documentation
         run: cargo doc --all-features --no-deps

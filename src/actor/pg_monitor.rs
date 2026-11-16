@@ -31,15 +31,16 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::context::{ActorContext, Released};
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::ActorHandle;
-use crate::actor::monitor::MonitorShared;
+use crate::actor::incarnation::{Coupling, IncarnationRef};
+use crate::actor::monitor::{fail_by_map, MapSite, MonitorShared};
 use crate::actor::panic::{catch_sync, payload_into_string};
 use crate::actor::pg::{peers_of, PgScope, PgScopeInner, ScopeTable, Slot};
 use crate::actor::runtime::{end_value, log_late_drop};
-use crate::actor::subtree::{AbortRecord, Coupling};
 use crate::actor::Actor;
-use crate::error::{ActorError, MonitorError};
-use crate::types::{ActorStatus, GroupChange, MonitorId, PeerRef, SignalTag, StopReason};
+use crate::error::MonitorError;
+use crate::types::{ActorStatus, GroupChange, MonitorId, PeerRef};
 
 /// Each group a monitor covers with its members, shared with the table: what a
 /// `Resync` and the answer of a new monitor are made from after the scope's
@@ -378,7 +379,7 @@ pub(crate) struct GroupEntry {
     scope: Arc<PgScopeInner>,
     counts: Arc<Counts>,
     /// The watcher's record, which shows how many monitors it holds.
-    record: AbortRecord,
+    record: IncarnationRef,
     /// The monitors the watcher holds, shared by its entries.
     live: Arc<AtomicU32>,
 }
@@ -390,7 +391,7 @@ impl GroupEntry {
         token: CancellationToken,
         scope: Arc<PgScopeInner>,
         counts: Arc<Counts>,
-        record: AbortRecord,
+        record: IncarnationRef,
         live: Arc<AtomicU32>,
     ) -> Self {
         let held = live.fetch_add(1, Ordering::Relaxed) + 1;
@@ -628,27 +629,7 @@ pub(crate) async fn group_forward<A: Actor>(
             }
             Err(panic) => {
                 drop(permit);
-                // Kept before the raise: a panic that lands after the
-                // watcher's message loop read its stop lane for the last
-                // time raises where no reader is left, and the stop reads
-                // the panic from the incarnation's record.
-                handle
-                    .stop_lane_ref()
-                    .abort_record()
-                    .keep_map_panic(panic.clone());
-                shared.spend();
-                #[cfg(feature = "tracing")]
-                caught_log!(warn,
-                    actor_id = %handle.id(),
-                    panic = %handle.log_fields().panic_text(&panic),
-                    "a group monitor's map function panicked; the actor fails with that panic"
-                );
-                let _ = crate::system::raise_noted(
-                    None,
-                    handle.stop_lane_ref(),
-                    StopReason::Failure(ActorError::Panic(panic.clone())),
-                    crate::telemetry::StopOrigin::MapPanic,
-                );
+                fail_by_map(&handle, &panic, Some(&shared), MapSite::Group);
                 return Released {
                     run: Some(panic),
                     end: None,
@@ -665,6 +646,8 @@ impl<A: Actor> ActorContext<A> {
     /// it reads `Stopped`). Returns the monitor's id and the group's members
     /// at the instant the monitor began, so the changes that follow are
     /// exactly the ones after the list.
+    ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `MonitorError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
     ///
     /// A monitor delivers until it is revoked with
     /// [`demonitor`](Self::demonitor) (queued changes stay) or
@@ -779,6 +762,8 @@ impl<A: Actor> ActorContext<A> {
     /// [`GroupChange`], made by `map`, each time any member joins or leaves
     /// any group of the scope. Returns the monitor's id and every group of
     /// the scope with its members at the instant the monitor began.
+    ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `MonitorError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
     ///
     /// The queue, the overflow, the revoke and the end behave as for
     /// [`monitor_group`](Self::monitor_group); a

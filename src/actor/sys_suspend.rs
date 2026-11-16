@@ -15,8 +15,8 @@
 //! suspends owns the suspension.
 
 use super::sys_loop::LoopSys;
+use crate::actor::envelope::Reply;
 use crate::actor::panic::send_contained;
-use crate::types::Reply;
 
 /// Sets the suspension and answers. A second call changes nothing.
 pub(crate) fn suspend(sys: &mut LoopSys<'_>, reply: Reply<()>) {

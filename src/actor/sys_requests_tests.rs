@@ -15,12 +15,13 @@ use tokio::runtime::Builder;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::actor::context::ActorContext;
+use crate::actor::envelope::SysCommand;
 use crate::actor::handle::ActorHandle;
 use crate::actor::runtime::ActorConfig;
 use crate::actor::sys::{SysError, DEFAULT_SYS_TIMEOUT};
 use crate::actor::{Actor, ActorExt};
 use crate::error::ActorResult;
-use crate::types::{StopReason, SysCommand};
+use crate::types::StopReason;
 
 /// The longest a wait for a condition may take. It only limits how long a real
 /// hang takes to report; a slow host must not read as one.

@@ -1,9 +1,5 @@
 //! Shared type definitions used across the Tokio Actors runtime.
 
-pub(crate) mod status_cell;
-pub(crate) mod stop_lane;
-pub(crate) mod turn_clock;
-
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,11 +9,7 @@ use tokio::sync::oneshot;
 
 use crate::error::{ActorError, AskError};
 
-pub(crate) use status_cell::{StatusRx, StatusTx};
-pub(crate) use stop_lane::{
-    LaneCell, LaneRx, LaneState, RaiseResult, StopLane, StopSeverity, WakeSlot,
-};
-pub(crate) use turn_clock::TurnClock;
+pub use crate::actor::envelope::{Envelope, SignalTag};
 
 /// Identifier of an actor within its system, unique among the system's live
 /// actors. An actor keeps its id across supervised restarts. An anonymous
@@ -45,6 +37,11 @@ impl ActorId {
     /// The id of a named actor, sharing the allocation that holds its name.
     pub(crate) fn from_shared(name: Arc<str>) -> Self {
         Self(name)
+    }
+
+    /// The allocation that holds the id, which is a named actor's name.
+    pub(crate) fn shared(&self) -> &Arc<str> {
+        &self.0
     }
 
     /// A fresh random (version 4) UUID id, hyphenated and lowercase, formatted
@@ -344,59 +341,6 @@ pub enum ActorStatus {
     Stopping,
     /// The actor has stopped.
     Stopped,
-}
-
-/// The value of an actor's runtime status plane: its lifecycle status and,
-/// once the actor's end is final, the reason it ended with and the instant
-/// that reason became final.
-///
-/// The reason is written exactly once and never changed, and the instant is
-/// taken by that same write. An actor that ends normally writes it at the
-/// seal of its stop lane, before its queued messages, its value and its
-/// context drop, and publishes the terminal [`ActorStatus::Stopped`] after
-/// them. A task that never reaches its seal has it written by its abort
-/// guard once its name is free (by its context when it is dropped before its
-/// first poll): `Kill` for an abort, a shutdown, or a runtime dropped during
-/// another unwind, `Failure(Panic)` for the task's own unwind outside every
-/// catch; no `Stopped` follows. A reader that finds the plane closed with no
-/// reason reads [`StopReason::Kill`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StatusValue {
-    pub(crate) status: ActorStatus,
-    pub(crate) reason: Option<StopReason>,
-    /// When the reason was written: the instant the actor's end became
-    /// final. `None` until the reason is written.
-    pub(crate) final_at: Option<tokio::time::Instant>,
-}
-
-impl StatusValue {
-    /// A non-terminal value: `status` with no reason.
-    pub(crate) fn new(status: ActorStatus) -> Self {
-        Self {
-            status,
-            reason: None,
-            final_at: None,
-        }
-    }
-
-    /// Writes the plane's reason, once, and stamps the instant of that
-    /// write: a plane that already carries a reason is left exactly as it
-    /// is, its stamp included. With `stopped` the same write publishes the
-    /// terminal status, so no reader sees `Stopped` without its reason.
-    /// Succeeds with no receivers left. Returns whether this call wrote.
-    pub(crate) fn write_reason(tx: &StatusTx, reason: StopReason, stopped: bool) -> bool {
-        tx.send_if_modified(|value| {
-            if value.reason.is_some() {
-                return false;
-            }
-            value.reason = Some(reason);
-            value.final_at = Some(tokio::time::Instant::now());
-            if stopped {
-                value.status = ActorStatus::Stopped;
-            }
-            true
-        })
-    }
 }
 
 /// Event wrapper for items received from a stream attached via
@@ -810,21 +754,6 @@ pub struct PeerRef {
     pub incarnation: Incarnation,
 }
 
-/// Tags a message that carries a [`Down`] or a [`GroupChange`], so the actor
-/// that made the monitor can revoke a notice that is already queued. It is opaque; it only
-/// appears in [`Envelope::Signal`].
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct SignalTag {
-    pub(crate) shared: Arc<crate::actor::monitor::MonitorShared>,
-}
-
-impl std::fmt::Debug for SignalTag {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SignalTag").finish_non_exhaustive()
-    }
-}
-
 /// A change to a process group, as a group or scope monitor reports it.
 ///
 /// The watcher's map function turns it into one of its own messages, which
@@ -909,16 +838,23 @@ pub enum RestartStrategy {
 /// Determines whether a child is restarted after stopping.
 ///
 /// Maps to OTP `permanent`/`transient`/`temporary`.
+///
+/// Given to an application's start
+/// ([`Applications::start`](crate::application::Applications::start)), the
+/// kind says what the application's end means for the others; the table of
+/// [`Applications::node_shutdown`](crate::application::Applications::node_shutdown)
+/// gives the rule. An application is never restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartType {
-    /// Always restart, even after a graceful stop.
+    /// For a supervised child: always restart, even after a graceful stop.
     Permanent,
-    /// Restart on crash/cancel/kill, but stay down on a clean end
+    /// For a supervised child: restart on crash/cancel/kill, but stay down on a clean end
     /// ([`StopReason::is_normal`]): [`StopReason::Graceful`],
     /// [`StopReason::ParentRequest`], [`StopReason::ParentKilled`] and
     /// [`StopReason::Shutdown`].
     Transient,
-    /// Never restart. Removed from the registry on any stop.
+    /// For a supervised child: never restart. Removed from the registry on any
+    /// stop.
     Temporary,
 }
 
@@ -1101,6 +1037,16 @@ pub struct ChildInfo {
     /// True when the child is itself a supervisor, that is when its
     /// configuration enables supervision.
     pub is_supervisor: bool,
+    /// Whether the child is significant: its end, when the supervisor does
+    /// not restart it, can shut the supervisor down under its
+    /// [`AutoShutdown`](crate::AutoShutdown) mode.
+    pub significant: bool,
+    /// The time the child is given, after a `Kill` is raised on it, to reach
+    /// its next turn boundary before its task is aborted.
+    pub kill_grace: Duration,
+    /// The bound on the initialization of each restart of the child; `None`
+    /// waits without a bound.
+    pub start_timeout: Option<Duration>,
 }
 
 /// The counts a supervisor's children add up to, as Erlang/OTP's
@@ -1272,148 +1218,6 @@ pub struct ShutdownReport {
     pub swept: Vec<(ActorId, StopReport)>,
 }
 
-/// Internal system-level messages sent via the system channel.
-///
-/// These have priority over user messages via `biased; select!`, and sit
-/// below the stop lane, which the run loop observes first of all (see the
-/// `runtime` module docs). Stop/kill requests do not travel through this
-/// channel: they are delivered through the stop lane instead, so they are
-/// never delayed by anything queued here. A child's death and a restart
-/// attempt's completion likewise never travel here: they are delivered
-/// through the supervisor's death plane and restart plane (per-incarnation
-/// fate cells and a parent-owned `JoinSet`, respectively) instead.
-///
-/// The full branch order, highest priority first: stop lane, system channel,
-/// restart plane, death plane, verdict signal, forwarder plane, priority lane,
-/// mailbox.
-#[derive(Debug)]
-pub(crate) enum SystemMessage {
-    /// Request a status snapshot.
-    GetStatus(StatusRequest),
-    /// Link, unlink or exit items are waiting in the actor's signal inbox.
-    Signals,
-    /// A request made through a
-    /// [`SupervisorRef`](crate::actor::supervisor_ref::SupervisorRef),
-    /// answered at a boundary of the run loop. Boxed so the message stays
-    /// the size of a status request.
-    Supervise(Box<SuperviseRequest>),
-    /// A call of the `sys` bundle, boxed so the channel's slots stay the
-    /// size of a status request.
-    #[allow(dead_code)]
-    Sys(Box<SysCommand>),
-}
-
-/// One request of a `SupervisorRef`. Each carries the sender its answer goes
-/// to, except [`Settle`](Self::Settle) and [`Start`](Self::Start), whose
-/// answers travel inside what they carry.
-#[derive(Debug)]
-pub(crate) enum SuperviseRequest {
-    /// `restart_child`.
-    Restart {
-        /// The child to restart.
-        child: ActorId,
-        /// Where the answer goes.
-        reply: oneshot::Sender<Result<(), crate::error::SupervisionError>>,
-    },
-    /// `delete_child`.
-    Delete {
-        /// The child whose spec is removed.
-        child: ActorId,
-        /// Where the answer goes.
-        reply: oneshot::Sender<Result<(), crate::error::SupervisionError>>,
-    },
-    /// `which_children`.
-    Which {
-        /// Where the answer goes.
-        reply: oneshot::Sender<Result<Vec<ChildInfo>, crate::error::SupervisionError>>,
-    },
-    /// `count_children`.
-    Count {
-        /// Where the answer goes.
-        reply: oneshot::Sender<Result<ChildCounts, crate::error::SupervisionError>>,
-    },
-    /// `terminate_child`: the stop is committed at the boundary, and the
-    /// answer goes out when the child and its subtree ended.
-    Terminate {
-        /// The child to stop.
-        child: ActorId,
-        /// Where the answer goes.
-        reply: oneshot::Sender<Result<(), crate::error::SupervisorRefError>>,
-    },
-    /// The end of a child stopped by a `Terminate`, seen by the reply helper:
-    /// the supervisor finishes the classification of that stop, if its death
-    /// arm has not, before the answer goes out.
-    Settle {
-        /// The child whose stop ended.
-        child: ActorId,
-        /// The incarnation the stop concerns.
-        incarnation: u64,
-        /// The kind the stop is classified with.
-        kind: crate::actor::supervision::ManualStop,
-        /// How the incarnation ended.
-        reason: StopReason,
-    },
-    /// `start_child`: the typed job the ref built, opened at one site by
-    /// `supervisor_ref::serve` and never seen by user code.
-    Start(Box<dyn std::any::Any + Send>),
-}
-
-/// Where the answer to a `sys` command goes.
-pub(crate) type Reply<T> = oneshot::Sender<T>;
-
-/// A call of the `sys` bundle, as the system channel carries it. The run
-/// loop serves it between two turns.
-#[allow(dead_code)]
-pub(crate) enum SysCommand {
-    /// Stop taking messages.
-    Suspend(Reply<()>),
-    /// Take messages again.
-    Resume(Reply<()>),
-    /// Turn the statistics on or off.
-    SetStatistics(bool, Reply<()>),
-    /// Read the statistics.
-    Statistics(Reply<Option<crate::actor::sys::Statistics>>),
-    /// Turn the log on with this capacity, or off.
-    SetLog(Option<usize>, Reply<()>),
-    /// Read the log.
-    Log(Reply<Option<Vec<crate::actor::sys::DebugEntry>>>),
-    /// Turn the trace on or off.
-    SetTrace(bool, Reply<()>),
-    /// Install a function under an id.
-    Install(
-        String,
-        Box<dyn FnMut(&crate::actor::sys::DebugEntry) -> crate::actor::sys::Install + Send>,
-        Reply<()>,
-    ),
-    /// Remove the function installed under an id.
-    Remove(String, Reply<bool>),
-    /// Run a read or a change of the actor's value on its task.
-    State(Box<dyn crate::actor::sys_state::StateOp>),
-    /// Count a run, for the tests of the request path.
-    #[cfg(test)]
-    Probe(std::sync::Arc<std::sync::atomic::AtomicUsize>, Reply<()>),
-}
-
-impl std::fmt::Debug for SysCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Self::Suspend(_) => "Suspend",
-            Self::Resume(_) => "Resume",
-            Self::SetStatistics(..) => "SetStatistics",
-            Self::Statistics(_) => "Statistics",
-            Self::SetLog(..) => "SetLog",
-            Self::Log(_) => "Log",
-            Self::SetTrace(..) => "SetTrace",
-            Self::Install(..) => "Install",
-            Self::Remove(..) => "Remove",
-            Self::State(_) => "State",
-            #[cfg(test)]
-            Self::Probe(..) => "Probe",
-        };
-        f.debug_tuple("SysCommand").field(&name).finish()
-    }
-}
-
 /// One status request: where its reply goes, and whether the requester is a
 /// runtime task. The kind travels with its own request, so the reply to it
 /// reads that request's kind whatever else is queued.
@@ -1454,32 +1258,4 @@ pub(crate) struct ChildFate {
     pub reason: StopReason,
     /// The incarnation this fate belongs to.
     pub incarnation: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Envelope (user messages only - Stop moved to SystemMessage)
-// ---------------------------------------------------------------------------
-
-/// Internal representation of actual payloads sent to actors.
-#[doc(hidden)]
-#[derive(Debug)]
-pub enum Envelope<M, R> {
-    /// A standard message with an optional responder.
-    Message {
-        /// The message payload.
-        payload: M,
-        /// The channel to send the response to (if any).
-        responder: Option<oneshot::Sender<Result<R, ActorError>>>,
-    },
-    /// A message built from a [`Down`] or a [`GroupChange`], carrying the tag
-    /// that lets the actor that made the monitor drop it while it is still
-    /// queued. It reaches
-    /// `handle` exactly as a [`Message`](Envelope::Message) with no responder
-    /// does.
-    Signal {
-        /// Identifies the monitor the notice belongs to.
-        tag: SignalTag,
-        /// The message the monitor's map function made from the [`Down`].
-        payload: M,
-    },
 }

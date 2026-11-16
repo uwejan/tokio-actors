@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use super::{raise_kill_declared, ActorSystem, KillKey};
+use super::{raise_kill_declared, ActorSystem, KillFrom, KillKey};
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::RaiseResult;
 use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult};
-use crate::types::{RaiseResult, StopReason};
+use crate::types::StopReason;
 
 /// The longest a call may take. It only limits how long a real hang takes to
 /// report.
@@ -76,10 +77,7 @@ async fn cause_raiser_declares_before_it_raises() {
         KillKey::Id(handle.id()),
         &handle.status_rx(),
         &handle.stop_lane(),
-        None,
-        None,
-        || {},
-        Some(signalled()),
+        KillFrom::Caused(signalled()),
     );
     assert_eq!(raised.result, RaiseResult::Recorded);
     let seen = seen

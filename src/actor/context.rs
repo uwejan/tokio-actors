@@ -19,14 +19,17 @@ use tokio_stream::StreamExt;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::actor::alias::{Alias, AliasOptions, AliasShared};
+use crate::actor::envelope::SignalTag;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StatusValue;
+use crate::actor::incarnation::{RaiseResult, StatusTx, StopLane, TurnClock};
+use crate::actor::incarnation::{SubtreeHold, SubtreeLink};
 use crate::actor::link::ExitPush;
 use crate::actor::link::{self as link, LinkTable, TrapCell, TrapMap};
 use crate::actor::monitor::{self, IntoMonitorTarget, MapFn, MonitorShared, MonitorState};
 use crate::actor::panic::{catch_sync, contain_waker_panic, payload_into_string, PanicPayload};
 use crate::actor::pg_monitor::GroupTable;
 use crate::actor::request;
-use crate::actor::subtree::{SubtreeHold, SubtreeLink};
 use crate::actor::supervision::{
     await_cell, await_predecessor, await_subtree, cancelled_before_factory, manual_commit, rules,
     run_attempt, slot_pair_for, Attempt, AttemptTicket, AutoShutdown, CellOutcome, CellWatch,
@@ -40,8 +43,8 @@ use crate::actor::sys_loop::LoopSys;
 use crate::actor::turn::{IdleKind, TurnState};
 use crate::actor::{runtime, Actor};
 use crate::error::{
-    ActorError, LinkError, MonitorError, RequestError, SpawnError, StopError, StreamError,
-    SupervisionError, TimerError,
+    ActorError, LinkError, MonitorError, RequestError, SpawnError, StopError, SupervisionError,
+    TimerError,
 };
 use crate::system::{raise_kill_declared, ActorSystem, KillKey};
 use crate::telemetry::reports;
@@ -52,9 +55,8 @@ use crate::telemetry::{
 use crate::time_probe::{require_caller_timers, require_runtime_timers};
 use crate::types::{
     ActorId, ActorStatus, ChildEvent, ChildInfo, Down, LinkExit, MissPolicy, MonitorId, PeerRef,
-    RaiseResult, RecurringId, RecurringIdGenerator, RequestId, RequestReply, RestartStrategy,
-    RestartType, Shutdown, SignalTag, StatusTx, StatusValue, StopChildOutcome, StopLane,
-    StopReason, StreamEvent, StreamId, TurnClock,
+    RecurringId, RecurringIdGenerator, RequestId, RequestReply, RestartStrategy, RestartType,
+    Shutdown, StopChildOutcome, StopReason, StreamEvent, StreamId,
 };
 
 /// Zero-sized marker that deliberately does not implement `Clone`, so
@@ -513,6 +515,11 @@ impl<A: Actor> ActorContext<A> {
         self.turn_clock.clone()
     }
 
+    /// The incarnation's turn clock, borrowed.
+    pub(crate) fn clock(&self) -> &TurnClock {
+        &self.turn_clock
+    }
+
     /// Sets a label for this actor, shown in a system snapshot.
     pub fn set_label(&self, label: impl Into<String>) {
         crate::telemetry::set_label(
@@ -844,17 +851,6 @@ impl<A: Actor> ActorContext<A> {
         )
     }
 
-    /// Reaps one forwarder task's completion: removes its registration from
-    /// `timers`/`streams` (a fired one-shot or a finished stream leaves zero
-    /// registrations behind) and, if it ended in a panic, records it as
-    /// [`last_forwarder_error`](Self::last_forwarder_error) and returns its
-    /// payload. With the `tracing` feature every payload it records is
-    /// logged once, naming the actor, whoever reaps it (the message loop
-    /// during the run, or the end). A forwarder that panicked both before and
-    /// after it saw the mailbox closed keeps the later panic; the earlier one
-    /// is logged as discarded. A completion whose registration was already
-    /// removed (an explicit `cancel_timer`/`cancel_stream` beat it here) is a
-    /// harmless no-op.
     /// Whether no entry of the forwarder plane can be ready and the plane
     /// holds the task's waker wherever the select's poll would leave one:
     /// every forwarder end counted so far has had its entry taken, and the
@@ -886,6 +882,17 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
+    /// Reaps one forwarder task's completion: removes its registration from
+    /// `timers`/`streams` (a fired one-shot or a finished stream leaves zero
+    /// registrations behind) and, if it ended in a panic, records it as
+    /// [`last_forwarder_error`](Self::last_forwarder_error) and returns its
+    /// payload. With the `tracing` feature every payload it records is
+    /// logged once, naming the actor, whoever reaps it (the message loop
+    /// during the run, or the end). A forwarder that panicked both before and
+    /// after it saw the mailbox closed keeps the later panic; the earlier one
+    /// is logged as discarded. A completion whose registration was already
+    /// removed (an explicit `cancel_timer`/`cancel_stream` beat it here) is a
+    /// harmless no-op.
     pub(crate) fn reap_forwarder(
         &mut self,
         outcome: Result<(tokio::task::Id, ForwarderEnd), JoinError>,
@@ -2660,6 +2667,8 @@ impl<A: Actor> ActorContext<A> {
 
     /// Creates a [`ScheduleBuilder`] for scheduling a message.
     ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
+    ///
     /// Chain `.at(instant)` or `.after(delay)` for one-shot, or `.every(interval)`
     /// for recurring timers, then `.await` to register. Registration happens
     /// entirely inside that final `.await`: a builder that is constructed and
@@ -2709,6 +2718,50 @@ impl<A: Actor> ActorContext<A> {
     ///     }
     /// }
     /// ```
+    ///
+    /// The time left on a timer is the actor's to keep: it records the
+    /// deadline it scheduled and subtracts the current instant.
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use tokio::time::Instant;
+    /// use tokio_actors::{actor::{Actor, ActorExt, context::ActorContext}, ActorResult};
+    ///
+    /// #[derive(Clone)]
+    /// enum Msg { Fire, Remaining }
+    ///
+    /// struct Alarm { deadline: Option<Instant> }
+    ///
+    /// impl Actor for Alarm {
+    ///     type Message = Msg;
+    ///     type Response = Duration;
+    ///
+    ///     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         let after = Duration::from_secs(5);
+    ///         self.deadline = Some(Instant::now() + after);
+    ///         ctx.schedule(Msg::Fire).after(after).await?;
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn handle(&mut self, msg: Msg, _: &mut ActorContext<Self>) -> ActorResult<Duration> {
+    ///         Ok(match (msg, self.deadline) {
+    ///             (Msg::Remaining, Some(deadline)) => {
+    ///                 deadline.saturating_duration_since(Instant::now())
+    ///             }
+    ///             _ => Duration::ZERO,
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alarm = Alarm { deadline: None }.spawn().await?;
+    /// assert_eq!(alarm.send(Msg::Remaining).await?, Duration::from_secs(5));
+    /// tokio::time::advance(Duration::from_secs(2)).await;
+    /// assert_eq!(alarm.send(Msg::Remaining).await?, Duration::from_secs(3));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn schedule(&mut self, message: A::Message) -> ScheduleBuilder<'_, A> {
         let message = require_timers_holding(
             "ActorContext::schedule",
@@ -2723,6 +2776,8 @@ impl<A: Actor> ActorContext<A> {
     /// `factory` on every tick, instead of being cloned from a single
     /// template. Use this when `Message` does not implement `Clone`; when it
     /// does, `.schedule(msg).every(interval)` is the shorter spelling.
+    ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
     ///
     /// Chain `.on_miss(policy)` before `.await` to override the default
     /// [`MissPolicy::Skip`]. As with every schedule builder, nothing is
@@ -2805,26 +2860,28 @@ impl<A: Actor> ActorContext<A> {
         Ok(id)
     }
 
-    /// Cancels a specific timer by its ID.
+    /// Cancels a specific timer by its ID. Kind: a revoke, see
+    /// [`signals`](crate::signals).
     ///
-    /// For a one-shot timer, `Ok` means its message was not put in the
-    /// mailbox and never will be. `Err(TimerError::NotFound)` means the timer
-    /// fired, so its message is in the mailbox or is being put there at that
-    /// instant (a message queued right after the answer may arrive first, and
-    /// an actor that stops first drops it with its other queued messages), or
-    /// that it was already cancelled or never existed. OTP's `cancel_timer`
-    /// likewise returns `false` for an expired timer without saying whether
-    /// its message has arrived.
+    /// For a one-shot timer, `true` means its message was not put in the
+    /// mailbox and never will be. `false` means there was no such timer
+    /// (already cancelled or never made) or the timer fired, so its message
+    /// is in the mailbox or is being put there at that instant and still
+    /// arrives (a message queued right after the answer may arrive first, and
+    /// an actor that stops first drops it with its other queued messages).
+    /// OTP's `cancel_timer` likewise returns `false` for an expired timer
+    /// without saying whether its message has arrived.
     ///
-    /// For a recurring timer, `Ok` means no later tick is sent; a tick
-    /// already sent, or being sent at that instant, arrives.
-    pub fn cancel_timer(&mut self, id: RecurringId) -> Result<(), TimerError> {
+    /// For a recurring timer, `true` means the timer was still held and no
+    /// later tick is sent; a tick already queued, or being put there at that
+    /// instant, arrives. `false` means there was no such timer.
+    pub fn cancel_timer(&mut self, id: RecurringId) -> bool {
         match self.ex_mut().timers.remove(&id) {
             Some(entry) if entry.claim() => {
                 entry.token.cancel();
-                Ok(())
+                true
             }
-            _ => Err(TimerError::NotFound),
+            _ => false,
         }
     }
 
@@ -2851,6 +2908,8 @@ impl<A: Actor> ActorContext<A> {
     // - Streams ------------------------------------------------------------
 
     /// Attaches an external stream to this actor's mailbox.
+    ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
     ///
     /// Like a recurring [`schedule`](Self::schedule), the forwarder task
     /// holds an internal self-reference (see [`self_handle`](Self::self_handle))
@@ -2887,22 +2946,25 @@ impl<A: Actor> ActorContext<A> {
         id
     }
 
-    /// Cancels a specific stream by its ID.
+    /// Cancels a specific stream by its ID. Kind: a revoke, see
+    /// [`signals`](crate::signals).
     ///
-    /// Once the call returns, nothing more from the stream is put in the
-    /// mailbox, except an item that a worker was already putting there at
-    /// that instant (multi-thread runtimes); items already in the mailbox are
-    /// handled as usual. An item that waits for room in a full mailbox is
-    /// dropped by the stream's forwarder in its next poll instead of being
-    /// delivered, and so is a `Finished` that waits; neither is dropped inside
-    /// the call.
-    pub fn cancel_stream(&mut self, id: StreamId) -> Result<(), StreamError> {
+    /// `true` means the stream was still held (a stream that finished is held
+    /// until the loop takes its end). Once the call returns, nothing more from
+    /// the stream is put in the mailbox, except an item that a worker was
+    /// already putting there at that instant (multi-thread runtimes); items
+    /// already in the mailbox are handled as usual. An item that waits for
+    /// room in a full mailbox is dropped by the stream's forwarder in its next
+    /// poll instead of being delivered, and so is a `Finished` that waits;
+    /// neither is dropped inside the call. `false` means there was no such
+    /// stream.
+    pub fn cancel_stream(&mut self, id: StreamId) -> bool {
         match self.ex_mut().streams.remove(&id) {
             Some(entry) => {
                 entry.token.cancel();
-                Ok(())
+                true
             }
-            None => Err(StreamError::NotFound),
+            None => false,
         }
     }
 
@@ -2927,6 +2989,8 @@ impl<A: Actor> ActorContext<A> {
     /// Subscribes this actor to the telemetry events of its system that
     /// `filter` selects, each handed to `map` as a [`Delivery`] and turned
     /// into a message of this actor's own type.
+    ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
     ///
     /// The events reach `map` through a queue the crate keeps for this
     /// subscription, so the code that raises an event never waits for this
@@ -2995,6 +3059,8 @@ impl<A: Actor> ActorContext<A> {
     /// in the mailbox for it, except a message that a worker was already
     /// putting there at that instant (multi-thread runtimes). Returns `false`
     /// for an id this actor does not hold.
+    ///
+    /// Kind: a revoke, answers `bool`. See [`signals`](crate::signals).
     pub fn unsubscribe(&mut self, id: SubscriptionId) -> bool {
         let Some(token) = self.ex_mut().subscriptions.remove(&id) else {
             return false;
@@ -3017,6 +3083,8 @@ impl<A: Actor> ActorContext<A> {
     /// message. The target is a handle, an [`ActorId`] or a name (see
     /// [`IntoMonitorTarget`]); an id or a name is resolved once, when the call is made, in this
     /// actor's system.
+    ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `MonitorError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
     ///
     /// The notice is sent once. It names the run of the target the monitor
     /// was bound to ([`Down::incarnation`]), so a supervised restart of the
@@ -3122,6 +3190,8 @@ impl<A: Actor> ActorContext<A> {
     /// actor without a priority lane takes it through the mailbox, as
     /// `monitor` does.
     ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `MonitorError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
+    ///
     /// Erlang/OTP: `erlang:monitor(process, Target, [priority])` (OTP 28).
     ///
     /// # Examples
@@ -3198,6 +3268,8 @@ impl<A: Actor> ActorContext<A> {
     /// any other: through `handle` when its turn comes, or, if the actor stops
     /// first, once at the stop with the notices the actor is owed.
     ///
+    /// Kind: a revoke, answers `bool`. See [`signals`](crate::signals).
+    ///
     /// Erlang/OTP: `erlang:demonitor(Ref, [info])`, which returns `false` when
     /// a `DOWN` has probably been placed in the queue already. The plain
     /// `demonitor/1` never returns `false`, and demonitoring a reference of
@@ -3258,8 +3330,8 @@ impl<A: Actor> ActorContext<A> {
 
     /// As [`demonitor`](Self::demonitor), and a notice that is queued but not
     /// yet handled is dropped, so it never reaches `handle`. `true` means the
-    /// revoke was in time and no notice existed; `false` means one had been
-    /// queued and this call dropped it.
+    /// revoke was in time and no notice existed; `false` means there was no
+    /// such monitor, or one had been queued and this call dropped it.
     ///
     /// Erlang/OTP: `erlang:demonitor(Ref, [flush, info])`, which removes a
     /// `DOWN` message from the queue and returns `false` when it had to.
@@ -3408,16 +3480,17 @@ impl<A: Actor> ActorContext<A> {
         self.spawn_forwarder(ForwarderKind::Group(id), fut, PanicSlot::default());
     }
 
-    /// The monitor of a spawn this actor has just made: as
+    /// The monitor of a run known to have started (a spawn this actor has
+    /// just made, or a top supervisor an application's start returned): as
     /// `monitor`, except that a run which has already ended
     /// gives its own reason, where `monitor` gives `NoProc`.
-    pub(crate) fn monitor_spawned<B, F>(
+    pub(crate) fn monitor_spawned<T, F>(
         &mut self,
-        target: &ActorHandle<B>,
+        target: T,
         map: F,
     ) -> Result<MonitorId, MonitorError>
     where
-        B: Actor,
+        T: IntoMonitorTarget,
         F: Fn(Down) -> A::Message + Send + Sync + 'static,
     {
         self.register_monitor(target, map, false, true)
@@ -3472,6 +3545,8 @@ impl<A: Actor> ActorContext<A> {
 
 impl<A: Actor> ActorContext<A> {
     /// Links this actor to another: when either ends, the other is told.
+    ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `LinkError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
     ///
     /// The target is an [`ActorHandle`], an [`ActorId`] or a name, as for
     /// [`monitor`](Self::monitor). When the actor it names ends, this actor
@@ -3574,6 +3649,8 @@ impl<A: Actor> ActorContext<A> {
     /// this actor's own: the other end's lane is its own choice, and a
     /// repeated call to `link` or `link_priority` sets this end's lane.
     ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `LinkError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
+    ///
     /// # Errors
     /// [`LinkError::Stopping`] once this actor is stopping.
     ///
@@ -3636,6 +3713,8 @@ impl<A: Actor> ActorContext<A> {
     /// actor ends, as Erlang/OTP guarantees for `unlink/1`. False means no
     /// such link is held, or the exit was already acted on (it may be queued
     /// in this actor's mailbox, and it is still delivered).
+    ///
+    /// Kind: a revoke, answers `bool`. See [`signals`](crate::signals).
     ///
     /// The other actor is told, and drops its end of the link.
     ///
@@ -3867,6 +3946,8 @@ impl<A: Actor> ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     /// Sends `target` an exit signal carrying `reason`, from this actor.
     ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
+    ///
     /// An actor that does not trap exit signals ends at once with `reason`
     /// as its reason, runs no `on_stopped`, and a request it was handling
     /// reads `ResponseDropped` carrying `reason`. A `reason` of
@@ -4039,10 +4120,10 @@ impl<A: Actor> ActorContext<A> {
             key,
             &status_rx,
             &lane,
-            None,
-            None,
-            || {},
-            cause,
+            cause.map_or(
+                crate::system::KillFrom::Plain,
+                crate::system::KillFrom::Caused,
+            ),
         );
         drop(gate);
         Ok(())
@@ -4339,6 +4420,8 @@ impl<A: Actor> ActorContext<A> {
     /// Makes an alias of this actor: a name others can send to, which this
     /// actor can end with [`unalias`](Self::unalias).
     ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
+    ///
     /// The alias accepts messages until `unalias` returns `true` for it, it
     /// is a reply alias ([`AliasOptions::reply`]) that has taken its one
     /// message, or this actor ends. It never keeps the actor alive. With
@@ -4391,6 +4474,8 @@ impl<A: Actor> ActorContext<A> {
     }
 
     /// Ends `alias`. Returns `true` when it was active and this actor made it.
+    ///
+    /// Kind: a revoke, answers `bool`. See [`signals`](crate::signals).
     ///
     /// When this returns `true` no message of the alias enters the mailbox
     /// afterwards; a message that entered before it stays queued and is
@@ -4453,6 +4538,8 @@ impl<A: Actor> ActorContext<A> {
     /// Sends `target`'s actor an exit signal carrying `reason`, as
     /// [`exit`](Self::exit) does, and asks that a trapping receiver gets it
     /// ahead of its ordinary messages.
+    ///
+    /// Kind: a send; a stopping actor may still make it. See [`signals`](crate::signals).
     ///
     /// The signal rides the receiver's priority lane only when all of this
     /// holds: `target` is active and was made with
@@ -4535,6 +4622,8 @@ impl<A: Actor> ActorContext<A> {
     /// crate, and the callee's response, or the reason there is none, arrives
     /// through `map` as a [`RequestReply`] that names the returned
     /// [`RequestId`].
+    ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `RequestError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
     ///
     /// The reply enters this actor's mailbox through an ordinary slot, after
     /// every message the callee sent this actor before it answered, so a full
@@ -4643,6 +4732,8 @@ impl<A: Actor> ActorContext<A> {
     /// not cancelled, and an answer that comes late is discarded, so the
     /// request gets exactly one reply.
     ///
+    /// Kind: a registration of a notice or an answer the actor then waits for; refused with `RequestError::Stopping` while the actor is stopping or stopped. See [`signals`](crate::signals).
+    ///
     /// Erlang/OTP: `gen_server:send_request/2` with the timeout of
     /// `receive_response/2`.
     ///
@@ -4729,6 +4820,8 @@ impl<A: Actor> ActorContext<A> {
     /// when its turn comes instead of reaching `handle`. An id this actor did
     /// not make, one that is unknown, and one whose reply was already handed
     /// to `handle` all return `false`.
+    ///
+    /// Kind: a revoke, answers `bool`. See [`signals`](crate::signals).
     ///
     /// The callee is not told: a request that is already in its mailbox is
     /// still handled, and its answer is discarded. A request still waiting
@@ -5091,8 +5184,9 @@ where
     /// a placed child would lose its kill grace without a sign. The refusals
     /// of [`spawn_child`](ActorContext::spawn_child)
     /// ([`SpawnError::NotASupervisor`], [`SpawnError::SupervisorStopping`]
-    /// and [`SpawnError::DuplicateChild`]) are answered first, so a spawn
-    /// refused for one of those three reasons never panics; any other
+    /// and [`SpawnError::DuplicateChild`]) and
+    /// [`SpawnError::InvalidSupervision`] are answered first, so a spawn
+    /// refused for one of those four reasons never panics; any other
     /// refusal, such as a zero child mailbox capacity or a name already taken
     /// in the system, is answered after the check and panics first on a
     /// runtime without the driver. The check asks the runtime whether it
@@ -5598,6 +5692,8 @@ impl<'ctx, A: Actor> ScheduleBuilder<'ctx, A> {
     }
 
     /// Schedule a recurring timer at `interval`. Default `MissPolicy::Skip`.
+    ///
+    /// Kind: a registration of a source of the actor's own; accepted while the actor is stopping, and it then produces nothing. See [`signals`](crate::signals).
     ///
     /// Chain `.on_miss(policy)` before `.await` to override. Requires
     /// `Message: Clone` (the template is cloned for every tick) - use
@@ -6129,7 +6225,7 @@ struct RunPanic {
     /// The incarnation's record, for the identity fields of the log line;
     /// held only in a build that writes the line.
     #[cfg(feature = "tracing")]
-    record: crate::actor::subtree::AbortRecord,
+    record: crate::actor::incarnation::IncarnationRef,
 }
 
 impl RunPanic {
@@ -6720,8 +6816,8 @@ mod skip_policy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::incarnation::StopLane;
     use crate::actor::supervision::{SupervisionConfig, SupervisionState};
-    use crate::types::StopLane;
 
     #[derive(Default)]
     struct Dummy;
@@ -6744,7 +6840,7 @@ mod tests {
     }
 
     /// A context and the receiving end of its stop lane.
-    fn dummy_ctx_with_lane() -> (ActorContext<Dummy>, crate::types::LaneRx) {
+    fn dummy_ctx_with_lane() -> (ActorContext<Dummy>, crate::actor::incarnation::LaneRx) {
         let (tx, _rx) = crate::actor::mailbox::test_channel(1);
         let (status_tx, status_rx) = StatusTx::channel(StatusValue::new(ActorStatus::Running));
         let (stop_lane, stop_rx) = StopLane::new();
@@ -6844,7 +6940,7 @@ mod tests {
 
     struct Timed {
         fired: Arc<std::sync::atomic::AtomicUsize>,
-        answers: Arc<std::sync::Mutex<Vec<Result<(), TimerError>>>>,
+        answers: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl Actor for Timed {
@@ -6894,7 +6990,7 @@ mod tests {
     /// Runs `msg` on a fresh [`Timed`] actor whose mailbox holds one
     /// message, then a `Ping` behind everything the turn queued; returns
     /// the cancel's answer and how many times the timer's message arrived.
-    async fn cancel_in_a_turn(msg: TimedMsg) -> (Vec<Result<(), TimerError>>, usize) {
+    async fn cancel_in_a_turn(msg: TimedMsg) -> (Vec<bool>, usize) {
         use crate::actor::ActorExt;
         let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let answers = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6922,21 +7018,18 @@ mod tests {
 
     /// A one-shot timer whose forwarder put its message in the mailbox is
     /// not cancelled, even before the loop reaps the forwarder: the cancel
-    /// reads `NotFound`, and the message arrives once.
+    /// reads `false`, and the message arrives once.
     async fn a_cancel_after_the_firing_reads_not_found() {
         let (answers, fired) = cancel_in_a_turn(TimedMsg::CancelAfterTheFiring).await;
-        assert!(
-            matches!(answers.as_slice(), [Err(TimerError::NotFound)]),
-            "{answers:?}"
-        );
+        assert!(answers.as_slice() == [false], "{answers:?}");
         assert_eq!(fired, 1, "the message arrives once");
     }
 
     /// A one-shot timer whose send waits on a full mailbox is cancelled: the
-    /// cancel reads `Ok`, and the message never arrives.
+    /// cancel reads `true`, and the message never arrives.
     async fn a_cancel_while_the_send_waits_reads_ok() {
         let (answers, fired) = cancel_in_a_turn(TimedMsg::CancelWhileTheSendWaits).await;
-        assert!(matches!(answers.as_slice(), [Ok(())]), "{answers:?}");
+        assert_eq!(answers, [true]);
         assert_eq!(fired, 0, "the message never arrives");
     }
 

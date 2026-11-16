@@ -549,10 +549,11 @@ fn a_death_collected_for_the_final_delivery_is_no_longer_owed() {
 /// from the child's end otherwise.
 #[test]
 fn a_child_found_ended_at_its_claim_is_owed_from_the_claim() {
-    use crate::actor::subtree::AbortRecord;
-    use crate::types::{StatusValue, StopReason};
+    use crate::actor::incarnation::IncarnationRef;
+    use crate::actor::incarnation::StatusValue;
+    use crate::types::StopReason;
 
-    type Mark = fn(&AbortRecord, &crate::types::StatusTx);
+    type Mark = fn(&IncarnationRef, &crate::actor::incarnation::StatusTx);
     let rows: [(&str, Mark, u32); 4] = [
         ("no sign of an end", |_, _| {}, 0),
         (
@@ -598,7 +599,7 @@ fn a_child_found_ended_at_its_claim_is_owed_from_the_claim() {
         .expect("the supervisor has an identity");
         for (index, (row, mark, owed)) in rows.iter().enumerate() {
             let incarnation = 9_000 + index as u64;
-            let child = AbortRecord::new();
+            let child = IncarnationRef::new();
             let (tx, _rx) = child.status_channel();
             mark(&child, &tx);
             let before = identity.owed_deaths_for_test();

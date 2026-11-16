@@ -19,12 +19,13 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::StatusRx;
 use crate::actor::runtime::{spawn_actor, spawn_actor_parts, ActorConfig};
 use crate::actor::supervision::DEFAULT_KILL_GRACE;
 use crate::actor::Actor;
 use crate::error::ActorResult;
 use crate::system::ActorSystem;
-use crate::types::{ActorId, StatusRx, StopReason};
+use crate::types::{ActorId, StopReason};
 
 /// The longest a wait may take. It only limits how long a real hang takes to
 /// report.

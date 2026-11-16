@@ -154,7 +154,7 @@ pub(crate) use sinks::test_sink::TestSinkGuard;
 #[cfg(test)]
 pub(crate) fn identity_of(
     system: &crate::system::ActorSystem,
-    record: &crate::actor::subtree::AbortRecord,
+    record: &crate::actor::incarnation::IncarnationRef,
 ) -> Option<std::sync::Arc<Identity>> {
     system.telemetry_mode().find(record.key())
 }

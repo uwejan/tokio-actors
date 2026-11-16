@@ -971,6 +971,20 @@ impl Cfg {
         self.pool_of(x) || self.kid_of(x, c).restart == Restart::Temporary
     }
 
+    /// As `prunable_of`, decided by the production rule: the accessor the
+    /// model's steps read.
+    fn step_prunable_of(&self, x: SupId, c: Key) -> bool {
+        rules::spec_prunable(
+            img_strategy(self.strategy_of(x)),
+            img_restart(self.kid_of(x, c).restart),
+        )
+    }
+
+    /// As `first_signal_of`, decided by the production rule.
+    fn step_first_signal_of(&self, x: SupId, c: Key) -> Reason {
+        img_signal(rules::first_signal(img_shutdown(self.kid_of(x, c))))
+    }
+
     fn first_signal_of(&self, x: SupId, c: Key) -> Reason {
         match self.kid_of(x, c).policy {
             Policy::Kill => Reason::Kill,
@@ -979,14 +993,64 @@ impl Cfg {
     }
 }
 
+/// The model's restart decision is the production rule over the model's
+/// values.
 fn restart_eligible(restart: Restart, r: Reason) -> bool {
-    match restart {
-        Restart::Permanent => true,
-        Restart::Transient => !matches!(
-            r,
-            Reason::Graceful | Reason::ParentRequest | Reason::Shutdown | Reason::ParentKilled
-        ),
-        Restart::Temporary => false,
+    rules::restart_decision(img_restart(restart), &img_reason(r)) == RestartDecision::Restart
+}
+
+/// One instant for every call of a production rule from the model's steps:
+/// the model has no clock, so every charge and every deadline it hands a rule
+/// is this instant.
+fn model_instant() -> StdInstant {
+    static EPOCH: std::sync::OnceLock<StdInstant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(StdInstant::now)
+}
+
+fn img_strategy(strategy: Strategy) -> RestartStrategy {
+    match strategy {
+        Strategy::OneForOne => RestartStrategy::OneForOne,
+        Strategy::OneForAll => RestartStrategy::OneForAll,
+        Strategy::RestForOne => RestartStrategy::RestForOne,
+        Strategy::Pool => RestartStrategy::SimpleOneForOne,
+    }
+}
+
+fn img_shutdown(kid: &ChildCfg) -> Shutdown {
+    match kid.policy {
+        Policy::Kill => Shutdown::Kill,
+        Policy::Timeout => Shutdown::Timeout(Clock::duration(kid.window_ns)),
+        Policy::Infinity => Shutdown::Infinity,
+    }
+}
+
+fn img_signal(signal: Signal) -> Reason {
+    match signal {
+        Signal::ParentRequest => Reason::ParentRequest,
+        Signal::Kill => Reason::Kill,
+    }
+}
+
+fn ladder_to_prod(ladder: Ladder) -> LadderStep {
+    let at = model_instant();
+    match ladder {
+        Ladder::Off => LadderStep::Idle,
+        Ladder::Window => LadderStep::Graceful { deadline: Some(at) },
+        Ladder::WindowInf => LadderStep::Graceful { deadline: None },
+        Ladder::KillGrace => LadderStep::KillGrace { deadline: at },
+        Ladder::AbortGrace => LadderStep::AbortGrace { deadline: at },
+        Ladder::Spent => LadderStep::Spent,
+    }
+}
+
+fn ladder_from_prod(step: LadderStep) -> Ladder {
+    match step {
+        LadderStep::Idle => Ladder::Off,
+        LadderStep::Graceful { deadline: Some(_) } => Ladder::Window,
+        LadderStep::Graceful { deadline: None } => Ladder::WindowInf,
+        LadderStep::KillGrace { .. } => Ladder::KillGrace,
+        LadderStep::AbortGrace { .. } => Ladder::AbortGrace,
+        LadderStep::Spent => Ladder::Spent,
     }
 }
 
@@ -1654,21 +1718,27 @@ impl<'a> Ap<'a> {
         }
         let raised = self.s.cell(t).order.is_some_and(|o| o.raised);
         if !raised {
-            let first = self.cfg.first_signal_of(owner, key);
+            let first = self.cfg.step_first_signal_of(owner, key);
             self.raise(t, first);
             if let Some(o) = self.s.cells.get_mut(&t).and_then(|c| c.order.as_mut()) {
                 o.raised = true;
             }
         }
-        let policy = self.cfg.kid_of(owner, key).policy;
+        let kid = self.cfg.kid_of(owner, key);
+        let (shutdown, grace) = (img_shutdown(kid), Clock::duration(kid.kg()));
+        let at = model_instant();
         let cell = self.s.cells.get_mut(&t).expect("model invariant: cell");
-        if cell.ladder == Ladder::Off {
-            cell.ladder = match policy {
-                Policy::Kill => Ladder::KillGrace,
-                Policy::Timeout => Ladder::Window,
-                Policy::Infinity => Ladder::WindowInf,
-            };
-        }
+        let (next, _) = rules::ladder_step(
+            ladder_to_prod(cell.ladder),
+            LadderEvent::Order {
+                policy: shutdown,
+                issued_at: at,
+                initial_raised: true,
+            },
+            at,
+            grace,
+        );
+        cell.ladder = ladder_from_prod(next);
     }
 
     /// Write a stop order into the cell of `t`; the first order wins and keeps
@@ -1707,6 +1777,8 @@ impl<'a> Ap<'a> {
         let kid = self.cfg_of(t);
         let (supervisor, policy) = (kid.is_supervisor, kid.policy);
         let (window_ns, kill_grace_ns) = (kid.window_ns, kid.kg());
+        let shutdown = img_shutdown(kid);
+        let grace = Clock::duration(kill_grace_ns);
         if supervisor
             && self.s.cell(t).sup == SupId::S
             && self
@@ -1717,7 +1789,7 @@ impl<'a> Ap<'a> {
             self.hit(Wit::ShutdownKillReachesSupervisorChild);
         }
         let kill_stored = self.s.inc(t).lane == Some(Reason::Kill);
-        let raised = if supervisor && kill_stored {
+        if supervisor && kill_stored {
             // A `Kill` the lane already holds keeps the abort it is owed,
             // whatever the child's policy.
             self.hit(match (self.s.reaper.contains_key(&t), policy) {
@@ -1726,21 +1798,33 @@ impl<'a> Ap<'a> {
                 (false, Policy::Infinity) => Wit::GuardKeepsLadderKillAbortUnderInfinity,
                 (false, _) => Wit::GuardKeepsLadderKillAbortUnderBoundedPolicy,
             });
-            self.raise(t, Reason::ParentKilled);
-            self.s.reaper.entry(t).or_insert(Reap::AbortDue);
-            Reason::Kill
-        } else if supervisor {
-            // An orderly inherited stop, bounded by the child's own window:
-            // its Kill stage is due at the window, zero under `Kill`.
-            self.raise(t, Reason::ParentKilled);
-            if policy != Policy::Infinity {
-                self.s.reaper.insert(t, Reap::KillThenAbort);
+        }
+        // The guard's plan is the production rule's: an orderly stop of a
+        // supervisor child raises `ParentKilled`, any other raises `Kill`, and
+        // the rest of the plan decides what the reaper owes.
+        let first = rules::guard_first(
+            rules::inherited_stop(supervisor, shutdown, grace),
+            false,
+            shutdown,
+        );
+        self.raise(
+            t,
+            if first.parent_killed {
+                Reason::ParentKilled
+            } else {
+                Reason::Kill
+            },
+        );
+        let raised = match rules::guard_rest(first, kill_stored, model_instant()) {
+            GuardRest::Kill { .. } => {
+                self.s.reaper.entry(t).or_insert(Reap::AbortDue);
+                Reason::Kill
             }
-            Reason::ParentKilled
-        } else {
-            self.raise(t, Reason::Kill);
-            self.s.reaper.entry(t).or_insert(Reap::AbortDue);
-            Reason::Kill
+            GuardRest::Staged { .. } => {
+                self.s.reaper.insert(t, Reap::KillThenAbort);
+                Reason::ParentKilled
+            }
+            GuardRest::Unforced => Reason::ParentKilled,
         };
         self.obs.push(Obs::Guard {
             is_supervisor: supervisor,
@@ -1756,6 +1840,19 @@ impl<'a> Ap<'a> {
             .get_mut(&t)
             .expect("model invariant: cell")
             .exec = exec;
+    }
+
+    /// The production ladder's answer to the deadline of the ladder
+    /// position of `t`: the position it moves to and the action it owes.
+    fn ladder_deadline(&self, t: Tok) -> (Ladder, LadderAction) {
+        let grace = Clock::duration(self.cfg_of(t).kg());
+        let (next, action) = rules::ladder_step(
+            ladder_to_prod(self.s.cell(t).ladder),
+            LadderEvent::DeadlineReached,
+            model_instant(),
+            grace,
+        );
+        (ladder_from_prod(next), action)
     }
 
     /// Cancel a task at its next await: it ends as `Kill`, unless it never
@@ -2094,12 +2191,16 @@ impl<'a> Ap<'a> {
         if self.s.x_torn_down(x) || self.s.x_final(x) {
             self.fail(NO_RESTART_STRATEGY_OR_DELIVERY_DURING_TEARDOWN);
         }
-        if self.s.sup_ref(x).charges < self.cfg.budget_of(x) {
-            self.s.sup_mut(x).charges += 1;
-            true
-        } else {
-            false
+        let at = model_instant();
+        let mut budget =
+            BudgetState::new(u32::from(self.cfg.budget_of(x)), Duration::from_secs(3600));
+        budget.charges = (0..self.s.sup_ref(x).charges).map(|_| at).collect();
+        let charge = rules::budget_check(&mut budget, at);
+        if charge.accepted {
+            self.s.sup_mut(x).charges =
+                u8::try_from(charge.used).expect("model invariant: a charge count fits a byte");
         }
+        charge.accepted
     }
 
     /// The supervisor's `on_child_stopped` runs with `(c, r, a)`.
@@ -2189,7 +2290,7 @@ impl Ap<'_> {
             remove,
             initiate,
         };
-        let pool = self.cfg.is_pool();
+        let pool = rules::is_pool(img_strategy(self.cfg.strategy));
         if kind == Kind::Bounce && matches!(r, Reason::Failure(_)) {
             // A crash racing a bounce is still a crash.
             self.obs.push(observed(
@@ -2205,7 +2306,7 @@ impl Ap<'_> {
             return;
         }
         let action;
-        let prunable = self.cfg.prunable(c);
+        let prunable = self.cfg.step_prunable_of(SupId::S, c);
         if in_restart_set {
             // A stop committed before the group's evaluation rejoins it.
             self.down(SupId::S, c, n, Pend::Snapshot);
@@ -2267,7 +2368,7 @@ impl Ap<'_> {
     /// The end of a child that is not restarted: prune a prunable spec, keep
     /// any other as a down child with a pending snapshot.
     fn finish_without_restart(&mut self, c: Key, n: Tok) {
-        if self.cfg.prunable(c) {
+        if self.cfg.step_prunable_of(SupId::S, c) {
             self.remove_spec(SupId::S, c);
         } else {
             self.down(SupId::S, c, n, Pend::Snapshot);
@@ -2278,7 +2379,7 @@ impl Ap<'_> {
     fn evaluate(&mut self, x: SupId, c: Key, t: Tok, r: Reason) {
         let restart = self.cfg.kid_of(x, c).restart;
         if !restart_eligible(restart, r) {
-            if self.cfg.prunable_of(x, c) {
+            if self.cfg.step_prunable_of(x, c) {
                 self.remove_spec(x, c);
             }
             self.deliver(x, c, t, r, Action::Removed, Delivery::Decision);
@@ -2294,9 +2395,9 @@ impl Ap<'_> {
             self.final_drain(x, Reason::ParentRequest);
             return;
         }
-        match self.cfg.strategy_of(x) {
-            Strategy::OneForOne | Strategy::Pool => self.initiate(x, c, Origin::Strategy),
-            Strategy::OneForAll | Strategy::RestForOne => self.begin_group(c),
+        match rules::strategy_scope(img_strategy(self.cfg.strategy_of(x))) {
+            StrategyScope::One => self.initiate(x, c, Origin::Strategy),
+            StrategyScope::Group => self.begin_group(c),
         }
         self.deliver(x, c, t, r, Action::RestartInitiated, Delivery::Decision);
     }
@@ -2308,18 +2409,23 @@ impl Ap<'_> {
     fn group_members(&self, kind: &GKind, c0: Key) -> BTreeMap<Key, Option<Tok>> {
         let order = &self.s.sup.order;
         let pos = order.iter().position(|k| *k == c0).unwrap_or(0);
-        let keys: &[Key] = match kind {
-            GKind::All => order,
-            GKind::Rest => &order[pos..],
+        let strategy = match kind {
+            GKind::All => RestartStrategy::OneForAll,
+            GKind::Rest => RestartStrategy::RestForOne,
         };
-        keys.iter().map(|k| (*k, self.s.occ(*k))).collect()
+        order
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| rules::group_covers(strategy, *i < pos))
+            .map(|(_, k)| (*k, self.s.occ(*k)))
+            .collect()
     }
 
     fn begin_group(&mut self, c0: Key) {
-        let kind = if self.cfg.strategy == Strategy::OneForAll {
-            GKind::All
-        } else {
+        let kind = if rules::leaves_earlier_outside(img_strategy(self.cfg.strategy)) {
             GKind::Rest
+        } else {
+            GKind::All
         };
         let members = self.group_members(&kind, c0);
         let outside: BTreeSet<Key> = match kind {
@@ -3306,7 +3412,8 @@ impl Ap<'_> {
     /// conformance check.
     fn member_end_prunes(&mut self, x: SupId, c: Key) -> bool {
         let restart = self.cfg.kid_of(x, c).restart;
-        let prune = restart == Restart::Temporary;
+        let prune =
+            rules::group_member_end(img_restart(restart)) == rules::MemberEnd::PruneAndRemove;
         self.obs.push(Obs::MemberEnd { restart, prune });
         prune
     }
@@ -3493,7 +3600,7 @@ impl Ap<'_> {
                 .as_ref()
                 .is_some_and(|g| g.overrides.contains(&c));
             if overridden {
-                if self.cfg.prunable_of(x, c) {
+                if self.cfg.step_prunable_of(x, c) {
                     self.remove_spec(x, c);
                 }
                 self.deliver(x, c, t, r, Action::Removed, Delivery::Decision);
@@ -4311,7 +4418,7 @@ impl Ap<'_> {
                     .map(|e| e.2)
             })
             .expect("model invariant: an owed evaluation has its report in a plane");
-        if self.cfg.prunable(c) {
+        if self.cfg.step_prunable_of(SupId::S, c) {
             self.remove_spec(SupId::S, c);
         } else {
             self.down(SupId::S, c, n, Pend::Snapshot);
@@ -4953,15 +5060,21 @@ impl State {
             match cell.exec {
                 Exec::Attempt(AttemptStage::Wait) => {
                     let w = cell.waits_on.expect("model invariant: a waiting attempt");
-                    if cell.order.is_some() {
-                        v.push(Step::AttemptCancels(t));
-                    } else {
-                        if self.gone(w) {
-                            v.push(Step::SuccessorProceeds(t));
-                        }
-                        if self.expirable(cfg, w) {
-                            v.push(Step::SuccessorWaitExpires(t));
-                        }
+                    // The wait's decision is the production rule's, asked once
+                    // with the bound not yet reached (the order cancels, the
+                    // subtree's end lets the waiter go on) and once with the
+                    // subtree still alive and the bound reached.
+                    let order = cell.order.is_some();
+                    match rules::successor_wait_step(self.gone(w), order, false) {
+                        rules::WaitAction::Cancel => v.push(Step::AttemptCancels(t)),
+                        rules::WaitAction::Proceed => v.push(Step::SuccessorProceeds(t)),
+                        rules::WaitAction::Escalate | rules::WaitAction::Keep => {}
+                    }
+                    if self.expirable(cfg, w)
+                        && rules::successor_wait_step(false, order, true)
+                            == rules::WaitAction::Escalate
+                    {
+                        v.push(Step::SuccessorWaitExpires(t));
                     }
                     if self.left.runner_fail > 0 {
                         v.push(Step::RunnerFails(t));
@@ -5636,28 +5749,35 @@ impl Ap<'_> {
                         .expect("model invariant: cell")
                         .st_fired = true;
                 }
+                let grace = Clock::duration(self.cfg_of(m).kg());
                 self.s
                     .cells
                     .get_mut(&m)
                     .expect("model invariant: cell")
-                    .ladder = Ladder::KillGrace;
+                    .ladder = ladder_from_prod(rules::kill_grace_from(model_instant(), grace));
             }
             Step::WindowEnds(t) => {
-                self.raise(t, Reason::Kill);
+                let (next, action) = self.ladder_deadline(t);
+                if let LadderAction::Raise(signal) = action {
+                    self.raise(t, img_signal(signal));
+                }
                 self.s
                     .cells
                     .get_mut(&t)
                     .expect("model invariant: cell")
-                    .ladder = Ladder::KillGrace;
+                    .ladder = next;
             }
             Step::GraceEnds(t) => {
-                self.abort(t);
+                let (next, action) = self.ladder_deadline(t);
+                if action == LadderAction::Abort {
+                    self.abort(t);
+                }
                 if self.s.live(t) {
                     self.s
                         .cells
                         .get_mut(&t)
                         .expect("model invariant: cell")
-                        .ladder = Ladder::AbortGrace;
+                        .ladder = next;
                 }
             }
             Step::AbortGraceEnds(t) => {
@@ -5676,9 +5796,10 @@ impl Ap<'_> {
                 {
                     self.hit(Wit::InitOutlivesStartTimeoutAndLadder);
                 }
+                let (next, _) = self.ladder_deadline(t);
                 let c = self.s.cells.get_mut(&t).expect("model invariant: cell");
                 c.verdict = true;
-                c.ladder = Ladder::Spent;
+                c.ladder = next;
             }
             Step::ReaperFires(t) => {
                 self.abort(t);
@@ -9315,6 +9436,7 @@ fn check_manual(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<
 
 use std::time::{Duration, Instant as StdInstant};
 
+use super::model::{BudgetState, GuardRest, RestartDecision, StrategyScope};
 use super::rules::{
     self, Absorption, AttemptAction, AttemptEvent, AttemptLadder, AttemptReport,
     AttemptStage as RAttemptStage, AttemptView, Commit, CommitEffect, GroupMember, GroupMembership,
@@ -9325,9 +9447,10 @@ use super::{
     AutoShutdown, ChildLifecycle, ChildSpec, ChildState, DownPending, GroupPhase, GroupRestart,
     GroupScope, ManualStop, Origin as ProdOrigin, SupervisionConfig, SupervisionState,
 };
+use crate::actor::incarnation::stop_lane::LaneState;
+use crate::actor::incarnation::{RaiseResult, StopLane};
 use crate::types::{
-    ActorId, ChildEvent, LaneState, RaiseResult, RestartStrategy, RestartType, Shutdown, StopLane,
-    StopReason, SupervisionAction,
+    ActorId, ChildEvent, RestartStrategy, RestartType, Shutdown, StopReason, SupervisionAction,
 };
 use std::collections::{HashMap, VecDeque as ProdQueue};
 
@@ -11709,7 +11832,7 @@ fn prod_lane(
         sealed: mode == LaneMode::Sealed,
         kill_cause: None,
     };
-    rules::lane_accept(&state, &img_reason(new), receiver_gone)
+    crate::actor::incarnation::stop_lane::lane_accept(&state, &img_reason(new), receiver_gone)
 }
 
 /// The model's decision on a request: refused when the target ended, the lane
@@ -12249,8 +12372,8 @@ fn site_answer(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<&
 /// planes its cell publishes, so the cell reads open.
 struct KeptSlot {
     _io: super::SlotIo,
-    _lane_rx: crate::types::LaneRx,
-    _status_tx: Option<crate::types::StatusTx>,
+    _lane_rx: crate::actor::incarnation::LaneRx,
+    _status_tx: Option<crate::actor::incarnation::StatusTx>,
 }
 
 fn img_status(status: Status) -> crate::types::ActorStatus {
@@ -12298,12 +12421,12 @@ fn img_supervision(cfg: &Cfg, pre: &State, kept: &mut Vec<KeptSlot>) -> Supervis
             if inc.reasked {
                 ctl.mark_reasked();
             }
-            let (lane, lane_rx) = crate::types::StopLane::new();
+            let (lane, lane_rx) = crate::actor::incarnation::StopLane::new();
             if let Some(reason) = inc.lane {
                 lane.raise(img_reason(reason));
             }
-            let (status_tx, status_rx) = crate::types::StatusTx::channel(
-                crate::types::StatusValue::new(img_status(inc.status)),
+            let (status_tx, status_rx) = crate::actor::incarnation::StatusTx::channel(
+                crate::actor::incarnation::StatusValue::new(img_status(inc.status)),
             );
             io.publish(
                 lane,
@@ -12323,7 +12446,7 @@ fn img_supervision(cfg: &Cfg, pre: &State, kept: &mut Vec<KeptSlot>) -> Supervis
                 _status_tx: status_keep,
             });
         } else {
-            let (_lane, lane_rx) = crate::types::StopLane::new();
+            let (_lane, lane_rx) = crate::actor::incarnation::StopLane::new();
             kept.push(KeptSlot {
                 _io: io,
                 _lane_rx: lane_rx,

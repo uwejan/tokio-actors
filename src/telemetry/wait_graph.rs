@@ -18,7 +18,7 @@ use super::actor_ref::ActorRef;
 use super::event::{EventKind, TelemetryEvent};
 use super::mode::{Mode, CTL_DEADLOCK};
 use super::token;
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::IncarnationRef;
 
 /// The id of one recorded wait edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +211,7 @@ impl Drop for WaitEdge<'_> {
 /// a branch, and the mode word is read only behind it, so a send from a task
 /// that is in no hook pays that load and nothing else, and no call.
 #[inline(always)]
-pub(crate) fn wait_wanted(record: &AbortRecord) -> bool {
+pub(crate) fn wait_wanted(record: &IncarnationRef) -> bool {
     token::peek() != 0
         && record
             .mode()
@@ -229,7 +229,7 @@ pub(crate) fn wait_wanted(record: &AbortRecord) -> bool {
 /// edge closes a cycle, one `WaitCycle` event is queued for the pump; the send
 /// itself is not touched.
 #[inline(never)]
-pub(crate) fn begin_wait(record: &AbortRecord) -> Option<WaitEdge<'_>> {
+pub(crate) fn begin_wait(record: &IncarnationRef) -> Option<WaitEdge<'_>> {
     let mode = record.mode()?;
     if mode.word() & CTL_DEADLOCK == 0 {
         return None;

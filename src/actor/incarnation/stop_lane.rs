@@ -40,9 +40,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 
+use crate::actor::incarnation::IncarnationRef;
 use crate::actor::panic::contain_waker_panic;
-use crate::actor::subtree::AbortRecord;
-use crate::actor::supervision::rules::lane_accept;
 use crate::types::StopReason;
 
 #[cfg(test)]
@@ -152,6 +151,40 @@ pub(crate) enum RaiseResult {
     Refused,
 }
 
+/// How the stop lane answers a request: what it reports to the caller,
+/// whether the request replaces the stored reason, and whether the lane's
+/// generation moves (waking the actor to observe it).
+///
+/// The lane refuses everything once it is sealed, everything but `Kill` once
+/// it is open to `Kill` only, and every request when `receiver_gone` (the
+/// actor's task has dropped the receiving half). A request of strictly
+/// lower severity than the stored one is superseded and changes nothing.
+/// Anything else is recorded and bumps the generation; a request of strictly
+/// higher severity, or of equal severity and at least the stored rank
+/// (`ParentRequest` over `Shutdown` over `Graceful`, `Failure` over
+/// `ParentKilled` over `Cancelled`, the newer of two equals), also replaces
+/// the stored reason.
+pub(crate) fn lane_accept(
+    state: &LaneState,
+    new: &StopReason,
+    receiver_gone: bool,
+) -> (RaiseResult, bool, bool) {
+    let kill_only_refuses = state.kill_only && !matches!(new, StopReason::Kill);
+    if receiver_gone || state.sealed || kill_only_refuses {
+        return (RaiseResult::Refused, false, false);
+    }
+    let Some(stored) = state.reason.as_ref() else {
+        return (RaiseResult::Recorded, true, true);
+    };
+    let (new_severity, stored_severity) = (StopSeverity::of(new), StopSeverity::of(stored));
+    if new_severity < stored_severity {
+        return (RaiseResult::Superseded, false, false);
+    }
+    let store =
+        new_severity > stored_severity || StopSeverity::rank(new) >= StopSeverity::rank(stored);
+    (RaiseResult::Recorded, store, true)
+}
+
 /// The lane's state, version and receiver-gone flag. Lives in the
 /// incarnation's abort block; see the module documentation for the
 /// orderings.
@@ -168,17 +201,19 @@ pub(crate) struct LaneCell {
     // The three fields below belong to the incarnation's record, not to the
     // lane: they sit in this cell's tail padding, so the record's own small
     // atomics fit one word and the record grows by nothing for them. Each is
-    // an independent atomic with the ordering its accessor on `AbortRecord`
+    // an independent atomic with the ordering its accessor on `IncarnationRef`
     // documents; none is read or written under the lane's lock.
     /// The `sys` bundle's bits (`SYS_SUSPENDED`, `SYS_ALLOW_STATE`,
-    /// `SYS_SENSITIVE`) and the self-stop mark (`SELF_STOP`); see
-    /// `AbortRecord::sys_bits` and `AbortRecord::mark_self_stop`.
+    /// `SYS_SENSITIVE`), the self-stop mark (`SELF_STOP`), the child flag
+    /// (`SYS_CHILD`) and the taken flag (`SYS_TAKEN`); see
+    /// `IncarnationRef::sys_bits`, `IncarnationRef::mark_self_stop`,
+    /// `IncarnationRef::is_root` and `IncarnationRef::take_as_top`.
     pub(crate) sys_bits: std::sync::atomic::AtomicU8,
     /// The children the incarnation supervises now; see
-    /// `AbortRecord::children`.
+    /// `IncarnationRef::children`.
     pub(crate) children: std::sync::atomic::AtomicU32,
     /// Set when the incarnation's registry guard starts to drop, while the
-    /// system tracks turns; see `AbortRecord::has_ended`.
+    /// system tracks turns; see `IncarnationRef::has_ended`.
     pub(crate) ended: AtomicBool,
 }
 
@@ -289,7 +324,7 @@ impl LaneCell {
     /// and the cause is not `Kill` itself; a `Kill` raised without one
     /// clears the stored cause. The cause the raise cleared or did not store
     /// comes back with the result, to be dropped after the unlock.
-    fn raise_kill(&self, cause: Option<StopReason>) -> (Raised, Option<StopReason>) {
+    fn accept_kill(&self, cause: Option<StopReason>) -> (Raised, Option<StopReason>) {
         let mut section = self.section();
         let receiver_gone = self.rx_gone.load(Ordering::Acquire);
         let (result, store, bump) = lane_accept(&section, &StopReason::Kill, receiver_gone);
@@ -343,14 +378,14 @@ impl LaneCell {
 pub(crate) struct StopLane {
     /// The incarnation's abort block: the lane's cell, beside the first abort
     /// issued against the incarnation's task.
-    aborted: AbortRecord,
+    aborted: IncarnationRef,
 }
 
 /// The run loop's receiving half of the lane. It observes versions; it is
 /// not cloneable, and its drop is how the lane learns the task is gone.
 #[derive(Debug)]
 pub(crate) struct LaneRx {
-    record: AbortRecord,
+    record: IncarnationRef,
     /// The last version this receiver marked seen.
     seen: u64,
 }
@@ -477,7 +512,7 @@ impl StopLane {
     /// a unit test that names no system.
     #[cfg(test)]
     pub(crate) fn new() -> (StopLane, LaneRx) {
-        let aborted = AbortRecord::new();
+        let aborted = IncarnationRef::new();
         let rx = LaneRx {
             record: aborted.clone(),
             seen: 0,
@@ -492,7 +527,7 @@ impl StopLane {
         mode: Arc<crate::telemetry::Mode>,
         incarnation: crate::types::Incarnation,
     ) -> (StopLane, LaneRx) {
-        let aborted = AbortRecord::in_system(mode, incarnation);
+        let aborted = IncarnationRef::in_system(mode, incarnation);
         let rx = LaneRx {
             record: aborted.clone(),
             seen: 0,
@@ -501,7 +536,7 @@ impl StopLane {
     }
 
     /// The incarnation's abort record.
-    pub(crate) fn abort_record(&self) -> &AbortRecord {
+    pub(crate) fn abort_record(&self) -> &IncarnationRef {
         &self.aborted
     }
 
@@ -516,7 +551,7 @@ impl StopLane {
     /// specific reason is unchanged from the one already pending.
     pub(crate) fn try_raise(&self, reason: StopReason) -> RaiseResult {
         if matches!(reason, StopReason::Kill) {
-            let (raised, spare_cause) = self.aborted.lane().raise_kill(None);
+            let (raised, spare_cause) = self.aborted.lane().accept_kill(None);
             let result = self.after_raise(raised);
             drop(spare_cause);
             return result;
@@ -532,7 +567,7 @@ impl StopLane {
     /// [`raise_kill_declared`](crate::system::raise_kill_declared) calls it,
     /// so a caused `Kill` is always declared and backstopped.
     pub(crate) fn try_raise_kill_caused(&self, cause: StopReason) -> RaiseResult {
-        let (raised, spare_cause) = self.aborted.lane().raise_kill(Some(cause));
+        let (raised, spare_cause) = self.aborted.lane().accept_kill(Some(cause));
         let result = self.after_raise(raised);
         drop(spare_cause);
         result
@@ -970,7 +1005,7 @@ mod cell_tests {
     /// A waker that probes the lane's lock: it records whether the lock was
     /// free when the wake ran.
     struct LockProbe {
-        record: AbortRecord,
+        record: IncarnationRef,
         free: AtomicUsize,
         held: AtomicUsize,
     }

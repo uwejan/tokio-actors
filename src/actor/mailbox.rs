@@ -132,9 +132,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::turn_clock::now_nanos;
+use crate::actor::incarnation::IncarnationRef;
 use crate::telemetry::{self, EventKind, TelemetryEvent, WaitOutcome};
-use crate::types::turn_clock::now_nanos;
 use crate::types::Who;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
@@ -164,7 +164,7 @@ pub(crate) fn channel<T>(
     capacity: usize,
     lanes: usize,
     owner: Option<Who>,
-    telemetry: Option<AbortRecord>,
+    telemetry: Option<IncarnationRef>,
 ) -> (MailTx<T>, MailRx<T>) {
     assert!(capacity > 0, "a mailbox needs a capacity of at least 1");
     let shared = Arc::new(Shared::new(
@@ -295,7 +295,7 @@ struct Shared<T> {
     /// by the drop of a message that arrived after the end.
     owner: Option<Who>,
     /// The abort record of the actor the mailbox belongs to.
-    telemetry: Option<AbortRecord>,
+    telemetry: Option<IncarnationRef>,
     /// Runs once inside the next park, after it read the closed flag as open
     /// and before it queued itself.
     #[cfg(test)]
@@ -312,7 +312,7 @@ impl<T> Shared<T> {
         capacity: usize,
         lane_count: usize,
         owner: Option<Who>,
-        telemetry: Option<AbortRecord>,
+        telemetry: Option<IncarnationRef>,
     ) -> Self {
         Self {
             capacity,
@@ -459,7 +459,7 @@ impl<T> Shared<T> {
     fn sender_wait_is_taken(&self) -> bool {
         self.telemetry
             .as_ref()
-            .and_then(AbortRecord::mode)
+            .and_then(IncarnationRef::mode)
             .is_some_and(|mode| mode.armed(EventKind::SenderWaited))
     }
 

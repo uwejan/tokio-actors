@@ -1,6 +1,6 @@
 //! The status plane: one actor incarnation's lifecycle status, final reason
 //! and terminal instant, kept in a cell inside the incarnation's shared
-//! block ([`AbortRecord`]) together with a version, a count of the senders
+//! block ([`IncarnationRef`]) together with a version, a count of the senders
 //! that keep the plane open and a lock-free copy of the status byte.
 //!
 //! A [`StatusTx`] writes the cell, a [`StatusRx`] reads it and waits for it
@@ -39,8 +39,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use tokio::task::coop::cooperative;
 
-use crate::actor::subtree::AbortRecord;
-use crate::types::{ActorStatus, StatusValue, StopReason};
+use crate::actor::incarnation::IncarnationRef;
+use crate::types::{ActorStatus, StopReason};
 
 /// Every sender of the plane is gone: the plane is closed and holds its
 /// final value.
@@ -192,7 +192,7 @@ impl Deref for StatusRef<'_> {
     }
 }
 
-impl AbortRecord {
+impl IncarnationRef {
     /// The incarnation's status plane: its first and only sender, and a
     /// receiver that has seen no version. Called once per record.
     pub(crate) fn status_channel(&self) -> (StatusTx, StatusRx) {
@@ -215,7 +215,7 @@ impl AbortRecord {
     /// Wakes every waiter on the block's signals. Never called with the
     /// status cell's lock held. A waiter's waker belongs to the waiter's task,
     /// so a panic of its wake is contained in the call (see
-    /// [`AbortRecord::notify_signals`]): the write that woke it, the actor's
+    /// [`IncarnationRef::notify_signals`]): the write that woke it, the actor's
     /// own task and the drop of the last sender go on.
     fn wake_status_waiters(&self) {
         #[cfg(test)]
@@ -224,10 +224,63 @@ impl AbortRecord {
     }
 }
 
+/// The value of an actor's runtime status plane: its lifecycle status and,
+/// once the actor's end is final, the reason it ended with and the instant
+/// that reason became final.
+///
+/// The reason is written exactly once and never changed, and the instant is
+/// taken by that same write. An actor that ends normally writes it at the
+/// seal of its stop lane, before its queued messages, its value and its
+/// context drop, and publishes the terminal [`ActorStatus::Stopped`] after
+/// them. A task that never reaches its seal has it written by its abort
+/// guard once its name is free (by its context when it is dropped before its
+/// first poll): `Kill` for an abort, a shutdown, or a runtime dropped during
+/// another unwind, `Failure(Panic)` for the task's own unwind outside every
+/// catch; no `Stopped` follows. A reader that finds the plane closed with no
+/// reason reads [`StopReason::Kill`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusValue {
+    pub(crate) status: ActorStatus,
+    pub(crate) reason: Option<StopReason>,
+    /// When the reason was written: the instant the actor's end became
+    /// final. `None` until the reason is written.
+    pub(crate) final_at: Option<tokio::time::Instant>,
+}
+
+impl StatusValue {
+    /// A non-terminal value: `status` with no reason.
+    pub(crate) fn new(status: ActorStatus) -> Self {
+        Self {
+            status,
+            reason: None,
+            final_at: None,
+        }
+    }
+
+    /// Writes the plane's reason, once, and stamps the instant of that
+    /// write: a plane that already carries a reason is left exactly as it
+    /// is, its stamp included. With `stopped` the same write publishes the
+    /// terminal status, so no reader sees `Stopped` without its reason.
+    /// Succeeds with no receivers left. Returns whether this call wrote.
+    pub(crate) fn write_reason(tx: &StatusTx, reason: StopReason, stopped: bool) -> bool {
+        tx.send_if_modified(|value| {
+            if value.reason.is_some() {
+                return false;
+            }
+            value.reason = Some(reason);
+            value.final_at = Some(tokio::time::Instant::now());
+            if stopped {
+                value.status = ActorStatus::Stopped;
+            }
+            true
+        })
+    }
+}
+
 /// The writing half of the plane. Cloning adds a sender; the plane closes
 /// when the last sender drops.
 pub(crate) struct StatusTx {
-    record: AbortRecord,
+    record: IncarnationRef,
 }
 
 impl fmt::Debug for StatusTx {
@@ -238,7 +291,7 @@ impl fmt::Debug for StatusTx {
 
 impl StatusTx {
     /// The abort record of the incarnation whose plane this is.
-    pub(crate) fn abort_record(&self) -> &AbortRecord {
+    pub(crate) fn abort_record(&self) -> &IncarnationRef {
         &self.record
     }
 }
@@ -270,7 +323,7 @@ impl Drop for StatusTx {
 
 impl StatusTx {
     /// The incarnation's block this sender writes.
-    pub(crate) fn record(&self) -> &AbortRecord {
+    pub(crate) fn record(&self) -> &IncarnationRef {
         &self.record
     }
 
@@ -352,7 +405,7 @@ impl StatusTx {
     /// A plane of its own, holding `init`.
     #[cfg(test)]
     pub(crate) fn channel(init: StatusValue) -> (StatusTx, StatusRx) {
-        let record = AbortRecord::new();
+        let record = IncarnationRef::new();
         {
             let cell = record.status_cell();
             let mut guard = cell.lock();
@@ -366,7 +419,7 @@ impl StatusTx {
 /// The reading half of the plane. Cloning keeps what the clone has seen and
 /// takes no lock; dropping it counts nothing.
 pub(crate) struct StatusRx {
-    record: AbortRecord,
+    record: IncarnationRef,
     /// The last version this receiver saw.
     seen: u64,
 }
@@ -391,7 +444,7 @@ impl Clone for StatusRx {
 impl StatusRx {
     /// The incarnation's block this receiver reads, for the counters and the
     /// public name that live beside the plane.
-    pub(crate) fn record(&self) -> &crate::actor::subtree::AbortRecord {
+    pub(crate) fn record(&self) -> &crate::actor::incarnation::IncarnationRef {
         &self.record
     }
 
@@ -440,8 +493,8 @@ impl StatusRx {
 
     /// An observer of the subtree of the incarnation this receiver reads,
     /// or `None` while the incarnation's hold is not built yet. See
-    /// [`AbortRecord::subtree_watch`].
-    pub(crate) fn subtree_watch(&self) -> Option<crate::actor::subtree::SubtreeWatch> {
+    /// [`IncarnationRef::subtree_watch`].
+    pub(crate) fn subtree_watch(&self) -> Option<crate::actor::incarnation::SubtreeWatch> {
         self.record.subtree_watch()
     }
 
@@ -479,7 +532,7 @@ fn maybe_changed(cell: &StatusCell, seen: &mut u64) -> Option<Result<(), RecvErr
     None
 }
 
-async fn changed_impl(record: &AbortRecord, seen: &mut u64) -> Result<(), RecvError> {
+async fn changed_impl(record: &IncarnationRef, seen: &mut u64) -> Result<(), RecvError> {
     loop {
         // The notification is created before the state is read, so a write
         // landing after the read wakes this wait. Another signal of the
@@ -495,7 +548,7 @@ async fn changed_impl(record: &AbortRecord, seen: &mut u64) -> Result<(), RecvEr
 }
 
 async fn wait_for_impl(
-    record: &AbortRecord,
+    record: &IncarnationRef,
     seen: &mut u64,
     mut accept: impl FnMut(&StatusValue) -> bool,
 ) -> Result<(), RecvError> {
@@ -617,7 +670,7 @@ mod tests {
     /// A waker that, when it runs, records whether the plane's lock was
     /// free for the thread that woke it.
     struct LockProbe {
-        record: AbortRecord,
+        record: IncarnationRef,
         free: std::sync::atomic::AtomicUsize,
         locked: std::sync::atomic::AtomicUsize,
         /// The version and the closed bit at each wake.
@@ -625,7 +678,7 @@ mod tests {
     }
 
     impl LockProbe {
-        fn new(record: AbortRecord) -> Arc<Self> {
+        fn new(record: IncarnationRef) -> Arc<Self> {
             Arc::new(Self {
                 record,
                 free: Default::default(),
@@ -754,7 +807,7 @@ mod tests {
 #[cfg(test)]
 mod cause_read_tests {
     use super::*;
-    use crate::types::StopLane;
+    use crate::actor::incarnation::StopLane;
 
     fn held() -> StopReason {
         StopReason::Shutdown("held".into())

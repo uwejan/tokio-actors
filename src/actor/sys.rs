@@ -15,9 +15,10 @@ use tokio::sync::oneshot;
 use super::handle::ActorHandle;
 use super::sys_state::{state_access, InspectOp, ReplaceOp};
 use super::Actor;
+use crate::actor::envelope::SysCommand;
 use crate::system::wait_final_reason;
 use crate::time_probe::runtime_has_timers;
-use crate::types::{StopReason, SysCommand};
+use crate::types::StopReason;
 
 /// The bound of a `sys` call when none is set: five seconds.
 pub const DEFAULT_SYS_TIMEOUT: Duration = Duration::from_millis(5000);

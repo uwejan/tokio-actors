@@ -23,12 +23,13 @@ use tokio::task::JoinHandle;
 
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
+use crate::actor::incarnation::StatusRx;
+use crate::actor::incarnation::SubtreeWatch;
 use crate::actor::runtime::{spawn_actor, ActorConfig};
-use crate::actor::subtree::SubtreeWatch;
 use crate::actor::Actor;
 use crate::error::{ActorError, ActorResult};
 use crate::system::ActorSystem;
-use crate::types::{ActorId, ActorStatus, StatusRx, StopReason, StreamEvent};
+use crate::types::{ActorId, ActorStatus, StopReason, StreamEvent};
 
 type InitAck = oneshot::Receiver<Result<(), ActorError>>;
 
@@ -362,7 +363,7 @@ impl Rig {
                 // reaches Stopped.
                 tokio::task::yield_now().await;
             }
-            let mut wait = crate::actor::subtree::SubtreeWait::new(&self.subtree);
+            let mut wait = crate::actor::incarnation::SubtreeWait::new(&self.subtree);
             while !self.subtree.is_gone() {
                 tokio::time::timeout(Duration::from_secs(60), wait.changed())
                     .await
@@ -1325,8 +1326,8 @@ struct CancelsBoth {
 impl CancelsBoth {
     fn cancel(&mut self, ctx: &mut ActorContext<Self>) {
         let (timer, stream) = self.ids.take().expect("registered in on_started");
-        ctx.cancel_timer(timer).expect("the timer is registered");
-        ctx.cancel_stream(stream).expect("the stream is registered");
+        assert!(ctx.cancel_timer(timer), "the timer is registered");
+        assert!(ctx.cancel_stream(stream), "the stream is registered");
     }
 }
 

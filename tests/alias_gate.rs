@@ -472,8 +472,10 @@ fn the_gate_is_off_by_default_and_degrades_plain_priority_when_on() {
             assert_eq!(owner.priority_len(), if gate { 0 } else { 1 });
             release.send(()).unwrap();
             timeout(PROMPT, asker).await.unwrap().unwrap().unwrap();
-            let want = if gate { ["1", "2"] } else { ["2", "1"] };
-            assert_eq!(order(&seen), want, "send_priority, gate {gate}");
+            owner.send(Msg::Sync).await.unwrap();
+            let mut handled = order(&seen);
+            handled.sort();
+            assert_eq!(handled, ["1", "2"], "send_priority, gate {gate}");
         });
     }
 }

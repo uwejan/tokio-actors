@@ -14,9 +14,9 @@
 //! - A breached global deadline hands every remaining root to a concurrent
 //!   force-stop sweep instead of continuing one root at a time.
 //! - Every system fixture in this file is created fresh via `ActorSystem::create`
-//!   (a UUID-suffixed name): the registry is process-global, and shutdown's new
-//!   `shutting_down` flag is never reset, so reusing `ActorSystem::default()`
-//!   here would permanently affect other tests in this file.
+//!   (a UUID-suffixed name): the registry is process-global, and a shut-down
+//!   system stays `Defunct` until `ActorSystem::reactivate`, so reusing
+//!   `ActorSystem::default()` here would affect other tests in this file.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

@@ -1,6 +1,6 @@
 //! Behavioral suite for the structured error taxonomy.
 //!
-//! - `ActorError` gains `Timer`/`Stream`/`Supervision` variants that carry the
+//! - `ActorError` gains `Timer`/`Supervision` variants that carry the
 //!   source error structurally (no stringification); `User(String)` remains
 //!   reserved for genuinely actor-authored errors.
 //! - `ChildSpawnBuilder` fails with `SpawnError`, not `ActorError`.
@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorError, ActorResult, AskError, SendError, SpawnError, StopReason,
+    ActorConfig, ActorError, ActorResult, AskError, RestartType, SendError, SpawnError, StopReason,
+    SupervisionConfig, SupervisionError,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,12 +58,92 @@ fn actor_error_spawn_preserves_type() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 18: ?-conversion structures Timer/Stream/Supervision errors
+// Test 18: ?-conversion structures Timer/Supervision errors
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Test 19: budget exhaustion records the structured Supervision error
 // ---------------------------------------------------------------------------
+
+/// A child whose `pre_start` always panics: every (re)incarnation burns one
+/// restart, driving the supervisor's budget to exhaustion quickly.
+#[derive(Debug, Default)]
+struct AlwaysFailsInit;
+
+impl Actor for AlwaysFailsInit {
+    type Message = ();
+    type Response = ();
+
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        panic!("init always fails (budget-exhaustion driver)");
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+}
+
+/// A supervisor with a tight restart budget. `on_stopped` captures
+/// `ctx.last_error()` externally so the test can inspect it after the
+/// supervisor exits: the exit reason itself is `StopReason::ParentRequest`
+/// (OTP intensity-exceeded parity), which carries no error detail - only
+/// `last_error` does.
+struct BudgetSupervisor {
+    captured: Arc<Mutex<Option<ActorError>>>,
+}
+
+impl Actor for BudgetSupervisor {
+    type Message = ();
+    type Response = ();
+
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        ctx.spawn_child(AlwaysFailsInit::default)
+            .restart_type(RestartType::Permanent)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
+
+    async fn on_stopped(
+        &mut self,
+        _reason: &StopReason,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorResult<()> {
+        *self.captured.lock().unwrap() = ctx.last_error().cloned();
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn budget_exhaustion_records_structured_supervision_error() {
+    let captured = Arc::new(Mutex::new(None));
+    let sup = BudgetSupervisor {
+        captured: captured.clone(),
+    }
+    .spawn()
+    .with_config(ActorConfig::default().with_supervision(
+        SupervisionConfig::one_for_one().max_restarts(2, Duration::from_secs(60)),
+    ))
+    .await
+    .unwrap();
+
+    let reason = tokio::time::timeout(Duration::from_secs(10), sup.wait_stopped())
+        .await
+        .expect("supervisor must exit once its restart budget is exhausted");
+    assert_eq!(reason, StopReason::ParentRequest, "the OTP shutdown reason");
+
+    let err = captured.lock().unwrap().take();
+    assert!(
+        matches!(
+            err,
+            Some(ActorError::Supervision(SupervisionError::BudgetExhausted))
+        ),
+        "expected Some(Supervision(BudgetExhausted)), got: {err:?}"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Test 20: DuplicateChild (kept spec), then delete_child clears the way

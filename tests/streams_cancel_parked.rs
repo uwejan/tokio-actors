@@ -12,12 +12,14 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorHandle, ActorResult, StreamEvent,
+    ActorConfig, ActorHandle, ActorResult, StopReason, StreamEvent,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
 const BOUND: Duration = Duration::from_secs(10);
+/// Rounds a scenario may take to show the schedule it asserts.
+const ROUNDS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Seen {
@@ -106,7 +108,7 @@ impl Actor for Sink {
                 if cancel_all {
                     ctx.cancel_all_streams();
                 } else {
-                    ctx.cancel_stream(id).expect("the stream is live");
+                    assert!(ctx.cancel_stream(id), "the stream is live");
                 }
             }
             Msg::Ping => {}
@@ -188,38 +190,56 @@ async fn start(items: &[u32], close_stream: bool, cancel_all: bool) -> Run {
     }
 }
 
+/// Ends a round's sink and waits for it to be gone, so the next round starts
+/// from nothing.
+async fn finish(run: Run) {
+    drop(run.tx);
+    run.handle.stop(StopReason::Graceful).await.unwrap();
+    run.handle.wait_stopped().await;
+}
+
+/// Item 2 waits for room behind item 1 when the stream is cancelled; none
+/// reaches the actor afterwards. On a multi-thread runtime the forwarder may
+/// already have put item 2 into the slot item 1 frees, which shows as both
+/// items seen after the fence: that round is run again.
+async fn a_parked_item_is_dropped_by_cancel(cancel_all: bool) {
+    for _ in 0..ROUNDS {
+        let run = start(&[1, 2, 3], false, cancel_all).await;
+        // Item 1 holds the slot; item 2 is taken from the channel and waits for
+        // room; item 3 is still in the channel.
+        let tx = run.tx.clone().expect("the stream is open");
+        until("item 2 waits for room", || {
+            tx.capacity() == 7 && run.handle.mailbox_len() == 1
+        })
+        .await;
+        run.gate.notify_one();
+        until("the stream is dropped", || {
+            run.dropped.load(Ordering::SeqCst)
+        })
+        .await;
+        run.handle.send(Msg::Ping).await.unwrap();
+        let seen = run.seen.lock().unwrap().clone();
+        if seen == [Seen::Data(1), Seen::Data(2)] {
+            drop(tx);
+            finish(run).await;
+            continue;
+        }
+        assert_eq!(seen, vec![Seen::Data(1)]);
+        drop(tx);
+        finish(run).await;
+        return;
+    }
+    panic!(
+        "no round dropped the waiting item: item 2 was delivered after the cancel in every round"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_waiting_for_room_is_dropped_by_cancel_stream() {
-    let run = start(&[1, 2, 3], false, false).await;
-    // Item 1 holds the slot; item 2 is taken from the channel and waits for
-    // room; item 3 is still in the channel.
-    let tx = run.tx.clone().expect("the stream is open");
-    until("item 2 waits for room", || {
-        tx.capacity() == 7 && run.handle.mailbox_len() == 1
-    })
-    .await;
-    run.gate.notify_one();
-    until("the stream is dropped", || {
-        run.dropped.load(Ordering::SeqCst)
-    })
-    .await;
-    run.handle.send(Msg::Ping).await.unwrap();
-    assert_eq!(*run.seen.lock().unwrap(), vec![Seen::Data(1)]);
+    a_parked_item_is_dropped_by_cancel(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_waiting_for_room_is_dropped_by_cancel_all_streams() {
-    let run = start(&[1, 2, 3], false, true).await;
-    let tx = run.tx.clone().expect("the stream is open");
-    until("item 2 waits for room", || {
-        tx.capacity() == 7 && run.handle.mailbox_len() == 1
-    })
-    .await;
-    run.gate.notify_one();
-    until("the stream is dropped", || {
-        run.dropped.load(Ordering::SeqCst)
-    })
-    .await;
-    run.handle.send(Msg::Ping).await.unwrap();
-    assert_eq!(*run.seen.lock().unwrap(), vec![Seen::Data(1)]);
+    a_parked_item_is_dropped_by_cancel(true).await;
 }

@@ -12,14 +12,15 @@
 //! - Budget exhaustion stops the supervisor with `StopReason::ParentRequest`.
 //! - `ActorId` is stable across restarts, anonymous children included.
 //!
-//! All tests use event-based waiting (poll with a deadline) instead of fixed sleeps
-//! wherever the condition is observable.
+//! Every wait is a handshake the test observes (a start counter, the event
+//! log, an actor's end); a wall-clock bound only reports a hang.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::{sleep, Instant};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::time::timeout;
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -33,10 +34,38 @@ mod common;
 // Helpers
 // ---------------------------------------------------------------------------
 
-type EventLog = Arc<tokio::sync::Mutex<Vec<ChildEvent>>>;
+/// The supervisor's `ChildEvent`s in delivery order; a waiter is woken at
+/// each push.
+type EventLog = Arc<watch::Sender<Vec<ChildEvent>>>;
 
 fn recorder() -> EventLog {
-    Arc::new(tokio::sync::Mutex::new(Vec::new()))
+    Arc::new(watch::channel(Vec::new()).0)
+}
+
+/// A count a test waits on, woken at each step: the starts of a child's
+/// incarnations (each `on_started` adds one) or the turns an actor took.
+type Counter = Arc<watch::Sender<usize>>;
+
+fn counter() -> Counter {
+    Arc::new(watch::channel(0).0)
+}
+
+/// Adds one to `counter`, if there is one.
+fn bump(counter: &Option<Counter>) {
+    if let Some(counter) = counter {
+        counter.send_modify(|n| *n += 1);
+    }
+}
+
+/// Waits until `counter` reads at least `n`; the bound only reports a hang.
+async fn reach(counter: &Counter, n: usize, what: &str) {
+    let mut rx = counter.subscribe();
+    timeout(Duration::from_secs(60), async {
+        rx.wait_for(|count| *count >= n).await.map(|_| ())
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: the count never reached {n}"))
+    .expect("the counter is alive");
 }
 
 /// Unique registry names so tests can run in parallel within one process.
@@ -46,74 +75,42 @@ fn uname(base: &str) -> String {
     format!("crash-{base}-{}", UNIQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Polls a synchronous predicate until it holds or the deadline passes.
-async fn wait_until<F>(timeout_ms: u64, mut pred: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Polls the recorder until `pred` holds (or the deadline passes) and returns a snapshot.
-async fn wait_for_events<P>(events: &EventLog, timeout_ms: u64, pred: P) -> Vec<ChildEvent>
+/// Waits until `pred` holds over the log and returns a snapshot; on a hang
+/// it returns the log as it stands, for the caller's assertion to report.
+async fn wait_for_events<P>(events: &EventLog, pred: P) -> Vec<ChildEvent>
 where
     P: Fn(&[ChildEvent]) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        {
-            let guard = events.lock().await;
-            if pred(&guard) {
-                return guard.clone();
-            }
-        }
-        if Instant::now() >= deadline {
-            return events.lock().await.clone();
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
+    let mut rx = events.subscribe();
+    let _ = timeout(Duration::from_secs(60), async {
+        rx.wait_for(|log| pred(log)).await.map(|_| ())
+    })
+    .await;
+    events.borrow().clone()
 }
 
-/// Re-looks a named `PanicWorker` up until a FRESH instance responds (counter == 0).
+/// Waits for the `n`th incarnation of a named `PanicWorker` to start, then
+/// looks it up by name and returns it if it is FRESH (counter == 0). An
+/// incarnation is registered before its `on_started` runs, so the lookup
+/// finds the incarnation that was counted.
 ///
 /// A fresh counter doubles as proof of a completed restart: a pre-crash instance
 /// with a bumped counter can never satisfy this predicate.
-async fn wait_worker_ready(name: &str, timeout_ms: u64) -> Option<ActorHandle<PanicWorker>> {
-    let sys = ActorSystem::default();
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    while Instant::now() < deadline {
-        if let Some(handle) = sys.get::<PanicWorker>(name) {
-            if let Ok(0) = handle.send(WorkerMsg::Count).await {
-                return Some(handle);
-            }
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    None
+async fn worker_ready(name: &str, starts: &Counter, n: usize) -> Option<ActorHandle<PanicWorker>> {
+    reach(starts, n, name).await;
+    let handle = ActorSystem::default().get::<PanicWorker>(name)?;
+    matches!(handle.send(WorkerMsg::Count).await, Ok(0)).then_some(handle)
 }
 
-/// Re-looks a named actor up until it answers `get_status` (proof of liveness).
-async fn wait_status<A: Actor>(name: &str, timeout_ms: u64) -> Option<ActorStatusInfo> {
-    let sys = ActorSystem::default();
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    while Instant::now() < deadline {
-        if let Some(handle) = sys.get::<A>(name) {
-            if let Ok(info) = handle.get_status().await {
-                return Some(info);
-            }
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    None
+/// Waits for the `n`th incarnation of a named actor to start, then looks it
+/// up by name and returns its `get_status` answer (proof of liveness).
+async fn status_of<A: Actor>(name: &str, starts: &Counter, n: usize) -> Option<ActorStatusInfo> {
+    reach(starts, n, name).await;
+    ActorSystem::default()
+        .get::<A>(name)?
+        .get_status()
+        .await
+        .ok()
 }
 
 fn is_panic_restart(event: &ChildEvent) -> bool {
@@ -129,6 +126,7 @@ fn is_panic_restart(event: &ChildEvent) -> bool {
 #[derive(Default)]
 struct PanicWorker {
     count: u32,
+    starts: Option<Counter>,
 }
 
 #[derive(Clone)]
@@ -141,6 +139,11 @@ enum WorkerMsg {
 impl Actor for PanicWorker {
     type Message = WorkerMsg;
     type Response = u32;
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        bump(&self.starts);
+        Ok(())
+    }
 
     async fn handle(&mut self, msg: WorkerMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         match msg {
@@ -156,7 +159,9 @@ impl Actor for PanicWorker {
 
 /// Panics in `handle` AND in `on_stopped` (double-panic, test 4).
 #[derive(Default)]
-struct DoublePanicker;
+struct DoublePanicker {
+    starts: Option<Counter>,
+}
 
 #[derive(Clone)]
 enum DoubleMsg {
@@ -166,6 +171,11 @@ enum DoubleMsg {
 impl Actor for DoublePanicker {
     type Message = DoubleMsg;
     type Response = ();
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        bump(&self.starts);
+        Ok(())
+    }
 
     async fn handle(&mut self, _msg: DoubleMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         panic!("original handle panic");
@@ -183,7 +193,7 @@ impl Actor for DoublePanicker {
 /// Anonymous child that crashes in `handle` on its first two incarnations (test 5).
 /// The shared counter is captured by the factory, so it survives restarts.
 struct AnonCrasher {
-    crashes: Arc<AtomicUsize>,
+    crashes: Counter,
 }
 
 #[derive(Clone)]
@@ -202,7 +212,12 @@ impl Actor for AnonCrasher {
     }
 
     async fn handle(&mut self, _msg: AnonMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        if self.crashes.fetch_add(1, Ordering::SeqCst) < 2 {
+        let mut before = 0;
+        self.crashes.send_modify(|n| {
+            before = *n;
+            *n += 1;
+        });
+        if before < 2 {
             panic!("anonymous incarnation crashed");
         }
         Ok(())
@@ -212,7 +227,9 @@ impl Actor for AnonCrasher {
 /// Supervisor-child with custom mailbox capacity (test 6). Crashes on command;
 /// on request it spawns an anonymous grandchild and reports its child count.
 #[derive(Default)]
-struct CfgWorker;
+struct CfgWorker {
+    starts: Option<Counter>,
+}
 
 #[derive(Clone)]
 enum CfgMsg {
@@ -223,6 +240,11 @@ enum CfgMsg {
 impl Actor for CfgWorker {
     type Message = CfgMsg;
     type Response = u32;
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        bump(&self.starts);
+        Ok(())
+    }
 
     async fn handle(&mut self, msg: CfgMsg, ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         match msg {
@@ -299,8 +321,12 @@ impl Actor for TimedCrasher {
     }
 }
 
-/// Actor with a recurring timer and an attached stream (test 15).
-struct Ticker;
+/// Actor with a recurring timer and an attached stream (test 15). It says
+/// when it has handled a tick and a stream item.
+struct Ticker {
+    ticked: Arc<Notify>,
+    streamed: Arc<Notify>,
+}
 
 #[derive(Clone)]
 enum TickMsg {
@@ -334,8 +360,11 @@ impl Actor for Ticker {
     async fn handle(&mut self, msg: TickMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         match msg {
             TickMsg::Boom => panic!("ticker boom"),
-            _ => Ok(()),
+            TickMsg::Tick => self.ticked.notify_one(),
+            TickMsg::Data => self.streamed.notify_one(),
+            TickMsg::Done => {}
         }
+        Ok(())
     }
 }
 
@@ -349,13 +378,13 @@ struct RecordingSup {
 #[allow(clippy::enum_variant_names)] // Spawn* mirrors the scenario names
 enum SupCmd {
     /// Named Permanent `PanicWorker` (tests 1, 2, 7).
-    SpawnWorker { name: String },
+    SpawnWorker { name: String, starts: Counter },
     /// Named Permanent `DoublePanicker` (test 4).
-    SpawnDoublePanicker { name: String },
+    SpawnDoublePanicker { name: String, starts: Counter },
     /// Anonymous Permanent `AnonCrasher` (test 5).
-    SpawnAnonCrasher { crashes: Arc<AtomicUsize> },
+    SpawnAnonCrasher { crashes: Counter },
     /// Named Permanent `CfgWorker` with mailbox capacity 7 + supervisor role (test 6).
-    SpawnCfgWorker { name: String },
+    SpawnCfgWorker { name: String, starts: Counter },
     /// Named Transient `MidSup` with a tight restart budget (test 3).
     SpawnMidSup { name: String },
     /// `count` anonymous Temporary `TimedCrasher`s (test 8).
@@ -368,18 +397,23 @@ impl Actor for RecordingSup {
 
     async fn handle(&mut self, msg: SupCmd, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         match msg {
-            SupCmd::SpawnWorker { name } => {
-                ctx.spawn_child(PanicWorker::default)
-                    .named(name)
-                    .restart_type(RestartType::Permanent)
-                    .shutdown(Shutdown::Timeout(Duration::from_secs(5)))
-                    .await?;
+            SupCmd::SpawnWorker { name, starts } => {
+                ctx.spawn_child(move || PanicWorker {
+                    count: 0,
+                    starts: Some(starts.clone()),
+                })
+                .named(name)
+                .restart_type(RestartType::Permanent)
+                .shutdown(Shutdown::Timeout(Duration::from_secs(5)))
+                .await?;
             }
-            SupCmd::SpawnDoublePanicker { name } => {
-                ctx.spawn_child(DoublePanicker::default)
-                    .named(name)
-                    .restart_type(RestartType::Permanent)
-                    .await?;
+            SupCmd::SpawnDoublePanicker { name, starts } => {
+                ctx.spawn_child(move || DoublePanicker {
+                    starts: Some(starts.clone()),
+                })
+                .named(name)
+                .restart_type(RestartType::Permanent)
+                .await?;
             }
             SupCmd::SpawnAnonCrasher { crashes } => {
                 ctx.spawn_child(move || AnonCrasher {
@@ -388,12 +422,14 @@ impl Actor for RecordingSup {
                 .restart_type(RestartType::Permanent)
                 .await?;
             }
-            SupCmd::SpawnCfgWorker { name } => {
-                ctx.spawn_child(CfgWorker::default)
-                    .named(name)
-                    .restart_type(RestartType::Permanent)
-                    .with_config(ActorConfig::default().with_mailbox_capacity(7).supervisor())
-                    .await?;
+            SupCmd::SpawnCfgWorker { name, starts } => {
+                ctx.spawn_child(move || CfgWorker {
+                    starts: Some(starts.clone()),
+                })
+                .named(name)
+                .restart_type(RestartType::Permanent)
+                .with_config(ActorConfig::default().with_mailbox_capacity(7).supervisor())
+                .await?;
             }
             SupCmd::SpawnMidSup { name } => {
                 ctx.spawn_child(MidSup::default)
@@ -420,7 +456,7 @@ impl Actor for RecordingSup {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        self.events.lock().await.push(event.clone());
+        self.events.send_modify(|log| log.push(event.clone()));
         Ok(())
     }
 }
@@ -451,10 +487,16 @@ fn panic_in_on_stopped_preserves_original_reason() {
         .unwrap();
 
         let name = uname("double-worker");
-        sup.send(SupCmd::SpawnDoublePanicker { name: name.clone() })
+        let starts = counter();
+        sup.send(SupCmd::SpawnDoublePanicker {
+            name: name.clone(),
+            starts: starts.clone(),
+        })
+        .await
+        .unwrap();
+        assert!(status_of::<DoublePanicker>(&name, &starts, 1)
             .await
-            .unwrap();
-        assert!(wait_status::<DoublePanicker>(&name, 5_000).await.is_some());
+            .is_some());
 
         // Crash: handle panics, then on_stopped panics too (double panic).
         let sys = ActorSystem::default();
@@ -464,7 +506,7 @@ fn panic_in_on_stopped_preserves_original_reason() {
             .await
             .unwrap();
 
-        let evs = wait_for_events(&events, 10_000, |e| !e.is_empty()).await;
+        let evs = wait_for_events(&events, |e| !e.is_empty()).await;
         let ev = evs
             .first()
             .unwrap_or_else(|| panic!("supervisor never saw the death"));
@@ -485,10 +527,19 @@ fn panic_in_on_stopped_preserves_original_reason() {
 
         // Restart still happens despite the double panic.
         assert!(
-            wait_status::<DoublePanicker>(&name, 10_000).await.is_some(),
+            status_of::<DoublePanicker>(&name, &starts, 2)
+                .await
+                .is_some(),
             "child must be restarted after a double panic"
         );
-        let final_len = events.lock().await.len();
+
+        // The supervisor stops, which delivers every death report still
+        // pending before it ends; the child its teardown stops gets none.
+        sup.stop(StopReason::Graceful).await.unwrap();
+        timeout(Duration::from_secs(60), sup.wait_stopped())
+            .await
+            .expect("the supervisor ends");
+        let final_len = events.borrow().len();
         assert_eq!(final_len, 1, "a double panic is exactly ONE death event");
     });
 }
@@ -520,6 +571,7 @@ type StopLog = Arc<tokio::sync::Mutex<Option<StopReason>>>;
 struct PoisonWorker {
     count: u32,
     stopped: StopLog,
+    starts: Option<Counter>,
 }
 
 #[derive(Clone)]
@@ -534,6 +586,11 @@ enum PoisonMsg {
 impl Actor for PoisonWorker {
     type Message = PoisonMsg;
     type Response = u32;
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        bump(&self.starts);
+        Ok(())
+    }
 
     async fn handle(&mut self, msg: PoisonMsg, _ctx: &mut ActorContext<Self>) -> ActorResult<u32> {
         match msg {
@@ -562,6 +619,7 @@ impl Actor for PoisonWorker {
 struct PoisonSupervisor {
     events: EventLog,
     child_name: String,
+    starts: Counter,
 }
 
 impl Actor for PoisonSupervisor {
@@ -569,9 +627,11 @@ impl Actor for PoisonSupervisor {
     type Response = ();
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        ctx.spawn_child(|| PoisonWorker {
+        let starts = self.starts.clone();
+        ctx.spawn_child(move || PoisonWorker {
             count: 0,
             stopped: Arc::new(tokio::sync::Mutex::new(None)),
+            starts: Some(starts.clone()),
         })
         .named(self.child_name.clone())
         .restart_type(RestartType::Permanent)
@@ -588,24 +648,17 @@ impl Actor for PoisonSupervisor {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        self.events.lock().await.push(event.clone());
+        self.events.send_modify(|log| log.push(event.clone()));
         Ok(())
     }
 }
 
-/// Re-looks a named `PoisonWorker` up until a FRESH instance responds (counter == 0).
-async fn wait_poison_ready(name: &str, timeout_ms: u64) -> Option<ActorHandle<PoisonWorker>> {
-    let sys = ActorSystem::default();
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    while Instant::now() < deadline {
-        if let Some(handle) = sys.get::<PoisonWorker>(name) {
-            if let Ok(0) = handle.send(PoisonMsg::Count).await {
-                return Some(handle);
-            }
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    None
+/// Waits for the `n`th incarnation of a named `PoisonWorker` to start, then
+/// looks it up by name and returns it if it is FRESH (counter == 0).
+async fn poison_ready(name: &str, starts: &Counter, n: usize) -> Option<ActorHandle<PoisonWorker>> {
+    reach(starts, n, name).await;
+    let handle = ActorSystem::default().get::<PoisonWorker>(name)?;
+    matches!(handle.send(PoisonMsg::Count).await, Ok(0)).then_some(handle)
 }
 
 fn is_err_restart(event: &ChildEvent) -> bool {
@@ -620,6 +673,7 @@ fn err_from_handle_notify_path_stops_actor_like_send() {
         let handle = PoisonWorker {
             count: 0,
             stopped: stopped.clone(),
+            starts: None,
         }
         .spawn()
         .await
@@ -630,14 +684,21 @@ fn err_from_handle_notify_path_stops_actor_like_send() {
         // stop the actor identically on the notify and send paths.
         handle.notify(PoisonMsg::Poison).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+        // A request queued behind the poison is never answered: the actor
+        // stops at the poison and drops what is still queued, where an actor
+        // that kept running would answer it.
+        let behind = handle.send(PoisonMsg::Count).await;
+        assert!(
+            behind.is_err(),
+            "the actor handled a message after a notify-path Err: {behind:?}"
+        );
+
+        timeout(Duration::from_secs(60), handle.wait_stopped())
             .await
             .expect("wait_stopped must resolve after a notify-path Err (cast-exception parity)");
-        // wait_stopped resolves on the status plane's terminal state; is_alive
-        // (mailbox closure) can lag it by one teardown beat under heavy
-        // instrumentation, so poll briefly instead of asserting instantly.
+        // The mailbox is closed before the end is published.
         assert!(
-            wait_until(2_000, || !handle.is_alive()).await,
+            !handle.is_alive(),
             "actor must be dead after the poison notify"
         );
 
@@ -663,8 +724,11 @@ fn err_from_handle_notify_path_stops_actor_like_send() {
 
 /// A child whose SECOND construction (the crash's own restart attempt) hangs
 /// forever in `on_started`; every other construction returns immediately.
+/// Each incarnation reports its own handle as `on_started` begins, when it
+/// is already registered under its name.
 struct HungRestartWorker {
     hang: bool,
+    report: mpsc::UnboundedSender<ActorHandle<HungRestartWorker>>,
 }
 
 #[derive(Clone)]
@@ -682,7 +746,8 @@ impl Actor for HungRestartWorker {
         }
     }
 
-    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let _ = self.report.send(ctx.self_handle());
         if self.hang {
             std::future::pending().await
         } else {
@@ -694,6 +759,7 @@ impl Actor for HungRestartWorker {
 struct HungRestartSup {
     name: String,
     constructions: Arc<AtomicUsize>,
+    report: mpsc::UnboundedSender<ActorHandle<HungRestartWorker>>,
 }
 
 impl Actor for HungRestartSup {
@@ -706,9 +772,13 @@ impl Actor for HungRestartSup {
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         let constructions = self.constructions.clone();
+        let report = self.report.clone();
         ctx.spawn_child(move || {
             let n = constructions.fetch_add(1, Ordering::SeqCst);
-            HungRestartWorker { hang: n == 1 }
+            HungRestartWorker {
+                hang: n == 1,
+                report: report.clone(),
+            }
         })
         .named(self.name.clone())
         .restart_type(RestartType::Permanent)

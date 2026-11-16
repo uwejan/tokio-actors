@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use super::token;
 use super::turn_tests::{both_flavors, unique};
 use crate::actor::context::ActorContext;
+use crate::actor::incarnation::TurnClock;
 use crate::actor::{Actor, ActorExt};
 use crate::error::ActorResult;
 use crate::system::ActorSystem;
-use crate::types::TurnClock;
 
 /// Reads the caller token from a hook and from a task the hook spawns.
 struct Reader {

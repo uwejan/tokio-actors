@@ -767,22 +767,31 @@ fn a_child_counts_as_active_while_a_start_follows_its_end() {
         let event = rig.event().await;
         assert_eq!(event.child_id, ActorId::from("f"));
         // d ends first, then c crashes: both wait behind the group, c's
-        // restart decision still owed when d's end is evaluated.
-        end_child(&kids["d"], Exit::Clean).await;
-        end_child(&kids["c"], Exit::Abnormal).await;
-        timeout(BOUND, async {
-            loop {
-                let Ok(Reply::Names(names)) = boss.send(Cmd::Pending).await else {
-                    panic!("the supervisor answers");
-                };
-                if names.iter().any(|n| n == "c") && names.iter().any(|n| n == "d") {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        // restart decision still owed when d's end is evaluated. The stop
+        // returns before d ends, so c is crashed only once the supervisor
+        // holds d's end: the ends are queued, and evaluated, d first.
+        let waiting = |want: &'static [&'static str]| {
+            let boss = boss.clone();
+            async move {
+                timeout(BOUND, async {
+                    loop {
+                        let Ok(Reply::Names(names)) = boss.send(Cmd::Pending).await else {
+                            panic!("the supervisor answers");
+                        };
+                        if want.iter().all(|w| names.iter().any(|n| n == w)) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{want:?} wait behind the group"));
             }
-        })
-        .await
-        .expect("both ends wait behind the group");
+        };
+        end_child(&kids["d"], Exit::Clean).await;
+        waiting(&["d"]).await;
+        end_child(&kids["c"], Exit::Abnormal).await;
+        waiting(&["c", "d"]).await;
         gate.add_permits(1);
         timeout(BOUND, async {
             while rig.builds("f") < 2 || rig.builds("c") < 2 {

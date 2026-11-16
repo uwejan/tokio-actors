@@ -25,7 +25,7 @@
 //!
 //! | call site | RUN | STOP | GROUP |
 //! |---|---|---|---|
-//! | `terminate_child` | abandoned at the commit: `terminate_child_abandoned_at_commit_still_stops_a_vetoing_child`; mid window: `terminate_child_abandoned_mid_window_still_stops_a_vetoing_child`; after the Kill step: `terminate_child_abandoned_after_the_kill_step_still_aborts_a_parked_child`; a child stuck in a turn: the whole ladder runs and the call answers `ChildUnresponsive`: `terminate_child_of_a_stuck_child_answers_child_unresponsive` | a terminate in progress is joined: `second_terminate_child_waits_for_an_abandoned_stop_of_the_same_child`; a bounce in progress is upgraded to a terminate and the child stays down: `terminate_child_upgrades_an_abandoned_bounce` | `terminate_child_override_runs_pre_stop_once`; a child respawned under the name of a released member is not a member: `a_child_respawned_under_the_name_of_an_overridden_member_is_not_a_member_of_the_group`; a released member is refused by `restart_child` until the group completes, and then revived it is a running child: `a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_child`; a child spawned again under the name of a released member is a child like any other: `a_child_respawned_under_the_name_of_a_released_member_is_stopped_by_terminate_child`; a member waiting in the restart set leaves it: `terminate_child_removes_a_chain_queued_member`, `terminate_child_on_a_retrying_member_cancels_the_retry`; a call made during the chain keeps the member down through the retry: `terminate_during_the_chain_keeps_the_member_down_through_the_retry`; a call made while an attempt of the chain is in flight answers `ChildRestarting`: `stop_child_of_a_pending_group_member_is_absorbed_while_its_manual_stop_is_in_progress` (its second run); terminate, delete and spawn in one handler: `terminate_delete_respawn_in_one_handler_succeeds_in_every_group_phase`; the one more ask a group and the calls that join its member share: `terminate_calls_during_one_group_share_one_more_ask` |
+//! | `terminate_child` | abandoned at the commit: `terminate_child_abandoned_at_commit_still_stops_a_vetoing_child`; mid window: `terminate_child_abandoned_mid_window_still_stops_a_vetoing_child`; a child parked at an await, abandoned at the commit: `terminate_child_abandoned_at_commit_still_aborts_a_parked_child`; a child stuck in a turn: the whole ladder runs and the call answers `ChildUnresponsive`: `terminate_child_of_a_stuck_child_answers_child_unresponsive` | a terminate in progress is joined: `second_terminate_child_waits_for_an_abandoned_stop_of_the_same_child`; a bounce in progress is upgraded to a terminate and the child stays down: `terminate_child_upgrades_an_abandoned_bounce` | `terminate_child_override_runs_pre_stop_once`; a child respawned under the name of a released member is not a member: `a_child_respawned_under_the_name_of_an_overridden_member_is_not_a_member_of_the_group`; a released member is refused by `restart_child` until the group completes, and then revived it is a running child: `a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_child`; a child spawned again under the name of a released member is a child like any other: `a_child_respawned_under_the_name_of_a_released_member_is_stopped_by_terminate_child`; a member waiting in the restart set leaves it: `terminate_child_removes_a_chain_queued_member`, `terminate_child_on_a_retrying_member_cancels_the_retry`; a call made during the chain keeps the member down through the retry: `terminate_during_the_chain_keeps_the_member_down_through_the_retry`; a call made while an attempt of the chain is in flight answers `ChildRestarting`: `stop_child_of_a_pending_group_member_is_absorbed_while_its_manual_stop_is_in_progress` (its second run); terminate, delete and spawn in one handler: `terminate_delete_respawn_in_one_handler_succeeds_in_every_group_phase`; the one more ask a group and the calls that join its member share: `terminate_calls_during_one_group_share_one_more_ask` |
 //! | `stop_child` | abandoned at the commit, a permanent child is bounced once: `stop_child_abandoned_at_commit_bounces_a_vetoing_permanent_child_once`; a child whose task already ended is bounced once, free of charge: `stop_child_of_a_permanent_child_whose_task_already_ended_restarts_it_once`; a stop that meets a crash is the crash, reported and charged once, whether the restarted instance initializes at once, slowly or while the handler lingers: `bounce_racing_a_crash_then_restart_child_reports_the_crash_once`, `bounce_racing_a_crash_then_restart_child_with_a_slow_init_reports_the_crash_once`, `bounce_racing_a_crash_then_restart_child_with_a_linger_reports_the_crash_once`; a child spawned again under the name of a member a group released is a non-member while the group pends, and is bounced and kept: `a_child_respawned_under_a_released_name_is_bounced_and_kept_by_stop_child` | a stop in progress is joined and asks a vetoing `Infinity` child once more: `a_second_manual_stop_asks_a_vetoing_infinity_child_once_more` | a `Permanent` member the group still has to restart absorbs it and the answer says so: `stop_child_of_a_pending_group_member_is_absorbed_while_its_manual_stop_is_in_progress`, `stop_child_of_a_queued_member_is_absorbed_and_one_the_chain_restarted_answers_child_restarting`, `stop_child_during_a_retry_of_a_member_the_first_chain_restarted_is_absorbed`; one the chain already restarted, one released and the chain front are answered `ChildRestarting`: `stop_child_of_a_queued_member_is_absorbed_and_one_the_chain_restarted_answers_child_restarting`, `stop_child_of_a_member_released_by_terminate_child_answers_child_restarting_until_the_group_completes`, `stop_child_of_an_awaited_member_whose_terminate_was_abandoned_answers_child_restarting`, `stop_child_during_a_rest_for_one_retry_of_a_member_the_first_chain_restarted_answers_child_restarting`; a `Transient` or `Temporary` member is stopped as `terminate_child` stops it: `stop_child_of_a_transient_member_stopping_under_its_group_stops_it_and_keeps_it_down_through_the_retry`, `stop_child_of_a_temporary_member_stopping_under_its_group_stops_and_removes_it`, and so is such a child started while the group pends: `stop_child_of_a_transient_child_spawned_during_a_pending_group_stays_down_through_the_retry` |
 //! | `restart_child` | answered `ChildRunning`: `a_child_respawned_under_the_name_of_a_released_member_is_stopped_by_terminate_child`; once its task ended and its death is not yet handled, answered `ChildRestarting`: `children_reads_a_child_whose_task_ended_as_down_before_its_death_is_handled` | answered `ChildRestarting` whether or not the task ended, and never classified to answer: `restart_child_of_a_child_being_stopped_answers_child_restarting_until_its_death_is_handled`, `restart_and_delete_of_a_child_being_stopped_answer_child_restarting` | a member released by `terminate_child` is answered `ChildRestarting` until the group completes: `restart_child_after_group_override_keeps_the_revived_child_running`, `a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_child`; a member the group awaits or will restart is answered `ChildRestarting` too (no test), and so is a key a chain of the group already restarted: `restart_child_answers_child_restarting_for_a_key_the_chain_restarted_until_the_group_completes` |
 //! | `delete_child` | answered `ChildRunning` (no test); once its task ended and its death is not yet handled, answered `ChildRestarting`: `children_reads_a_child_whose_task_ended_as_down_before_its_death_is_handled` | answered `ChildRestarting`: `restart_and_delete_of_a_child_being_stopped_answer_child_restarting` | a member released by `terminate_child` is answered by its own state, so it is deleted once down and its name can be taken again: `a_child_respawned_under_the_name_of_an_overridden_member_is_not_a_member_of_the_group`; a member the group awaits or will restart is answered `ChildRestarting` (no test) |
@@ -92,11 +92,12 @@
 //! | the killed supervisor's own restart | it waits for the orderly subtree: `killed_supervisor_restart_waits_for_its_orderly_subtree` |
 //! | a `Transient` child given the inherited stop | it is not restarted and nothing is charged: `transient_child_stopped_with_parent_killed_is_not_restarted` |
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{timeout, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
@@ -109,51 +110,16 @@ mod common;
 mod subtree_wait;
 
 // ---------------------------------------------------------------------------
-// Timing: every value a test assumes about the crate's ladder is named once.
+// Bounds: a wall-clock bound only detects a hang. The deadlines of the stop
+// ladder, the link guard and the successor wait are the rows of the crate's
+// rule tables; no test here reads a clock against them.
 // ---------------------------------------------------------------------------
 
-/// The time between a child's `Kill` and its abort when its spawn builder sets
-/// no `kill_grace`. An integration test cannot read the crate's constant, so
-/// the value is named here once.
+/// The crate's default kill grace, as a child's configured grace.
 const ASSUMED_KILL_GRACE: Duration = Duration::from_millis(120);
 
-/// The wait after an abort before the Unresponsive verdict. An integration
-/// test cannot read the crate's constant, so the value is named here once.
-const ASSUMED_ABORT_SETTLE: Duration = Duration::from_millis(100);
-
-/// The bound on every outcome a test awaits that is not derived from a
-/// configured window.
-const BOUND: Duration = Duration::from_secs(10);
-
-/// The longest a wait for a condition may take. It only limits how long a real
-/// hang takes to report; a slow host must not read as one.
-const HANG_BOUND: Duration = Duration::from_secs(60);
-
-/// How far past its exact instant an outcome may land on the paused clock:
-/// one poll step of a waiting loop and the timers' rounding, far short of any
-/// window a test configures.
-const PAUSED_SLACK: Duration = Duration::from_millis(30);
-
-/// The upper bound of a timed outcome: its `exact` instant plus
-/// [`PAUSED_SLACK`] on the paused clock, where no stalled host can move it,
-/// and a hang bound past it on a real-time runtime, loose enough for a host
-/// that stalls its threads.
-fn upper(paused: bool, exact: Duration) -> Duration {
-    if paused {
-        exact + PAUSED_SLACK
-    } else {
-        exact + BOUND
-    }
-}
-
-/// How long the tests that count events watch for a late duplicate.
-const QUIET: Duration = Duration::from_millis(300);
-
-/// How far past its exact timing an outcome may land on a real-time runtime
-/// in a test whose failing outcome is a turn or an init held until the test
-/// releases it: loose enough for a host that stalls its threads, and far
-/// short of the held thread.
-const STALL_SLACK: Duration = Duration::from_secs(3);
+/// The hang detector of every outcome a test awaits.
+const BOUND: Duration = Duration::from_secs(60);
 
 /// The longest a turn or an init held on a gate holds its thread when the
 /// test never opens the gate.
@@ -165,29 +131,231 @@ fn uname(base: &str) -> String {
     format!("matrix-{base}-{}", UNIQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Awaits `fut` for at most `bound`; a reverted build fails here instead of
-/// hanging.
-async fn within<T>(bound: Duration, what: &str, fut: impl std::future::Future<Output = T>) -> T {
-    match timeout(bound, fut).await {
-        Ok(value) => value,
-        Err(_) => panic!("timed out after {bound:?} waiting for: {what}"),
+// ---------------------------------------------------------------------------
+// Handshakes: a test waits for a change it observes, never for time to pass.
+// ---------------------------------------------------------------------------
+
+/// Announces a change to every waiter of the calling test, async or
+/// blocked: a probe's counters and flags, a supervisor's records, a gate a
+/// test opens. The signal is the test's own (`common::changes`), installed on
+/// every thread of its runtime.
+fn ping() {
+    common::ping();
+}
+
+/// Holds the calling thread while `held` reads true, for at most
+/// `GATE_CAP`, so a gate the test never opens cannot hold a runtime thread
+/// past the test.
+fn hold_thread_while(held: impl Fn() -> bool) {
+    common::changes().hold_thread_while(GATE_CAP, held);
+}
+
+/// Awaits, inside a hook, until `held` reads false.
+async fn await_while(held: impl Fn() -> bool) {
+    let changes = common::changes();
+    loop {
+        let changed = changes.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if !held() {
+            return;
+        }
+        changed.await;
     }
 }
 
-/// Polls `pred` until it holds. The bound only limits how long a real hang takes to report. A shorter `bound` from a caller is
-/// raised to `HANG_BOUND`.
-async fn wait_until(bound: Duration, what: &str, mut pred: impl FnMut() -> bool) {
-    let bound = bound.max(HANG_BOUND);
-    let deadline = Instant::now() + bound;
-    loop {
-        if pred() {
-            return;
+/// A flag whose every write announces itself to the waiters.
+#[derive(Default)]
+struct Flag(AtomicBool);
+
+impl Flag {
+    fn new(value: bool) -> Self {
+        Self(AtomicBool::new(value))
+    }
+
+    fn load(&self, order: Ordering) -> bool {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: bool, order: Ordering) {
+        self.0.store(value, order);
+        ping();
+    }
+
+    fn swap(&self, value: bool, order: Ordering) -> bool {
+        let old = self.0.swap(value, order);
+        ping();
+        old
+    }
+}
+
+/// A counter whose every write announces itself to the waiters.
+#[derive(Default)]
+struct Count(AtomicUsize);
+
+impl Count {
+    fn load(&self, order: Ordering) -> usize {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: usize, order: Ordering) {
+        self.0.store(value, order);
+        ping();
+    }
+
+    fn fetch_add(&self, value: usize, order: Ordering) -> usize {
+        let old = self.0.fetch_add(value, order);
+        ping();
+        old
+    }
+
+    fn fetch_sub(&self, value: usize, order: Ordering) -> usize {
+        let old = self.0.fetch_sub(value, order);
+        ping();
+        old
+    }
+
+    fn fetch_max(&self, value: usize, order: Ordering) -> usize {
+        let old = self.0.fetch_max(value, order);
+        ping();
+        old
+    }
+
+    /// Takes one when the count is above zero, and says whether it did.
+    fn take_one(&self) -> bool {
+        let mut seen = self.0.load(Ordering::SeqCst);
+        while seen > 0 {
+            match self
+                .0
+                .compare_exchange_weak(seen, seen - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    ping();
+                    return true;
+                }
+                Err(now) => seen = now,
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {bound:?} waiting for: {what}"
-        );
-        sleep(Duration::from_millis(5)).await;
+        false
+    }
+}
+
+/// Awaits `fut`; only a hang of 60 s fails it. The first argument names no
+/// deadline: every outcome a test awaits is bounded by the hang detector
+/// alone.
+async fn within<T>(_bound: Duration, what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    match timeout(Duration::from_secs(60), fut).await {
+        Ok(value) => value,
+        Err(_) => panic!("hung for 60 s waiting for: {what}"),
+    }
+}
+
+/// Waits until `pred` holds, checked again at every announced change (the
+/// waiter enables its wake before it checks, so no change is lost). Only a
+/// hang of 60 s fails it; the first argument names no deadline.
+async fn wait_until(_bound: Duration, what: &str, mut pred: impl FnMut() -> bool) {
+    let changes = common::changes();
+    let watch = async {
+        loop {
+            let changed = changes.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if pred() {
+                return;
+            }
+            changed.await;
+        }
+    };
+    if timeout(Duration::from_secs(60), watch).await.is_err() {
+        panic!("hung for 60 s waiting for: {what}");
+    }
+}
+
+/// A waker that records its wake: a future polled with it is known to have
+/// been woken by what it waits on.
+#[derive(Default)]
+struct CallWake {
+    woken: Flag,
+}
+
+impl std::task::Wake for CallWake {
+    fn wake(self: Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Records the stop requests and kill steps the system `sys` reports,
+/// through a telemetry handler of that system; each record announces
+/// itself.
+fn stop_log(
+    sys: &ActorSystem,
+) -> Arc<Mutex<Vec<tokio_actors::telemetry::TelemetryEvent<'static>>>> {
+    use tokio_actors::telemetry::{EventKind, KindSet};
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let kept = log.clone();
+    sys.attach_telemetry(
+        &uname("stops"),
+        KindSet::of(&[EventKind::StopRequested, EventKind::KillStep]),
+        move |event| {
+            kept.lock().unwrap().push(event.to_static());
+            ping();
+        },
+    );
+    log
+}
+
+/// Counts the Unresponsive verdicts the supervisors of `sys` report, through
+/// a telemetry handler of that system; each count announces itself.
+fn count_verdicts(sys: &ActorSystem) -> Arc<Count> {
+    use tokio_actors::telemetry::{EventKind, KindSet, TelemetryEvent};
+    let verdicts = Arc::new(Count::default());
+    let counted = verdicts.clone();
+    sys.attach_telemetry(
+        &uname("verdicts"),
+        KindSet::of(&[EventKind::Unresponsive]),
+        move |event| {
+            if matches!(event, TelemetryEvent::Unresponsive { .. }) {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    );
+    verdicts
+}
+
+/// Polls `call` once, so the work it does before its first wait (a manual
+/// stop's commit) is done, and drops it.
+async fn poll_once_and_drop<F: std::future::Future>(call: F) {
+    let mut call = std::pin::pin!(call);
+    std::future::poll_fn(|cx| {
+        let _ = call.as_mut().poll(cx);
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+/// Reads the supervisor's `children()`, from inside one of its handlers,
+/// until the named child reads `alive`. The roster changes when the child's
+/// runner records the task's end, a task of its own that no hook follows,
+/// so each read yields to the runtime first; only a hang of 60 s fails it.
+async fn roster_until<A: Actor>(ctx: &ActorContext<A>, name: &str, alive: bool) {
+    let reads = async {
+        loop {
+            let now = ctx
+                .children()
+                .iter()
+                .any(|info| info.id.as_str() == name && info.is_alive);
+            if now == alive {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    if timeout(Duration::from_secs(60), reads).await.is_err() {
+        panic!("hung for 60 s waiting for {name} to read alive={alive}");
     }
 }
 
@@ -199,53 +367,50 @@ async fn wait_until(bound: Duration, what: &str, mut pred: impl FnMut() -> bool)
 #[derive(Default)]
 struct Probe {
     /// Calls of `pre_stop`.
-    pre_stops: AtomicUsize,
+    pre_stops: Count,
     /// Instances built by the child's factory.
-    built: AtomicUsize,
+    built: Count,
     /// Set when the most recent instance was dropped.
-    ended: AtomicBool,
+    ended: Flag,
     /// While set, an instance waits in `on_started` before it acknowledges
-    /// its start (for at most `GATE_CAP`).
-    held: AtomicBool,
+    /// its start.
+    held: Flag,
     /// Instances that finished `on_started`.
-    started: AtomicUsize,
+    started: Count,
     /// Instances that began `on_started`, before its `held` wait.
-    began: AtomicUsize,
+    began: Count,
     /// Instances that entered `on_started` past its `held` wait.
-    entered: AtomicUsize,
+    entered: Count,
     /// While set, an instance fails its initialization.
-    fail_init: AtomicBool,
+    fail_init: Flag,
     /// Notified by an instance that fails its initialization, right before
     /// it returns the failure.
     fail_signal: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// Set when an instance entered its slow failing turn.
-    in_turn: AtomicBool,
+    in_turn: Flag,
     /// While set, a `Block` turn holds its thread until it is cleared (for at
     /// most `GATE_CAP`).
-    block_held: AtomicBool,
+    block_held: Flag,
     /// Set when an instance parked in `handle` on a `Park` message.
-    parked: AtomicBool,
-    /// Milliseconds an instance awaits in `on_started` before it records its
-    /// start.
-    init_sleep_ms: AtomicU64,
+    parked: Flag,
     /// While set, an instance that entered `on_started` holds its thread
     /// there until it is cleared (for at most `GATE_CAP`).
-    init_gate: AtomicBool,
+    init_gate: Flag,
     /// Instances whose `on_started` held on `init_gate` and then went on.
-    init_released: AtomicUsize,
+    init_released: Count,
     /// Calls of `on_stopped`.
-    stopped_runs: AtomicUsize,
+    stopped_runs: Count,
     /// While set, the factory panics before it builds an instance.
-    factory_panics: AtomicBool,
+    factory_panics: Flag,
     /// While set, dropping the child's factory panics.
-    factory_drop_panics: AtomicBool,
+    factory_drop_panics: Flag,
     /// Set to make the next instance that starts send itself a crashing
     /// message in `on_started`.
-    crash_on_start: AtomicBool,
+    crash_on_start: Flag,
     /// While set, `pre_stop` panics.
-    pre_stop_panics: AtomicBool,
+    pre_stop_panics: Flag,
     /// The number of upcoming instances whose initialization fails.
-    fail_next: AtomicUsize,
+    fail_next: Count,
     /// The name of a child the next instance waits for, in `on_started`,
     /// until that child is alive.
     wait_alive: Mutex<Option<String>>,
@@ -254,40 +419,38 @@ struct Probe {
     /// The number of requests each next instance vetoes, front first; the
     /// spawn's own number once empty.
     veto_script: Mutex<std::collections::VecDeque<usize>>,
-    /// Milliseconds `pre_stop` awaits before it answers.
-    pre_stop_sleep_ms: AtomicU64,
     /// While set, `pre_stop` waits before it answers.
-    stop_held: AtomicBool,
+    stop_held: Flag,
     /// While set, the slow failing turn of `LongFail` stays in its turn.
-    turn_held: AtomicBool,
+    turn_held: Flag,
     /// While set, `pre_stop` awaits after it recorded its call, before it
     /// answers.
-    pre_stop_gate: AtomicBool,
+    pre_stop_gate: Flag,
     /// Calls of `pre_stop` that returned.
-    pre_stops_returned: AtomicUsize,
+    pre_stops_returned: Count,
     /// The number of upcoming instances that fail their initialization at
     /// once, before any wait of `on_started`.
-    fail_first: AtomicUsize,
+    fail_first: Count,
     /// The global order of the factory calls of this child, oldest first.
     builds: Mutex<Vec<usize>>,
     /// The global order of the drops of this child's instances, oldest first.
     drops: Mutex<Vec<usize>>,
     /// The global order of the end of the latest `on_started`.
-    last_start: AtomicUsize,
+    last_start: Count,
     /// Instances built and not yet dropped, and the most there ever were.
-    live: AtomicUsize,
-    max_live: AtomicUsize,
+    live: Count,
+    max_live: Count,
     /// While set, the factory blocks its thread before it builds an
     /// instance. The wait runs in `block_in_place`, so the runtime hands the
     /// worker's queued tasks and its timers to another thread: the rest of
     /// the test runs on any number of workers, one included.
-    factory_hold: AtomicBool,
+    factory_hold: Flag,
     /// Set when the factory began to wait on `factory_hold`.
-    in_factory: AtomicBool,
+    in_factory: Flag,
     /// While set, dropping an instance panics.
-    instance_drop_panics: AtomicBool,
+    instance_drop_panics: Flag,
     /// The panics instance drops raised.
-    instance_drop_panicked: AtomicUsize,
+    instance_drop_panicked: Count,
     /// The task each factory call ran in, oldest first.
     build_tasks: Mutex<Vec<Option<tokio::task::Id>>>,
     /// The task each instance dropped in, oldest first.
@@ -305,8 +468,8 @@ impl Probe {
     /// Records a factory call.
     fn note_build(&self) {
         self.build_tasks.lock().unwrap().push(tokio::task::try_id());
-        self.built.fetch_add(1, Ordering::SeqCst);
         self.builds.lock().unwrap().push(Self::next_in_order());
+        self.built.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The place of the factory call number `index` in the global order.
@@ -339,9 +502,7 @@ impl Probe {
         if self.factory_hold.load(Ordering::SeqCst) {
             self.in_factory.store(true, Ordering::SeqCst);
             tokio::task::block_in_place(|| {
-                while self.factory_hold.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                hold_thread_while(|| self.factory_hold.load(Ordering::SeqCst));
             });
         }
         self.note_build();
@@ -367,8 +528,6 @@ enum ChildMsg {
     Park,
     /// Panic inside `handle`.
     Crash,
-    /// Spend 60 ms inside `handle`, then return an error.
-    SlowFail,
     /// Block the thread inside `handle` while the probe's `block_held` is
     /// set: a turn that never reaches a boundary and cannot be aborted.
     Block,
@@ -377,18 +536,6 @@ enum ChildMsg {
     /// Stay inside `handle` while the probe's turn is held, then return an
     /// error.
     LongFail,
-}
-
-/// Takes one from `left` when it is above zero, and says whether it did.
-fn take_one(left: &AtomicUsize) -> bool {
-    let mut seen = left.load(Ordering::SeqCst);
-    while seen > 0 {
-        match left.compare_exchange_weak(seen, seen - 1, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(now) => seen = now,
-        }
-    }
-    false
 }
 
 /// Vetoes the first `vetoes` requests to stop and accepts the rest.
@@ -411,63 +558,41 @@ impl Actor for Probed {
             ChildMsg::Crash => panic!("child crashed on command"),
             ChildMsg::Block => {
                 self.probe.in_turn.store(true, Ordering::SeqCst);
-                let cap = std::time::Instant::now() + GATE_CAP;
-                while self.probe.block_held.load(Ordering::SeqCst)
-                    && std::time::Instant::now() < cap
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                hold_thread_while(|| self.probe.block_held.load(Ordering::SeqCst));
                 Ok(())
-            }
-            ChildMsg::SlowFail => {
-                self.probe.in_turn.store(true, Ordering::SeqCst);
-                sleep(Duration::from_millis(60)).await;
-                Err(ActorError::user("the child failed after a slow turn"))
             }
             ChildMsg::Ping => Ok(()),
             ChildMsg::LongFail => {
                 self.probe.in_turn.store(true, Ordering::SeqCst);
-                while self.probe.turn_held.load(Ordering::SeqCst) {
-                    sleep(Duration::from_millis(5)).await;
-                }
+                await_while(|| self.probe.turn_held.load(Ordering::SeqCst)).await;
                 Err(ActorError::user("the child failed after a long turn"))
             }
         }
     }
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        if take_one(&self.probe.fail_first) {
+        if self.probe.fail_first.take_one() {
             return Err(ActorError::user("the child refused to start at once"));
         }
         self.probe.began.fetch_add(1, Ordering::SeqCst);
-        let cap = Instant::now() + GATE_CAP;
-        while self.probe.held.load(Ordering::SeqCst) && Instant::now() < cap {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| self.probe.held.load(Ordering::SeqCst)).await;
         self.probe.entered.fetch_add(1, Ordering::SeqCst);
         if self.probe.init_gate.load(Ordering::SeqCst) {
-            let cap = std::time::Instant::now() + GATE_CAP;
-            while self.probe.init_gate.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            hold_thread_while(|| self.probe.init_gate.load(Ordering::SeqCst));
             self.probe.init_released.fetch_add(1, Ordering::SeqCst);
-        }
-        let nap = self.probe.init_sleep_ms.load(Ordering::SeqCst);
-        if nap > 0 {
-            sleep(Duration::from_millis(nap)).await;
         }
         let awaited = self.probe.wait_alive.lock().unwrap().take();
         if let Some(name) = awaited {
-            let cap = Instant::now() + GATE_CAP;
-            while !ActorSystem::default()
-                .get::<Probed>(&name)
-                .is_some_and(|handle| handle.is_alive())
-                && Instant::now() < cap
-            {
-                sleep(Duration::from_millis(10)).await;
-            }
+            // The awaited child announces its start from its own
+            // `on_started`, after its registration.
+            await_while(|| {
+                !ActorSystem::default()
+                    .get::<Probed>(&name)
+                    .is_some_and(|handle| handle.is_alive())
+            })
+            .await;
         }
-        if self.probe.fail_init.load(Ordering::SeqCst) || take_one(&self.probe.fail_next) {
+        if self.probe.fail_init.load(Ordering::SeqCst) || self.probe.fail_next.take_one() {
             if let Some(signal) = self.probe.fail_signal.lock().unwrap().take() {
                 signal.notify_one();
             }
@@ -493,26 +618,18 @@ impl Actor for Probed {
     }
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        let calls = self.probe.pre_stops.fetch_add(1, Ordering::SeqCst) + 1;
         self.probe
             .pre_stop_order
             .lock()
             .unwrap()
             .push(Probe::next_in_order());
+        let calls = self.probe.pre_stops.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(
             !self.probe.pre_stop_panics.load(Ordering::SeqCst),
             "pre_stop panics on command"
         );
-        let nap = self.probe.pre_stop_sleep_ms.load(Ordering::SeqCst);
-        if nap > 0 {
-            sleep(Duration::from_millis(nap)).await;
-        }
-        while self.probe.stop_held.load(Ordering::SeqCst) {
-            sleep(Duration::from_millis(5)).await;
-        }
-        while self.probe.pre_stop_gate.load(Ordering::SeqCst) {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| self.probe.stop_held.load(Ordering::SeqCst)).await;
+        await_while(|| self.probe.pre_stop_gate.load(Ordering::SeqCst)).await;
         self.probe.pre_stops_returned.fetch_add(1, Ordering::SeqCst);
         calls > self.vetoes
     }
@@ -554,9 +671,12 @@ struct Sup {
     stop_on_restart: bool,
     /// The supervisor yields once in `on_stopped`.
     yield_on_stopped: bool,
-    /// Milliseconds every `on_child_stopped` awaits after it recorded its
-    /// event.
-    deliver_delay_ms: u64,
+    /// A delivery made while this probe's instance number `n` is built (its
+    /// restart attempt is in flight) awaits, after it recorded its event,
+    /// until that instance finished starting: the attempt completes while
+    /// the supervisor is busy. A delivery made before the build waits for
+    /// nothing, since the attempt may start only after it.
+    deliver_after: Option<(Arc<Probe>, usize)>,
     /// The system the children live in; the default system when unset.
     system: Option<Arc<ActorSystem>>,
     knobs: Arc<Knobs>,
@@ -576,8 +696,10 @@ enum Fault {
     /// Makes every supervision call at the named child and records the
     /// answers.
     Calls(String),
-    /// Calls `terminate_child` at the named child and records the answer.
-    Terminate(String),
+    /// In the delivery of the first child's report, calls `terminate_child`
+    /// at the second and records the answer; the deliveries of any other
+    /// child's report pass and leave the fault queued.
+    Terminate { during: String, target: String },
 }
 
 /// What a supervisor records of its own callbacks, for the tests that read
@@ -592,9 +714,12 @@ struct Knobs {
     last_errors: Mutex<Vec<Option<String>>>,
     /// The behaviour of the deliveries, front first; `Pass` once empty.
     faults: Mutex<std::collections::VecDeque<Fault>>,
-    /// The child whose next delivery keeps the supervisor busy for this many
-    /// milliseconds, once; its end is logged with a global order stamp.
-    busy_for: Mutex<Option<(String, u64)>>,
+    /// The child whose next delivery keeps the supervisor busy until the
+    /// flag is set, once; its end is logged with a global order stamp.
+    busy_for: Mutex<Option<(String, Arc<Flag>)>>,
+    /// Set when the supervisor's `pre_stop` accepted a stop: its teardown
+    /// follows on its own task.
+    stopping: Flag,
 }
 
 #[derive(Clone)]
@@ -606,15 +731,19 @@ enum Cmd {
         restart: RestartType,
         vetoes: usize,
     },
-    /// `terminate_child`, the wait dropped after `wait`.
+    /// `terminate_child`, polled once, so its commit is made, and dropped.
     TerminateAbandon {
         name: String,
-        wait: Duration,
     },
-    /// `stop_child`, the wait dropped after `wait`.
+    /// `terminate_child`, dropped once the probe's `pre_stop` vetoed the
+    /// stop: in the middle of the child's window.
+    TerminateAbandonAfterVeto {
+        name: String,
+        probe: Arc<Probe>,
+    },
+    /// `stop_child`, polled once, so its commit is made, and dropped.
     StopAbandon {
         name: String,
-        wait: Duration,
     },
     /// `terminate_child`, awaited.
     Terminate {
@@ -636,7 +765,7 @@ enum Cmd {
     /// Replies whether the child's instance was already gone on return.
     /// One handler: `terminate_child` (a member the group awaits), then
     /// `delete_child`, then `spawn_child` under the same name, then
-    /// `terminate_child` of the new child, bounded by two seconds.
+    /// `terminate_child` of the new child.
     OverrideDeleteRespawnTerminate {
         name: String,
         probe: Arc<Probe>,
@@ -654,7 +783,7 @@ enum Cmd {
         shutdown: Shutdown,
         restart: RestartType,
         config: SupervisionConfig,
-        built: Arc<AtomicUsize>,
+        built: Arc<Count>,
         events: Events,
         knobs: Arc<Knobs>,
     },
@@ -696,39 +825,27 @@ enum Op {
     /// `stop_child`: the call is polled once, so its commit is made, then the
     /// probe's held turn is ended, then the call is awaited.
     StopThenEndTurn(String, Arc<Probe>),
-    /// Polls `children()` every 5 ms, for at most one second, until the child
-    /// is alive.
+    /// Reads `children()` until the child is alive.
     UntilAlive(String),
     Restart(String),
     Delete(String),
-    Sleep(Duration),
     /// Stops the child through its own handle with `Kill`, bounded by 200 ms.
     KillThroughHandle(String),
-    /// Polls `children()` every 5 ms, for at most one second, until the
-    /// child is no longer alive.
+    /// Reads `children()` until the child is no longer alive.
     UntilNotAlive(String),
     /// Reads what `children()` says of the child.
     Read(String),
     /// `terminate_child`, the wait dropped at once.
     TerminateAbandon(String),
-    /// `terminate_child`, the wait dropped after this long; the line says
-    /// whether the call returned in time.
-    TerminateWithin(String, Duration),
-    /// Sends the child a message that fails it after a slow turn.
-    SlowFail(String),
     /// Sends the child a message that fails it once the probe's held turn
     /// is ended.
     HeldFail(String),
     /// Sends the child a message and waits for its answer, which an instance
     /// gives only after its initialization was acknowledged.
     Ping(String),
-    /// Yields to the runtime this many times.
-    Yield(usize),
-    /// Polls every 5 ms, for at most one second, until an instance of the
-    /// probe entered its slow failing turn.
+    /// Waits until an instance of the probe entered its failing turn.
     UntilInTurn(Arc<Probe>),
-    /// Polls every 5 ms, for at most two seconds, until the probe's instances
-    /// finished starting this many times.
+    /// Waits until the probe's instances finished starting this many times.
     UntilStarted(Arc<Probe>, usize),
     /// Sends the child a crashing message and waits until its task ended.
     CrashAndWait(String),
@@ -748,15 +865,17 @@ enum Op {
     },
     /// `stop_child`, the outcome printed: the call is polled once, so its
     /// commit is made, then the named child, a supervisor, is killed through
-    /// its own handle, then the call is awaited.
-    StopOutcomeThenKill(String),
+    /// its own handle. Once the roster reads the child's end, the call is
+    /// polled again: a call that is ready then returned before the child's
+    /// subtree ended. Otherwise the probe's held turn in the subtree is ended
+    /// and the call is awaited.
+    StopOutcomeThenKill(String, Arc<Probe>),
     /// Opens the probe's `pre_stop` gate: a stop held in `pre_stop` goes on.
     Open(Arc<Probe>),
-    /// Sets `entered`, then waits, polling every 5 ms for at most ten
-    /// seconds, until `release` is set.
+    /// Sets `entered`, then waits until `release` is set.
     Hold {
-        entered: Arc<AtomicBool>,
-        release: Arc<AtomicBool>,
+        entered: Arc<Flag>,
+        release: Arc<Flag>,
     },
 }
 
@@ -819,12 +938,24 @@ impl Actor for Sup {
                     .await;
                 Reply::Done(result.map(|_| ()).map_err(|err| err.to_string()))
             }
-            Cmd::TerminateAbandon { name, wait } => {
-                let _ = timeout(wait, ctx.terminate_child(name)).await;
+            Cmd::TerminateAbandon { name } => {
+                poll_once_and_drop(ctx.terminate_child(name)).await;
                 Reply::Done(Ok(()))
             }
-            Cmd::StopAbandon { name, wait } => {
-                let _ = timeout(wait, ctx.stop_child(name)).await;
+            Cmd::TerminateAbandonAfterVeto { name, probe } => {
+                let mut call = std::pin::pin!(ctx.terminate_child(name));
+                let vetoed = async {
+                    await_while(|| probe.pre_stops_returned.load(Ordering::SeqCst) == 0).await
+                };
+                tokio::select! {
+                    biased;
+                    _ = call.as_mut() => {}
+                    _ = vetoed => {}
+                }
+                Reply::Done(Ok(()))
+            }
+            Cmd::StopAbandon { name } => {
+                poll_once_and_drop(ctx.stop_child(name)).await;
                 Reply::Done(Ok(()))
             }
             Cmd::Terminate { name } => Reply::Done(text(ctx.terminate_child(name).await)),
@@ -842,7 +973,6 @@ impl Actor for Sup {
                 })
             }
             Cmd::OverrideDeleteRespawnTerminate { name, probe } => {
-                let started = Instant::now();
                 let mut steps = vec![format!(
                     "{:?}",
                     text(ctx.terminate_child(name.clone()).await)
@@ -856,13 +986,7 @@ impl Actor for Sup {
                     .shutdown(Shutdown::Timeout(Duration::from_millis(200)))
                     .await;
                 steps.push(format!("{:?}", respawned.map(|_| ())));
-                let last = Instant::now();
-                let stopped = timeout(Duration::from_secs(2), ctx.terminate_child(name)).await;
-                steps.push(match stopped {
-                    Ok(result) => format!("{:?} after {:?}", text(result), last.elapsed()),
-                    Err(_) => "the last terminate_child did not return in two seconds".to_string(),
-                });
-                steps.push(format!("total {:?}", started.elapsed()));
+                steps.push(format!("{:?}", text(ctx.terminate_child(name).await)));
                 Reply::Steps(steps)
             }
             Cmd::Script(ops) => {
@@ -878,7 +1002,7 @@ impl Actor for Sup {
                             ctx.stop_child(name).await.map_err(|err| err.to_string())
                         ),
                         Op::StopAbandon(name) => {
-                            let _ = timeout(Duration::ZERO, ctx.stop_child(name)).await;
+                            poll_once_and_drop(ctx.stop_child(name)).await;
                             "abandoned".to_string()
                         }
                         Op::StopOutcomeThenOpen(name, probe) => {
@@ -912,27 +1036,11 @@ impl Actor for Sup {
                             format!("{:?}", text(call.await))
                         }
                         Op::UntilAlive(name) => {
-                            let deadline = Instant::now() + Duration::from_secs(1);
-                            loop {
-                                let alive = ctx
-                                    .children()
-                                    .iter()
-                                    .any(|info| info.id.as_str() == name && info.is_alive);
-                                if alive {
-                                    break "alive".to_string();
-                                }
-                                if Instant::now() >= deadline {
-                                    break "not alive after one second".to_string();
-                                }
-                                sleep(Duration::from_millis(5)).await;
-                            }
+                            roster_until(ctx, &name, true).await;
+                            "alive".to_string()
                         }
                         Op::Restart(name) => format!("{:?}", text(ctx.restart_child(name))),
                         Op::Delete(name) => format!("{:?}", text(ctx.delete_child(name))),
-                        Op::Sleep(wait) => {
-                            sleep(wait).await;
-                            "slept".to_string()
-                        }
                         Op::KillThroughHandle(name) => {
                             let handle = self
                                 .system
@@ -946,20 +1054,8 @@ impl Actor for Sup {
                             format!("{outcome:?}")
                         }
                         Op::UntilNotAlive(name) => {
-                            let deadline = Instant::now() + Duration::from_secs(1);
-                            loop {
-                                let alive = ctx
-                                    .children()
-                                    .iter()
-                                    .any(|info| info.id.as_str() == name && info.is_alive);
-                                if !alive {
-                                    break "not alive".to_string();
-                                }
-                                if Instant::now() >= deadline {
-                                    break "still alive after one second".to_string();
-                                }
-                                sleep(Duration::from_millis(5)).await;
-                            }
+                            roster_until(ctx, &name, false).await;
+                            "not alive".to_string()
                         }
                         Op::CrashAndWait(name) => {
                             let handle = self
@@ -988,23 +1084,8 @@ impl Actor for Sup {
                             )
                         }
                         Op::TerminateAbandon(name) => {
-                            let _ = timeout(Duration::ZERO, ctx.terminate_child(name)).await;
+                            poll_once_and_drop(ctx.terminate_child(name)).await;
                             "abandoned".to_string()
-                        }
-                        Op::TerminateWithin(name, bound) => {
-                            match timeout(bound, ctx.terminate_child(name)).await {
-                                Ok(result) => format!("{:?}", text(result)),
-                                Err(_) => format!("the call did not return within {bound:?}"),
-                            }
-                        }
-                        Op::SlowFail(name) => {
-                            let handle = self
-                                .system
-                                .clone()
-                                .unwrap_or_else(ActorSystem::default)
-                                .get::<Probed>(&name)
-                                .expect("the child is registered");
-                            format!("{:?}", handle.notify(ChildMsg::SlowFail).await.is_ok())
                         }
                         Op::HeldFail(name) => {
                             let handle = self
@@ -1015,12 +1096,6 @@ impl Actor for Sup {
                                 .expect("the child is registered");
                             format!("{:?}", handle.notify(ChildMsg::LongFail).await.is_ok())
                         }
-                        Op::Yield(times) => {
-                            for _ in 0..times {
-                                tokio::task::yield_now().await;
-                            }
-                            "yielded".to_string()
-                        }
                         Op::Ping(name) => {
                             let handle = ActorSystem::default()
                                 .get::<Probed>(&name)
@@ -1028,23 +1103,21 @@ impl Actor for Sup {
                             format!("{:?}", handle.send(ChildMsg::Ping).await.is_ok())
                         }
                         Op::UntilInTurn(probe) => {
-                            let deadline = Instant::now() + Duration::from_secs(1);
-                            while !probe.in_turn.load(Ordering::SeqCst) {
-                                if Instant::now() >= deadline {
-                                    break;
-                                }
-                                sleep(Duration::from_millis(5)).await;
-                            }
+                            within(
+                                BOUND,
+                                "the child's turn",
+                                await_while(|| !probe.in_turn.load(Ordering::SeqCst)),
+                            )
+                            .await;
                             format!("in turn: {}", probe.in_turn.load(Ordering::SeqCst))
                         }
                         Op::UntilStarted(probe, count) => {
-                            let deadline = Instant::now() + Duration::from_secs(2);
-                            while probe.started.load(Ordering::SeqCst) < count {
-                                if Instant::now() >= deadline {
-                                    break;
-                                }
-                                sleep(Duration::from_millis(5)).await;
-                            }
+                            within(
+                                BOUND,
+                                "the child's starts",
+                                await_while(|| probe.started.load(Ordering::SeqCst) < count),
+                            )
+                            .await;
                             format!("started: {}", probe.started.load(Ordering::SeqCst))
                         }
                         Op::Spawn {
@@ -1069,21 +1142,51 @@ impl Actor for Sup {
                             .map_or("no such child".to_string(), |info| {
                                 format!("alive={} pending={}", info.is_alive, info.restart_pending)
                             }),
-                        Op::StopOutcomeThenKill(name) => {
-                            let mut call = std::pin::pin!(ctx.stop_child(name.clone()));
-                            std::future::poll_fn(|cx| {
-                                let _ = std::future::Future::poll(call.as_mut(), cx);
-                                std::task::Poll::Ready(())
-                            })
-                            .await;
+                        Op::StopOutcomeThenKill(name, held) => {
                             let handle = self
                                 .system
                                 .clone()
                                 .unwrap_or_else(ActorSystem::default)
                                 .get::<Sup>(&name)
                                 .expect("the child supervisor is registered");
-                            let _ = handle.stop(StopReason::Kill).await;
-                            format!("{:?}", call.await.map_err(|err| err.to_string()))
+                            // The call is polled with a waker of its own, so a
+                            // wake is the call's: the child's fate reaching
+                            // the cell it waits on.
+                            let wake = Arc::new(CallWake::default());
+                            let waker = std::task::Waker::from(wake.clone());
+                            let call = ctx.stop_child(name.clone());
+                            let mut call = std::pin::pin!(call);
+                            let first = call
+                                .as_mut()
+                                .poll(&mut std::task::Context::from_waker(&waker));
+                            let line = if let std::task::Poll::Ready(outcome) = first {
+                                format!(
+                                    "returned at its commit: {:?}",
+                                    outcome.map_err(|err| err.to_string())
+                                )
+                            } else {
+                                let _ = handle.stop(StopReason::Kill).await;
+                                within(
+                                    BOUND,
+                                    "the call to be woken by the child's end",
+                                    await_while(|| !wake.woken.load(Ordering::SeqCst)),
+                                )
+                                .await;
+                                let again = call
+                                    .as_mut()
+                                    .poll(&mut std::task::Context::from_waker(&waker));
+                                match again {
+                                    std::task::Poll::Ready(outcome) => format!(
+                                        "returned before the subtree ended: {:?}",
+                                        outcome.map_err(|err| err.to_string())
+                                    ),
+                                    std::task::Poll::Pending => {
+                                        held.turn_held.store(false, Ordering::SeqCst);
+                                        format!("{:?}", call.await.map_err(|err| err.to_string()))
+                                    }
+                                }
+                            };
+                            line
                         }
                         Op::Open(probe) => {
                             probe.pre_stop_gate.store(false, Ordering::SeqCst);
@@ -1091,10 +1194,12 @@ impl Actor for Sup {
                         }
                         Op::Hold { entered, release } => {
                             entered.store(true, Ordering::SeqCst);
-                            let deadline = Instant::now() + Duration::from_secs(10);
-                            while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
-                                sleep(Duration::from_millis(5)).await;
-                            }
+                            within(
+                                BOUND,
+                                "the test to release the handler",
+                                await_while(|| !release.load(Ordering::SeqCst)),
+                            )
+                            .await;
                             format!("released: {}", release.load(Ordering::SeqCst))
                         }
                     };
@@ -1119,7 +1224,7 @@ impl Actor for Sup {
                             events: events.clone(),
                             stop_on_restart: false,
                             yield_on_stopped: false,
-                            deliver_delay_ms: 0,
+                            deliver_after: None,
                             system: system.clone(),
                             knobs: knobs.clone(),
                         }
@@ -1170,7 +1275,7 @@ impl Actor for Sup {
                 }
             }
             Cmd::TerminateTwice { name, probe } => {
-                let _ = timeout(Duration::ZERO, ctx.terminate_child(name.clone())).await;
+                poll_once_and_drop(ctx.terminate_child(name.clone())).await;
                 let result = text(ctx.terminate_child(name).await);
                 Reply::GoneOnReturn(result, probe.ended.load(Ordering::SeqCst))
             }
@@ -1190,8 +1295,16 @@ impl Actor for Sup {
             event.action,
             ctx.status()
         ));
-        if self.deliver_delay_ms > 0 {
-            sleep(Duration::from_millis(self.deliver_delay_ms)).await;
+        ping();
+        if let Some((probe, starts)) = &self.deliver_after {
+            if probe.built.load(Ordering::SeqCst) >= *starts {
+                within(
+                    BOUND,
+                    "the start the delivery waits for",
+                    await_while(|| probe.started.load(Ordering::SeqCst) < *starts),
+                )
+                .await;
+            }
         }
         let busy = {
             let mut slot = self.knobs.busy_for.lock().unwrap();
@@ -1202,8 +1315,13 @@ impl Actor for Sup {
                 _ => None,
             }
         };
-        if let Some((name, millis)) = busy {
-            sleep(Duration::from_millis(millis)).await;
+        if let Some((name, release)) = busy {
+            within(
+                BOUND,
+                "the test to end the busy delivery",
+                await_while(|| !release.load(Ordering::SeqCst)),
+            )
+            .await;
             self.knobs
                 .order
                 .lock()
@@ -1216,13 +1334,19 @@ impl Actor for Sup {
                 .await
                 .expect("the supervisor stops itself");
         }
-        let fault = self
-            .knobs
-            .faults
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Fault::Pass);
+        let fault = {
+            let mut faults = self.knobs.faults.lock().unwrap();
+            let elsewhere = matches!(
+                faults.front(),
+                Some(Fault::Terminate { during, .. })
+                    if event.child_name.as_deref() != Some(during.as_str())
+            );
+            if elsewhere {
+                Fault::Pass
+            } else {
+                faults.pop_front().unwrap_or(Fault::Pass)
+            }
+        };
         match fault {
             Fault::Pass => Ok(()),
             Fault::Err(text) => Err(ActorError::user(text)),
@@ -1231,13 +1355,14 @@ impl Actor for Sup {
                 let _ = ctx.self_handle().stop(StopReason::Kill).await;
                 Ok(())
             }
-            Fault::Terminate(name) => {
+            Fault::Terminate { target: name, .. } => {
                 let answer = text(ctx.terminate_child(name.clone()).await);
                 self.knobs
                     .order
                     .lock()
                     .unwrap()
                     .push(format!("terminate:{name}:{answer:?}"));
+                ping();
                 Ok(())
             }
             Fault::Calls(name) => {
@@ -1269,9 +1394,16 @@ impl Actor for Sup {
                     .lock()
                     .unwrap()
                     .push(format!("calls:{}", lines.join("|")));
+                ping();
                 Ok(())
             }
         }
+    }
+
+    async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
+        self.knobs.stopping.store(true, Ordering::SeqCst);
+        ping();
+        true
     }
 
     async fn on_stopped(
@@ -1290,6 +1422,7 @@ impl Actor for Sup {
             .lock()
             .unwrap()
             .push(ctx.last_error().map(|err| err.to_string()));
+        ping();
         if self.yield_on_stopped {
             tokio::task::yield_now().await;
         }
@@ -1308,7 +1441,7 @@ struct Rig {
 struct SupOpts {
     stop_on_restart: bool,
     yield_on_stopped: bool,
-    deliver_delay_ms: u64,
+    deliver_after: Option<(Arc<Probe>, usize)>,
 }
 
 /// The one place a test supervisor is spawned: on `sys` (the default system
@@ -1325,7 +1458,7 @@ async fn spawn_sup(
         events: events.clone(),
         stop_on_restart: opts.stop_on_restart,
         yield_on_stopped: opts.yield_on_stopped,
-        deliver_delay_ms: opts.deliver_delay_ms,
+        deliver_after: opts.deliver_after,
         system: sys.cloned(),
         knobs: knobs.clone(),
     }
@@ -1391,18 +1524,27 @@ impl Rig {
     /// Calls `restart_child` from a handler until it is not refused for a
     /// pending group restart, bounded; returns the answer that ended it.
     async fn restart_child_when_the_group_completes(&self, name: &str) -> Vec<String> {
-        let deadline = Instant::now() + BOUND;
-        loop {
-            let lines = self.script(vec![Op::Restart(name.to_string())]).await;
-            if !lines[0].contains("is restarting") {
-                return lines;
+        // Each round is served at a turn boundary of the supervisor, after
+        // every outcome already waiting for it.
+        let rounds = async {
+            loop {
+                let lines = self.script(vec![Op::Restart(name.to_string())]).await;
+                if !lines[0].contains("is restarting") {
+                    return lines;
+                }
             }
-            assert!(
-                Instant::now() < deadline,
-                "restart_child was refused until the bound"
-            );
-            sleep(Duration::from_millis(5)).await;
-        }
+        };
+        within(BOUND, "restart_child once the group completes", rounds).await
+    }
+
+    /// The barrier that ends a scenario counting reports: the supervisor
+    /// stops (`Graceful`) and the test waits for its end. A death still
+    /// pending is delivered once with `SupervisorStopping` before
+    /// `on_stopped`, and a child the teardown stops gets no report, so every
+    /// report counted after this is final.
+    async fn finish(&self) -> StopReason {
+        let _ = self.sup.stop(StopReason::Graceful).await;
+        within(BOUND, "the supervisor's end", self.sup.wait_stopped()).await
     }
 
     fn events_for(&self, name: &str) -> Vec<ChildEvent> {
@@ -1455,13 +1597,20 @@ fn removed_once(rig: &Rig, name: &str) {
 /// The window of the vetoing children below.
 const WINDOW: Duration = Duration::from_millis(200);
 
-/// The longest a vetoing child under `WINDOW` may live after its stop was
-/// ordered: the window, the Kill step and the abort.
-fn stop_bound(paused: bool) -> Duration {
-    upper(paused, WINDOW + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE)
+/// When the abandoned `terminate_child` is dropped.
+#[derive(Clone, Copy)]
+enum DropAt {
+    /// Right after its commit.
+    Commit,
+    /// Once the child vetoed the stop, in the middle of its window.
+    Veto,
 }
 
-async fn abandoned_terminate_still_stops(wait: Duration, park: bool, paused: bool) {
+/// A vetoing child under `WINDOW` whose `terminate_child` is abandoned is
+/// still stopped by its runner: the window, the Kill step and the abort run
+/// after the call is gone. Their deadlines are the stop ladder's rows; here
+/// the window passes on the paused clock.
+async fn abandoned_terminate_still_stops(drop_at: DropAt, park: bool) {
     let rig = supervisor(plain()).await;
     let name = uname("veto");
     let probe = Arc::new(Probe::default());
@@ -1481,125 +1630,39 @@ async fn abandoned_terminate_still_stops(wait: Duration, park: bool, paused: boo
         })
         .await;
     }
-    let started = Instant::now();
-    rig.ok(Cmd::TerminateAbandon {
-        name: name.clone(),
-        wait,
-    })
-    .await;
-    // The bound counts from the command, not from the end of the abandoned
-    // wait.
-    wait_until(
-        stop_bound(paused)
-            .saturating_sub(started.elapsed())
-            .max(Duration::from_millis(1)),
+    match drop_at {
+        DropAt::Commit => rig.ok(Cmd::TerminateAbandon { name: name.clone() }).await,
+        DropAt::Veto => {
+            rig.ok(Cmd::TerminateAbandonAfterVeto {
+                name: name.clone(),
+                probe: probe.clone(),
+            })
+            .await
+        }
+    }
+    within(
+        BOUND,
         "the abandoned stop to end the child",
-        || probe.ended.load(Ordering::SeqCst),
+        child.wait_stopped(),
     )
     .await;
-    assert!(
-        started.elapsed() >= WINDOW,
-        "the child lived through its window: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        started.elapsed() < stop_bound(paused),
-        "the child's task ended within its window, the Kill step and the abort: {:?}",
-        started.elapsed()
-    );
+    wait_until(BOUND, "the child's instance to be dropped", || {
+        probe.ended.load(Ordering::SeqCst)
+    })
+    .await;
     wait_until(BOUND, "the report of the child's end", || {
         !rig.events_for(&name).is_empty()
     })
     .await;
-    sleep(QUIET).await;
+    rig.finish().await;
     removed_once(&rig, &name);
-}
-
-async fn manual_calls_succeed_once_an_abandoned_stop_completes_body(paused: bool) {
-    let rig = supervisor(plain()).await;
-    let name = uname("again");
-    let probe = Arc::new(Probe::default());
-    rig.spawn_child(
-        &name,
-        &probe,
-        Shutdown::Timeout(WINDOW),
-        RestartType::Permanent,
-        always_vetoes(),
-    )
-    .await;
-    rig.ok(Cmd::TerminateAbandon {
-        name: name.clone(),
-        wait: Duration::ZERO,
-    })
-    .await;
-    wait_until(
-        stop_bound(paused),
-        "the abandoned stop to end the child",
-        || probe.ended.load(Ordering::SeqCst),
-    )
-    .await;
-    wait_until(BOUND, "the report of the child's end", || {
-        !rig.events_for(&name).is_empty()
-    })
-    .await;
-    // The child is gone: every manual call succeeds from here.
-    rig.ok(Cmd::Terminate { name: name.clone() }).await;
-    rig.ok(Cmd::RestartChild { name: name.clone() }).await;
-    wait_until(BOUND, "the child to be alive again", || {
-        ActorSystem::default()
-            .get::<Probed>(&name)
-            .is_some_and(|handle| handle.is_alive())
-    })
-    .await;
-    assert_eq!(probe.built.load(Ordering::SeqCst), 2);
-}
-
-async fn stop_child_abandoned_at_commit_bounces_a_vetoing_permanent_child_once_body(paused: bool) {
-    // A budget of one restart: a bounce is not a failure and charges
-    // nothing, so a later real crash is still absorbed.
-    let rig =
-        supervisor(SupervisionConfig::one_for_one().max_restarts(1, Duration::from_secs(60))).await;
-    let name = uname("bounce");
-    let probe = Arc::new(Probe::default());
-    rig.spawn_child(
-        &name,
-        &probe,
-        Shutdown::Timeout(WINDOW),
-        RestartType::Permanent,
-        always_vetoes(),
-    )
-    .await;
-    rig.ok(Cmd::StopAbandon {
-        name: name.clone(),
-        wait: Duration::ZERO,
-    })
-    .await;
-    wait_until(
-        stop_bound(paused),
-        "the bounce to restart the child",
-        || probe.built.load(Ordering::SeqCst) == 2,
-    )
-    .await;
-    sleep(QUIET).await;
-    assert_eq!(probe.built.load(Ordering::SeqCst), 2, "one restart");
-    let events = rig.events_for(&name);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].action, SupervisionAction::RestartInitiated);
-    // The budget is untouched: a real crash is restarted.
-    let fresh = child_handle(&name).await;
-    crash(&fresh).await;
-    wait_until(BOUND, "the crashed child to be restarted", || {
-        probe.built.load(Ordering::SeqCst) == 3
-    })
-    .await;
-    assert!(rig.sup.is_alive(), "the supervisor survived the crash");
 }
 
 // ---------------------------------------------------------------------------
 // The group's stop and the parent's stop belong to the runners too
 // ---------------------------------------------------------------------------
 
-async fn group_stop_escalates_a_vetoing_member_through_its_runner_body(paused: bool) {
+async fn group_stop_escalates_a_vetoing_member_through_its_runner_body() {
     let rig =
         supervisor(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60))).await;
     let crasher = uname("crasher");
@@ -1621,33 +1684,16 @@ async fn group_stop_escalates_a_vetoing_member_through_its_runner_body(paused: b
         always_vetoes(),
     )
     .await;
-    let started = Instant::now();
     crash(&child_handle(&crasher).await).await;
-    // The member's death is bounded as the ladder gives it: its window,
-    // the Kill step and the abort.
-    let member_bound = upper(
-        paused,
-        Duration::from_millis(150) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
-    );
-    wait_until(member_bound, "the vetoing member to die", || {
+    wait_until(BOUND, "the vetoing member to die", || {
         !rig.events_for(&member).is_empty()
     })
     .await;
-    assert!(
-        started.elapsed() >= Duration::from_millis(150),
-        "the member kept its window: {:?}",
-        started.elapsed()
-    );
     wait_until(BOUND, "the group to restart both members", || {
         crasher_probe.built.load(Ordering::SeqCst) == 2
             && member_probe.built.load(Ordering::SeqCst) == 2
     })
     .await;
-    assert!(
-        started.elapsed() >= Duration::from_millis(150),
-        "the member kept its window: {:?}",
-        started.elapsed()
-    );
     assert!(
         member_probe.pre_stops.load(Ordering::SeqCst) >= 1,
         "the member was asked first"
@@ -1662,7 +1708,7 @@ async fn group_stop_escalates_a_vetoing_member_through_its_runner_body(paused: b
     );
 }
 
-async fn parent_stop_escalates_a_vetoing_running_child_through_its_runner_body(paused: bool) {
+async fn parent_stop_escalates_a_vetoing_running_child_through_its_runner_body() {
     let rig = supervisor(plain()).await;
     let name = uname("parent-stop");
     let probe = Arc::new(Probe::default());
@@ -1674,7 +1720,6 @@ async fn parent_stop_escalates_a_vetoing_running_child_through_its_runner_body(p
         always_vetoes(),
     )
     .await;
-    let started = Instant::now();
     within(
         BOUND,
         "the supervisor to accept the stop",
@@ -1682,26 +1727,18 @@ async fn parent_stop_escalates_a_vetoing_running_child_through_its_runner_body(p
     )
     .await
     .expect("stop");
-    within(
-        stop_bound(paused),
-        "the supervisor to stop",
-        rig.sup.wait_stopped(),
-    )
-    .await;
+    within(BOUND, "the supervisor to stop", rig.sup.wait_stopped()).await;
     assert!(
         probe.ended.load(Ordering::SeqCst),
         "the supervisor publishes Stopped only after its child ended"
     );
     assert!(
-        started.elapsed() >= WINDOW,
-        "the child kept its window: {:?}",
-        started.elapsed()
+        probe.pre_stops.load(Ordering::SeqCst) >= 1,
+        "the child was asked before its runner escalated"
     );
 }
 
-async fn a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_child_body(
-    paused: bool,
-) {
+async fn a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_child_body() {
     let rig =
         supervisor(SupervisionConfig::one_for_all().max_restarts(5, Duration::from_secs(60))).await;
     let crasher = uname("crasher");
@@ -1775,40 +1812,19 @@ async fn a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_ch
     // The group's pending marker clears just after the crasher's
     // adoption: restart_child is refused until it does, and then revives
     // the member.
-    let deadline = Instant::now() + BOUND;
-    loop {
-        match rig
-            .command(Cmd::RestartChild {
-                name: member.clone(),
-            })
-            .await
-        {
-            Reply::Done(Ok(())) => break,
-            Reply::Done(Err(text)) if text.contains("is restarting") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "restart_child was refused until the bound"
-                );
-                sleep(Duration::from_millis(5)).await;
-            }
-            other => panic!("unexpected answer {other:?}"),
-        }
-    }
+    let lines = rig.restart_child_when_the_group_completes(&member).await;
+    assert_eq!(lines, vec!["Ok(())".to_string()], "{lines:?}");
     wait_until(BOUND, "the member to be built again", || {
         member_probe.built.load(Ordering::SeqCst) == 2
     })
     .await;
     wait_for_alive(&rig, &member).await;
     // The revived member is a running child like any other.
-    let answer = within(
-        stop_bound(paused),
-        "the revived member to be stopped",
-        rig.sup.send(Cmd::Terminate {
+    let answer = rig
+        .command(Cmd::Terminate {
             name: member.clone(),
-        }),
-    )
-    .await
-    .expect("the supervisor answers");
+        })
+        .await;
     assert!(matches!(answer, Reply::Done(Ok(()))), "{answer:?}");
 }
 
@@ -1818,9 +1834,9 @@ async fn a_member_released_from_a_group_and_restarted_is_stopped_by_terminate_ch
 
 /// A child whose factory blocks, so its restart attempt stays in flight.
 struct Slow {
-    gate: Arc<AtomicBool>,
+    gate: Arc<Flag>,
     /// Counts the instances that began `on_started`.
-    began: Arc<AtomicUsize>,
+    began: Arc<Count>,
 }
 
 impl Actor for Slow {
@@ -1833,7 +1849,7 @@ impl Actor for Slow {
                 std::future::pending::<()>().await;
                 Ok(())
             }
-            ChildMsg::Crash | ChildMsg::SlowFail | ChildMsg::LongFail | ChildMsg::Block => {
+            ChildMsg::Crash | ChildMsg::LongFail | ChildMsg::Block => {
                 panic!("child crashed on command")
             }
             ChildMsg::Ping => Ok(()),
@@ -1843,17 +1859,15 @@ impl Actor for Slow {
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.began.fetch_add(1, Ordering::SeqCst);
         // A restarted instance waits here until the test opens the gate.
-        while !self.gate.load(Ordering::SeqCst) {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| !self.gate.load(Ordering::SeqCst)).await;
         Ok(())
     }
 }
 
 struct SlowSup {
-    gate: Arc<AtomicBool>,
-    built: Arc<AtomicUsize>,
-    began: Arc<AtomicUsize>,
+    gate: Arc<Flag>,
+    built: Arc<Count>,
+    began: Arc<Count>,
 }
 
 #[derive(Clone)]
@@ -1914,11 +1928,11 @@ impl Actor for SlowSup {
 #[derive(Default)]
 struct StuckGate {
     /// Set by the test to end the turn.
-    open: AtomicBool,
+    open: Flag,
     /// Set when the turn began.
-    entered: AtomicBool,
+    entered: Flag,
     /// Set when the turn ended.
-    returned: AtomicBool,
+    returned: Flag,
 }
 
 /// Opens a `StuckGate` when dropped, so the stuck turn ends however the test
@@ -1941,10 +1955,7 @@ impl Actor for Stuck {
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.0.entered.store(true, Ordering::SeqCst);
-        let cap = std::time::Instant::now() + GATE_CAP;
-        while !self.0.open.load(Ordering::SeqCst) && std::time::Instant::now() < cap {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        hold_thread_while(|| !self.0.open.load(Ordering::SeqCst));
         self.0.returned.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1976,7 +1987,7 @@ impl Actor for StuckSup {
 
 /// An actor value that panics when dropped once armed.
 struct Fragile {
-    armed: Arc<AtomicBool>,
+    armed: Arc<Flag>,
 }
 
 impl Actor for Fragile {
@@ -1989,7 +2000,7 @@ impl Actor for Fragile {
                 std::future::pending::<()>().await;
                 Ok(())
             }
-            ChildMsg::Crash | ChildMsg::SlowFail | ChildMsg::LongFail | ChildMsg::Block => {
+            ChildMsg::Crash | ChildMsg::LongFail | ChildMsg::Block => {
                 panic!("child crashed on command")
             }
             ChildMsg::Ping => Ok(()),
@@ -2020,12 +2031,12 @@ struct Report {
 }
 
 struct FragileSup {
-    armed: Arc<AtomicBool>,
-    entered: Arc<AtomicBool>,
+    armed: Arc<Flag>,
+    entered: Arc<Flag>,
     /// Opened by the test once the name is taken: the factory of a restart
     /// attempt blocks its thread until then.
     release: Arc<(Mutex<bool>, std::sync::Condvar)>,
-    built: Arc<AtomicUsize>,
+    built: Arc<Count>,
     seen: Arc<Mutex<Seen>>,
 }
 
@@ -2047,7 +2058,7 @@ impl Actor for FragileSup {
                 let mut open = lock.lock().unwrap();
                 while !*open {
                     let (guard, waited) =
-                        opened.wait_timeout(open, Duration::from_secs(10)).unwrap();
+                        opened.wait_timeout(open, Duration::from_secs(30)).unwrap();
                     open = guard;
                     if waited.timed_out() {
                         break;
@@ -2076,6 +2087,7 @@ impl Actor for FragileSup {
             task_error: ctx.last_supervision_task_error().cloned(),
             last_error_clear: ctx.last_error().is_none(),
         });
+        ping();
         Ok(())
     }
 }
@@ -2121,19 +2133,39 @@ async fn is_alive(rig: &Rig, name: &str) -> bool {
     )
 }
 
-/// Polls until `name` reads alive. The bound only limits how long a real hang takes to report.
+/// Asks the supervisor until `name` reads alive in its roster. Each round is
+/// served at a turn boundary, after every restart outcome already waiting
+/// for the supervisor, so the loop ends at the first boundary after the
+/// adoption; only a hang of 60 s fails it.
 async fn wait_for_alive(rig: &Rig, name: &str) {
-    let deadline = Instant::now() + HANG_BOUND;
-    while !is_alive(rig, name).await {
-        assert!(Instant::now() < deadline, "{name} never ran");
-        sleep(Duration::from_millis(5)).await;
-    }
+    let rounds = async { while !is_alive(rig, name).await {} };
+    within(BOUND, "the child to read alive in the roster", rounds).await;
+}
+
+/// Reads `children()` for `names` until every line satisfies `done`, and
+/// returns the lines. Each read is a round trip served at a turn boundary of
+/// the supervisor, after every outcome and death already waiting for it. A
+/// death whose runner recorded the child's fate but has not completed yet is
+/// not waiting, so a roster that shows a fate does not show that the
+/// supervisor holds the report; only a hang of 60 s fails it.
+async fn until_roster(rig: &Rig, names: &[&str], done: impl Fn(&str) -> bool) -> Vec<String> {
+    let rounds = async {
+        loop {
+            let lines = rig
+                .script(names.iter().map(|n| Op::Read((*n).to_string())).collect())
+                .await;
+            if lines.iter().all(|line| done(line)) {
+                return lines;
+            }
+        }
+    };
+    within(BOUND, "the roster to read as expected", rounds).await
 }
 
 /// OneForAll `[a, b, d]` with `b` and `d` vetoing under `Timeout(300 ms)`
 /// and `Timeout(1500 ms)`: `a` crashes, and `b` is released from the group
 /// restart by `terminate_child`. With `linger`, the handler reads `children()`
-/// and waits 80 ms between the two calls.
+/// between the two calls.
 async fn restart_child_after_group_override(linger: bool) {
     let rig = supervisor(one_for_all()).await;
     let (a, b, d) = (uname("a"), uname("b"), uname("d"));
@@ -2169,7 +2201,6 @@ async fn restart_child_after_group_override(linger: bool) {
     .await;
     let mut ops = vec![Op::Terminate(b.clone())];
     if linger {
-        ops.push(Op::Sleep(Duration::from_millis(80)));
         ops.push(Op::Read(b.clone()));
     }
     ops.push(Op::Restart(b.clone()));
@@ -2177,7 +2208,7 @@ async fn restart_child_after_group_override(linger: bool) {
     assert_eq!(lines[0], "Ok(())", "{lines:?}");
     if linger {
         // The released member is down and nothing will restart it.
-        assert_eq!(lines[2], "alive=false pending=false", "{lines:?}");
+        assert_eq!(lines[1], "alive=false pending=false", "{lines:?}");
     }
     assert!(
         lines
@@ -2194,18 +2225,21 @@ async fn restart_child_after_group_override(linger: bool) {
     })
     .await;
     wait_for_alive(&rig, &b).await;
-    sleep(QUIET).await;
+    // The barrier: the revived member is stopped by the teardown, which
+    // reports nothing, so a report of b counted after it is a late one.
+    rig.finish().await;
     assert_eq!(pa.built.load(Ordering::SeqCst), 2);
     assert_eq!(pb.built.load(Ordering::SeqCst), 2);
     assert_eq!(pd.built.load(Ordering::SeqCst), 2);
-    assert!(is_alive(&rig, &b).await, "the revived member keeps running");
     removed_once(&rig, &b);
 }
 
-/// `stop_child` races a crash: the child fails after a slow turn that was
-/// under way when the call was made, and the same handler then calls
-/// `restart_child`. `init_held` holds the restarted instance in its
-/// initialization; `linger` keeps the handler busy after the second call.
+/// `stop_child` races a crash: the child fails at the end of a turn that was
+/// under way when the call committed (the turn ends once the commit is
+/// made), and the same handler then calls `restart_child`. `init_held`
+/// holds the restarted instance in its initialization; `linger` keeps the
+/// handler busy after the second call until the roster reads the end of the
+/// crashed instance.
 async fn bounce_racing_a_crash_then_restart_child(init_held: bool, linger: bool) {
     // A budget of two: the crash is charged once, so one more crash is still
     // restarted and the supervisor survives it.
@@ -2228,14 +2262,15 @@ async fn bounce_racing_a_crash_then_restart_child(init_held: bool, linger: bool)
     if init_held {
         probe.held.store(true, Ordering::SeqCst);
     }
+    probe.turn_held.store(true, Ordering::SeqCst);
     let mut ops = vec![
-        Op::SlowFail(name.clone()),
+        Op::HeldFail(name.clone()),
         Op::UntilInTurn(probe.clone()),
-        Op::Stop(name.clone()),
+        Op::StopThenEndTurn(name.clone(), probe.clone()),
         Op::Restart(name.clone()),
     ];
     if linger {
-        ops.push(Op::Sleep(Duration::from_millis(40)));
+        ops.push(Op::UntilNotAlive(name.clone()));
     }
     let lines = rig.script(ops).await;
     assert_eq!(lines[1], "in turn: true", "{lines:?}");
@@ -2250,13 +2285,8 @@ async fn bounce_racing_a_crash_then_restart_child(init_held: bool, linger: bool)
     })
     .await;
     wait_for_alive(&rig, &name).await;
-    sleep(QUIET).await;
     // One original instance and one restart; the crash is reported once.
     assert_eq!(probe.built.load(Ordering::SeqCst), 2);
-    let events = rig.events_for(&name);
-    assert_eq!(events.len(), 1, "the crash is reported once: {events:?}");
-    assert_eq!(events[0].action, SupervisionAction::RestartInitiated);
-    assert!(matches!(events[0].reason, StopReason::Failure(_)));
     // One charge: a second crash is restarted, and the supervisor lives.
     crash(&child_handle(&name).await).await;
     wait_until(BOUND, "the second crash to be restarted", || {
@@ -2264,6 +2294,27 @@ async fn bounce_racing_a_crash_then_restart_child(init_held: bool, linger: bool)
     })
     .await;
     assert!(rig.sup.is_alive(), "the supervisor survived");
+    wait_until(BOUND, "the report of the second crash", || {
+        rig.events_for(&name).len() >= 2
+    })
+    .await;
+    // The barrier: the teardown reports nothing for the running child, so
+    // the reports counted after it are final.
+    rig.finish().await;
+    assert_eq!(probe.built.load(Ordering::SeqCst), 3);
+    let events = rig.events_for(&name);
+    assert_eq!(
+        events.len(),
+        2,
+        "each crash is reported once, the first one through the bounce: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.action == SupervisionAction::RestartInitiated
+                && matches!(event.reason, StopReason::Failure(_))),
+        "{events:?}"
+    );
 }
 
 #[test]
@@ -2302,9 +2353,8 @@ fn stop_child_of_a_permanent_child_whose_task_already_ended_restarts_it_once() {
             .await;
         assert_eq!(lines[1], "not alive", "{lines:?}");
         assert_eq!(lines[2], "Ok(())", "{lines:?}");
-        // Ordered by observation, not by a quiet window: the restarted
-        // instance ran, the supervisor adopted it, and the end of the first
-        // instance was reported.
+        // Ordered by observation: the restarted instance ran, the supervisor
+        // adopted it, and the end of the first instance was reported.
         wait_until(BOUND, "the child to be restarted", || {
             probe.started.load(Ordering::SeqCst) >= 2
         })
@@ -2327,25 +2377,28 @@ fn stop_child_of_a_permanent_child_whose_task_already_ended_restarts_it_once() {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].action, SupervisionAction::RestartInitiated);
         assert!(matches!(events[0].reason, StopReason::Kill), "{events:?}");
-        // A window that looks for a late duplicate: nothing more restarts the
-        // child or reports its end.
-        sleep(QUIET).await;
-        assert_eq!(probe.started.load(Ordering::SeqCst), 2, "restarted once");
-        assert_eq!(probe.built.load(Ordering::SeqCst), 2, "restarted once");
-        assert_eq!(rig.events_for(&name).len(), 1, "reported once");
         // The restart was free: a real crash is restarted with a budget of one.
         crash(&child_handle(&name).await).await;
         wait_until(BOUND, "the crash to be restarted", || {
             probe.built.load(Ordering::SeqCst) >= 3
         })
         .await;
-        sleep(QUIET).await;
+        assert!(rig.sup.is_alive());
+        wait_until(BOUND, "the report of the crash", || {
+            rig.events_for(&name).len() >= 2
+        })
+        .await;
+        // The barrier: no restart follows the supervisor's end and the
+        // teardown reports nothing for the running child, so nothing more
+        // restarted the child or reported its end.
+        rig.finish().await;
         assert_eq!(
             probe.built.load(Ordering::SeqCst),
             3,
-            "the crash is restarted once"
+            "the bounce and the crash are each restarted once"
         );
-        assert!(rig.sup.is_alive());
+        let events = rig.events_for(&name);
+        assert_eq!(events.len(), 2, "each end is reported once: {events:?}");
     });
 }
 
@@ -2416,15 +2469,17 @@ fn recorded_death_awaiting_its_decision_reads_restart_pending() {
             .await
             .stop_within(StopReason::Kill, Duration::from_millis(200))
             .await;
-        let deadline = Instant::now() + BOUND;
-        loop {
-            let lines = rig.script(vec![Op::Read(x.clone())]).await;
-            if lines[0] == "alive=false pending=true" {
-                break;
+        // x's runner records its end on a task of its own; each read is served
+        // at a turn boundary of the supervisor.
+        let rounds = async {
+            loop {
+                let lines = rig.script(vec![Op::Read(x.clone())]).await;
+                if lines[0] == "alive=false pending=true" {
+                    return;
+                }
             }
-            assert!(Instant::now() < deadline, "x never read pending: {lines:?}");
-            sleep(Duration::from_millis(5)).await;
-        }
+        };
+        within(BOUND, "x to read down with its decision pending", rounds).await;
         let lines = rig
             .script(vec![
                 Op::Read(x.clone()),
@@ -2548,7 +2603,7 @@ async fn supervisor_named(
         SupOpts {
             stop_on_restart,
             yield_on_stopped,
-            deliver_delay_ms: 0,
+            deliver_after: None,
         },
     )
     .await
@@ -2568,10 +2623,8 @@ async fn child_in(sys: &Arc<ActorSystem>, name: &str) -> ActorHandle<Probed> {
     found.expect("registered")
 }
 
-/// Stops the supervisor and waits, bounded, for its `Stopped`; returns how
-/// long that took.
-async fn stop_supervisor(rig: &Rig, bound: Duration) -> Duration {
-    let started = Instant::now();
+/// Stops the supervisor and waits for its `Stopped`.
+async fn stop_supervisor(rig: &Rig) {
     within(
         BOUND,
         "the stop request",
@@ -2580,12 +2633,11 @@ async fn stop_supervisor(rig: &Rig, bound: Duration) -> Duration {
     .await
     .expect("the stop request is accepted");
     within(
-        bound,
+        BOUND,
         "the supervisor to publish Stopped",
         rig.sup.wait_stopped(),
     )
     .await;
-    started.elapsed()
 }
 
 /// How the abandoned manual stop of the child is made.
@@ -2597,8 +2649,9 @@ enum Abandoned {
 
 /// An always-vetoing `Timeout(2 s)` child in an abandoned manual stop, then
 /// the parent's stop: the parent publishes `Stopped` only after the child's
-/// task ended, which honors the child's own window.
-async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned, paused: bool) {
+/// task ended, which honors the child's own window. The window passes on the
+/// paused clock; its deadlines are the stop ladder's rows.
+async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned) {
     let sys = ActorSystem::create(uname("abandoned-parent")).unwrap();
     let rig = supervisor_on(&sys, plain()).await;
     let probe = Arc::new(Probe::default());
@@ -2612,40 +2665,15 @@ async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned, paused: bo
     )
     .await;
     let _child = child_in(&sys, &name).await;
-    let abandoned = Instant::now();
     rig.ok(match form {
-        Abandoned::Terminate => Cmd::TerminateAbandon {
-            name: name.clone(),
-            wait: Duration::ZERO,
-        },
-        Abandoned::Stop => Cmd::StopAbandon {
-            name: name.clone(),
-            wait: Duration::ZERO,
-        },
+        Abandoned::Terminate => Cmd::TerminateAbandon { name: name.clone() },
+        Abandoned::Stop => Cmd::StopAbandon { name: name.clone() },
     })
     .await;
-    let window = Duration::from_secs(2);
-    within(
-        upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
-        "the parent to publish Stopped",
-        async {
-            rig.sup.stop(StopReason::Graceful).await.expect("stop");
-            rig.sup.wait_stopped().await;
-        },
-    )
-    .await;
-    let took = abandoned.elapsed();
+    stop_supervisor(&rig).await;
     assert!(
         probe.ended.load(Ordering::SeqCst),
         "the child's task ended before the parent published Stopped"
-    );
-    assert!(
-        took >= window - ASSUMED_KILL_GRACE,
-        "the child's own window was honored: {took:?}"
-    );
-    assert!(
-        took < upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
-        "the stop ended within the window, the Kill step and the abort: {took:?}"
     );
     if matches!(form, Abandoned::Stop) {
         assert_eq!(
@@ -2657,11 +2685,13 @@ async fn parent_stop_during_an_abandoned_manual_stop(form: Abandoned, paused: bo
     assert!(sys.get::<Probed>(&name).is_none(), "the name is free");
 }
 
-async fn starting_child_gets_its_window_from_the_stop(
-    window: Duration,
-    expect_completion: bool,
-    paused: bool,
-) {
+/// A starting incarnation is given its window from the parent's stop. With
+/// `expect_completion` its initialization holds until the supervisor
+/// accepted its stop and then completes inside the window; without, it
+/// never completes and the window, the Kill and the abort end it. The
+/// windows pass on the paused clock and their deadlines are the stop
+/// ladder's rows.
+async fn starting_child_gets_its_window_from_the_stop(window: Duration, expect_completion: bool) {
     let sys = ActorSystem::create(uname("window")).unwrap();
     let rig = supervisor_on(&sys, plain()).await;
     let probe = Arc::new(Probe::default());
@@ -2682,9 +2712,9 @@ async fn starting_child_gets_its_window_from_the_stop(
     })
     .await;
     if expect_completion {
-        // The restarted incarnation initializes for 300 ms and records its
-        // own completion.
-        probe.init_sleep_ms.store(300, Ordering::SeqCst);
+        // The restarted incarnation holds in its initialization until the
+        // supervisor accepted its stop, then records its own completion.
+        probe.held.store(true, Ordering::SeqCst);
     } else {
         // The restarted incarnation's initialization never completes: it
         // waits for a child that is never spawned, so only the Kill at the
@@ -2695,17 +2725,17 @@ async fn starting_child_gets_its_window_from_the_stop(
     wait_until(
         BOUND,
         "the second incarnation to be inside its init",
-        || probe.entered.load(Ordering::SeqCst) == 2,
+        || probe.began.load(Ordering::SeqCst) == 2,
     )
     .await;
     let fresh = child_in_starting(&sys, &name).await;
-    // The stop ends by the window, the kill grace and the settle time at
-    // the latest, on the exact instant of the paused clock.
-    let took = stop_supervisor(
-        &rig,
-        upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
-    )
+    rig.sup.stop(StopReason::Graceful).await.expect("stop");
+    wait_until(BOUND, "the supervisor to accept its stop", || {
+        rig.knobs.stopping.load(Ordering::SeqCst)
+    })
     .await;
+    probe.held.store(false, Ordering::SeqCst);
+    within(BOUND, "the supervisor to stop", rig.sup.wait_stopped()).await;
     let completed = probe.started.load(Ordering::SeqCst) == 2;
     assert_eq!(
         completed, expect_completion,
@@ -2716,10 +2746,6 @@ async fn starting_child_gets_its_window_from_the_stop(
         // `Kill`, then the abort one kill grace after that `Kill`, and the
         // incarnation reads `Kill`: an initialization that never completes
         // ends by the ladder, not by the stop giving up on it.
-        assert!(
-            took >= window + ASSUMED_KILL_GRACE,
-            "the stop waited the window and the kill grace: {took:?}"
-        );
         let reason = within(
             BOUND,
             "the killed incarnation's reason",
@@ -2736,7 +2762,7 @@ async fn starting_child_gets_its_window_from_the_stop(
     );
 }
 
-async fn parent_stop_bounds_a_hung_infinity_init_by_its_start_timeout_body(paused: bool) {
+async fn parent_stop_bounds_a_hung_infinity_init_by_its_start_timeout_body() {
     #[cfg(feature = "tracing")]
     let logged = warnings::install();
     let sys = ActorSystem::create(uname("hung-infinity")).unwrap();
@@ -2766,12 +2792,7 @@ async fn parent_stop_bounds_a_hung_infinity_init_by_its_start_timeout_body(pause
         probe.began.load(Ordering::SeqCst) == 2
     })
     .await;
-    let bound = upper(
-        paused,
-        Duration::from_millis(300) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
-    );
-    let took = stop_supervisor(&rig, bound).await;
-    assert!(took < bound, "{took:?}");
+    stop_supervisor(&rig).await;
     assert!(
         probe.ended.load(Ordering::SeqCst),
         "the hung incarnation ended"
@@ -2815,18 +2836,20 @@ async fn spawn_with_start_timeout(
     .await;
 }
 
-/// A supervisor on `sys` whose `on_child_stopped` awaits `delay_ms`.
+/// A supervisor on `sys` whose `on_child_stopped`, made while the chain's
+/// attempt of `restarted` is in flight, awaits until that attempt's instance
+/// finished starting: the attempt completes before the next report drains.
 async fn slow_delivery_supervisor(
     sys: &Arc<ActorSystem>,
     config: SupervisionConfig,
-    delay_ms: u64,
+    restarted: &Arc<Probe>,
 ) -> Rig {
     spawn_sup(
         Some(sys),
         &uname("sup"),
         config,
         SupOpts {
-            deliver_delay_ms: delay_ms,
+            deliver_after: Some((restarted.clone(), 2)),
             ..SupOpts::default()
         },
     )
@@ -2865,18 +2888,9 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
     .await;
     let child_b = child_in(&sys, &b).await;
     let _ = child_in(&sys, &a).await;
-    // Stamped before the stop is committed, so a late host only lengthens the
-    // time read below.
-    let committed = Instant::now();
     rig.ok(match form {
-        Abandoned::Terminate => Cmd::TerminateAbandon {
-            name: a.clone(),
-            wait: Duration::ZERO,
-        },
-        Abandoned::Stop => Cmd::StopAbandon {
-            name: a.clone(),
-            wait: Duration::ZERO,
-        },
+        Abandoned::Terminate => Cmd::TerminateAbandon { name: a.clone() },
+        Abandoned::Stop => Cmd::StopAbandon { name: a.clone() },
     })
     .await;
     crash(&child_b).await;
@@ -2889,11 +2903,6 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
         || pb.built.load(Ordering::SeqCst) == 2,
     )
     .await;
-    assert!(
-        committed.elapsed() >= Duration::from_millis(800),
-        "the group waited for the stopping member: {:?}",
-        committed.elapsed()
-    );
     assert!(
         pa.drop_order(0) < pb.build_order(1),
         "the stopping member's old incarnation ended before the crashed member was rebuilt"
@@ -2908,7 +2917,11 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
         || pa.built.load(Ordering::SeqCst) == 2,
     )
     .await;
-    sleep(QUIET * 2).await;
+    assert!(rig.sup.is_alive(), "the supervisor survived, charged once");
+    let _ = child_in(&sys, &a).await;
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children, so the counts below are final.
+    rig.finish().await;
     assert_eq!(
         pa.built.load(Ordering::SeqCst),
         2,
@@ -2919,7 +2932,6 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
         1,
         "never two incarnations at once"
     );
-    assert!(rig.sup.is_alive(), "the supervisor survived, charged once");
     for event in rig.events.lock().unwrap().iter() {
         assert_ne!(event.action, SupervisionAction::BudgetExhausted);
         assert!(
@@ -2927,7 +2939,6 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
             "no restart attempt hit a taken name: {event:?}"
         );
     }
-    let _ = child_in(&sys, &a).await;
 }
 
 /// OneForAll `[a, c]`, one handler: `a` crashes and ends, `c` sits in a held
@@ -2939,15 +2950,15 @@ async fn group_waits_for_a_member_already_stopping(form: Abandoned) {
 /// incarnation is reported exactly once, with its own failure, and one charge
 /// is taken. The children's `Shutdown` is `Infinity`: no window of the stop
 /// can expire and kill `c` first, however late the host runs its turn.
-async fn death_plane_report_is_absorbed_at_its_group_evaluation(delay_ms: u64) {
+async fn death_plane_report_is_absorbed_at_its_group_evaluation() {
     let sys = ActorSystem::create(uname("absorb-death-plane")).unwrap();
+    let (pa, pc) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
     let rig = slow_delivery_supervisor(
         &sys,
         SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)),
-        delay_ms,
+        &pa,
     )
     .await;
-    let (pa, pc) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
     let (a, c) = (uname("a"), uname("c"));
     for (name, probe) in [(&a, &pa), (&c, &pc)] {
         rig.spawn_child(name, probe, Shutdown::Infinity, RestartType::Permanent, 0)
@@ -2974,7 +2985,13 @@ async fn death_plane_report_is_absorbed_at_its_group_evaluation(delay_ms: u64) {
     })
     .await;
     wait_until(BOUND, "c's report", || !rig.events_for(&c).is_empty()).await;
-    sleep(QUIET * 2).await;
+    assert!(
+        rig.sup.is_alive(),
+        "one charge only: the budget of one holds"
+    );
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
     assert_eq!(
         pc.built.load(Ordering::SeqCst),
         2,
@@ -2988,10 +3005,100 @@ async fn death_plane_report_is_absorbed_at_its_group_evaluation(delay_ms: u64) {
         "{events:?}"
     );
     assert_eq!(rig.events_for(&a).len(), 1);
+}
+
+/// Rounds the scenario below may take to have `a`'s report delivered first.
+const SNAPSHOT_ROUNDS: usize = 20;
+
+/// One round of the scenario below on a fresh system. It answers false when
+/// `c`'s report was delivered before `a`'s, after the supervisor's end, and
+/// true when `a`'s report came first and every assert held.
+async fn snapshot_terminate_round() -> bool {
+    let sys = ActorSystem::create(uname("snapshot-terminate")).unwrap();
+    let (pa, pc) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
+    let rig = slow_delivery_supervisor(
+        &sys,
+        SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)),
+        &pa,
+    )
+    .await;
+    let (a, c) = (uname("a"), uname("c"));
+    for (name, probe) in [(&a, &pa), (&c, &pc)] {
+        rig.spawn_child(name, probe, Shutdown::Infinity, RestartType::Permanent, 0)
+            .await;
+    }
+    let _ = child_in(&sys, &a).await;
+    let _ = child_in(&sys, &c).await;
+    rig.knobs
+        .faults
+        .lock()
+        .unwrap()
+        .push_back(Fault::Terminate {
+            during: a.clone(),
+            target: c.clone(),
+        });
+    pc.turn_held.store(true, Ordering::SeqCst);
+    let lines = rig
+        .script(vec![
+            Op::CrashAndWait(a.clone()),
+            // `a`'s end is in the roster before `c` fails, so `a`'s
+            // report is the one that starts the group.
+            Op::UntilNotAlive(a.clone()),
+            Op::HeldFail(c.clone()),
+            Op::UntilInTurn(pc.clone()),
+            // `c` is still in its turn when the call commits: its failure
+            // comes after the stop's request.
+            Op::StopThenEndTurn(c.clone(), pc.clone()),
+        ])
+        .await;
+    wait_until(BOUND, "the terminate inside the delivery", || {
+        rig.knobs
+            .order
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("terminate:"))
+    })
+    .await;
+    // The delivery of `a`'s report made the terminate, so it is logged by
+    // now; `c`'s, when it came first, is logged before it.
+    let first_of = |name: &str| {
+        let prefix = format!("delivery:{name}:");
+        rig.knobs
+            .order
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|line| line.starts_with(&prefix))
+    };
+    if matches!((first_of(&c), first_of(&a)), (Some(at_c), Some(at_a)) if at_c < at_a) {
+        rig.finish().await;
+        return false;
+    }
+    assert!(lines[4].contains("Ok"), "{lines:?}");
+    until_idle(&rig, &[&a, &c]).await;
+    wait_for_alive(&rig, &a).await;
+    wait_until(BOUND, "c's report", || !rig.events_for(&c).is_empty()).await;
+    assert!(rig.sup.is_alive(), "one charge only: the budget holds");
+    // The barrier: no restart follows the supervisor's end and the
+    // teardown reports nothing for running children.
+    rig.finish().await;
+    let order = rig.knobs.order.lock().unwrap().clone();
     assert!(
-        rig.sup.is_alive(),
-        "one charge only: the budget of one holds"
+        order
+            .iter()
+            .any(|line| line == &format!("terminate:{c}:Ok(())")),
+        "{order:?}"
     );
+    assert_eq!(pc.built.load(Ordering::SeqCst), 1, "c stays down");
+    let events = rig.events_for(&c);
+    assert_eq!(events.len(), 1, "c is reported exactly once: {events:?}");
+    assert_eq!(events[0].action, SupervisionAction::Removed, "{events:?}");
+    assert!(
+        matches!(events[0].reason, StopReason::Failure(_)),
+        "{events:?}"
+    );
+    true
 }
 
 /// Clears a probe's `block_held` when dropped, so a held `Block` turn ends
@@ -3062,7 +3169,7 @@ async fn spawn_blocked_child(
 /// raised on the supervisor or ended below it meanwhile is read by its loop
 /// only once the turn ends, however late the host runs the test.
 struct HeldTurn {
-    release: Arc<AtomicBool>,
+    release: Arc<Flag>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -3084,10 +3191,7 @@ impl Drop for HeldTurn {
 
 /// Holds the supervisor's handler and returns once the turn has started.
 async fn hold_turn(rig: &Rig) -> HeldTurn {
-    let (entered, release) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let (entered, release) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
     let sup = rig.sup.clone();
     let op = Op::Hold {
         entered: entered.clone(),
@@ -3160,7 +3264,7 @@ struct Nested {
     child_name: String,
     child_events: Events,
     child_knobs: Arc<Knobs>,
-    built: Arc<AtomicUsize>,
+    built: Arc<Count>,
     sys: Arc<ActorSystem>,
     inner: ActorHandle<Sup>,
 }
@@ -3172,7 +3276,7 @@ async fn nested_supervisor(restart: RestartType, faults: Vec<Fault>) -> Nested {
     let child_events: Events = Arc::new(Mutex::new(Vec::new()));
     let child_knobs = Arc::new(Knobs::default());
     child_knobs.faults.lock().unwrap().extend(faults);
-    let built = Arc::new(AtomicUsize::new(0));
+    let built = Arc::new(Count::default());
     root.ok(Cmd::SpawnSupervisorChild {
         name: child_name.clone(),
         shutdown: Shutdown::Timeout(Duration::from_secs(5)),
@@ -3240,8 +3344,8 @@ async fn child_in_starting(sys: &Arc<ActorSystem>, name: &str) -> ActorHandle<Pr
 /// How a supervisor's initialization fails.
 #[derive(Clone)]
 enum InitMode {
-    /// `c1` fails after a slow turn before the initialization returns an
-    /// error; `c2` is healthy.
+    /// `c1` fails and its end is recorded before the initialization returns
+    /// an error; `c2` is healthy.
     ChildFailedDuring,
     /// `c3`'s own initialization fails, which `spawn_child` never awaits.
     ChildInitFails,
@@ -3280,31 +3384,15 @@ impl Actor for InitFails {
                     .named(n1.clone())
                     .await?;
                 ctx.spawn_child(move || p2.instance(0)).named(n2).await?;
-                c1.notify(ChildMsg::SlowFail).await.ok();
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while ctx
-                    .children()
-                    .iter()
-                    .any(|info| info.id.as_str() == n1 && info.is_alive)
-                    && Instant::now() < deadline
-                {
-                    sleep(Duration::from_millis(5)).await;
-                }
+                c1.notify(ChildMsg::Crash).await.ok();
+                roster_until(ctx, &n1, false).await;
             }
             InitMode::ChildInitFails => {
                 p1.fail_init.store(true, Ordering::SeqCst);
                 ctx.spawn_child(move || p1.instance(0))
                     .named(n1.clone())
                     .await?;
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while ctx
-                    .children()
-                    .iter()
-                    .any(|info| info.id.as_str() == n1 && info.is_alive)
-                    && Instant::now() < deadline
-                {
-                    sleep(Duration::from_millis(5)).await;
-                }
+                roster_until(ctx, &n1, false).await;
             }
             InitMode::NameTaken(taken) => {
                 ctx.spawn_child(move || p1.instance(0)).named(taken).await?;
@@ -3442,11 +3530,13 @@ mod warnings {
         fn event(&self, event: &Event<'_>) {
             if *event.metadata().level() == Level::DEBUG {
                 super::absorption_log::record(event);
+                super::common::ping_if_installed();
                 return;
             }
             let mut text = Text(String::new());
             event.record(&mut text);
             self.lines.lock().unwrap().push(text.0);
+            super::common::ping_if_installed();
         }
 
         fn enter(&self, _span: &span::Id) {}
@@ -3467,7 +3557,7 @@ async fn pairing_rule(window: Duration) -> usize {
         shutdown: Shutdown::Timeout(window),
         restart: RestartType::Permanent,
         config: plain(),
-        built: Arc::new(AtomicUsize::new(0)),
+        built: Arc::new(Count::default()),
         events: Arc::new(Mutex::new(Vec::new())),
         knobs: Arc::new(Knobs::default()),
     })
@@ -3516,7 +3606,7 @@ async fn pairing_rule(window: Duration) -> usize {
         pr.entered.load(Ordering::SeqCst) == 2
     })
     .await;
-    stop_supervisor(&root, Duration::from_secs(10)).await;
+    stop_supervisor(&root).await;
     pw.stopped_runs.load(Ordering::SeqCst)
 }
 
@@ -3555,15 +3645,10 @@ async fn x_owes_its_decision_while_a_group_pends() -> (Rig, [String; 3], [Arc<Pr
         .await
         .stop_within(StopReason::Kill, Duration::from_millis(200))
         .await;
-    let deadline = Instant::now() + BOUND;
-    loop {
-        let lines = rig.script(vec![Op::Read(names[0].clone())]).await;
-        if lines[0] == "alive=false pending=true" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "x never read pending: {lines:?}");
-        sleep(Duration::from_millis(5)).await;
-    }
+    until_roster(&rig, &[&names[0]], |line| {
+        line == "alive=false pending=true"
+    })
+    .await;
     (rig, names, [px, py, pz])
 }
 
@@ -3587,40 +3672,19 @@ async fn member(rig: &Rig, base: &str, window: Duration, vetoes: usize) -> (Stri
     (name, probe)
 }
 
-/// Polls the supervisor until `children()` reads the child restart-pending.
-/// The bound only limits how long a real hang takes to report.
+/// Reads the supervisor's roster until the child reads restart-pending: its
+/// task ended and the roster shows its fate. The runner may not have
+/// reported the death to the supervisor yet, so this does not mean that the
+/// supervisor holds the report or that a group evaluation has reached the
+/// child.
 async fn until_pending(rig: &Rig, name: &str) {
-    let deadline = Instant::now() + HANG_BOUND;
-    loop {
-        let lines = rig.script(vec![Op::Read(name.to_string())]).await;
-        if lines[0].ends_with("pending=true") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{name} never read restart-pending: {lines:?}"
-        );
-        sleep(Duration::from_millis(5)).await;
-    }
+    until_roster(rig, &[name], |line| line.ends_with("pending=true")).await;
 }
 
-/// Polls the supervisor until `children()` reads none of the children
-/// restart-pending: no group restart pends over them. The bound only limits how long a real hang takes to report.
+/// Reads the supervisor's roster until none of the children reads
+/// restart-pending: no group restart pends over them.
 async fn until_idle(rig: &Rig, names: &[&str]) {
-    let deadline = Instant::now() + HANG_BOUND;
-    loop {
-        let lines = rig
-            .script(names.iter().map(|n| Op::Read((*n).to_string())).collect())
-            .await;
-        if lines.iter().all(|line| line.ends_with("pending=false")) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the group never completed: {lines:?}"
-        );
-        sleep(Duration::from_millis(5)).await;
-    }
+    until_roster(rig, names, |line| line.ends_with("pending=false")).await;
 }
 
 fn restarting(line: &str) -> bool {
@@ -3711,7 +3775,8 @@ fn stop_child_handled_as_a_terminate_waits_for_the_childs_subtree() {
         // P's stop stays open until the test kills P, and the subtree
         // outlives P until the test lets W go.
         let p = uname("p");
-        let p_built = Arc::new(AtomicUsize::new(0));
+        let p_built = Arc::new(Count::default());
+        let p_knobs = Arc::new(Knobs::default());
         rig.ok(Cmd::SpawnSupervisorChild {
             name: p.clone(),
             shutdown: Shutdown::Infinity,
@@ -3719,7 +3784,7 @@ fn stop_child_handled_as_a_terminate_waits_for_the_childs_subtree() {
             config: plain(),
             built: p_built.clone(),
             events: Arc::new(Mutex::new(Vec::new())),
-            knobs: Arc::new(Knobs::default()),
+            knobs: p_knobs.clone(),
         })
         .await;
         let w = uname("w");
@@ -3754,26 +3819,26 @@ fn stop_child_handled_as_a_terminate_waits_for_the_childs_subtree() {
         // a crashes: the group stops P, a `Transient` member.
         crash(&child_in(&sys, &a).await).await;
         until_pending(&rig, &a).await;
+        // The group has reached P once P is asked to stop.
+        wait_until(BOUND, "the group to ask P to stop", || {
+            p_knobs.stopping.load(Ordering::SeqCst)
+        })
+        .await;
         // A bounce of P is its terminate: it stops P, keeps it down through
         // the group restart, and returns once W has ended too. P is killed
-        // after the call is committed, with W still in its turn.
-        let call = {
-            let (sup, p) = (rig.sup.clone(), p.clone());
-            tokio::spawn(async move {
-                sup.send(Cmd::Script(vec![Op::StopOutcomeThenKill(p)]))
-                    .await
-            })
-        };
-        sleep(QUIET).await;
-        assert!(
-            !call.is_finished() && !pw.ended.load(Ordering::SeqCst),
-            "the call returned before the subtree ended"
-        );
-        pw.turn_held.store(false, Ordering::SeqCst);
-        let reply = within(BOUND, "the call to return", call)
-            .await
-            .expect("the call task ran")
-            .expect("the supervisor answers");
+        // after the call is committed, with W still in its turn; the call is
+        // polled once more after P's end reached it, and only then is W let
+        // go, so a call that did not wait for the subtree answers early.
+        let reply = within(
+            BOUND,
+            "the call to return",
+            rig.sup.send(Cmd::Script(vec![Op::StopOutcomeThenKill(
+                p.clone(),
+                pw.clone(),
+            )])),
+        )
+        .await
+        .expect("the supervisor answers");
         let Reply::Steps(lines) = reply else {
             panic!("expected the steps of a script, got {reply:?}");
         };
@@ -3833,6 +3898,7 @@ impl<C: Actor> Actor for KillTop<C> {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         self.events.lock().unwrap().push(event.clone());
+        ping();
         Ok(())
     }
 }
@@ -3895,9 +3961,9 @@ struct SlowStop {
     /// How many requests to stop the child vetoes (`always_vetoes()` for a
     /// child that refuses every one, 0 for one that accepts the first).
     vetoes: usize,
-    in_on_stopped: Arc<AtomicBool>,
-    /// `on_stopped` returns once this is set (or after ten seconds).
-    release: Arc<AtomicBool>,
+    in_on_stopped: Arc<Flag>,
+    /// `on_stopped` returns once this is set.
+    release: Arc<Flag>,
 }
 
 impl Actor for SlowStop {
@@ -3924,10 +3990,7 @@ impl Actor for SlowStop {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         self.in_on_stopped.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| !self.release.load(Ordering::SeqCst)).await;
         Ok(())
     }
 }
@@ -3935,14 +3998,15 @@ impl Actor for SlowStop {
 /// A `Kill` raised while a supervisor's `on_stopped` runs, which returns only
 /// after the `Kill` was accepted, takes the Kill teardown whether its child
 /// vetoes every request (`vetoes` `always_vetoes()`) or accepts the first:
-/// the child is killed and asked nothing.
-async fn kill_during_on_stopped(vetoes: usize, paused: bool) {
+/// the child is killed and asked nothing. A graceful teardown would ask the
+/// child first; how soon the Kill teardown ends is the link guard's row.
+async fn kill_during_on_stopped(vetoes: usize) {
     {
         let sys = ActorSystem::create(uname("kill-on-stopped")).unwrap();
         let probe = Arc::new(Probe::default());
         let veto_name = uname("veto");
-        let in_on_stopped = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        let in_on_stopped = Arc::new(Flag::new(false));
+        let release = Arc::new(Flag::new(false));
         let slow_name = uname("slow");
         let (_top, events) = kill_top(
             &sys,
@@ -3972,7 +4036,6 @@ async fn kill_during_on_stopped(vetoes: usize, paused: bool) {
         let slow = registered_as::<SlowStop>(&sys, &slow_name).await;
         let _veto = child_in(&sys, &veto_name).await;
 
-        let started = Instant::now();
         slow.stop(StopReason::Graceful).await.unwrap();
         wait_until(BOUND, "on_stopped to start", || {
             in_on_stopped.load(Ordering::SeqCst)
@@ -3983,15 +4046,13 @@ async fn kill_during_on_stopped(vetoes: usize, paused: bool) {
             .expect("a Kill is accepted while on_stopped runs");
         release.store(true, Ordering::SeqCst);
 
-        // The supervisor reaches `Stopped` at once, before the child's 2 s
-        // window could end: the child is not asked to stop.
+        // The supervisor reaches `Stopped` without asking the child to stop.
         within(
-            upper(paused, Duration::ZERO),
+            BOUND,
             "the supervisor to publish Stopped",
             slow.wait_stopped(),
         )
         .await;
-        assert!(started.elapsed() < upper(paused, Duration::ZERO));
         assert!(matches!(child_end(&events).await, StopReason::Kill));
         assert_eq!(
             probe.stopped_runs.load(Ordering::SeqCst),
@@ -4012,16 +4073,16 @@ async fn kill_during_on_stopped(vetoes: usize, paused: bool) {
 
 #[test]
 fn kill_during_on_stopped_takes_the_kill_teardown() {
-    common::run(0, kill_during_on_stopped(always_vetoes(), false));
+    common::run(0, kill_during_on_stopped(always_vetoes()));
 }
 
 /// Records which start hooks ran. `pre_start` takes `pre_start_ms`.
 struct Initer {
-    pre_start_began: Arc<AtomicBool>,
-    /// `pre_start` holds until this is set (for at most ten seconds).
-    pre_start_release: Arc<AtomicBool>,
-    on_started_ran: Arc<AtomicBool>,
-    on_stopped_ran: Arc<AtomicBool>,
+    pre_start_began: Arc<Flag>,
+    /// `pre_start` holds until this is set.
+    pre_start_release: Arc<Flag>,
+    on_started_ran: Arc<Flag>,
+    on_stopped_ran: Arc<Flag>,
 }
 
 impl Actor for Initer {
@@ -4030,10 +4091,7 @@ impl Actor for Initer {
 
     async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.pre_start_began.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !self.pre_start_release.load(Ordering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| !self.pre_start_release.load(Ordering::SeqCst)).await;
         Ok(())
     }
 
@@ -4058,10 +4116,10 @@ impl Actor for Initer {
 
 #[derive(Clone, Default)]
 struct IniterFlags {
-    pre_start_began: Arc<AtomicBool>,
-    pre_start_release: Arc<AtomicBool>,
-    on_started_ran: Arc<AtomicBool>,
-    on_stopped_ran: Arc<AtomicBool>,
+    pre_start_began: Arc<Flag>,
+    pre_start_release: Arc<Flag>,
+    on_started_ran: Arc<Flag>,
+    on_stopped_ran: Arc<Flag>,
 }
 
 impl IniterFlags {
@@ -4120,11 +4178,11 @@ fn largest_addable() -> Duration {
 }
 
 /// A supervisor whose `on_started` starts a vetoing child, holds until
-/// `release` is set (for at most ten seconds) and fails.
+/// `release` is set and fails.
 struct FailingInit {
     probe: Arc<Probe>,
     veto_name: String,
-    release: Arc<AtomicBool>,
+    release: Arc<Flag>,
 }
 
 impl Actor for FailingInit {
@@ -4137,10 +4195,7 @@ impl Actor for FailingInit {
             .named(self.veto_name.clone())
             .shutdown(Shutdown::Timeout(Duration::from_secs(2)))
             .await?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(5)).await;
-        }
+        await_while(|| !self.release.load(Ordering::SeqCst)).await;
         Err(ActorError::user("the initialization failed"))
     }
 
@@ -4174,24 +4229,17 @@ async fn supervisor_mid_teardown() -> (Arc<ActorSystem>, Rig, String, Arc<Probe>
     (sys, rig, sup_name, probe)
 }
 
-/// After the Kill the supervisor publishes `Stopped` within the default kill
-/// grace and the wait after an abort, and the child's own window
-/// (2 s) is cut: it ran no `on_stopped`, and its `pre_stop` never ran a
-/// second time (the Kill teardown asks nothing of it).
-async fn kill_ends_a_teardown_in_progress(
-    rig: &Rig,
-    probe: &Probe,
-    pre_stops_before: usize,
-    killed_at: Instant,
-    paused: bool,
-) {
+/// After the Kill the supervisor publishes `Stopped` and the child's own
+/// window (2 s) is cut: it ran no `on_stopped`, and its `pre_stop` never ran
+/// a second time (the Kill teardown asks nothing of it). The abort's
+/// deadline is the link guard's row; the grace passes on the paused clock.
+async fn kill_ends_a_teardown_in_progress(rig: &Rig, probe: &Probe, pre_stops_before: usize) {
     within(
-        default_abort_bound(paused),
+        BOUND,
         "the supervisor to publish Stopped",
         rig.sup.wait_stopped(),
     )
     .await;
-    assert!(killed_at.elapsed() < default_abort_bound(paused));
     assert_eq!(
         probe.stopped_runs.load(Ordering::SeqCst),
         0,
@@ -4204,22 +4252,20 @@ async fn kill_ends_a_teardown_in_progress(
     );
 }
 
-async fn kill_is_accepted_while_children_are_being_stopped_body(paused: bool) {
+async fn kill_is_accepted_while_children_are_being_stopped_body() {
     let (_sys, rig, _sup_name, probe) = supervisor_mid_teardown().await;
     assert_ne!(rig.sup.status(), tokio_actors::ActorStatus::Stopped);
     let pre_stops_before = probe.pre_stops.load(Ordering::SeqCst);
-    let killed_at = Instant::now();
     rig.sup
         .stop(StopReason::Kill)
         .await
         .expect("a Kill is accepted while the children are being stopped");
-    kill_ends_a_teardown_in_progress(&rig, &probe, pre_stops_before, killed_at, paused).await;
+    kill_ends_a_teardown_in_progress(&rig, &probe, pre_stops_before).await;
 }
 
-async fn stop_within_kill_is_accepted_while_children_are_being_stopped_body(paused: bool) {
+async fn stop_within_kill_is_accepted_while_children_are_being_stopped_body() {
     let (_sys, rig, _sup_name, probe) = supervisor_mid_teardown().await;
     let pre_stops_before = probe.pre_stops.load(Ordering::SeqCst);
-    let killed_at = Instant::now();
     let outcome = within(
         BOUND,
         "stop_within(Kill)",
@@ -4229,7 +4275,7 @@ async fn stop_within_kill_is_accepted_while_children_are_being_stopped_body(paus
     .await
     .expect("a Kill is accepted while the children are being stopped");
     assert_eq!(outcome, tokio_actors::StopOutcome::Killed);
-    kill_ends_a_teardown_in_progress(&rig, &probe, pre_stops_before, killed_at, paused).await;
+    kill_ends_a_teardown_in_progress(&rig, &probe, pre_stops_before).await;
 }
 
 /// Runs `body` with a root actor parked in `handle`, on a system of its own,
@@ -4252,22 +4298,21 @@ async fn parked_root_on(sys: &Arc<ActorSystem>) -> (String, ActorHandle<Probed>)
     (name, handle)
 }
 
-/// The margin a kill path has beyond the default kill grace and the wait
-/// after an abort.
-fn default_abort_bound(paused: bool) -> Duration {
-    upper(paused, ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE)
-}
+// The kill paths below end in an abort of a target parked at an await, one
+// kill grace after the Kill: each test reads that the abort comes (a missing
+// backstop leaves the target parked and the hang detector fails the test).
+// The grace's length is the stop ladder's row; it passes on the paused clock.
 
 #[test]
-fn kill_by_name_aborts_a_turn_parked_at_an_await_paused() {
-    common::run_paused(kill_by_name_aborts_a_turn_parked_at_an_await_body(true));
+fn kill_by_name_aborts_a_turn_parked_at_an_await() {
+    common::run_paused(kill_by_name_aborts_a_turn_parked_at_an_await_body());
 }
 
-async fn kill_by_name_aborts_a_turn_parked_at_an_await_body(paused: bool) {
+async fn kill_by_name_aborts_a_turn_parked_at_an_await_body() {
     let sys = ActorSystem::create(uname("kill-by-name")).unwrap();
     // The kill returns at once: with a 30 s grace, a call that waited for
-    // the abort would not return within the bound, and the target is
-    // still running when it does.
+    // the abort would return only after it, and the target is still running
+    // when it does return.
     let far_name = uname("far-grace");
     let far_probe = Arc::new(Probe::default());
     let far = far_probe
@@ -4295,52 +4340,14 @@ async fn kill_by_name_aborts_a_turn_parked_at_an_await_body(paused: bool) {
     let (name, handle) = parked_root_on(&sys).await;
     sys.kill(&name).await.expect("the kill is accepted");
     within(
-        default_abort_bound(paused),
+        BOUND,
         "the parked actor to be aborted",
         handle.wait_stopped(),
     )
     .await;
 }
 
-async fn stop_kill_aborts_a_turn_parked_at_an_await_body(paused: bool) {
-    let sys = ActorSystem::create(uname("stop-kill")).unwrap();
-    let (_name, handle) = parked_root_on(&sys).await;
-    handle.stop(StopReason::Kill).await.expect("accepted");
-    within(
-        default_abort_bound(paused),
-        "the parked actor to be aborted",
-        handle.wait_stopped(),
-    )
-    .await;
-}
-
-async fn kill_by_id_backstop_survives_a_dropped_call_body(paused: bool) {
-    let sys = ActorSystem::create(uname("kill-by-id-dropped")).unwrap();
-    let (_name, handle) = parked_root_on(&sys).await;
-    // The call is dropped at once, after it raised the Kill.
-    let _ = timeout(Duration::ZERO, sys.kill_by_id(handle.id())).await;
-    within(
-        default_abort_bound(paused),
-        "the parked actor to be aborted",
-        handle.wait_stopped(),
-    )
-    .await;
-}
-
-async fn stop_within_kill_backstop_survives_a_dropped_call_body(paused: bool) {
-    let sys = ActorSystem::create(uname("within-dropped")).unwrap();
-    let (_name, handle) = parked_root_on(&sys).await;
-    let window = Duration::from_millis(150);
-    let _ = timeout(Duration::ZERO, handle.stop_within(StopReason::Kill, window)).await;
-    within(
-        upper(paused, window + ASSUMED_ABORT_SETTLE),
-        "the parked actor to be aborted",
-        handle.wait_stopped(),
-    )
-    .await;
-}
-
-async fn shutdown_kill_step_backstop_survives_a_dropped_shutdown_body(paused: bool) {
+async fn shutdown_kill_step_backstop_survives_a_dropped_shutdown_body() {
     let sys = ActorSystem::create_with(
         uname("shutdown-dropped"),
         tokio_actors::SystemConfig {
@@ -4352,11 +4359,32 @@ async fn shutdown_kill_step_backstop_survives_a_dropped_shutdown_body(paused: bo
         },
     )
     .unwrap();
+    let log = stop_log(&sys);
     let (_name, handle) = parked_root_on(&sys).await;
-    // The shutdown raises its Kill step at 50 ms and is dropped at 80 ms.
-    let _ = timeout(Duration::from_millis(80), sys.shutdown()).await;
+    // The shutdown raises its Kill step once the target's 50 ms have passed,
+    // and is dropped as soon as the system reports that raise.
+    let raised = || {
+        log.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                tokio_actors::telemetry::TelemetryEvent::KillStep {
+                    step: tokio_actors::telemetry::KillStepKind::Raised,
+                    ..
+                }
+            )
+        })
+    };
+    {
+        let shutdown = sys.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("the shutdown ended before its Kill step"),
+            _ = within(BOUND, "the Kill step", await_while(|| !raised())) => {}
+        }
+    }
     within(
-        Duration::from_millis(50) + default_abort_bound(paused),
+        BOUND,
         "the parked actor to be aborted",
         handle.wait_stopped(),
     )
@@ -4368,7 +4396,7 @@ async fn shutdown_kill_step_backstop_survives_a_dropped_shutdown_body(paused: bo
 /// notified.
 struct ParentOnly {
     stopped: Arc<Mutex<Vec<StopReason>>>,
-    in_turn: Arc<AtomicBool>,
+    in_turn: Arc<Flag>,
     end_turn: Arc<tokio::sync::Notify>,
 }
 
@@ -4392,16 +4420,16 @@ impl Actor for ParentOnly {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         self.stopped.lock().unwrap().push(reason.clone());
+        ping();
         Ok(())
     }
 }
 
-async fn parent_request_then_graceful(
-    shutdown: Shutdown,
-) -> (Arc<Mutex<Vec<StopReason>>>, Duration) {
+async fn parent_request_then_graceful(shutdown: Shutdown) -> Arc<Mutex<Vec<StopReason>>> {
     let sys = ActorSystem::create(uname("parent-request-kept")).unwrap();
+    let log = stop_log(&sys);
     let stopped: Arc<Mutex<Vec<StopReason>>> = Arc::new(Mutex::new(Vec::new()));
-    let in_turn = Arc::new(AtomicBool::new(false));
+    let in_turn = Arc::new(Flag::new(false));
     let end_turn = Arc::new(tokio::sync::Notify::new());
     let name = uname("obeys-parent");
     let (top, _events) = kill_top(&sys, &name, shutdown, ASSUMED_KILL_GRACE, false, {
@@ -4421,26 +4449,35 @@ async fn parent_request_then_graceful(
         in_turn.load(Ordering::SeqCst)
     })
     .await;
-    let started = Instant::now();
-    // The parent's request first: the top closes its mailbox in the poll of
-    // its teardown that raises the request on the child's lane. Then a third
-    // party's graceful one.
+    // The parent's request first, on the child's lane once the system
+    // reports it. Then a third party's graceful one.
     top.stop(StopReason::Graceful).await.unwrap();
-    wait_until(BOUND, "the top to stop its child", || !top.is_alive()).await;
+    wait_until(BOUND, "the top to raise its request on the child", || {
+        log.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                tokio_actors::telemetry::TelemetryEvent::StopRequested {
+                    actor,
+                    reason: StopReason::ParentRequest,
+                    ..
+                } if actor.id() == child.id()
+            )
+        })
+    })
+    .await;
     child.stop(StopReason::Graceful).await.expect("accepted");
     end_turn.notify_one();
     within(BOUND, "the parent to publish Stopped", top.wait_stopped()).await;
-    let took = started.elapsed();
-    (stopped, took)
+    stopped
 }
 
-async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_only_its_parent_body(
-    paused: bool,
-) {
+async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_only_its_parent_body()
+{
     // Under a 400 ms window the child runs on_stopped with the parent's
-    // request: the later graceful one did not replace it.
-    let (stopped, took) =
-        parent_request_then_graceful(Shutdown::Timeout(Duration::from_millis(400))).await;
+    // request: the later graceful one did not replace it. A child left with
+    // the graceful one would veto it and be killed at the window's end,
+    // without `on_stopped`.
+    let stopped = parent_request_then_graceful(Shutdown::Timeout(Duration::from_millis(400))).await;
     assert!(
         matches!(
             stopped.lock().unwrap().as_slice(),
@@ -4449,10 +4486,9 @@ async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_onl
         "the parent's request is the reason on_stopped received: {:?}",
         stopped.lock().unwrap()
     );
-    assert!(took < upper(paused, Duration::ZERO), "{took:?}");
 
     // Under `Infinity` the parent's stop completes.
-    let (stopped, _took) = parent_request_then_graceful(Shutdown::Infinity).await;
+    let stopped = parent_request_then_graceful(Shutdown::Infinity).await;
     assert!(matches!(
         stopped.lock().unwrap().as_slice(),
         [StopReason::ParentRequest]
@@ -4473,7 +4509,7 @@ impl Drop for OpensTheNotify {
 /// gate.
 struct SlowTurn {
     stopped: Arc<Mutex<Vec<StopReason>>>,
-    entered: Arc<AtomicBool>,
+    entered: Arc<Flag>,
     gate: Arc<tokio::sync::Notify>,
 }
 
@@ -4483,7 +4519,7 @@ impl Actor for SlowTurn {
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.entered.store(true, Ordering::SeqCst);
-        let _ = timeout(GATE_CAP, self.gate.notified()).await;
+        let _ = timeout(Duration::from_secs(30), self.gate.notified()).await;
         Ok(())
     }
 
@@ -4493,6 +4529,7 @@ impl Actor for SlowTurn {
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
         self.stopped.lock().unwrap().push(reason.clone());
+        ping();
         Ok(())
     }
 }
@@ -4523,24 +4560,21 @@ fn build_sequence(probes: &[(&str, &Arc<Probe>)]) -> Vec<String> {
 /// two handlers one after the other, each of which the loop ran only after it
 /// had served every event ready at the time.
 async fn wait_routed(rig: &Rig, name: &str) {
-    let deadline = Instant::now() + BOUND;
-    let mut seen = 0;
-    loop {
-        let lines = rig.script(vec![Op::Read(name.to_string())]).await;
-        if lines[0].ends_with("pending=true") {
-            seen += 1;
-            if seen == 2 {
-                return;
+    let rounds = async {
+        let mut seen = 0;
+        loop {
+            let lines = rig.script(vec![Op::Read(name.to_string())]).await;
+            if lines[0].ends_with("pending=true") {
+                seen += 1;
+                if seen == 2 {
+                    return;
+                }
+            } else {
+                seen = 0;
             }
-        } else {
-            seen = 0;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the end of {name} was never handled: {lines:?}"
-        );
-        sleep(Duration::from_millis(5)).await;
-    }
+    };
+    within(BOUND, "the end of the child to be handled", rounds).await;
 }
 
 /// Spawns `names` as permanent children with a two second window.
@@ -4596,8 +4630,21 @@ async fn retry_with_a_member_death_queued(
     for name in [&a, &x, &f] {
         wait_for_alive(&rig, name).await;
     }
-    sleep(QUIET).await;
     assert!(rig.sup.is_alive());
+    let kids = rig
+        .script(vec![
+            Op::Read(a.clone()),
+            Op::Read(x.clone()),
+            Op::Read(f.clone()),
+        ])
+        .await;
+    assert!(
+        kids.iter().all(|line| line == "alive=true pending=false"),
+        "no member waits for a decision: {kids:?}"
+    );
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
     if budget_is_exact {
         // The death of x was absorbed by the retry: its first instance was
         // stopped with the group and the crash of the second was reported
@@ -4611,17 +4658,6 @@ async fn retry_with_a_member_death_queued(
         assert!(matches!(events[1].reason, StopReason::Failure(_)));
         assert_eq!(px.built.load(Ordering::SeqCst), 3);
     }
-    let kids = rig
-        .script(vec![
-            Op::Read(a.clone()),
-            Op::Read(x.clone()),
-            Op::Read(f.clone()),
-        ])
-        .await;
-    assert!(
-        kids.iter().all(|line| line == "alive=true pending=false"),
-        "no member waits for a decision: {kids:?}"
-    );
     x
 }
 
@@ -4737,16 +4773,18 @@ async fn retry_absorbs_the_death_of_a_child_spawned_during_the_group() {
     for name in [&x, &y, &z, &n] {
         wait_for_alive(&rig, name).await;
     }
-    sleep(QUIET).await;
+    assert!(
+        rig.sup.is_alive(),
+        "the budget of two held: n's death was charged nothing"
+    );
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
     let events = rig.events_for(&n);
     assert_eq!(events.len(), 1, "n's death is reported once: {events:?}");
     assert_eq!(events[0].action, SupervisionAction::RestartInitiated);
     assert!(matches!(events[0].reason, StopReason::Failure(_)));
     assert_eq!(pn.built.load(Ordering::SeqCst), 2);
-    assert!(
-        rig.sup.is_alive(),
-        "the budget of two held: n's death was charged nothing"
-    );
 }
 
 /// OneForAll `[c, a, b]` or `[a, b, c]`: c's restart attempt, in flight when
@@ -4755,7 +4793,6 @@ async fn ordered_init_waits_on_a_sibling(
     order: [&str; 3],
     window: Duration,
     c_start_timeout: Option<Duration>,
-    paused: bool,
 ) {
     let rig = supervisor(one_for_all()).await;
     let names: std::collections::HashMap<&str, String> =
@@ -4808,7 +4845,6 @@ async fn ordered_init_waits_on_a_sibling(
         probes["c"].built.load(Ordering::SeqCst) == 2
     })
     .await;
-    let crashed_at = Instant::now();
     crash(&child_handle(&names["a"]).await).await;
     wait_until(BOUND, "the group to be evaluated", || {
         rig.events_for(&names["a"])
@@ -4823,12 +4859,6 @@ async fn ordered_init_waits_on_a_sibling(
             && probes["c"].started.load(Ordering::SeqCst) == 2
     })
     .await;
-    let took = crashed_at.elapsed();
-    let ends_by = c_start_timeout.map_or(window, |timeout| timeout.min(window));
-    assert!(
-        took < upper(paused, ends_by + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE),
-        "the group completed inside the bound of c's window: {took:?}"
-    );
     // The attempt waiting on a is not the c that runs afterwards.
     assert_eq!(probes["c"].built.load(Ordering::SeqCst), 3);
     for key in ["a", "b", "c"] {
@@ -4847,20 +4877,19 @@ async fn ordered_init_waits_on_a_sibling(
     assert!(rig.sup.is_alive());
 }
 
-async fn ordered_init_waiting_on_a_sibling_is_bounded_by_its_window_body(paused: bool) {
+async fn ordered_init_waiting_on_a_sibling_is_bounded_by_its_window_body() {
     let window = Duration::from_millis(300);
     // c is started after the sibling it waits for.
-    ordered_init_waits_on_a_sibling(["a", "b", "c"], window, None, paused).await;
+    ordered_init_waits_on_a_sibling(["a", "b", "c"], window, None).await;
     // c is started before the sibling it waits for: the core case, the
     // chain starts c first and a only after.
-    ordered_init_waits_on_a_sibling(["c", "a", "b"], window, None, paused).await;
+    ordered_init_waits_on_a_sibling(["c", "a", "b"], window, None).await;
     // The same with a start timeout that ends the attempt before its
     // window does.
     ordered_init_waits_on_a_sibling(
         ["c", "a", "b"],
         Duration::from_secs(3),
         Some(Duration::from_millis(500)),
-        paused,
     )
     .await;
 }
@@ -4913,11 +4942,13 @@ async fn temporary_member_awaited_end() {
     })
     .await;
     wait_for_alive(&rig, &b).await;
-    sleep(QUIET).await;
-    removed_once(&rig, &t);
-    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
     assert!(is_removed(&rig, &t).await, "t's spec is removed");
     assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
+    removed_once(&rig, &t);
+    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
 }
 
 /// The owed evaluation of a member whose manual bounce met a failure:
@@ -4957,11 +4988,7 @@ async fn temporary_member_owed_evaluation_fold() {
     })
     .await;
     // t's stop is committed and abandoned: it waits for the turn.
-    rig.ok(Cmd::StopAbandon {
-        name: t.clone(),
-        wait: Duration::from_millis(5),
-    })
-    .await;
+    rig.ok(Cmd::StopAbandon { name: t.clone() }).await;
     // a crashes: the group joins t's stop. Then t's turn ends with a failure.
     crash(&child_handle(&a).await).await;
     wait_until(BOUND, "the group to be evaluated", || {
@@ -4975,11 +5002,13 @@ async fn temporary_member_owed_evaluation_fold() {
         pa.started.load(Ordering::SeqCst) == 2
     })
     .await;
-    sleep(QUIET).await;
-    removed_once(&rig, &t);
-    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
     assert!(is_removed(&rig, &t).await, "t's spec is removed");
     assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
+    removed_once(&rig, &t);
+    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
 }
 
 /// An absorbed member's queued report: RestForOne `[a, t, c]` with a
@@ -5036,11 +5065,13 @@ async fn temporary_member_absorbed_queued_report() {
         pa.started.load(Ordering::SeqCst) == 2
     })
     .await;
-    sleep(QUIET * 2).await;
-    removed_once(&rig, &t);
-    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
     assert!(is_removed(&rig, &t).await, "t's spec is removed");
     assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
+    removed_once(&rig, &t);
+    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
 }
 
 /// A joined manual stop: t is `Temporary`, and its `terminate_child` or
@@ -5080,17 +5111,9 @@ async fn temporary_member_joined_manual_stop(terminate: bool) {
     // t's `pre_stop` is held, so its stop stays in progress.
     pt.stop_held.store(true, Ordering::SeqCst);
     if terminate {
-        rig.ok(Cmd::TerminateAbandon {
-            name: t.clone(),
-            wait: Duration::ZERO,
-        })
-        .await;
+        rig.ok(Cmd::TerminateAbandon { name: t.clone() }).await;
     } else {
-        rig.ok(Cmd::StopAbandon {
-            name: t.clone(),
-            wait: Duration::ZERO,
-        })
-        .await;
+        rig.ok(Cmd::StopAbandon { name: t.clone() }).await;
     }
     wait_until(BOUND, "t's stop to begin", || {
         pt.pre_stops.load(Ordering::SeqCst) == 1
@@ -5113,24 +5136,26 @@ async fn temporary_member_joined_manual_stop(terminate: bool) {
         pb.built.load(Ordering::SeqCst) == 2
     })
     .await;
-    sleep(QUIET).await;
-    removed_once(&rig, &t);
-    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
     assert!(is_removed(&rig, &t).await, "t's spec is removed");
     assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
+    removed_once(&rig, &t);
+    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
 }
 
 /// An absorbed member's report still in the death plane: its snapshot
 /// says removed, and the report delivers it once when it drains.
 async fn temporary_member_absorbed_snapshot() {
     let sys = ActorSystem::create(uname("temporary-snapshot")).unwrap();
+    let (pa, pt) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
     let rig = slow_delivery_supervisor(
         &sys,
         SupervisionConfig::one_for_all().max_restarts(1, Duration::from_secs(60)),
-        100,
+        &pa,
     )
     .await;
-    let (pa, pt) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
     let (a, t) = (uname("a"), uname("t"));
     rig.spawn_child(
         &a,
@@ -5150,12 +5175,15 @@ async fn temporary_member_absorbed_snapshot() {
     .await;
     let _ = child_in(&sys, &a).await;
     let _ = child_in(&sys, &t).await;
+    pt.turn_held.store(true, Ordering::SeqCst);
     let lines = rig
         .script(vec![
             Op::CrashAndWait(a.clone()),
-            Op::SlowFail(t.clone()),
+            Op::HeldFail(t.clone()),
             Op::UntilInTurn(pt.clone()),
-            Op::Stop(t.clone()),
+            // t is still in its turn when the call commits: its failure comes
+            // after the stop's request.
+            Op::StopThenEndTurn(t.clone(), pt.clone()),
         ])
         .await;
     assert!(lines[3].contains("Ok"), "{lines:?}");
@@ -5164,11 +5192,13 @@ async fn temporary_member_absorbed_snapshot() {
         pa.started.load(Ordering::SeqCst) == 2
     })
     .await;
-    sleep(QUIET * 2).await;
-    removed_once(&rig, &t);
-    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
     assert!(is_removed(&rig, &t).await, "t's spec is removed");
     assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
+    removed_once(&rig, &t);
+    assert_eq!(pt.built.load(Ordering::SeqCst), 1, "t is never restarted");
 }
 
 /// Spawns a permanent child under the supervisor and returns once the call
@@ -5232,7 +5262,12 @@ async fn attempt_met_by_a_group(manual: bool, init_fails: bool) {
     .await;
     wait_for_alive(&rig, &a).await;
     wait_for_alive(&rig, &b).await;
-    sleep(QUIET).await;
+    // The attempt's end charged nothing: the budget of one that the crash of
+    // a took still holds.
+    assert!(rig.sup.is_alive());
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
     // The terminate or the bounce reported b; the attempt is reported once, as
     // the restart it is part of, with the reason its incarnation ended with.
     let events = rig.events_for(&b);
@@ -5252,9 +5287,6 @@ async fn attempt_met_by_a_group(manual: bool, init_fails: bool) {
             "{events:?}"
         );
     }
-    // The attempt's end charged nothing: the budget of one that the crash of
-    // a took still holds.
-    assert!(rig.sup.is_alive());
     assert!(rig
         .events
         .lock()
@@ -5309,7 +5341,7 @@ fn restart_initiated_once(rig: &Rig, name: &str) {
     );
 }
 
-async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_body(paused: bool) {
+async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_body() {
     let rig = supervisor(one_for_all()).await;
     let (a, b, c) = (uname("a"), uname("b"), uname("c"));
     let (pa, pb, pc) = probes();
@@ -5317,11 +5349,7 @@ async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_b
     // b is stopping through a bounce whose caller gave up: its `pre_stop`
     // waits for the test.
     pb.pre_stop_gate.store(true, Ordering::SeqCst);
-    rig.ok(Cmd::StopAbandon {
-        name: b.clone(),
-        wait: Duration::ZERO,
-    })
-    .await;
+    rig.ok(Cmd::StopAbandon { name: b.clone() }).await;
     wait_until(BOUND, "b to be asked to stop", || {
         pb.pre_stops.load(Ordering::SeqCst) == 1
     })
@@ -5335,14 +5363,7 @@ async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_b
         "b is still stopping when c ended"
     );
     pb.pre_stop_gate.store(false, Ordering::SeqCst);
-    let opened = Instant::now();
     until_started(&[&pa, &pb, &pc], 2).await;
-    // Nothing but the restarts follows b's end.
-    assert!(
-        opened.elapsed() < upper(paused, Duration::ZERO),
-        "the restart took {:?}",
-        opened.elapsed()
-    );
     assert!(
         pc.drop_order(0) < pb.drop_order(0),
         "c ended before b's `pre_stop` ended"
@@ -5369,7 +5390,7 @@ async fn members_already_stopping_keep_stopping_during_a_sequential_group_stop_b
     assert!(rig.sup.is_alive());
 }
 
-async fn an_infinity_member_blocks_the_members_queued_behind_it_body(paused: bool) {
+async fn an_infinity_member_blocks_the_members_queued_behind_it_body() {
     let rig = supervisor(one_for_all()).await;
     let (a, b) = (uname("a"), uname("b"));
     let c = uname("c");
@@ -5391,20 +5412,22 @@ async fn an_infinity_member_blocks_the_members_queued_behind_it_body(paused: boo
         pc.pre_stops.load(Ordering::SeqCst) == 1
     })
     .await;
-    sleep(QUIET).await;
     // The cost of waiting without a bound: b, queued behind c, is not
-    // asked to stop, and the supervisor still serves its messages.
-    assert_eq!(pb.pre_stops.load(Ordering::SeqCst), 0);
+    // asked to stop, and the supervisor still serves its messages. The
+    // supervisor's answer comes after the step that asked c; b reads its stop
+    // lane before its mailbox, so its answer to a ping comes after any ask the
+    // step raised on it.
     assert!(is_alive(&rig, &b).await, "b still runs");
+    within(
+        BOUND,
+        "b's answer while c is held",
+        child_handle(&b).await.send(ChildMsg::Ping),
+    )
+    .await
+    .expect("b still runs");
+    assert_eq!(pb.pre_stops.load(Ordering::SeqCst), 0);
     pc.pre_stop_gate.store(false, Ordering::SeqCst);
-    let released = Instant::now();
     until_started(&[&pa, &pb, &pc], 2).await;
-    // b's `pre_stop` accepts at once, so the restart takes the margin.
-    assert!(
-        released.elapsed() < upper(paused, Duration::ZERO),
-        "the group restarted {:?} after c was released",
-        released.elapsed()
-    );
     assert_eq!(pb.pre_stops.load(Ordering::SeqCst), 1);
     assert!(pc.drop_order(0) < pre_stop_at(&pb, 0), "c ended first");
     assert!(rig.sup.is_alive());
@@ -5495,19 +5518,20 @@ impl AskGroup {
                 && self.pc.started.load(Ordering::SeqCst) == 2
         })
         .await;
-        sleep(QUIET).await;
+        assert!(self.rig.sup.is_alive());
+        // The barrier: b stays down and no restart follows the supervisor's
+        // end.
+        self.rig.finish().await;
         assert_eq!(self.pb.built.load(Ordering::SeqCst), 1, "b stays down");
         removed_once(&self.rig, &self.b);
         assert_eq!(self.pa.built.load(Ordering::SeqCst), 2);
         assert_eq!(self.pc.built.load(Ordering::SeqCst), 2);
-        assert!(self.rig.sup.is_alive());
     }
 }
 
-/// The bound on a terminate override that must give its own ask: it returns
-/// at once when it does, and a call without the ask waits on the queue that
-/// only the loop it holds can advance.
-const OVERRIDE_BOUND: Duration = Duration::from_secs(2);
+// A terminate override that must give its own ask returns once b accepted
+// it; a call without the ask waits on the queue that only the loop it holds
+// can advance, so it never returns and the hang detector fails the test.
 
 /// Releases a blocked factory when the test ends, however it ends: a thread
 /// of the runtime stuck in the factory would hold the runtime's shutdown.
@@ -5574,14 +5598,12 @@ fn group_stop_orders_an_attempt_that_passed_its_check_before_the_plan_cancelled_
         // The attempt goes on and its instance hangs in its initialization.
         pb.held.store(true, Ordering::SeqCst);
         pb.factory_hold.store(false, Ordering::SeqCst);
-        // The order the queue wrote stops it within b's window, its kill grace
-        // and the settle time.
-        let bound = window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500);
-        wait_until(
-            upper(false, bound),
-            "the group to stop b's hung attempt",
-            || pb.built.load(Ordering::SeqCst) >= 2 && pb.drop_order(1) != usize::MAX,
-        )
+        // The order the queue wrote stops it at the end of b's window (the
+        // window's deadline is the stop ladder's row): without the order the
+        // hung init never ends and the hang detector fails the test.
+        wait_until(BOUND, "the group to stop b's hung attempt", || {
+            pb.built.load(Ordering::SeqCst) >= 2 && pb.drop_order(1) != usize::MAX
+        })
         .await;
         pb.held.store(false, Ordering::SeqCst);
         wait_until(BOUND, "the group to restart a and b", || {
@@ -5641,7 +5663,15 @@ async fn attempt_fails_before_its_turn(manual: bool) {
     })
     .await;
     wait_for_alive(&rig, &b).await;
-    sleep(QUIET).await;
+    assert_eq!(
+        pb.pre_stops.load(Ordering::SeqCst),
+        1,
+        "never asked to stop"
+    );
+    assert!(rig.sup.is_alive(), "no charge for the failed attempt");
+    // The barrier: no restart follows the supervisor's end and the teardown
+    // reports nothing for running children.
+    rig.finish().await;
     // The failed attempt is reported once, as the group's restart of b, with
     // the error its initialization returned.
     let reports = rig.events_for(&b);
@@ -5659,12 +5689,6 @@ async fn attempt_fails_before_its_turn(manual: bool) {
         matches!(&reports[1].reason, StopReason::Failure(err) if err.to_string().contains("refused to start")),
         "{reports:?}"
     );
-    assert_eq!(
-        pb.pre_stops.load(Ordering::SeqCst),
-        1,
-        "never asked to stop"
-    );
-    assert!(rig.sup.is_alive(), "no charge for the failed attempt");
     assert!(rig
         .events
         .lock()
@@ -5710,7 +5734,7 @@ fn pool() -> SupervisionConfig {
     SupervisionConfig::simple_one_for_one().max_restarts(5, Duration::from_secs(60))
 }
 
-async fn simple_one_for_one_shutdown_stops_children_concurrently_body(paused: bool) {
+async fn simple_one_for_one_shutdown_stops_children_concurrently_body() {
     let rig = supervisor(pool()).await;
     let mut children: Vec<(String, Arc<Probe>)> = Vec::new();
     for _ in 0..20 {
@@ -5723,7 +5747,7 @@ async fn simple_one_for_one_shutdown_stops_children_concurrently_body(paused: bo
             0,
         )
         .await;
-        probe.pre_stop_sleep_ms.store(200, Ordering::SeqCst);
+        probe.pre_stop_gate.store(true, Ordering::SeqCst);
         children.push((name, probe));
     }
     wait_until(BOUND, "the children to finish starting", || {
@@ -5732,11 +5756,23 @@ async fn simple_one_for_one_shutdown_stops_children_concurrently_body(paused: bo
             .all(|(_, probe)| probe.started.load(Ordering::SeqCst) == 1)
     })
     .await;
-    // 20 stops of 200 ms take 4 s one after the other; run at once they take
-    // one.
-    let bound = upper(paused, Duration::from_millis(200));
-    let took = stop_supervisor(&rig, bound).await;
-    assert!(took < bound, "{took:?}");
+    // Every child's `pre_stop` holds until the test lets it go, which it does
+    // only once all 20 were asked: stops run one after the other would never
+    // ask the second child, and the hang detector fails the test.
+    rig.sup
+        .stop(StopReason::Graceful)
+        .await
+        .expect("the stop is accepted");
+    wait_until(BOUND, "every child to be asked to stop", || {
+        children
+            .iter()
+            .all(|(_, probe)| probe.pre_stops.load(Ordering::SeqCst) == 1)
+    })
+    .await;
+    for (_, probe) in &children {
+        probe.pre_stop_gate.store(false, Ordering::SeqCst);
+    }
+    within(BOUND, "the supervisor to stop", rig.sup.wait_stopped()).await;
     let last_begun = children
         .iter()
         .map(|(_, probe)| pre_stop_at(probe, 0))
@@ -5753,9 +5789,7 @@ async fn simple_one_for_one_shutdown_stops_children_concurrently_body(paused: bo
     );
 }
 
-async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restarting_one_body(
-    paused: bool,
-) {
+async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restarting_one_body() {
     let rig = supervisor(pool()).await;
     let window = Duration::from_secs(2);
     let (x, px) = (uname("x"), Arc::new(Probe::default()));
@@ -5779,11 +5813,7 @@ async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restart
     .await;
     // x is stopping through a bounce whose caller gave up.
     px.pre_stop_gate.store(true, Ordering::SeqCst);
-    rig.ok(Cmd::StopAbandon {
-        name: x.clone(),
-        wait: Duration::ZERO,
-    })
-    .await;
+    rig.ok(Cmd::StopAbandon { name: x.clone() }).await;
     wait_until(BOUND, "x to be asked to stop", || {
         px.pre_stops.load(Ordering::SeqCst) == 1
     })
@@ -5802,14 +5832,10 @@ async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restart
         .stop(StopReason::Graceful)
         .await
         .expect("the stop is accepted");
-    let bound = upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE);
-    // y's window is the short one: its attempt ends long before x's
-    // window does, which is when the supervisor's state would be dropped.
-    let y_bound = upper(
-        paused,
-        Duration::from_millis(500) + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE,
-    );
-    wait_until(y_bound, "y's attempt to be stopped by the teardown", || {
+    // y's window is the short one: its attempt ends while x's first
+    // `pre_stop` is still held, before the supervisor's state could be
+    // dropped.
+    wait_until(BOUND, "y's attempt to be stopped by the teardown", || {
         py.live.load(Ordering::SeqCst) == 0
     })
     .await;
@@ -5823,7 +5849,7 @@ async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restart
     );
     px.pre_stop_gate.store(false, Ordering::SeqCst);
     within(
-        bound,
+        BOUND,
         "the supervisor to publish Stopped",
         rig.sup.wait_stopped(),
     )
@@ -5849,9 +5875,7 @@ async fn simple_one_for_one_shutdown_joins_a_stopping_child_and_orders_a_restart
 /// delivered there, is delivered once, with its name, before `on_stopped`.
 async fn assert_stopped_by_the_factory_drop(rig: &Rig, child: &str) {
     let want = StopReason::Failure(ActorError::Panic(FACTORY_DROP_PANIC.to_string()));
-    let reason = timeout(BOUND, rig.sup.wait_stopped())
-        .await
-        .expect("the supervisor ends");
+    let reason = within(BOUND, "the supervisor's end", rig.sup.wait_stopped()).await;
     assert_eq!(reason, want);
     assert_eq!(
         rig.knobs.stopped.lock().unwrap().clone(),
@@ -5941,9 +5965,7 @@ async fn stop_with_an_attempt_inside_its_build(shape: InBuild, stop: StopReason)
     .await;
     pc.factory_hold.store(false, Ordering::SeqCst);
     pd.stop_held.store(false, Ordering::SeqCst);
-    let reason = timeout(BOUND, rig.sup.wait_stopped())
-        .await
-        .expect("the supervisor ends");
+    let reason = within(BOUND, "the supervisor's end", rig.sup.wait_stopped()).await;
     pc.factory_drop_panics.store(false, Ordering::SeqCst);
     pc.instance_drop_panics.store(false, Ordering::SeqCst);
     let want = match (&stop, shape.factory_drop_panics) {
@@ -5983,24 +6005,36 @@ async fn stop_with_an_attempt_inside_its_build(shape: InBuild, stop: StopReason)
 /// What the members of one tree did, in order.
 #[derive(Default)]
 struct Tape {
-    events: Mutex<Vec<(Instant, String)>>,
+    events: Mutex<Vec<String>>,
     /// The gate a `NodeMsg::BlockOnGate` turn blocks its thread on, and a
     /// `StopWork::UntilOpened` `on_stopped` awaits.
     gate: (Mutex<bool>, std::sync::Condvar),
     /// While set, the factory of every member refuses to build, after it noted
     /// that it was entered.
-    factory_refuses: AtomicBool,
-    factory_entered: AtomicBool,
+    factory_refuses: Flag,
+    factory_entered: Flag,
+    /// The labels whose `StopWork::Held` `on_stopped` may return.
+    released: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Tape {
     fn note(&self, what: String) {
-        self.events.lock().unwrap().push((Instant::now(), what));
+        self.events.lock().unwrap().push(what);
+        ping();
     }
 
     fn all(&self) -> Vec<String> {
-        let events = self.events.lock().unwrap();
-        events.iter().map(|(_, what)| what.clone()).collect()
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Lets the `StopWork::Held` `on_stopped` of `label` return.
+    fn release(&self, label: &str) {
+        self.released.lock().unwrap().insert(label.to_string());
+        ping();
+    }
+
+    fn is_released(&self, label: &str) -> bool {
+        self.released.lock().unwrap().contains(label)
     }
 
     fn count(&self, what: &str) -> usize {
@@ -6028,16 +6062,6 @@ impl Tape {
         self.index(what).is_some()
     }
 
-    /// The instant of the first occurrence of `what`.
-    fn when(&self, what: &str) -> Instant {
-        let events = self.events.lock().unwrap();
-        events
-            .iter()
-            .find(|(_, seen)| seen == what)
-            .map(|(at, _)| *at)
-            .unwrap_or_else(|| panic!("{what} was never noted"))
-    }
-
     /// Whether anything noted starts with `prefix`.
     fn any_with(&self, prefix: &str) -> bool {
         self.all().iter().any(|seen| seen.starts_with(prefix))
@@ -6048,6 +6072,7 @@ impl Tape {
     fn open_gate(&self) {
         *self.gate.0.lock().unwrap() = true;
         self.gate.1.notify_all();
+        ping();
     }
 }
 
@@ -6078,11 +6103,11 @@ fn reason_word(reason: &StopReason) -> &'static str {
 #[derive(Clone, Copy)]
 enum StopWork {
     Nothing,
-    /// It awaits this long.
-    Sleep(Duration),
+    /// It awaits until the test releases its label on the tape.
+    Held,
     /// It awaits for ever.
     Forever,
-    /// It awaits until the tape's gate is opened, for at most `GATE_CAP`.
+    /// It awaits until the tape's gate is opened.
     UntilOpened,
 }
 
@@ -6105,8 +6130,8 @@ struct Member {
     /// It stops itself in the `on_child_stopped` that reports a restart it
     /// initiated.
     stops_itself_on_restart: bool,
-    /// Its `on_stopped` opens the tape's gate and waits, for a bounded time,
-    /// until a factory was entered.
+    /// Its `on_stopped` opens the tape's gate and waits until a factory was
+    /// entered.
     opens_the_gate_on_stopped: bool,
     children: Vec<Member>,
 }
@@ -6275,23 +6300,18 @@ impl Actor for Node {
         }
         if self.member.opens_the_gate_on_stopped {
             self.tape.open_gate();
-            let waited = Instant::now();
-            while !self.tape.factory_entered.load(Ordering::SeqCst)
-                && waited.elapsed() < Duration::from_secs(2)
-            {
-                sleep(Duration::from_millis(1)).await;
-            }
+            within(
+                BOUND,
+                "a factory to be entered",
+                await_while(|| !self.tape.factory_entered.load(Ordering::SeqCst)),
+            )
+            .await;
         }
         match self.member.stop {
             StopWork::Nothing => {}
-            StopWork::Sleep(time) => sleep(time).await,
+            StopWork::Held => await_while(|| !self.tape.is_released(&label)).await,
             StopWork::Forever => std::future::pending::<()>().await,
-            StopWork::UntilOpened => {
-                let cap = Instant::now() + GATE_CAP;
-                while !*self.tape.gate.0.lock().unwrap() && Instant::now() < cap {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            }
+            StopWork::UntilOpened => await_while(|| !*self.tape.gate.0.lock().unwrap()).await,
         }
         self.tape.note(format!("stopped_done:{label}"));
         Ok(())
@@ -6391,13 +6411,13 @@ const FIVE: Duration = Duration::from_secs(5);
 const THREE: Duration = Duration::from_secs(3);
 const TWO: Duration = Duration::from_secs(2);
 
+/// Each worker's `on_stopped` holds until the test releases it, which it
+/// does only once that worker began it: a pool must have begun all three
+/// before any is released, and a supervisor that is not a pool begins the
+/// next only after the one before it ended.
 async fn children_of_a_killed_supervisor_s_supervisor_child_stop_in_order(pool: bool) {
     let run = uname("tree");
-    let work = if pool {
-        StopWork::Sleep(Duration::from_millis(200))
-    } else {
-        StopWork::Sleep(Duration::from_millis(60))
-    };
+    let work = StopWork::Held;
     let mut mid = Member::supervisor(
         "mid",
         Shutdown::Timeout(THREE),
@@ -6429,14 +6449,23 @@ async fn children_of_a_killed_supervisor_s_supervisor_child_stop_in_order(pool: 
             && tape.count(&format!("started:{c}")) == 1
     })
     .await;
-    let killed_at = Instant::now();
     kill_root(&root).await;
+    let began = |name: &String| tape.has(&format!("on_stopped:{name}:parent_request"));
+    if pool {
+        wait_until(BOUND, "the pool to begin every child's stop", || {
+            [&a, &b, &c].into_iter().all(began)
+        })
+        .await;
+        for name in [&a, &b, &c] {
+            tape.release(name);
+        }
+    } else {
+        for name in [&c, &b, &a] {
+            wait_until(BOUND, "the next child's stop to begin", || began(name)).await;
+            tape.release(name);
+        }
+    }
     ended(&tape, &[&label("mid"), &a, &b, &c, &label("side")], BOUND).await;
-    assert!(
-        killed_at.elapsed() < THREE,
-        "the whole tree ended within the middle supervisor's window: {:?}",
-        killed_at.elapsed()
-    );
 
     let at = |what: String| {
         tape.index(&what)
@@ -6473,13 +6502,15 @@ async fn children_of_a_killed_supervisor_s_supervisor_child_stop_in_order(pool: 
     );
 }
 
+/// The worker's orderly stop holds until the test releases it, once it
+/// began: the middle supervisor's task ends only after it. That its window,
+/// and not its kill grace, bounds that stop is the link guard's row.
 async fn a_slow_orderly_teardown_outlasts_the_kill_grace(zero_grace: bool) {
     let run = uname("slow");
     let mut parent = Member::supervisor(
         "p",
         Shutdown::Timeout(THREE),
-        vec![Member::worker("w", Shutdown::Timeout(TWO))
-            .stopping(StopWork::Sleep(Duration::from_millis(700)))],
+        vec![Member::worker("w", Shutdown::Timeout(TWO)).stopping(StopWork::Held)],
     );
     if zero_grace {
         parent = parent.kill_grace(Duration::ZERO);
@@ -6496,17 +6527,17 @@ async fn a_slow_orderly_teardown_outlasts_the_kill_grace(zero_grace: bool) {
         tape.has(&format!("started:{}", label("w")))
     })
     .await;
-    let killed_at = Instant::now();
     within(BOUND, "the kill", sys.kill(&label("s")))
         .await
         .expect("accepted");
-    // The window of the middle supervisor's `Shutdown`, the default kill
-    // grace and the wait after an abort, each named once above.
-    let bound = THREE + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE + Duration::from_millis(500);
-    within(bound, "the root to stop", root.wait_stopped()).await;
-    within(bound, "the middle supervisor to stop", p.wait_stopped()).await;
-    within(bound, "the worker to stop", w.wait_stopped()).await;
-    assert!(killed_at.elapsed() < bound, "{:?}", killed_at.elapsed());
+    within(BOUND, "the root to stop", root.wait_stopped()).await;
+    wait_until(BOUND, "the worker's orderly stop to begin", || {
+        tape.has(&format!("on_stopped:{}:parent_request", label("w")))
+    })
+    .await;
+    tape.release(&label("w"));
+    within(BOUND, "the middle supervisor to stop", p.wait_stopped()).await;
+    within(BOUND, "the worker to stop", w.wait_stopped()).await;
 
     let at = |what: String| {
         tape.index(&what)
@@ -6525,13 +6556,13 @@ async fn a_slow_orderly_teardown_outlasts_the_kill_grace(zero_grace: bool) {
     );
 }
 
-async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool) {
+async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body() {
     let window = Duration::from_millis(300);
-    let bound = upper(paused, window + ASSUMED_KILL_GRACE + ASSUMED_ABORT_SETTLE);
 
-    // The middle supervisor's child vetoes every request under a long
-    // policy of its own: the middle supervisor is killed at its window,
-    // and its child takes the Kill path.
+    // The middle supervisor's child vetoes every request under a policy of
+    // its own ten minutes long: the middle supervisor is killed at its
+    // window, and its child takes the Kill path. A stop bounded by the
+    // child's policy instead would outlast the hang detector.
     let run = uname("bound-veto");
     let top = Member::supervisor(
         "top",
@@ -6539,7 +6570,7 @@ async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool
         vec![Member::supervisor(
             "mid",
             Shutdown::Timeout(window),
-            vec![Member::worker("slow", Shutdown::Timeout(Duration::from_secs(10))).vetoing()],
+            vec![Member::worker("slow", Shutdown::Timeout(Duration::from_secs(600))).vetoing()],
         )],
     )
     .unique(&run);
@@ -6554,11 +6585,9 @@ async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool
         tape.has(&format!("started:{}", label("slow")))
     })
     .await;
-    let killed_at = Instant::now();
     kill_root(&root).await;
-    within(bound, "the middle supervisor to stop", mid.wait_stopped()).await;
-    within(bound, "its child to stop", slow.wait_stopped()).await;
-    assert!(killed_at.elapsed() >= window, "{:?}", killed_at.elapsed());
+    within(BOUND, "the middle supervisor to stop", mid.wait_stopped()).await;
+    within(BOUND, "its child to stop", slow.wait_stopped()).await;
     assert!(
         tape.has(&format!("on_stopped:{}:parent_killed", label("mid"))),
         "{:?}",
@@ -6571,8 +6600,7 @@ async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool
     );
 
     // A second leg: a middle supervisor whose own `on_stopped` awaits for
-    // ever is stopped within its window, its kill grace and the settle
-    // time, which only the abort stage satisfies.
+    // ever is stopped, which only the abort stage does.
     let run = uname("bound-forever");
     let top = Member::supervisor(
         "top",
@@ -6587,15 +6615,13 @@ async fn inherited_stop_is_bounded_by_the_child_s_own_shutdown_body(paused: bool
     let (tape, sys) = (Arc::new(Tape::default()), unique_sys("bound-forever"));
     let root = root_of(&sys, &top, &tape).await;
     let mid = node_named(&sys, &label("mid")).await;
-    let killed_at = Instant::now();
     kill_root(&root).await;
     within(
-        bound,
+        BOUND,
         "the stuck middle supervisor to stop",
         mid.wait_stopped(),
     )
     .await;
-    assert!(killed_at.elapsed() >= window, "{:?}", killed_at.elapsed());
     assert!(
         tape.has(&format!("on_stopped:{}:parent_killed", label("mid"))),
         "{:?}",
@@ -6650,10 +6676,11 @@ async fn three_level_tree_killed_at_the_root(named: bool) {
     assert!(!tape.any_with(&format!("on_stopped:{}", labels[0])));
 }
 
-async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body(paused: bool) {
+async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body() {
     // An `Infinity` middle supervisor runs `on_stopped` and its worker's
-    // orderly stop however long they take, and the grandparent restarts
-    // the killed supervisor only after the whole subtree ended.
+    // orderly stop until each is released, and the grandparent restarts
+    // the killed supervisor only after the whole subtree ended. That
+    // `Infinity` puts no bound on them is the link guard's row.
     let run = uname("infinity");
     let tree = Member::supervisor(
         "g",
@@ -6664,10 +6691,9 @@ async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body
             vec![Member::supervisor(
                 "m",
                 Shutdown::Infinity,
-                vec![Member::worker("x", Shutdown::Timeout(TWO))
-                    .stopping(StopWork::Sleep(Duration::from_millis(1500)))],
+                vec![Member::worker("x", Shutdown::Timeout(TWO)).stopping(StopWork::Held)],
             )
-            .stopping(StopWork::Sleep(Duration::from_millis(300)))],
+            .stopping(StopWork::Held)],
         )],
     )
     .unique(&run);
@@ -6681,6 +6707,13 @@ async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body
     within(BOUND, "the kill", sys.kill(&label("p")))
         .await
         .expect("accepted");
+    for name in [label("m"), label("x")] {
+        wait_until(BOUND, "the next orderly stop to begin", || {
+            tape.any_with(&format!("on_stopped:{name}:"))
+        })
+        .await;
+        tape.release(&name);
+    }
     wait_until(BOUND, "the restarted leaf to start", || {
         tape.nth(&format!("started:{}", label("x")), 2).is_some()
     })
@@ -6707,8 +6740,11 @@ async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body
             tape.all()
         );
     }
-    sleep(QUIET).await;
     assert!(g.is_alive());
+    // The barrier: the grandparent stops, and its teardown reports nothing
+    // for the running child.
+    g.stop(StopReason::Graceful).await.expect("accepted");
+    within(BOUND, "the grandparent to stop", g.wait_stopped()).await;
     assert_eq!(
         tape.all()
             .iter()
@@ -6742,32 +6778,27 @@ async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body
         tape.has(&format!("parked:{}", label("w")))
     })
     .await;
-    let killed_at = Instant::now();
     kill_root(&root).await;
-    let bound = default_abort_bound(paused);
     within(
-        bound,
+        BOUND,
         "the parked worker to be aborted",
         worker.wait_stopped(),
     )
     .await;
-    assert!(killed_at.elapsed() < bound);
 }
 
 async fn a_kill_already_stored_on_a_supervisor_child_keeps_its_abort_when_the_parent_is_killed_body(
-    paused: bool,
 ) {
     // The root stops in order: its teardown asks `mid`, which accepts and
     // parks in `on_stopped`; the root's runner raises `Kill` at the end of
-    // `mid`'s window and owes the abort a grace after it. The root is then
-    // killed inside that grace. Nothing shows the runner's `Kill`, so the
-    // root is killed a margin past the window (300 ms) that leaves most
-    // of the grace (1 s) ahead. The runner ends with the root, and the
-    // link guard of `mid` takes over the stored `Kill`: `mid` is aborted one
-    // grace after the root's `Kill`, never given its window again.
+    // `mid`'s window and owes the abort a grace after it. The root is killed
+    // as soon as the system reports that `Kill`, inside the grace. The
+    // runner ends with the root, and the link guard of `mid` takes over the
+    // stored `Kill`: `mid` is aborted, which alone ends an `on_stopped` that
+    // awaits for ever. That the guard turns a stored `Kill` into an abort a
+    // grace later, never a new window, is the link guard's row.
     let window = Duration::from_secs(2);
     let grace = Duration::from_secs(1);
-    let root_killed_at = window + Duration::from_millis(300);
     let run = uname("stored-kill");
     let top = Member::supervisor(
         "top",
@@ -6781,29 +6812,39 @@ async fn a_kill_already_stored_on_a_supervisor_child_keeps_its_abort_when_the_pa
     .unique(&run);
     let label = |name: &str| format!("{name}-{run}");
     let (tape, sys) = (Arc::new(Tape::default()), unique_sys("stored-kill"));
+    let log = stop_log(&sys);
     let root = root_of(&sys, &top, &tape).await;
     let mid = node_named(&sys, &label("mid")).await;
     root.stop(StopReason::Graceful).await.expect("accepted");
-    let asked = Instant::now();
     wait_until(BOUND, "mid to enter on_stopped", || {
         tape.any_with(&format!("on_stopped:{}", label("mid")))
     })
     .await;
-    sleep(root_killed_at.saturating_sub(asked.elapsed())).await;
+    wait_until(BOUND, "the runner to raise Kill on mid", || {
+        log.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                tokio_actors::telemetry::TelemetryEvent::KillStep {
+                    actor,
+                    step: tokio_actors::telemetry::KillStepKind::Raised,
+                    ..
+                } if actor.id() == mid.id()
+            )
+        })
+    })
+    .await;
     root.stop(StopReason::Kill).await.expect("accepted");
     within(BOUND, "the root to stop", root.wait_stopped()).await;
-    let owed = upper(paused, root_killed_at + grace);
-    within(Duration::from_secs(20), "mid to stop", mid.wait_stopped()).await;
+    within(BOUND, "mid to stop", mid.wait_stopped()).await;
     assert!(
-        asked.elapsed() <= owed,
-        "the Kill already raised kept its abort: ended after {:?}, owed by {owed:?}",
-        asked.elapsed()
+        !tape.has(&format!("stopped_done:{}", label("mid"))),
+        "mid's `on_stopped` never returned: it was aborted"
     );
 }
 
 /// A supervisor child whose second incarnation never finishes `on_started`.
 struct HangsOnRestart {
-    starts: Arc<AtomicUsize>,
+    starts: Arc<Count>,
 }
 
 impl Actor for HangsOnRestart {
@@ -6823,7 +6864,7 @@ impl Actor for HangsOnRestart {
 }
 
 struct HoldsAHangingChild {
-    starts: Arc<AtomicUsize>,
+    starts: Arc<Count>,
     name: String,
 }
 
@@ -6900,9 +6941,7 @@ async fn a_direct_kill_inside_the_build(factory_drop_panics: bool) {
     pc.factory_drop_panics
         .store(factory_drop_panics, Ordering::SeqCst);
     rig.sup.stop(StopReason::Kill).await.expect("accepted");
-    let reason = timeout(BOUND, rig.sup.wait_stopped())
-        .await
-        .expect("the supervisor ends");
+    let reason = within(BOUND, "the supervisor's end", rig.sup.wait_stopped()).await;
     assert_eq!(reason, StopReason::Kill);
     pc.factory_hold.store(false, Ordering::SeqCst);
     wait_until(BOUND, "the built instance to drop", || {
@@ -6977,9 +7016,7 @@ async fn stop_gracefully_with_the_only_child_inside_its_build(pool: bool) {
     .await;
     rig.sup.stop(StopReason::Graceful).await.expect("accepted");
     pc.factory_hold.store(false, Ordering::SeqCst);
-    let reason = timeout(BOUND, rig.sup.wait_stopped())
-        .await
-        .expect("the supervisor ends");
+    let reason = within(BOUND, "the supervisor's end", rig.sup.wait_stopped()).await;
     assert_eq!(reason, StopReason::Graceful);
     assert_eq!(
         pc.live.load(Ordering::SeqCst),

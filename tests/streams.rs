@@ -80,7 +80,7 @@ async fn test_cancel_stream() {
                 }
                 Msg::DoCancel => {
                     if let Some(id) = self.stream_id.take() {
-                        ctx.cancel_stream(id).unwrap();
+                        assert!(ctx.cancel_stream(id));
                     }
                     Ok(Resp::Ack)
                 }

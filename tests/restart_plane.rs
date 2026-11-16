@@ -28,30 +28,28 @@
 //!   per triggering failure.
 //! - A factory panic inside the restart task surfaces as a typed failure and
 //!   charges the budget like any other crash.
+//!
+//! Every step is ordered by a handshake the test observes: the test actors
+//! ring one shared bell at each change of the probe state, and a hook that
+//! must stay in progress waits on a gate the test opens.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::future::pending;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use tokio::time::{sleep, Instant};
 
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     ActorError, ActorHandle, ActorResult, ActorSystem, ChildEvent, RestartType, Shutdown,
-    StopChildOutcome, StopReason, SupervisionAction, SupervisionConfig,
+    StopChildOutcome, StopReason, SubtreeEnd, SupervisionAction, SupervisionConfig,
 };
 
 mod common;
 
 // ---------------------------------------------------------------------------
-// Timing / waiting helpers
+// Waiting helpers
 // ---------------------------------------------------------------------------
-
-/// The longest a poll for a condition may take. It only limits how long a real
-/// hang takes to report; a slow host must not read as one.
-const DEADLINE: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_millis(10);
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -62,31 +60,70 @@ fn uname(base: &str) -> String {
     )
 }
 
-/// Polls `cond` until it holds. The bound only limits how long a real hang takes to report.
-async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + DEADLINE;
+/// Rung at every change of the probe state a test waits on: a construction,
+/// a drop, a start hook entered or finished, a gate entered or opened, a
+/// recorded `ChildEvent`. It rings the calling test's own change signal
+/// (`common::changes`), installed on every thread of its runtime.
+fn ring() {
+    common::ping();
+}
+
+/// Resolves once `cond` holds. The `Notified` is enabled before each check,
+/// so a ring that lands between the check and the wait is not lost.
+async fn until(mut cond: impl FnMut() -> bool) {
+    let changes = common::changes();
     loop {
+        let changed = changes.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         if cond() {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!("timed out after {DEADLINE:?} waiting for: {what}");
-        }
-        sleep(POLL).await;
+        changed.await;
     }
 }
 
-async fn wait_until<F: FnMut() -> bool>(timeout_ms: u64, mut pred: F) -> bool {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(POLL).await;
+/// [`until`] with a hang detector: the bound only limits how long a real
+/// hang takes to report.
+async fn wait_for(what: &str, cond: impl FnMut() -> bool) {
+    if tokio::time::timeout(Duration::from_secs(60), until(cond))
+        .await
+        .is_err()
+    {
+        panic!("timed out after 60 s waiting for: {what}");
     }
+}
+
+/// Waits for `sup`'s end; the bound only limits how long a real hang takes
+/// to report.
+async fn stopped<A: Actor>(what: &str, sup: &ActorHandle<A>) -> StopReason {
+    match tokio::time::timeout(Duration::from_secs(60), sup.wait_stopped()).await {
+        Ok(reason) => reason,
+        Err(_) => panic!("timed out after 60 s waiting for: {what}"),
+    }
+}
+
+/// Waits until `sup` and every actor below it have ended, after which every
+/// name they held is free; the bound only limits how long a real hang takes
+/// to report.
+async fn subtree_ended<A: Actor>(sup: &ActorHandle<A>) {
+    let end = tokio::time::timeout(Duration::from_secs(60), sup.observe_subtree().wait_ended())
+        .await
+        .expect("timed out after 60 s waiting for the supervisor's subtree to end");
+    assert_eq!(
+        end,
+        SubtreeEnd::Ended,
+        "every incarnation below the supervisor ends"
+    );
+}
+
+/// Stops `sup` with `Graceful` and waits for its end: the barrier after
+/// which no restart starts and no report arrives. A child the supervisor's
+/// own teardown stops gets no callback, so a report recorded after it is a
+/// duplicate.
+async fn barrier<A: Actor>(sup: &ActorHandle<A>) {
+    let _ = sup.stop(StopReason::Graceful).await;
+    stopped("the supervisor to stop", sup).await;
 }
 
 /// A fresh, dedicated [`ActorSystem`] per test - never the process-wide
@@ -105,44 +142,106 @@ fn alive_as<A: Actor>(sys: &ActorSystem, name: &str) -> bool {
     sys.get::<A>(name).map(|h| h.is_alive()).unwrap_or(false)
 }
 
-/// Polls until `name` resolves in `sys` to a live handle. The bound only limits how long a real hang takes to report.
-async fn live_handle<A: Actor>(sys: &ActorSystem, name: &str) -> ActorHandle<A> {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Some(h) = sys.get::<A>(name) {
-            if h.is_alive() {
-                return h;
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out after {DEADLINE:?} waiting for live actor '{name}'");
-        }
-        sleep(POLL).await;
+/// The handle of the incarnation that holds `name`, read once that
+/// incarnation's start hook has finished: it is registered and alive.
+fn handle_of<A: Actor>(sys: &ActorSystem, name: &str) -> ActorHandle<A> {
+    let handle = sys
+        .get::<A>(name)
+        .unwrap_or_else(|| panic!("'{name}' is registered"));
+    assert!(handle.is_alive(), "'{name}' is alive");
+    handle
+}
+
+/// A point a hook waits at until the test opens it. Once open it stays open,
+/// so every later incarnation passes straight through.
+#[derive(Default)]
+struct Gate {
+    open: AtomicBool,
+    entered: AtomicUsize,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    async fn pass(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        ring();
+        until(|| self.open.load(Ordering::SeqCst)).await;
+    }
+
+    fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        ring();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Instance accounting (construction in the factory, drop-decrement, so a
 // Kill-torn-down instance - which skips every lifecycle callback - is still
-// counted).
+// counted). `live` only rises at a construction, and the construction records
+// the value it reached, so `max_live` is the exact peak.
 // ---------------------------------------------------------------------------
+
+/// The order of constructions and drops across several counters, as
+/// `<label>+<n>` and `<label>-<n>` for the n-th construction.
+type Trail = Arc<Mutex<Vec<String>>>;
 
 #[derive(Clone, Default)]
 struct InstanceCounter {
     live: Arc<AtomicUsize>,
     max_live: Arc<AtomicUsize>,
     constructions: Arc<AtomicUsize>,
+    inits: Arc<AtomicUsize>,
+    started: Arc<AtomicUsize>,
+    trail: Option<(Trail, &'static str)>,
 }
 
 impl InstanceCounter {
-    fn on_construct(&self) {
-        self.constructions.fetch_add(1, Ordering::SeqCst);
-        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_live.fetch_max(now, Ordering::SeqCst);
+    fn traced(trail: &Trail, label: &'static str) -> Self {
+        Self {
+            trail: Some((trail.clone(), label)),
+            ..Self::default()
+        }
     }
 
-    fn on_drop(&self) {
+    /// Counts a construction and returns its number, from 1.
+    fn on_construct(&self) -> usize {
+        let nth = self.constructions.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_live.fetch_max(now, Ordering::SeqCst);
+        self.note('+', nth);
+        ring();
+        nth
+    }
+
+    fn on_drop(&self, nth: usize) {
         self.live.fetch_sub(1, Ordering::SeqCst);
+        self.note('-', nth);
+        ring();
+    }
+
+    /// An incarnation entered its start hook.
+    fn on_init(&self) {
+        self.inits.fetch_add(1, Ordering::SeqCst);
+        ring();
+    }
+
+    /// An incarnation's start hook finished.
+    fn on_started(&self) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        ring();
+    }
+
+    fn note(&self, step: char, nth: usize) {
+        if let Some((trail, label)) = &self.trail {
+            trail.lock().unwrap().push(format!("{label}{step}{nth}"));
+        }
     }
 
     fn live(&self) -> usize {
@@ -156,19 +255,14 @@ impl InstanceCounter {
     fn constructions(&self) -> usize {
         self.constructions.load(Ordering::SeqCst)
     }
-}
 
-/// Background sampler catching a transient two-live spike the increment-site
-/// `fetch_max` alone might land between polls of.
-fn spawn_max_sampler(counter: &InstanceCounter) -> tokio::task::JoinHandle<()> {
-    let live = counter.live.clone();
-    let max_live = counter.max_live.clone();
-    tokio::spawn(async move {
-        loop {
-            max_live.fetch_max(live.load(Ordering::SeqCst), Ordering::SeqCst);
-            sleep(Duration::from_millis(1)).await;
-        }
-    })
+    fn inits(&self) -> usize {
+        self.inits.load(Ordering::SeqCst)
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
 }
 
 type EventLog = Arc<Mutex<Vec<ChildEvent>>>;
@@ -177,11 +271,26 @@ fn recorder() -> EventLog {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+fn record(events: &EventLog, event: &ChildEvent) {
+    events.lock().unwrap().push(event.clone());
+    ring();
+}
+
+fn reports_of(events: &EventLog, name: &str) -> Vec<(StopReason, SupervisionAction)> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.child_id.as_str() == name)
+        .map(|event| (event.reason.clone(), event.action))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
-// `Flex`: a child whose every incarnation's `on_started` delay is scripted in
-// advance (a per-child queue of `Duration`s, one popped per construction,
-// defaulting to zero once exhausted) - the knob every scenario below uses to
-// control exactly which restart is "the slow one".
+// `Flex`: a child whose every incarnation's start hook is scripted in advance
+// (a per-child queue of `Init`s, one popped per construction, `Ready` once
+// exhausted) - the knob every scenario below uses to control exactly which
+// restart is "the slow one".
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -189,15 +298,27 @@ enum CMsg {
     Crash,
 }
 
+/// How one incarnation's `on_started` behaves.
+#[derive(Clone)]
+enum Init {
+    /// Returns at once.
+    Ready,
+    /// Returns once the test opens the gate.
+    Gate(Arc<Gate>),
+    /// Never returns: only a stop order, a start timeout or an abort ends it.
+    Never,
+}
+
 struct Flex {
     name: String,
     counter: InstanceCounter,
-    delay: Duration,
-    /// Held in `pre_stop` before accepting a `Graceful`/`ParentRequest` stop:
-    /// lets a test control exactly how long this incarnation's own teardown
-    /// takes under `Shutdown::Timeout` (irrelevant under `Shutdown::Kill`,
-    /// which bypasses every callback).
-    teardown_delay: Duration,
+    nth: usize,
+    init: Init,
+    /// Passed in `pre_stop` before accepting a `Graceful`/`ParentRequest`
+    /// stop: lets a test hold this incarnation's own teardown open under
+    /// `Shutdown::Timeout` (irrelevant under `Shutdown::Kill`, which bypasses
+    /// every callback).
+    teardown: Option<Arc<Gate>>,
 }
 
 impl Actor for Flex {
@@ -211,15 +332,19 @@ impl Actor for Flex {
     }
 
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
-        if !self.delay.is_zero() {
-            sleep(self.delay).await;
+        self.counter.on_init();
+        match self.init.clone() {
+            Init::Ready => {}
+            Init::Gate(gate) => gate.pass().await,
+            Init::Never => pending::<()>().await,
         }
+        self.counter.on_started();
         Ok(())
     }
 
     async fn pre_stop(&mut self, _reason: &StopReason, _ctx: &mut ActorContext<Self>) -> bool {
-        if !self.teardown_delay.is_zero() {
-            sleep(self.teardown_delay).await;
+        if let Some(gate) = self.teardown.clone() {
+            gate.pass().await;
         }
         true
     }
@@ -227,30 +352,30 @@ impl Actor for Flex {
 
 impl Drop for Flex {
     fn drop(&mut self) {
-        self.counter.on_drop();
+        self.counter.on_drop(self.nth);
     }
 }
 
 /// One child's full spec for [`FlexSup`]: name, instance accounting, and the
-/// scripted per-construction `on_started` delay queue.
+/// scripted per-construction start hooks.
 struct Member {
     name: String,
     counter: InstanceCounter,
-    delays: Arc<Mutex<VecDeque<Duration>>>,
+    inits: Arc<Mutex<VecDeque<Init>>>,
     shutdown: Shutdown,
     start_timeout: Option<Duration>,
-    teardown_delay: Duration,
+    teardown: Option<Arc<Gate>>,
 }
 
 impl Member {
-    fn new(name: String, counter: InstanceCounter, delays: Vec<Duration>) -> Self {
+    fn new(name: String, counter: InstanceCounter, inits: Vec<Init>) -> Self {
         Self {
             name,
             counter,
-            delays: Arc::new(Mutex::new(delays.into())),
+            inits: Arc::new(Mutex::new(inits.into())),
             shutdown: Shutdown::Kill,
             start_timeout: None,
-            teardown_delay: Duration::ZERO,
+            teardown: None,
         }
     }
 
@@ -264,8 +389,8 @@ impl Member {
         self
     }
 
-    fn teardown_delay(mut self, dur: Duration) -> Self {
-        self.teardown_delay = dur;
+    fn teardown(mut self, gate: &Arc<Gate>) -> Self {
+        self.teardown = Some(gate.clone());
         self
     }
 }
@@ -309,17 +434,18 @@ impl Actor for FlexSup {
         for m in &self.members {
             let name = m.name.clone();
             let counter = m.counter.clone();
-            let delays = m.delays.clone();
-            let teardown_delay = m.teardown_delay;
+            let inits = m.inits.clone();
+            let teardown = m.teardown.clone();
             let mut builder = ctx
                 .spawn_child(move || {
-                    let delay = delays.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
-                    counter.on_construct();
+                    let init = inits.lock().unwrap().pop_front().unwrap_or(Init::Ready);
+                    let nth = counter.on_construct();
                     Flex {
                         name: name.clone(),
                         counter: counter.clone(),
-                        delay,
-                        teardown_delay,
+                        nth,
+                        init,
+                        teardown: teardown.clone(),
                     }
                 })
                 .named(m.name.clone())
@@ -338,7 +464,7 @@ impl Actor for FlexSup {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        self.events.lock().unwrap().push(event.clone());
+        record(&self.events, event);
         Ok(())
     }
 }
@@ -348,8 +474,26 @@ async fn op(sup: &ActorHandle<FlexSup>, cmd: SupCmd) -> Result<StopChildOutcome,
     res
 }
 
+async fn flex_sup(
+    sys: &Arc<ActorSystem>,
+    members: Vec<Member>,
+    events: &EventLog,
+    config: SupervisionConfig,
+) -> ActorHandle<FlexSup> {
+    FlexSup {
+        members,
+        events: events.clone(),
+    }
+    .spawn()
+    .named(uname("sup"))
+    .on_system(sys)
+    .with_supervision(config)
+    .await
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
-// Item 5: parent killed mid-restart - no orphaned incarnation, name freed.
+// Parent killed mid-restart - no orphaned incarnation, name freed.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -357,13 +501,91 @@ async fn op(sup: &ActorHandle<FlexSup>, cmd: SupCmd) -> Result<StopChildOutcome,
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Item 3: a restart attempt in flight at the group's evaluation is stopped
-// with the group and started again in its slot.
+// A restart attempt in flight at the group's evaluation is stopped with the
+// group and started again in its slot.
 // ---------------------------------------------------------------------------
 
+/// A one-for-all group of three members, all started, where b's second
+/// construction waits at `b_init` in its start hook and c's teardown is held
+/// at `c_teardown`.
+struct HeldGroup {
+    sys: Arc<ActorSystem>,
+    sup: ActorHandle<FlexSup>,
+    events: EventLog,
+    a_name: String,
+    b_name: String,
+    c_name: String,
+    a_counter: InstanceCounter,
+    b_counter: InstanceCounter,
+    c_counter: InstanceCounter,
+    b_init: Arc<Gate>,
+    c_teardown: Arc<Gate>,
+}
+
+async fn held_group() -> HeldGroup {
+    let a_name = uname("a");
+    let b_name = uname("b");
+    let c_name = uname("c");
+    let a_counter = InstanceCounter::default();
+    let b_counter = InstanceCounter::default();
+    let c_counter = InstanceCounter::default();
+    let b_init = Gate::new();
+    let c_teardown = Gate::new();
+
+    let members = vec![
+        Member::new(a_name.clone(), a_counter.clone(), Vec::new()),
+        // b's SECOND construction (the manual bounce) waits in its start
+        // hook, so it is still in flight when a's crash evaluates the group.
+        // b's policy is the `Member` default, `Shutdown::Kill`, so the
+        // group's order, written in b's turn after c ended, kills the
+        // incarnation the attempt adopted at once.
+        Member::new(
+            b_name.clone(),
+            b_counter.clone(),
+            vec![Init::Ready, Init::Gate(b_init.clone())],
+        ),
+        // c's own teardown is held open until b's attempt has finished its
+        // initialization, so the group's stop phase is still open at c when
+        // b's attempt is ready: the group stops members one at a time, c
+        // first, so the attempt is adopted while c is being stopped and is
+        // stopped in its turn, after c, never kept.
+        Member::new(c_name.clone(), c_counter.clone(), Vec::new())
+            .shutdown(Shutdown::Timeout(Duration::from_secs(3600)))
+            .teardown(&c_teardown),
+    ];
+
+    let events = recorder();
+    let sys = new_system();
+    let sup = flex_sup(
+        &sys,
+        members,
+        &events,
+        SupervisionConfig::one_for_all().max_restarts(10, Duration::from_secs(60)),
+    )
+    .await;
+
+    wait_for("all three members started", || {
+        a_counter.started() >= 1 && b_counter.started() >= 1 && c_counter.started() >= 1
+    })
+    .await;
+    HeldGroup {
+        sys,
+        sup,
+        events,
+        a_name,
+        b_name,
+        c_name,
+        a_counter,
+        b_counter,
+        c_counter,
+        b_init,
+        c_teardown,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Item 4: a restart attempt in flight at the group's evaluation, whose own
-// start timeout ends it before the group's stop window does.
+// A restart attempt in flight at the group's evaluation, whose own start
+// timeout ends it before the group's stop window does.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -380,7 +602,9 @@ async fn op(sup: &ActorHandle<FlexSup>, cmd: SupCmd) -> Result<StopChildOutcome,
 // Factory panic inside the restart task: typed failure, budget charged.
 // ---------------------------------------------------------------------------
 
-struct PanicOnce;
+struct PanicOnce {
+    started: Arc<AtomicUsize>,
+}
 
 #[derive(Clone)]
 enum PMsg {
@@ -396,11 +620,18 @@ impl Actor for PanicOnce {
             PMsg::Crash => panic!("crashed on command"),
         }
     }
+
+    async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        ring();
+        Ok(())
+    }
 }
 
 struct FactorySup {
     name: String,
     calls: Arc<AtomicUsize>,
+    started: Arc<AtomicUsize>,
     events: EventLog,
 }
 
@@ -414,6 +645,7 @@ impl Actor for FactorySup {
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         let calls = self.calls.clone();
+        let started = self.started.clone();
         ctx.spawn_child(move || {
             // The SECOND call (the first restart attempt) panics; every
             // other call succeeds.
@@ -421,7 +653,9 @@ impl Actor for FactorySup {
             if n == 1 {
                 panic!("factory boom on restart");
             }
-            PanicOnce
+            PanicOnce {
+                started: started.clone(),
+            }
         })
         .named(self.name.clone())
         .restart_type(RestartType::Permanent)
@@ -435,7 +669,7 @@ impl Actor for FactorySup {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        self.events.lock().unwrap().push(event.clone());
+        record(&self.events, event);
         Ok(())
     }
 }
@@ -452,12 +686,12 @@ impl Actor for FactorySup {
 // ---------------------------------------------------------------------------
 
 /// `a`: its first incarnation starts cleanly; every incarnation after that
-/// (every restart attempt) sleeps `fail_after` in `on_started` and then
-/// fails, so every restart of it is a failed attempt.
+/// (every restart attempt) passes `gate` in `on_started` and then fails, so
+/// every restart of it is a failed attempt.
 struct AlwaysFailsOnRestart {
     counter: InstanceCounter,
     attempt: usize,
-    fail_after: Duration,
+    gate: Arc<Gate>,
 }
 
 impl Actor for AlwaysFailsOnRestart {
@@ -470,27 +704,28 @@ impl Actor for AlwaysFailsOnRestart {
 
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         if self.attempt <= 1 {
+            self.counter.on_started();
             return Ok(());
         }
-        sleep(self.fail_after).await;
+        self.gate.pass().await;
         Err(ActorError::user("restart attempt deliberately fails"))
     }
 }
 
 impl Drop for AlwaysFailsOnRestart {
     fn drop(&mut self) {
-        self.counter.on_drop();
+        self.counter.on_drop(self.attempt);
     }
 }
 
 /// `b`: every incarnation starts cleanly except the one immediately after
-/// its own crash (`attempt == 2`), which sleeps `slow_after_crash` first -
-/// long enough to keep its own group restart in flight while `a`'s
+/// its own crash (`attempt == 2`), which passes `gate` first - the test
+/// holds it there to keep b's own group restart in flight while `a`'s
 /// independent attempt fails.
 struct SlowToRecoverAfterCrash {
     counter: InstanceCounter,
     attempt: usize,
-    slow_after_crash: Duration,
+    gate: Arc<Gate>,
 }
 
 impl Actor for SlowToRecoverAfterCrash {
@@ -503,15 +738,16 @@ impl Actor for SlowToRecoverAfterCrash {
 
     async fn on_started(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         if self.attempt == 2 {
-            sleep(self.slow_after_crash).await;
+            self.gate.pass().await;
         }
+        self.counter.on_started();
         Ok(())
     }
 }
 
 impl Drop for SlowToRecoverAfterCrash {
     fn drop(&mut self) {
-        self.counter.on_drop();
+        self.counter.on_drop(self.attempt);
     }
 }
 
@@ -521,8 +757,10 @@ impl Drop for SlowToRecoverAfterCrash {
 struct IndependentFailureSup {
     a_name: String,
     a_counter: InstanceCounter,
+    a_gate: Arc<Gate>,
     b_name: String,
     b_counter: InstanceCounter,
+    b_gate: Arc<Gate>,
     events: EventLog,
 }
 
@@ -540,13 +778,11 @@ impl Actor for IndependentFailureSup {
 
     async fn on_started(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         let a_counter = self.a_counter.clone();
-        ctx.spawn_child(move || {
-            a_counter.on_construct();
-            AlwaysFailsOnRestart {
-                counter: a_counter.clone(),
-                attempt: a_counter.constructions(),
-                fail_after: Duration::from_millis(400),
-            }
+        let a_gate = self.a_gate.clone();
+        ctx.spawn_child(move || AlwaysFailsOnRestart {
+            counter: a_counter.clone(),
+            attempt: a_counter.on_construct(),
+            gate: a_gate.clone(),
         })
         .named(self.a_name.clone())
         .restart_type(RestartType::Permanent)
@@ -554,13 +790,11 @@ impl Actor for IndependentFailureSup {
         .await?;
 
         let b_counter = self.b_counter.clone();
-        ctx.spawn_child(move || {
-            b_counter.on_construct();
-            SlowToRecoverAfterCrash {
-                counter: b_counter.clone(),
-                attempt: b_counter.constructions(),
-                slow_after_crash: Duration::from_millis(500),
-            }
+        let b_gate = self.b_gate.clone();
+        ctx.spawn_child(move || SlowToRecoverAfterCrash {
+            counter: b_counter.clone(),
+            attempt: b_counter.on_construct(),
+            gate: b_gate.clone(),
         })
         .named(self.b_name.clone())
         .restart_type(RestartType::Permanent)
@@ -575,26 +809,91 @@ impl Actor for IndependentFailureSup {
         event: &ChildEvent,
         _ctx: &mut ActorContext<Self>,
     ) -> ActorResult<()> {
-        self.events.lock().unwrap().push(event.clone());
+        record(&self.events, event);
         Ok(())
     }
 }
 
-/// Waits for an event matching `pred` to appear in `events`, polling like
-/// every other wait helper in this file. The bound only limits how long a real hang takes to report.
-async fn wait_for_event(events: &EventLog, what: &str, pred: impl Fn(&ChildEvent) -> bool) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if events.lock().unwrap().iter().any(&pred) {
-            return;
+/// The children whose failed start a supervisor has logged, read from the
+/// `start_error` report: the supervisor logs it in the turn that takes the
+/// failed attempt from its restart plane, before it reports or retries the
+/// child, so a test can wait for that turn.
+#[cfg(feature = "tracing")]
+mod start_errors {
+    use std::fmt::Debug;
+    use std::sync::{Mutex, OnceLock};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{span, Event, Metadata, Subscriber};
+
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct Fields {
+        report: Option<String>,
+        child: Option<String>,
+    }
+
+    impl Fields {
+        fn put(&mut self, field: &Field, value: String) {
+            match field.name() {
+                "report" => self.report = Some(value),
+                "child" => self.child = Some(value),
+                _ => {}
+            }
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out after {DEADLINE:?} waiting for: {what}; events so far: {:?}",
-                events.lock().unwrap()
-            );
+    }
+
+    impl Visit for Fields {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.put(field, value.to_string());
         }
-        sleep(POLL).await;
+
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            self.put(field, format!("{value:?}"));
+        }
+    }
+
+    struct StartErrors;
+
+    impl Subscriber for StartErrors {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "tokio_actors::supervisor"
+        }
+
+        fn new_span(&self, _attrs: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if let (Some("start_error"), Some(child)) = (fields.report.as_deref(), fields.child) {
+                LOGGED.lock().unwrap().push(child);
+                super::ring();
+            }
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    /// Installs the process's subscriber, once.
+    pub fn install() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            tracing::subscriber::set_global_default(StartErrors)
+                .expect("no other global subscriber is installed in this process");
+        });
+    }
+
+    pub fn logged(child: &str) -> bool {
+        LOGGED.lock().unwrap().iter().any(|c| c == child)
     }
 }
 
@@ -605,19 +904,25 @@ async fn wait_for_event(events: &EventLog, what: &str, pred: impl Fn(&ChildEvent
 /// retried once `b`'s group completes.
 #[test]
 fn independent_restart_failure_outside_an_in_flight_group_is_not_swallowed() {
+    #[cfg(feature = "tracing")]
+    start_errors::install();
     common::run(0, async {
-        let a_name = uname("g3-a");
-        let b_name = uname("g3-b");
+        let a_name = uname("indep-a");
+        let b_name = uname("indep-b");
         let a_counter = InstanceCounter::default();
         let b_counter = InstanceCounter::default();
+        let a_gate = Gate::new();
+        let b_gate = Gate::new();
         let events = recorder();
 
         let sys = new_system();
         let sup = IndependentFailureSup {
             a_name: a_name.clone(),
             a_counter: a_counter.clone(),
+            a_gate: a_gate.clone(),
             b_name: b_name.clone(),
             b_counter: b_counter.clone(),
+            b_gate: b_gate.clone(),
             events: events.clone(),
         }
         .spawn()
@@ -630,38 +935,58 @@ fn independent_restart_failure_outside_an_in_flight_group_is_not_swallowed() {
         .unwrap();
 
         wait_for("both members started", || {
-            a_counter.constructions() >= 1 && b_counter.constructions() >= 1
+            a_counter.started() >= 1 && b_counter.started() >= 1
         })
         .await;
 
         // Bounce a: a budget-free independent restart whose fresh
-        // incarnation will fail 400ms after it starts.
+        // incarnation waits at its gate, then fails.
         let res = sup
             .send(a_name.clone())
             .await
             .expect("supervisor must answer");
         res.expect("stop_child(a) must succeed");
-        wait_for("a's restart attempt to begin", || {
-            a_counter.constructions() >= 2
+        wait_for("a's restart attempt to wait in its start hook", || {
+            a_gate.entered() >= 1
         })
         .await;
 
         // Crash b: drives a RestForOne group restart for [b] alone (a
         // precedes b in start order, so it is not a member), independent of
-        // a's own in-flight restart attempt.
-        let hb = live_handle::<SlowToRecoverAfterCrash>(&sys, &b_name).await;
-        hb.notify(()).await.expect("deliver crash to b");
-
-        // a's restart attempt fails (at ~400ms) while b's group restart is
-        // still in flight (b takes ~500ms): its failure must still be
-        // reported and retried once the group completes, not dropped.
-        wait_for_event(&events, "a's failed restart attempt to be reported", |e| {
-            e.child_id.as_str() == a_name
-                && matches!(&e.reason, StopReason::Failure(_))
-                && e.action == SupervisionAction::RestartInitiated
+        // a's own in-flight restart attempt. b's restart waits at its gate,
+        // so the group stays in flight.
+        handle_of::<SlowToRecoverAfterCrash>(&sys, &b_name)
+            .notify(())
+            .await
+            .expect("deliver crash to b");
+        wait_for("b's group restart to wait in b's start hook", || {
+            b_gate.entered() >= 1
         })
         .await;
 
+        // a's restart attempt fails while b's group restart is in flight.
+        a_gate.open();
+        #[cfg(feature = "tracing")]
+        wait_for(
+            "the supervisor to take a's failed attempt while b's group is in flight",
+            || start_errors::logged(&a_name),
+        )
+        .await;
+        // Without the log line the nearest observable step is the end of a's
+        // attempt: its incarnation has been dropped.
+        #[cfg(not(feature = "tracing"))]
+        wait_for("a's failed attempt to end", || a_counter.live() == 0).await;
+
+        // b's group completes; a's failure must then be reported and
+        // retried, not dropped.
+        b_gate.open();
+        wait_for("a's failed restart attempt to be reported", || {
+            reports_of(&events, &a_name).iter().any(|(reason, action)| {
+                matches!(reason, StopReason::Failure(_))
+                    && *action == SupervisionAction::RestartInitiated
+            })
+        })
+        .await;
         wait_for("a's restart to actually be retried", || {
             a_counter.constructions() >= 3
         })

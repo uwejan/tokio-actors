@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::actor::context::ActorContext;
 use crate::actor::handle::ActorHandle;
-use crate::actor::subtree::{SYS_ALLOW_STATE, SYS_SENSITIVE};
+use crate::actor::incarnation::{SYS_ALLOW_STATE, SYS_SENSITIVE};
 use crate::actor::sys::{DebugOptions, SysError, SysOptions};
 use crate::actor::sys_loop::starts;
 use crate::actor::sys_state::state_access;

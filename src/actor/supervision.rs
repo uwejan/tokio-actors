@@ -11,18 +11,24 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::actor::runtime::saturating_deadline;
-use crate::actor::subtree::AbortRecord;
+use crate::actor::incarnation::IncarnationRef;
+use crate::actor::incarnation::StopLane;
 use crate::error::ActorError;
 use crate::system::{raise_noted, ActorSystem, ReaperEntry, ReaperFeed};
 use crate::telemetry::AttemptOutcome;
 use crate::types::{
     ActorId, ChildCounts, ChildEvent, ChildInfo, ChildStoppedInternal, RestartStrategy,
-    RestartType, Shutdown, StopLane, StopReason, SupervisionAction,
+    RestartType, Shutdown, StopReason, SupervisionAction,
 };
 
+pub(crate) mod model;
 pub(crate) mod rules;
 pub(crate) mod slot;
+
+pub use model::AutoShutdown;
+pub(crate) use model::{
+    BudgetCharge, ChildLifecycle, DownPending, ManualStop, Origin, ABORT_SETTLE,
+};
 
 pub(crate) use rules::{
     manual_commit, CommitEffect, GroupMembership, ManualFacts, ManualOp, ManualReply, ReportClass,
@@ -134,11 +140,6 @@ pub(crate) enum RestartOutcome {
 /// next turn boundary before its task is aborted, when its spawn builder set
 /// no other.
 pub(crate) const DEFAULT_KILL_GRACE: Duration = Duration::from_millis(120);
-
-/// Wait after an abort before the Unresponsive verdict: a task that yields
-/// ends at the abort, so only a non-yielding task outlives it. Independent of
-/// any kill grace.
-pub(crate) const ABORT_SETTLE: Duration = Duration::from_millis(100);
 
 /// Outcome of one child incarnation's runner task: the child's id, its real
 /// stop reason, and the incarnation token - in the order the run loop's
@@ -258,14 +259,8 @@ impl Drop for ChildLinkGuard {
         // supervisor child has that stop in `inherited` already.
         let record = self.stop_lane.abort_record();
         let trapping = record.trap();
-        let if_trapping = match self.inherited {
-            rules::InheritedStop::Kill { grace } if trapping => {
-                rules::inherited_stop_if_trapping(false, record.worker_shutdown(), grace)
-            }
-            _ => None,
-        };
-        let inherited = rules::guard_stop(self.inherited, if_trapping, trapping);
-        if matches!(inherited, rules::InheritedStop::Orderly { .. }) {
+        let first = rules::guard_first(self.inherited, trapping, record.worker_shutdown());
+        if first.parent_killed {
             raise_noted(
                 Some(&self.system),
                 &self.stop_lane,
@@ -274,35 +269,33 @@ impl Drop for ChildLinkGuard {
             );
         }
         let kill_stored = matches!(self.stop_lane.reason(), Some(StopReason::Kill));
-        let entry = match rules::fired_stop(inherited, kill_stored) {
-            rules::InheritedStop::Kill { grace } => {
-                // The entry below holds the child's abort handle, so no
-                // registry entry is involved and no deadline is declared.
-                raise_noted(
-                    Some(&self.system),
-                    &self.stop_lane,
-                    StopReason::Kill,
-                    crate::telemetry::StopOrigin::Requested,
-                );
-                ReaperEntry::new(
-                    saturating_deadline(Instant::now(), grace),
-                    self.abort.clone(),
-                    self.stop_lane.abort_record().clone(),
-                )
-            }
-            rules::InheritedStop::Orderly { window, grace } => {
-                // An unbounded orderly stop has no entry: nothing forces it.
-                let Some(window) = window else {
-                    return;
-                };
-                let kill_at = saturating_deadline(Instant::now(), window);
-                ReaperEntry::two_stage(
-                    kill_at,
-                    self.stop_lane.clone(),
-                    saturating_deadline(kill_at, grace),
-                    self.abort.clone(),
-                )
-            }
+        if rules::guard_raises_kill(first, kill_stored) {
+            // The entry below holds the child's abort handle, so no
+            // registry entry is involved and no deadline is declared.
+            raise_noted(
+                Some(&self.system),
+                &self.stop_lane,
+                StopReason::Kill,
+                crate::telemetry::StopOrigin::Requested,
+            );
+        }
+        // The clock is read once, after every raise: a kill's abort is
+        // counted from its raise.
+        let now = Instant::now().into_std();
+        let entry = match rules::guard_rest(first, kill_stored, now) {
+            model::GuardRest::Kill { abort_at } => ReaperEntry::new(
+                Instant::from_std(abort_at),
+                self.abort.clone(),
+                self.stop_lane.abort_record().clone(),
+            ),
+            model::GuardRest::Staged { kill_at, abort_at } => ReaperEntry::two_stage(
+                Instant::from_std(kill_at),
+                self.stop_lane.clone(),
+                Instant::from_std(abort_at),
+                self.abort.clone(),
+            ),
+            // An unbounded orderly stop has no entry: nothing forces it.
+            model::GuardRest::Unforced => return,
         };
         // The reaper this guard was handed may belong to a runtime that is
         // gone now: the system feeds the entry to the reaper of the child's
@@ -315,140 +308,9 @@ impl Drop for ChildLinkGuard {
     }
 }
 
-/// How a manual stop was requested, recorded on the child so its death event
-/// bypasses strategy evaluation (manual stops are never failures).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ManualStop {
-    /// `stop_child`: restart per policy afterwards, budget-free.
-    Bounce,
-    /// `terminate_child`: stay down until restart_child/delete_child (OTP).
-    Terminate,
-}
-
-// ---------------------------------------------------------------------------
-// ChildLifecycle
-// ---------------------------------------------------------------------------
-
-/// What a down child's last incarnation still owes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DownPending {
-    /// Nothing: the incarnation's end was delivered or decided.
-    None,
-    /// A completed manual stop holds a snapshot of the incarnation's end
-    /// that the death plane's report delivers (see
-    /// [`SupervisionState::pending_manual_events`]).
-    Snapshot,
-    /// The incarnation died and the restart decision for its death is still
-    /// to be made; its report is evaluated exactly once.
-    Evaluate,
-}
-
-/// Where a restart attempt came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
-    /// The child's first incarnation, started by `spawn_child`.
-    Initial,
-    /// A restart the strategy decided.
-    Strategy,
-    /// The restart of a `Permanent` child after `stop_child`.
-    Bounce,
-    /// A `restart_child` call.
-    Manual,
-    /// The start a group restart's chain made in the member's slot.
-    Chain,
-}
-
-/// The lifecycle of one child spec inside its supervisor's registry.
-///
-/// Exactly one variant holds at any moment, and [`transition`](ChildState::transition)
-/// is the single, default-closed authority for moving between them: every
-/// row of [`rules::is_legal`] is explicit, and anything else is rejected
-/// outright instead of silently applying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildLifecycle {
-    /// The child's current incarnation is live and processing messages.
-    Running(u64),
-    /// A manual stop (`stop_child`/`terminate_child`) has been committed:
-    /// the lane has been raised, and the caller (or the group machinery) is
-    /// awaiting this incarnation's fate cell. `kind` decides what happens
-    /// once that fate is observed.
-    Stopping { incarnation: u64, kind: ManualStop },
-    /// A restart is in flight: `incarnation` is the dead/stopped instance
-    /// this spec last held, `next` is the fresh incarnation token assigned
-    /// to the attempt (adopted on a successful [`RestartOutcome::Adopted`],
-    /// or recorded as `Down` on a [`RestartOutcome::Failed`]).
-    Restarting { incarnation: u64, next: u64 },
-    /// The spec is retained but no instance is running. `incarnation` is the
-    /// last incarnation the spec held, and `pending` what its end still owes.
-    Down {
-        incarnation: u64,
-        pending: DownPending,
-    },
-}
-
-impl ChildLifecycle {
-    /// The incarnation this spec currently holds a live or in-flight
-    /// instance of: the running one, the one being stopped, or the attempt in
-    /// flight (`next`). A down spec has none, and the token of a restart's
-    /// retired incarnation is never an occupant.
-    pub(crate) fn occupant(&self) -> Option<u64> {
-        match self {
-            ChildLifecycle::Running(incarnation) | ChildLifecycle::Stopping { incarnation, .. } => {
-                Some(*incarnation)
-            }
-            ChildLifecycle::Restarting { next, .. } => Some(*next),
-            ChildLifecycle::Down { .. } => None,
-        }
-    }
-
-    /// The token the ledger holds for the incarnation a barrier awaits: the
-    /// occupant's, or for a down spec the incarnation it last held.
-    pub(crate) fn held_token(&self) -> u64 {
-        match self {
-            ChildLifecycle::Running(incarnation)
-            | ChildLifecycle::Stopping { incarnation, .. }
-            | ChildLifecycle::Down { incarnation, .. } => *incarnation,
-            ChildLifecycle::Restarting { next, .. } => *next,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SupervisionConfig
 // ---------------------------------------------------------------------------
-
-/// When a supervisor shuts itself down because of its significant children.
-///
-/// Erlang/OTP: the supervisor flag `auto_shutdown`. A child is significant
-/// when it is spawned with
-/// [`significant(true)`](crate::actor::context::ChildSpawnBuilder::significant).
-/// The check runs only for a child's end that the supervisor did not order:
-/// a child that ends and is not restarted, a `Transient` child after a normal
-/// exit or a `Temporary` child after any exit. An end the supervisor ordered
-/// (`stop_child`, `terminate_child`, `restart_child`, or the stop of a group
-/// restart) never triggers it. A child whose restart is under way has not
-/// terminated.
-///
-/// # Examples
-/// ```rust
-/// use tokio_actors::{AutoShutdown, SupervisionConfig};
-///
-/// let config = SupervisionConfig::one_for_one().with_auto_shutdown(AutoShutdown::AnySignificant);
-/// assert_eq!(config.auto_shutdown, AutoShutdown::AnySignificant);
-/// assert_eq!(SupervisionConfig::default().auto_shutdown, AutoShutdown::Never);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AutoShutdown {
-    /// The supervisor never shuts itself down because of a child. The default.
-    #[default]
-    Never,
-    /// The supervisor shuts down when any significant child ends without a
-    /// restart.
-    AnySignificant,
-    /// The supervisor shuts down when the last significant child that was
-    /// still active ends without a restart.
-    AllSignificant,
-}
 
 /// Configuration for an actor acting as a supervisor.
 ///
@@ -597,74 +459,26 @@ impl SupervisionConfig {
 // RestartBudget
 // ---------------------------------------------------------------------------
 
-/// Sliding-window restart budget tracker.
-///
-/// Uses a `VecDeque<Instant>` to record restart timestamps.
-/// Expired entries (outside the window) are pruned on each check.
+/// Sliding-window restart budget tracker: the state of
+/// [`rules::budget_check`], charged at the instant each caller reads once per
+/// death event.
 pub(crate) struct RestartBudget {
-    max_restarts: u32,
-    restart_window: Duration,
-    timestamps: VecDeque<Instant>,
+    state: model::BudgetState,
 }
 
 impl RestartBudget {
     pub(crate) fn new(max_restarts: u32, restart_window: Duration) -> Self {
         Self {
-            max_restarts,
-            restart_window,
-            timestamps: VecDeque::new(),
+            state: model::BudgetState::new(max_restarts, restart_window),
         }
     }
 
-    /// Checks if a restart is allowed. If yes, records it. Returns the charge
-    /// as it stands after the call: whether the restart was accepted, how
-    /// many restarts the window holds (on a refusal, the maximum), and the
-    /// budget's limits.
-    pub(crate) fn check_and_record(&mut self) -> BudgetCharge {
-        let now = Instant::now();
-        // checked_sub, never `now - self.restart_window`: a paused or
-        // simulated clock (tokio::time::pause) can sit close to its own
-        // epoch, so a window wider than elapsed time would underflow a raw
-        // subtraction and panic. `None` here just means nothing is old
-        // enough to prune yet - a safe no-op, so the count-based check below
-        // still runs correctly.
-        let cutoff = now.checked_sub(self.restart_window);
-
-        // Prune expired entries
-        if let Some(cutoff) = cutoff {
-            while let Some(&front) = self.timestamps.front() {
-                if front < cutoff {
-                    self.timestamps.pop_front();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        let accepted = self.timestamps.len() < self.max_restarts as usize;
-        if accepted {
-            self.timestamps.push_back(now);
-        }
-        BudgetCharge {
-            accepted,
-            used: u32::try_from(self.timestamps.len()).unwrap_or(u32::MAX),
-            max: self.max_restarts,
-            window: self.restart_window,
-        }
+    /// Checks if a restart at `now` is allowed. If yes, records it. Returns
+    /// the charge as it stands after the call: whether the restart was
+    /// accepted, how many restarts the window holds, and the budget's limits.
+    pub(crate) fn check_and_record(&mut self, now: Instant) -> BudgetCharge {
+        rules::budget_check(&mut self.state, now.into_std())
     }
-}
-
-/// The outcome of one charge against a [`RestartBudget`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BudgetCharge {
-    /// Whether the restart was within the budget (and was recorded).
-    pub(crate) accepted: bool,
-    /// The restarts the window holds after the charge.
-    pub(crate) used: u32,
-    /// The most restarts the window allows.
-    pub(crate) max: u32,
-    /// The window the restarts are counted in.
-    pub(crate) window: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +499,7 @@ pub(crate) struct ChildSpec {
     /// Stored here for restart-path lookups; the active reader is the
     /// restart closure's own captured copy (see `spawn_child_internal` in
     /// `context.rs`), which the restart path consumes to bound the ack wait.
-    #[allow(dead_code)]
+    /// `children_info` and `child_info` read it.
     pub start_timeout: Option<Duration>,
     /// The time this child is given, after a `Kill` is raised on it, to reach
     /// its next turn boundary before its task is aborted. An invariant of
@@ -838,7 +652,7 @@ pub(crate) struct ChildRegistry {
     /// first child spawned through the supervisor's context. The registry
     /// writes its length there at every add and remove, which is where a
     /// system snapshot reads a supervisor's child count without asking it.
-    owner: Option<AbortRecord>,
+    owner: Option<IncarnationRef>,
 }
 
 /// A registered child and its place in start order.
@@ -858,14 +672,14 @@ impl ChildRegistry {
 
     /// Names the record the child count is published to, unless one is named
     /// already. The count is published from the next add or remove on.
-    pub(crate) fn adopt_owner(&mut self, record: &AbortRecord) {
+    pub(crate) fn adopt_owner(&mut self, record: &IncarnationRef) {
         if self.owner.is_none() {
             self.owner = Some(record.clone());
         }
     }
 
     /// The record of the supervisor that owns this registry, if named.
-    pub(crate) fn owner_record(&self) -> Option<AbortRecord> {
+    pub(crate) fn owner_record(&self) -> Option<IncarnationRef> {
         self.owner.clone()
     }
 
@@ -1195,7 +1009,7 @@ impl SupervisionState {
         let Some(spec) = self.registry.get(child) else {
             return false;
         };
-        let pool = matches!(self.config.strategy, RestartStrategy::SimpleOneForOne);
+        let pool = rules::is_pool(self.config.strategy);
         // Only `AllSignificant` of a significant child reads the others.
         let others_active = mode == AutoShutdown::AllSignificant
             && spec.spec.significant
@@ -1507,7 +1321,7 @@ impl SupervisionState {
     /// group restart planned for `failed` leaves outside it. Empty for every
     /// other strategy.
     pub(crate) fn first_plan_outside(&self, failed: &ActorId) -> HashSet<ActorId> {
-        if self.config.strategy != RestartStrategy::RestForOne {
+        if !rules::leaves_earlier_outside(self.config.strategy) {
             return HashSet::new();
         }
         self.registry
@@ -1526,11 +1340,7 @@ impl SupervisionState {
         let Some(scope) = self.group_scope() else {
             return false;
         };
-        match self.config.strategy {
-            RestartStrategy::OneForAll => true,
-            RestartStrategy::RestForOne => !scope.outside.contains(child_id),
-            RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => false,
-        }
+        rules::group_covers(self.config.strategy, scope.outside.contains(child_id))
     }
 
     /// Records that the pending group restart must leave the child down: the
@@ -1594,8 +1404,7 @@ impl SupervisionState {
             reason,
             action: SupervisionAction::Removed,
         };
-        let prunable = matches!(self.config.strategy, RestartStrategy::SimpleOneForOne)
-            || child.spec.restart_type == RestartType::Temporary;
+        let prunable = rules::spec_prunable(self.config.strategy, child.spec.restart_type);
         self.pending_manual_events
             .insert((child_id.clone(), incarnation), event);
         if prunable {
@@ -1641,7 +1450,7 @@ impl SupervisionState {
             task: child.map_or(TaskState::Ended, |child| child.ctl.task_state()),
             membership: self.group_membership(child_id),
             restart_type: child.map_or(RestartType::Permanent, |child| child.spec.restart_type),
-            pool: matches!(self.config.strategy, RestartStrategy::SimpleOneForOne),
+            pool: rules::is_pool(self.config.strategy),
             restarted: self
                 .group_scope()
                 .is_some_and(|scope| scope.restarted.contains(child_id)),
@@ -1665,22 +1474,33 @@ impl SupervisionState {
     pub(crate) fn children_info(&self) -> Vec<ChildInfo> {
         self.registry
             .iter()
-            .map(|child| {
-                let fate_present = child.ctl.task_state() == TaskState::Ended;
-                let in_restart_set = self.in_restart_set(&child.id);
-                let (is_alive, restart_pending) =
-                    rules::child_info_flags(child.lifecycle, fate_present, in_restart_set);
-                ChildInfo {
-                    id: child.id.clone(),
-                    name: child.name.as_deref().map(str::to_string),
-                    restart_type: child.spec.restart_type,
-                    shutdown: child.spec.shutdown,
-                    is_alive,
-                    restart_pending,
-                    is_supervisor: child.spec.is_supervisor,
-                }
-            })
+            .map(|child| self.child_info_of(child))
             .collect()
+    }
+
+    /// Introspection info for one child, or `None` when the registry holds no
+    /// spec under `id`.
+    pub(crate) fn child_info(&self, id: &ActorId) -> Option<ChildInfo> {
+        self.registry.get(id).map(|child| self.child_info_of(child))
+    }
+
+    fn child_info_of(&self, child: &ChildState) -> ChildInfo {
+        let fate_present = child.ctl.task_state() == TaskState::Ended;
+        let in_restart_set = self.in_restart_set(&child.id);
+        let (is_alive, restart_pending) =
+            rules::child_info_flags(child.lifecycle, fate_present, in_restart_set);
+        ChildInfo {
+            id: child.id.clone(),
+            name: child.name.as_deref().map(str::to_string),
+            restart_type: child.spec.restart_type,
+            shutdown: child.spec.shutdown,
+            is_alive,
+            restart_pending,
+            is_supervisor: child.spec.is_supervisor,
+            significant: child.spec.significant,
+            kill_grace: child.spec.kill_grace,
+            start_timeout: child.spec.start_timeout,
+        }
     }
 
     /// The child counts of `count_children`: every spec, the specs with an
@@ -2118,15 +1938,17 @@ pub(crate) fn evaluate_strategy(
     failed_child_id: &ActorId,
     reason: &crate::types::StopReason,
 ) -> StrategyOutcome {
-    evaluate_strategy_charged(sup, failed_child_id, reason, &mut |_, _| {})
+    evaluate_strategy_charged(sup, failed_child_id, reason, Instant::now(), &mut |_, _| {})
 }
 
-/// [`evaluate_strategy`], telling `charged` the incarnation and the charge of
-/// the budget when the death is charged against it.
+/// [`evaluate_strategy`] at `now`, the instant the caller read for the death
+/// event, telling `charged` the incarnation and the charge of the budget
+/// when the death is charged against it.
 pub(crate) fn evaluate_strategy_charged(
     sup: &mut SupervisionState,
     failed_child_id: &ActorId,
     reason: &crate::types::StopReason,
+    now: Instant,
     charged: &mut dyn FnMut(u64, BudgetCharge),
 ) -> StrategyOutcome {
     let child = match sup.registry.get(failed_child_id) {
@@ -2136,35 +1958,21 @@ pub(crate) fn evaluate_strategy_charged(
 
     let restart_type = child.spec.restart_type;
     let incarnation = child.lifecycle.held_token();
-    let should_restart = match restart_type {
-        RestartType::Permanent => true,
-        // OTP transient parity: restart only on ABNORMAL exits. The clean
-        // reasons are normal, shutdown and {shutdown, Term} - our Graceful,
-        // ParentRequest (which is also the exit reason of a budget-exhausted
-        // supervisor) and Shutdown, and ParentKilled, a clean exit ordered
-        // from above. Kill (OTP `killed`) is abnormal and does restart. The
-        // supervisor's `child_terminated` report reads the same test.
-        RestartType::Transient => !reason.is_normal(),
-        RestartType::Temporary => false,
-    };
-
-    if !should_restart {
+    if rules::restart_decision(restart_type, reason) == model::RestartDecision::Remove {
         return StrategyOutcome::Remove;
     }
 
     // Check budget
-    let charge = sup.budget.check_and_record();
+    let charge = sup.budget.check_and_record(now);
     charged(incarnation, charge);
     if !charge.accepted {
         return StrategyOutcome::BudgetExhausted;
     }
 
     // Determine the affected set based on strategy
-    match sup.config.strategy {
-        RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => {
-            StrategyOutcome::RestartOne(failed_child_id.clone())
-        }
-        RestartStrategy::OneForAll | RestartStrategy::RestForOne => {
+    match rules::strategy_scope(sup.config.strategy) {
+        model::StrategyScope::One => StrategyOutcome::RestartOne(failed_child_id.clone()),
+        model::StrategyScope::Group => {
             let children: Vec<rules::GroupMember> = sup.registry.iter().map(group_member).collect();
             StrategyOutcome::RestartGroup {
                 commit: rules::group_commit(sup.config.strategy, &children, failed_child_id),
@@ -2309,8 +2117,6 @@ mod tests {
     use super::*;
 
     use tokio::task::JoinHandle;
-
-    // - RestartBudget -------------------------------------------------------
 
     // - ChildRegistry -------------------------------------------------------
 
