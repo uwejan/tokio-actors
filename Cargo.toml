@@ -51,5 +51,11 @@ harness = false
 name = "abort_profile"
 harness = false
 
+# Tests build unoptimized, with line tables so a backtrace names its lines.
 [profile.test]
+debug = "line-tables-only"
+
+# The explorer's configurations run on optimized code.
+[profile.explore]
+inherits = "test"
 opt-level = 1

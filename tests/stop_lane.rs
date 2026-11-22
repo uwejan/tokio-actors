@@ -249,12 +249,17 @@ fn kill_before_pending_graceful_observation_suppresses_it_entirely() {
 
 #[test]
 fn kill_under_a_flooded_mailbox_waits_for_the_in_flight_handler() {
+    // Far longer than the test holds the handler after its Kill: inside that
+    // hold only a turn boundary could end the actor, never the abort that
+    // follows the kill grace.
+    const GRACE: Duration = Duration::from_secs(60);
     common::run(2, async {
         let config = ActorConfig::default().with_mailbox_capacity(1);
         let handle = Prober::default()
             .spawn()
             .named("lane-flood-turn-boundary")
             .with_config(config)
+            .kill_grace(GRACE)
             .await
             .unwrap();
 

@@ -434,11 +434,21 @@ async fn own_release_waits_for_every_incarnation() {
         .unwrap();
 }
 
-/// The id of the one controller the default system holds.
-fn controller_id() -> tokio_actors::ActorId {
+/// The ids of the controllers the default system lists.
+fn controllers() -> Vec<tokio_actors::ActorId> {
     let rows = ActorSystem::default().snapshot();
-    let row = rows.iter().find(|r| r.type_name.ends_with("Controller"));
-    row.expect("a controller").actor.id().clone()
+    let found = rows.iter().filter(|r| r.type_name.ends_with("Controller"));
+    found.map(|r| r.actor.id().clone()).collect()
+}
+
+/// Spawns a controller and names it: the one the default system lists after
+/// the spawn and not before it. A controller of an earlier test may still be
+/// listed while its runtime ends, so a type name alone does not name this one.
+async fn spawn_named() -> (Applications, tokio_actors::ActorId) {
+    let before = controllers();
+    let apps = Applications::spawn().await.unwrap();
+    let id = controllers().into_iter().find(|id| !before.contains(id));
+    (apps, id.expect("a controller"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -446,7 +456,7 @@ async fn controller_end_hands_on_its_applications() {
     let _serial = SERIAL.lock().await;
     // A controller killed while a stop waits in `prep_stop`: the stop runs to
     // its end, hooks included, and the own system is walked.
-    let apps = Applications::spawn().await.unwrap();
+    let (apps, controller) = spawn_named().await;
     let (stops_tx, mut stops) = mpsc::unbounded_channel();
     let (entered_tx, entered) = oneshot::channel();
     let (open, open_rx) = oneshot::channel();
@@ -462,7 +472,7 @@ async fn controller_end_hands_on_its_applications() {
     let stopping = apps.clone();
     let stop = tokio::spawn(async move { stopping.stop("killed-in-stop").await });
     entered.await.unwrap();
-    ActorSystem::default().kill_by_id(&controller_id()).await;
+    ActorSystem::default().kill_by_id(&controller).await;
     open.send(()).unwrap();
     within("the stop hook", stops.recv()).await.unwrap();
     let ended = within("the node verdict", apps.node_shutdown()).await;
@@ -472,7 +482,7 @@ async fn controller_end_hands_on_its_applications() {
     );
     assert!(matches!(stop.await.unwrap(), Err(AppError::Ended(_))));
     // A controller killed while idle: the top reads `Kill` and no hook runs.
-    let apps = Applications::spawn().await.unwrap();
+    let (apps, controller) = spawn_named().await;
     let (stops_tx, mut stops) = mpsc::unbounded_channel();
     let (tops_tx, mut tops) = mpsc::unbounded_channel();
     let probe = Probe {
@@ -485,7 +495,7 @@ async fn controller_end_hands_on_its_applications() {
     apps.load(probe).await.unwrap();
     apps.start("killed-idle", TE).await.unwrap();
     let top = tops.recv().await.unwrap();
-    ActorSystem::default().kill_by_id(&controller_id()).await;
+    ActorSystem::default().kill_by_id(&controller).await;
     assert_eq!(
         within("the top's end", top.wait_stopped()).await,
         StopReason::Kill
