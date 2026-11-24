@@ -169,8 +169,12 @@ fn test_only_files_come_from_their_declarations() {
             "#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks_inside;\nmod unit;\n#[cfg(test)]\npub(crate) mod harness;\n",
         ),
         ("actor/checks.rs", ""),
-        ("actor/unit.rs", "#[cfg(test)]\nmod tests;\n"),
+        (
+            "actor/unit.rs",
+            "#[cfg(test)]\nmod tests;\n#[cfg(test)]\n#[cfg_attr(\n    not(unix),\n    allow(dead_code)\n)]\nmod wrapped;\n",
+        ),
         ("actor/unit/tests.rs", ""),
+        ("actor/unit/wrapped.rs", ""),
         ("actor/harness/mod.rs", ""),
     ]
     .into_iter()
@@ -183,6 +187,7 @@ fn test_only_files_come_from_their_declarations() {
             "actor/checks.rs",
             "actor/harness/mod.rs",
             "actor/unit/tests.rs",
+            "actor/unit/wrapped.rs",
             "probe_tests.rs",
             "probe_tests/deeper.rs",
         ]

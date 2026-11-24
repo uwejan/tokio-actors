@@ -159,6 +159,22 @@ This is the kind of edge-case thinking production systems need.
 cargo add tokio-actors
 ```
 
+### Cargo Features
+
+| Feature | Default | Adds |
+|---|---|---|
+| `telemetry` | on | Delivery of the typed events of the `telemetry` module to handlers (`attach_telemetry`) and to actors (`ctx.subscribe`), the system snapshot and `is_quiescent`, the system monitor, turn tracking, the turn watchdog and wait-cycle detection |
+| `sys` | on | `ActorHandle::sys()`: suspend and resume, statistics, the debug log and trace, installed debug functions and state access, with the `debug` and `allow_state_access` spawn options |
+| `tracing` | off | The crate's log statements, through the `tracing` crate |
+
+Everything else is compiled in every build: actors, supervision, timers, streams, monitors, links, process groups, aliases, requests, state machines, event managers and applications. To build that alone, turn the default features off:
+
+```bash
+cargo add tokio-actors --no-default-features
+```
+
+The Turn Watchdog and Telemetry sections below describe the `telemetry` feature, and so do the `subscribe` and `unsubscribe` rows of the ActorContext table and the rows of the ActorSystem table from `set_turn_warning_threshold` to `is_quiescent`. The three telemetry settings of `SystemConfig` are fields of every build and have no effect without the feature.
+
 ### Counter: The Basics
 
 ```rust

@@ -6,6 +6,8 @@ use super::actor_ref::ActorRef;
 use crate::types::ActorStatus;
 
 /// What a system snapshot reports about one actor.
+///
+/// Needs the `telemetry` feature, which is on by default.
 #[derive(Clone, Debug)]
 pub struct ActorRecord {
     /// The incarnation, with its ancestors.

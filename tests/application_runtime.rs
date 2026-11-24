@@ -434,6 +434,7 @@ async fn own_release_waits_for_every_incarnation() {
         .unwrap();
 }
 
+#[cfg(feature = "telemetry")]
 /// The ids of the controllers the default system lists.
 fn controllers() -> Vec<tokio_actors::ActorId> {
     let rows = ActorSystem::default().snapshot();
@@ -441,6 +442,7 @@ fn controllers() -> Vec<tokio_actors::ActorId> {
     found.map(|r| r.actor.id().clone()).collect()
 }
 
+#[cfg(feature = "telemetry")]
 /// Spawns a controller and names it: the one the default system lists after
 /// the spawn and not before it. A controller of an earlier test may still be
 /// listed while its runtime ends, so a type name alone does not name this one.
@@ -451,6 +453,7 @@ async fn spawn_named() -> (Applications, tokio_actors::ActorId) {
     (apps, id.expect("a controller"))
 }
 
+#[cfg(feature = "telemetry")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_end_hands_on_its_applications() {
     let _serial = SERIAL.lock().await;

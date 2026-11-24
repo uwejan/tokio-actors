@@ -1,6 +1,7 @@
 //! A registration made while the actor stops is refused (an owed notice) or
 //! accepted and silent (a source of its own); a revoke answers `true` for a
 //! pending item and the family's answer once the item is queued.
+#![cfg(feature = "telemetry")]
 
 mod common;
 
@@ -66,7 +67,6 @@ fn rev<I: Send + 'static>(id: I, f: fn(&mut Ctx, &I) -> bool) -> Result<Rev, Str
 fn st(e: impl std::fmt::Debug) -> String {
     format!("{e:?}")
 }
-
 /// Registers one item of `fam` and returns its revoke, or the registration's
 /// error. A `due` item has produced, or is about to produce, its notice.
 async fn item(

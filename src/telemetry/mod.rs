@@ -1,6 +1,10 @@
 //! Typed events about the actors of a system: their ends, stop requests,
 //! supervision decisions and helper tasks, with each actor's ancestry.
 //!
+//! Delivery needs the `telemetry` feature, which is on by default. Without
+//! it this module keeps its event and filter types, no handler or
+//! subscription can be made, and no event is produced.
+//!
 //! # Fields of the `tracing` output
 //!
 //! With the `tracing` feature, a log statement about one actor carries these
@@ -60,22 +64,28 @@
 mod actor_ref;
 #[allow(dead_code)]
 mod event;
+#[cfg_attr(not(feature = "telemetry"), path = "off/handlers.rs")]
 #[allow(dead_code)]
 pub(crate) mod handlers;
+#[cfg_attr(not(feature = "telemetry"), path = "off/hot.rs")]
 #[allow(dead_code)]
 mod hot;
 #[allow(dead_code)]
 mod identity;
 #[allow(dead_code)]
 mod mode;
+#[cfg(feature = "telemetry")]
 #[allow(dead_code)]
 pub(crate) mod monitor;
+#[cfg_attr(not(feature = "telemetry"), path = "off/pump.rs")]
 #[allow(dead_code)]
 mod pump;
+#[cfg(feature = "telemetry")]
 #[allow(dead_code)]
 mod record;
 #[allow(dead_code)]
 pub(crate) mod reports;
+#[cfg_attr(not(feature = "telemetry"), path = "off/sinks.rs")]
 #[allow(dead_code)]
 mod sinks;
 #[allow(dead_code)]
@@ -84,34 +94,48 @@ mod span;
 pub(crate) mod subscription;
 #[allow(dead_code)]
 pub(crate) mod token;
+#[cfg_attr(not(feature = "telemetry"), path = "off/wait_graph.rs")]
 #[allow(dead_code)]
 pub(crate) mod wait_graph;
 
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod events_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod gate_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod lifecycle_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod mode_word_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod pump_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod quiescence_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod sender_wait_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod snapshot_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod subscription_life_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod timer_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod turn_state_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod turn_tests;
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 mod wait_cycle_tests;
 
 pub use actor_ref::ActorRef;
@@ -121,8 +145,11 @@ pub use event::{
     AttemptOutcome, EventKind, HelperEnd, HelperKind, HookKind, KillStepKind, KindSet,
     RaiseOutcome, StopOrigin, TelemetryEvent, TurnOutcome, WaitOutcome,
 };
+#[cfg(feature = "telemetry")]
 pub use monitor::{LongQueue, MonitorConfig, MonitorError, MonitorSettings};
+#[cfg(feature = "telemetry")]
 pub use record::ActorRecord;
+#[cfg(feature = "telemetry")]
 #[allow(unused_imports)]
 pub(crate) use record::CouplingInfo;
 pub use subscription::{
@@ -147,6 +174,7 @@ pub(crate) use mode::{
 pub(crate) use span::{ActorSpan, SpawnTraced};
 
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 #[allow(unused_imports)]
 pub(crate) use sinks::test_sink::TestSinkGuard;
 

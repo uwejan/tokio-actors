@@ -14,9 +14,11 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
-    ActorConfig, ActorError, ActorHandle, ActorResult, ActorSystem, Alias, AliasError,
-    AliasOptions, LinkExit, StopReason, SystemConfig,
+    ActorConfig, ActorError, ActorHandle, ActorResult, Alias, AliasError, AliasOptions, LinkExit,
+    StopReason,
 };
+#[cfg(feature = "telemetry")]
+use tokio_actors::{ActorSystem, SystemConfig};
 
 const PROMPT: Duration = Duration::from_secs(20);
 
@@ -662,6 +664,7 @@ fn exit_priority_needs_an_active_priority_alias_a_trapping_receiver_and_a_lane()
     }
 }
 
+#[cfg(feature = "telemetry")]
 /// The trap map of an exit that rides the priority lane runs in the owner's
 /// own task, between turns: the stuck-turn watchdog sees it as a turn, as it
 /// sees one that handles a message.

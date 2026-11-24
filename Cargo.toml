@@ -1,6 +1,6 @@
 [package]
 name = "tokio-actors"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.85"
 description = "An OTP-style actor runtime for Rust: supervision, lifecycle and crash semantics traced to Erlang/OTP, with the known departures listed in the README"
@@ -19,7 +19,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
+default = ["telemetry", "sys"]
+telemetry = []
+sys = []
 tracing = ["dep:tracing"]
 
 [dependencies]
@@ -46,6 +48,11 @@ tokio = { version = "1.53", features = ["test-util"] }
 [[bench]]
 name = "actor_bench"
 harness = false
+required-features = ["telemetry"]
+
+[[example]]
+name = "app_tree"
+required-features = ["telemetry"]
 
 [[test]]
 name = "abort_profile"

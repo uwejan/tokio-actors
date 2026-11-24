@@ -274,6 +274,7 @@ fn remember(rt: &Handle, state: TimerState) -> TimerState {
 /// thread's last answer, then the process-wide table. It never probes and
 /// never answers for a runtime without the driver. Always `true` when the
 /// build cannot unwind, where no probe exists.
+#[cfg(feature = "telemetry")]
 pub(crate) fn runtime_known_to_have_timers(rt: &Handle) -> bool {
     #[cfg(panic = "unwind")]
     {

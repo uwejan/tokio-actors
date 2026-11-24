@@ -15,7 +15,11 @@ use crate::actor::sys_state::state_access;
 use crate::actor::{Actor, ActorExt, SpawnBuilder};
 use crate::error::{ActorError, ActorResult};
 use crate::system::ActorSystem;
-use crate::telemetry::subscription::{self, Filter, Scope, SubEntry, SubQueue, SubscriptionId};
+#[cfg(feature = "telemetry")]
+use crate::telemetry::subscription::{self, Filter, Scope, SubscriptionId};
+#[cfg(feature = "telemetry")]
+use crate::telemetry::subscription::{SubEntry, SubQueue};
+#[cfg(feature = "telemetry")]
 use crate::telemetry::{ActorRef, EventKind, KindSet, Mode};
 use crate::types::ActorId;
 
@@ -215,6 +219,7 @@ async fn state_access_rows() {
     state_access_is_allowed_only_for_an_opted_in_actor_that_is_not_sensitive().await;
 }
 
+#[cfg(feature = "telemetry")]
 fn sub_entry(filter: Filter) -> SubEntry {
     let (queue, _rx) = SubQueue::new(4);
     SubEntry {
@@ -225,6 +230,7 @@ fn sub_entry(filter: Filter) -> SubEntry {
     }
 }
 
+#[cfg(feature = "telemetry")]
 #[test]
 fn the_new_kinds_sit_at_eighteen_to_twenty_and_trace_is_handler_only() {
     assert_eq!(EventKind::TurnStuck as u8, 18);

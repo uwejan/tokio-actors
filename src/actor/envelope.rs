@@ -54,6 +54,7 @@ pub(crate) enum SystemMessage {
     Supervise(Box<SuperviseRequest>),
     /// A call of the `sys` bundle, boxed so the channel's slots stay the
     /// size of a status request.
+    #[cfg(feature = "sys")]
     #[allow(dead_code)]
     Sys(Box<SysCommand>),
 }
@@ -121,10 +122,12 @@ pub(crate) enum SuperviseRequest {
 }
 
 /// Where the answer to a `sys` command goes.
+#[cfg(feature = "sys")]
 pub(crate) type Reply<T> = oneshot::Sender<T>;
 
 /// A call of the `sys` bundle, as the system channel carries it. The run
 /// loop serves it between two turns.
+#[cfg(feature = "sys")]
 #[allow(dead_code)]
 pub(crate) enum SysCommand {
     /// Stop taking messages.
@@ -156,6 +159,7 @@ pub(crate) enum SysCommand {
     Probe(std::sync::Arc<std::sync::atomic::AtomicUsize>, Reply<()>),
 }
 
+#[cfg(feature = "sys")]
 impl std::fmt::Debug for SysCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {

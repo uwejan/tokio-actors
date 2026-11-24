@@ -1,6 +1,7 @@
 //! The system monitor through the public API: which configurations it
 //! accepts, how a second monitor replaces the first, what clears it, and that
 //! it leaves the turn warning threshold alone.
+#![cfg(feature = "telemetry")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

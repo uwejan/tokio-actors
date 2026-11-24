@@ -288,6 +288,7 @@ impl std::task::Wake for CallWake {
     }
 }
 
+#[cfg(feature = "telemetry")]
 /// Records the stop requests and kill steps the system `sys` reports,
 /// through a telemetry handler of that system; each record announces
 /// itself.
@@ -308,6 +309,7 @@ fn stop_log(
     log
 }
 
+#[cfg(feature = "telemetry")]
 /// Counts the Unresponsive verdicts the supervisors of `sys` report, through
 /// a telemetry handler of that system; each count announces itself.
 fn count_verdicts(sys: &ActorSystem) -> Arc<Count> {
@@ -4347,6 +4349,7 @@ async fn kill_by_name_aborts_a_turn_parked_at_an_await_body() {
     .await;
 }
 
+#[cfg(feature = "telemetry")]
 async fn shutdown_kill_step_backstop_survives_a_dropped_shutdown_body() {
     let sys = ActorSystem::create_with(
         uname("shutdown-dropped"),
@@ -4425,6 +4428,7 @@ impl Actor for ParentOnly {
     }
 }
 
+#[cfg(feature = "telemetry")]
 async fn parent_request_then_graceful(shutdown: Shutdown) -> Arc<Mutex<Vec<StopReason>>> {
     let sys = ActorSystem::create(uname("parent-request-kept")).unwrap();
     let log = stop_log(&sys);
@@ -4471,6 +4475,7 @@ async fn parent_request_then_graceful(shutdown: Shutdown) -> Arc<Mutex<Vec<StopR
     stopped
 }
 
+#[cfg(feature = "telemetry")]
 async fn parent_request_is_kept_over_a_later_graceful_for_a_child_that_obeys_only_its_parent_body()
 {
     // Under a 400 ms window the child runs on_stopped with the parent's
@@ -6787,6 +6792,7 @@ async fn infinity_supervisor_child_under_a_killed_parent_follows_its_policy_body
     .await;
 }
 
+#[cfg(feature = "telemetry")]
 async fn a_kill_already_stored_on_a_supervisor_child_keeps_its_abort_when_the_parent_is_killed_body(
 ) {
     // The root stops in order: its teardown asks `mid`, which accepts and

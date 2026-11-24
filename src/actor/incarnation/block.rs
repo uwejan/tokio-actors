@@ -224,6 +224,7 @@ impl IncarnationRef {
     }
 
     /// How many children the incarnation supervises, as it last recorded.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn children(&self) -> usize {
         self.shared
             .lane
@@ -240,6 +241,7 @@ impl IncarnationRef {
 
     /// The address of the incarnation's subtree token, once the actor's hold
     /// has linked it. An address only: it is compared, never read through.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn token_addr(&self) -> Option<usize> {
         self.shared
             .linked
@@ -251,6 +253,7 @@ impl IncarnationRef {
     /// the incarnation is linked below one and its token is alive. An
     /// address only, which the supervisor's own record answers to through
     /// [`token_addr`](Self::token_addr).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn parent_token_addr(&self) -> Option<usize> {
         let token = self.shared.linked.get()?.token.upgrade()?;
         token

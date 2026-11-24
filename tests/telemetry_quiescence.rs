@@ -4,6 +4,7 @@
 //! The answer is `None` while turn tracking is off, `Some(true)` for a system
 //! whose actors are idle with empty lanes, and `Some(false)` while an actor is
 //! inside a turn, has a queued message or has a restart attempt in flight.
+#![cfg(feature = "telemetry")]
 
 mod common;
 

@@ -110,5 +110,6 @@ mod served {
 }
 
 #[cfg(test)]
+#[cfg(feature = "sys")]
 #[path = "sys_requests_tests.rs"]
 mod requests;

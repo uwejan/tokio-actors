@@ -302,30 +302,18 @@ fn escalation_ladder_contains_no_awaited_stop_sends() {
     // supervision's escalation ladder, and system-level shutdown alike -
     // must signal through the stop lane (a synchronous, infallible watch
     // write), never through an awaited send of a `Stop` message.
-    let sources: &[(&str, &str)] = &[
-        (
-            "src/actor/runtime.rs",
-            include_str!("../src/actor/runtime.rs"),
-        ),
-        (
-            "src/actor/context.rs",
-            include_str!("../src/actor/context.rs"),
-        ),
-        (
-            "src/actor/supervision.rs",
-            include_str!("../src/actor/supervision.rs"),
-        ),
-        (
-            "src/actor/handle.rs",
-            include_str!("../src/actor/handle.rs"),
-        ),
-        ("src/system.rs", include_str!("../src/system.rs")),
-        ("src/types/mod.rs", include_str!("../src/types/mod.rs")),
-        (
-            "src/actor/envelope.rs",
-            include_str!("../src/actor/envelope.rs"),
-        ),
-    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let all = source_scan::rust_sources(&root);
+    let sources = [
+        "actor/runtime.rs",
+        "actor/context.rs",
+        "actor/supervision.rs",
+        "actor/handle.rs",
+        "system.rs",
+        "types/mod.rs",
+        "actor/envelope.rs",
+    ]
+    .map(|path| (path, all[path].as_str()));
     for (path, src) in sources {
         assert!(
             !src.contains("SystemMessage::Stop"),
@@ -387,6 +375,14 @@ const SCANNED: &[(&str, [usize; 3])] = &[
     ("actor/runtime.rs", [0, 0, 0]),
     ("actor/start_bound.rs", [0, 0, 0]),
     ("actor/incarnation/block.rs", [0, 0, 0]),
+    ("actor/incarnation/live_holds.rs", [0, 0, 0]),
+    ("actor/off/sys_debug.rs", [0, 0, 0]),
+    ("system/off/sweep.rs", [0, 0, 0]),
+    ("telemetry/off/handlers.rs", [0, 0, 0]),
+    ("telemetry/off/hot.rs", [0, 0, 0]),
+    ("telemetry/off/pump.rs", [0, 0, 0]),
+    ("telemetry/off/sinks.rs", [0, 0, 0]),
+    ("telemetry/off/wait_graph.rs", [0, 0, 0]),
     ("actor/incarnation/owed.rs", [0, 0, 0]),
     ("actor/incarnation/signals.rs", [0, 0, 0]),
     ("actor/incarnation/subtree.rs", [0, 0, 0]),

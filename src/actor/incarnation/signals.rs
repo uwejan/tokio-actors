@@ -1,7 +1,9 @@
 //! The signal cell, the system plane and the wake slot of an incarnation.
 
 use super::block::*;
-use crate::actor::envelope::{SuperviseRequest, SysCommand, SystemMessage};
+#[cfg(feature = "sys")]
+use crate::actor::envelope::SysCommand;
+use crate::actor::envelope::{SuperviseRequest, SystemMessage};
 use crate::actor::panic::contain_waker_panic;
 use crate::types::StopReason;
 use std::sync::atomic::Ordering;
@@ -388,6 +390,7 @@ impl IncarnationRef {
     /// The lengths last recorded, in the order monitors, links, group
     /// monitors; zeros for an incarnation that never used a signal. Makes no
     /// cell.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn coupling(&self) -> [u32; 3] {
         self.existing_cell().map_or([0; 3], |cell| {
             cell.lock().unwrap_or_else(|p| p.into_inner()).coupling
@@ -1053,6 +1056,7 @@ impl IncarnationRef {
     /// answered first, exactly as [`submit_status`](Self::submit_status)
     /// does. As there, no clone of the plane's sender outlives this call, so
     /// the caller's wait for the reply never keeps the channel open.
+    #[cfg(feature = "sys")]
     pub(crate) async fn submit_sys(&self, command: SysCommand) -> Result<(), ()> {
         let message = SystemMessage::Sys(Box::new(command));
         let tx = {

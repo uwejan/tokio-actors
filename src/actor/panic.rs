@@ -367,6 +367,7 @@ impl<T> AnswerHold<T> {
     }
 
     /// Whether the receiver is gone, or the guard holds nothing.
+    #[cfg(feature = "sys")]
     pub(crate) fn is_closed(&self) -> bool {
         self.0.as_ref().is_none_or(oneshot::Sender::is_closed)
     }
@@ -524,6 +525,24 @@ pub(crate) fn contain_log(log: impl FnOnce()) {
 /// binary.
 #[cfg(test)]
 const CHILD_PROCESS: &str = "TOKIO_ACTORS_UNIT_TEST_CHILD";
+
+/// Drops `value` inside a catch. The handlers' captured state is user code, so
+/// its drop never unwinds into the caller; the panic is logged with the
+/// `tracing` feature.
+#[cfg(any(feature = "telemetry", feature = "sys"))]
+pub(crate) fn drop_contained<T>(value: T) {
+    if let Err(payload) = catch_sync(move || drop(value)) {
+        let text = payload_into_string(payload);
+        #[cfg(feature = "tracing")]
+        caught_log!(
+            warn,
+            target: "tokio_actors::telemetry::handlers",
+            panic = %crate::telemetry::LogFields::foreign().panic_text(&text),
+            "the state a telemetry handler captured panicked when it was dropped; the panic is contained"
+        );
+        let _ = text;
+    }
+}
 
 /// Runs the unit test `name` of module `module` (`module_path!()` at the call)
 /// alone in a child process of this test binary, and asserts the child exited

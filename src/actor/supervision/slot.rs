@@ -4270,6 +4270,7 @@ mod tests {
         (ctl, io, status_tx, lane)
     }
 
+    #[cfg(feature = "telemetry")]
     /// An attempt task lost after its incarnation was spawned is followed to
     /// the incarnation's end by a death task, which the supervisor claims
     /// before the attempt settles: an incarnation whose final reason is
@@ -4353,6 +4354,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "telemetry")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lost_attempt_task_claims_its_incarnation_before_it_settles_multi_thread() {
         a_lost_attempt_task_claims_its_incarnation_before_it_settles().await;

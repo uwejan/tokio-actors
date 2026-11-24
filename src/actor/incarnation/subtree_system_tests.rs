@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! The system plane in isolation: the order it answers requests in, how many
 //! it queues, and what becomes of the requests and the reserved slots when
 //! the run loop ends it. Nothing here is ordered by a sleep.
@@ -10,9 +11,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
+#[cfg(feature = "sys")]
+use tokio::time::timeout;
 
 use super::*;
 use crate::actor::envelope::SystemMessage;
+use crate::actor::runtime::end_queue;
 use crate::types::{ActorId, ActorStatusInfo, StatusRequest};
 
 const BOUND: Duration = Duration::from_secs(5);
@@ -37,6 +41,7 @@ fn submit_now(record: &IncarnationRef, reply: oneshot::Sender<Box<ActorStatusInf
     matches!(submit.as_mut().poll(&mut cx), Poll::Ready(Ok(())))
 }
 
+#[cfg(feature = "sys")]
 /// Takes the next request now, when one is ready.
 fn take_request_now(plane: &mut SystemPlane) -> Option<StatusRequest> {
     let mut cx = Context::from_waker(Waker::noop());
@@ -50,6 +55,7 @@ fn take_request_now(plane: &mut SystemPlane) -> Option<StatusRequest> {
     }
 }
 
+#[cfg(feature = "sys")]
 /// Takes the next request's reply now, when one is ready.
 fn take_now(plane: &mut SystemPlane) -> Option<oneshot::Sender<Box<ActorStatusInfo>>> {
     take_request_now(plane).map(|request| request.reply)
@@ -64,6 +70,7 @@ fn marked() -> (
     oneshot::channel()
 }
 
+#[cfg(feature = "sys")]
 /// A `sys` command submitted while a status request is held opens the
 /// channel and leaves the held request first, as a second status request
 /// does.
@@ -84,6 +91,7 @@ fn a_command_behind_a_held_status_request_leaves_the_request_first() {
     ));
 }
 
+#[cfg(feature = "sys")]
 /// The plane queues 64 requests in steady state, as the system channel of an
 /// actor without a held slot does. Before the run loop has taken the request
 /// held ahead of the channel, that request is queued beside the 64.
@@ -146,6 +154,7 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[cfg(feature = "sys")]
 /// The kinds of the requests the plane hands out, in the order it hands them.
 fn kinds_taken(plane: &mut SystemPlane) -> Vec<bool> {
     let mut kinds = Vec::new();
@@ -272,6 +281,7 @@ fn park_submit(record: &IncarnationRef, wake: &Arc<CountingWake>) -> Submit {
     parked
 }
 
+#[cfg(feature = "sys")]
 /// A `sys` command whose caller is gone reads closed; one whose caller is
 /// kept reads open.
 fn sys_command(
@@ -287,6 +297,7 @@ fn sys_command(
     )
 }
 
+#[cfg(feature = "sys")]
 /// Polls `submit_sys` once: whether the command was queued without waiting.
 fn submit_sys_now(record: &IncarnationRef) -> bool {
     let (command, _caller) = sys_command(false);
@@ -295,6 +306,7 @@ fn submit_sys_now(record: &IncarnationRef) -> bool {
     matches!(submit.as_mut().poll(&mut cx), Poll::Ready(Ok(())))
 }
 
+#[cfg(feature = "sys")]
 /// Parks a `submit_sys` on the full plane, polled once with `wake`.
 fn park_submit_sys(
     record: &IncarnationRef,
@@ -315,6 +327,7 @@ fn park_submit_sys(
     (parked, caller.expect("kept"))
 }
 
+#[cfg(feature = "sys")]
 /// Whether each `sys` command the plane holds has a caller that is gone, in
 /// the order the plane hands them out.
 fn sys_callers_gone(plane: &mut SystemPlane) -> Vec<bool> {
@@ -329,6 +342,7 @@ fn sys_callers_gone(plane: &mut SystemPlane) -> Vec<bool> {
     gone
 }
 
+#[cfg(feature = "sys")]
 /// A `sys` caller parked on the full plane gets the slot the run loop frees;
 /// if it is dropped before it takes the slot, the slot goes to the caller
 /// parked behind it, whose waker panics. The panic stays in the drop: the

@@ -297,12 +297,14 @@ impl TurnClock {
     /// Returns the raw token: `0` when no turn is in flight (including
     /// whenever the watchdog is off), otherwise one plus the turn's start
     /// offset in nanoseconds since the epoch.
+    #[cfg(feature = "telemetry")]
     pub(crate) fn token(&self) -> u64 {
         self.cell.started.load(Ordering::Relaxed)
     }
 
     /// Returns how long the current turn has been running, or `None` if no
     /// turn is in flight (including whenever the watchdog is off).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn elapsed(&self) -> Option<Duration> {
         let token = self.token();
         if token == 0 {
@@ -321,6 +323,7 @@ impl TurnClock {
     /// different turns if the actor ends one and starts the next between
     /// the two loads. `None` if no turn is in flight (including whenever the
     /// watchdog is off).
+    #[cfg(feature = "telemetry")]
     pub(crate) fn snapshot(&self) -> Option<(u64, Duration)> {
         let token = self.cell.started.load(Ordering::Relaxed);
         if token == 0 {
@@ -413,6 +416,7 @@ pub(crate) fn push_run(record: &IncarnationRef, takes: u32, started: std::time::
     });
 }
 
+#[cfg(feature = "telemetry")]
 #[cfg(test)]
 mod tests {
     use super::*;

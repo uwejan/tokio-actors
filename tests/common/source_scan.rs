@@ -371,10 +371,26 @@ pub fn module_decls(source: &str) -> Vec<ModDecl> {
     let mut out = Vec::new();
     let mut test_only = false;
     let mut path = None;
+    // An attribute that the formatter wrapped over several lines, read so far.
+    let mut wrapped = String::new();
     for line in code_lines(source, true) {
+        let joined;
         let mut text = line.trim();
+        if !wrapped.is_empty() {
+            wrapped.push(' ');
+            wrapped.push_str(text);
+            if attr_end(&wrapped).is_none() {
+                continue;
+            }
+            joined = std::mem::take(&mut wrapped);
+            text = joined.as_str();
+        }
         while text.starts_with("#[") {
-            let Some(end) = attr_end(text) else { break };
+            let Some(end) = attr_end(text) else {
+                wrapped = text.to_string();
+                text = "";
+                break;
+            };
             let attr = &text[..end];
             if test_only_cfg(attr) {
                 test_only = true;
@@ -466,10 +482,111 @@ pub fn test_only_files(sources: &BTreeMap<String, String>) -> (BTreeSet<String>,
     (set, unresolved)
 }
 
+/// The modules whose items are spread over part modules: the file of the
+/// module and the names of its parts, each a child module in its own file. A
+/// scan reads such a module as one file under the parent's name, so a table
+/// that names a file covers the whole module, and a part that is not listed
+/// here is a file of its own that every table has to place.
+pub const PARTS: &[(&str, &[&str])] = &[
+    ("actor/handle.rs", &["access", "send", "stop", "observe"]),
+    (
+        "actor/context.rs",
+        &[
+            "access",
+            "children",
+            "child_ops",
+            "timers",
+            "streams",
+            "subscriptions",
+            "monitors",
+            "links",
+            "idle",
+            "aliases",
+            "requests",
+            "forwarders",
+            "signal_state",
+        ],
+    ),
+    (
+        "actor/runtime.rs",
+        &[
+            "spawn",
+            "run_loop",
+            "end",
+            "task",
+            "holds",
+            "dispatch",
+            "answer",
+            "branches",
+            "children",
+            "restart",
+            "group_stop",
+            "teardown",
+            "final_drain",
+        ],
+    ),
+    ("actor/mod.rs", &["spawn"]),
+    ("actor/sys.rs", &["client"]),
+    ("actor/sys_state.rs", &["ops"]),
+    ("actor/alias.rs", &["send"]),
+    ("actor/request.rs", &["forward"]),
+    ("telemetry/monitor.rs", &["forward"]),
+    ("telemetry/subscription.rs", &["registry"]),
+    (
+        "system.rs",
+        &[
+            "process_map",
+            "actors",
+            "lifecycle",
+            "monitoring",
+            "shutdown",
+            "registry",
+            "kill",
+            "sweep",
+            "reaper",
+        ],
+    ),
+];
+
+/// The file of the part module `part` of the module in `parent`.
+fn part_file(parent: &str, part: &str) -> String {
+    let stem = parent.strip_suffix(".rs").unwrap_or(parent);
+    match stem.strip_suffix("/mod") {
+        Some(dir) => format!("{dir}/{part}.rs"),
+        None => format!("{stem}/{part}.rs"),
+    }
+}
+
+/// Every Rust file under `dir` as [`rust_files`] gives it, with the text of
+/// each part module of [`PARTS`] appended to its parent's and the part left
+/// out as a file. A parent that `dir` does not hold is skipped, unless one of
+/// its parts is there.
+pub fn rust_sources(dir: &Path) -> BTreeMap<String, String> {
+    let mut out = rust_files(dir);
+    for (parent, parts) in PARTS {
+        for part in parts.iter() {
+            let file = part_file(parent, part);
+            let Some(text) = out.remove(&file) else {
+                assert!(
+                    !out.contains_key(*parent),
+                    "{file} is listed as a part of {parent} and does not exist"
+                );
+                continue;
+            };
+            let whole = out
+                .get_mut(*parent)
+                .unwrap_or_else(|| panic!("{file} is a part of {parent}, which does not exist"));
+            whole.push('\n');
+            whole.push_str(&text);
+        }
+    }
+    out
+}
+
 /// Every Rust file under `dir`, by its path relative to `dir`, with `/`
 /// separators, and its text with `\n` line ends, whatever line ends the
 /// checkout has.
-pub fn rust_sources(dir: &Path) -> BTreeMap<String, String> {
+pub fn rust_files(dir: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();

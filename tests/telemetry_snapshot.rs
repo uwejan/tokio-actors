@@ -5,6 +5,7 @@
 //! label, the type name and the child count are reported, and a storm of
 //! spawns and stops beside the snapshot neither deadlocks it nor leaves a dead
 //! actor in it.
+#![cfg(feature = "telemetry")]
 
 mod common;
 

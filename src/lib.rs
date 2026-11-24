@@ -4,6 +4,11 @@
 #![warn(unreachable_pub)]
 #![warn(rust_2018_idioms)]
 #![warn(rustdoc::broken_intra_doc_links)]
+// A doc link to an item of a feature that is off cannot resolve in that build.
+#![cfg_attr(
+    not(all(feature = "telemetry", feature = "sys")),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 #![cfg_attr(test, allow(dead_code))]
 //! Tokio Actors is a Tokio-native actor framework for building
 //! hierarchical systems with strongly-typed mailboxes, timers, and supervision.
@@ -12,6 +17,17 @@
 //! - Thread-safe actors, each running as its own task on the Tokio runtime you provide, multi-threaded or current-thread.
 //! - Typed request/response semantics through [`ActorHandle::send`](crate::actor::handle::ActorHandle::send).
 //! - Recurring timers and supervision (both need a runtime with the Tokio time driver, which `#[tokio::main]` and `#[tokio::test]` enable) and bounded mailboxes, out of the box.
+//!
+//! # Cargo features
+//! - `telemetry` (on by default): delivers the typed events of [`telemetry`] to handlers and to
+//!   subscribed actors, and adds the system snapshot, the system monitor, turn tracking, the turn
+//!   watchdog and wait-cycle detection.
+//! - `sys` (on by default): [`ActorHandle::sys`](crate::actor::handle::ActorHandle::sys), the debug
+//!   and state-access calls of an actor, with the `debug` and `allow_state_access` spawn options.
+//! - `tracing` (off by default): the crate's log statements, through the `tracing` crate.
+//!
+//! Everything else is compiled in every build, and `default-features = false` builds it alone.
+//! An item that needs a feature says so in its docs, or in the docs of the type it belongs to.
 //!
 //! # Liveness
 //! An actor runs until it is stopped or killed (by a caller, by its supervisor

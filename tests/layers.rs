@@ -1,8 +1,10 @@
-//! The source files sit in three layers, and a file imports its own layer or
+//! The source files sit in five layers, and a file imports its own layer or
 //! a lower one: layer 0 holds the public plain types, layer 1 the pure cores
-//! of the supervision rules, layer 2 everything else. The test reads each
-//! file's `crate::..` paths outside test code and fails on an import that
-//! goes from a lower layer to a higher one, or on a file that is in no layer.
+//! of the supervision rules, layer 2 the kernel (what an actor's life runs
+//! without a call from outside), layer 3 the calls that only a user starts,
+//! layer 4 the behaviours. The test reads each file's `crate::..` paths
+//! outside test code and fails on an import that goes from a lower layer to a
+//! higher one, or on a file that is in no layer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -10,7 +12,7 @@ use std::path::Path;
 #[path = "common/source_scan.rs"]
 mod source_scan;
 
-use source_scan::{library_code, rust_sources, test_only_files};
+use source_scan::{library_code, rust_files, test_only_files};
 
 /// Path prefixes (relative to `src/`) and the layer each belongs to.
 const LAYERS: &[(&str, u8)] = &[
@@ -18,14 +20,31 @@ const LAYERS: &[(&str, u8)] = &[
     ("error.rs", 0),
     ("actor/supervision/model.rs", 1),
     ("actor/supervision/rules.rs", 1),
+    ("system/actors.rs", 3),
+    ("system/lifecycle.rs", 3),
+    ("system/shutdown.rs", 3),
+    ("system/monitoring.rs", 3),
+    ("actor/context/subscriptions.rs", 3),
+    ("actor/context/monitors.rs", 3),
+    ("actor/context/links.rs", 3),
+    ("actor/context/idle.rs", 3),
+    ("actor/context/aliases.rs", 3),
+    ("actor/context/requests.rs", 3),
+    ("actor/handle/observe.rs", 3),
+    ("actor/handle/send.rs", 3),
+    ("actor/handle/stop.rs", 3),
+    ("actor/spawn.rs", 3),
+    ("actor/alias/send.rs", 3),
+    ("actor/request/forward.rs", 3),
+    ("telemetry/monitor/forward.rs", 3),
+    ("application.rs", 4),
+    ("behavior.rs", 4),
+    ("event.rs", 4),
+    ("signals.rs", 4),
+    ("statem.rs", 4),
     ("actor/", 2),
-    ("application.rs", 2),
-    ("behavior.rs", 2),
-    ("event.rs", 2),
     ("helper", 2),
     ("lib.rs", 2),
-    ("signals.rs", 2),
-    ("statem.rs", 2),
     ("system", 2),
     ("telemetry/", 2),
     ("time_probe.rs", 2),
@@ -113,7 +132,7 @@ fn crate_paths(code: &str) -> Vec<Vec<String>> {
 #[test]
 fn layers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let sources = rust_sources(&root);
+    let sources = rust_files(&root);
     let (test_only, unresolved) = test_only_files(&sources);
     assert!(
         unresolved.is_empty(),

@@ -1,3 +1,4 @@
+#![cfg(feature = "telemetry")]
 #![allow(dead_code)]
 //! `SupervisorRef`: the supervisor's child management over its system channel.
 //!

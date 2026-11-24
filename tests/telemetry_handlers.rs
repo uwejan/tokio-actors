@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 //! Attaching and detaching telemetry handlers by id through the public API.
+#![cfg(feature = "telemetry")]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

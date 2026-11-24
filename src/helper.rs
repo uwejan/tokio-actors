@@ -63,6 +63,7 @@ pub(crate) enum HelperKind {
     /// Aborts the tasks that outlive their grace.
     Reaper,
     /// Reports the turns that run longer than the system's threshold.
+    #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
     Sweep,
     /// Cuts the start of a spawn that outlives its start timeout.
     StartBound,

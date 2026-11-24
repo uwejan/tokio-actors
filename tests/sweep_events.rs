@@ -6,6 +6,7 @@
 //! The sampling takes a look every 50 ms or more, so a test that waits for
 //! something not to happen waits for several looks; every wait for something
 //! to happen ends when it does.
+#![cfg(feature = "telemetry")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

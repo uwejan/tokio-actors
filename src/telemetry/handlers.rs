@@ -8,6 +8,7 @@ use std::sync::{Arc, MutexGuard};
 use super::event::{EventKind, KindSet, TelemetryEvent};
 use super::mode::Mode;
 use super::sinks::SinkTables;
+pub(crate) use crate::actor::panic::drop_contained;
 use crate::actor::panic::{catch_sync, payload_into_string, PanicPayload};
 
 /// One attached handler.
@@ -86,22 +87,6 @@ pub(super) fn lock(mode: &Mode) -> MutexGuard<'_, SinkTables> {
         .tables
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Drops `value` inside a catch. The handlers' captured state is user code, so
-/// its drop never unwinds into the caller; the panic is logged with the
-/// `tracing` feature.
-pub(crate) fn drop_contained<T>(value: T) {
-    if let Err(payload) = catch_sync(move || drop(value)) {
-        let text = payload_into_string(payload);
-        #[cfg(feature = "tracing")]
-        caught_log!(
-            warn,
-            panic = %crate::telemetry::LogFields::foreign().panic_text(&text),
-            "the state a telemetry handler captured panicked when it was dropped; the panic is contained"
-        );
-        let _ = text;
-    }
 }
 
 /// Runs every handler in `entries` that takes `kind`, one after another, each
@@ -242,5 +227,6 @@ pub(crate) fn generation(mode: &Mode) -> u64 {
 }
 
 #[cfg(test)]
+#[cfg(feature = "telemetry")]
 #[path = "handlers_tests.rs"]
 mod tests;

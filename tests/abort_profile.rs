@@ -678,6 +678,7 @@ mod checks {
         }
     }
 
+    #[cfg(feature = "sys")]
     /// Does `action` to a supervised `Victim` and waits for the victim to end.
     /// Returns only when the process was not ended, with `Ok` when the victim
     /// ended by itself.

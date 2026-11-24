@@ -5,6 +5,7 @@
 //! their own inside a catch, and a request whose caller left never runs.
 //!
 //! Each case runs on a current-thread and on a multi-thread runtime.
+#![cfg(feature = "sys")]
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,10 +16,12 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+#[cfg(feature = "telemetry")]
+use tokio_actors::SystemConfig;
 use tokio_actors::{
     actor::{context::ActorContext, Actor, ActorExt},
     sys::SysError,
-    ActorError, ActorResult, ActorStatus, ActorSystem, StopReason, SystemConfig,
+    ActorError, ActorResult, ActorStatus, ActorSystem, StopReason,
 };
 
 /// Bounds how long a hang takes to report; a slow host must not read as one.
@@ -270,6 +273,7 @@ both_flavors!(
 // The closure is a turn
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "telemetry")]
 /// A closure that holds the actor's task shows in `stuck_actors`, which only
 /// a turn the watchdog brackets does. The closure waits until a thread of the
 /// test has seen it there.
@@ -325,6 +329,7 @@ async fn a_closure_is_a_turn_the_watchdog_sees() {
     assert!(write_seen, "a replace_state closure was a turn in flight");
 }
 
+#[cfg(feature = "telemetry")]
 both_flavors!(turn, a_closure_is_a_turn_the_watchdog_sees);
 
 // ---------------------------------------------------------------------------

@@ -136,6 +136,7 @@ fn row_on_its_own_runtime(feed_reaper: bool, hold: bool) -> Left {
     })
 }
 
+#[cfg(feature = "telemetry")]
 /// The turn-watchdog sweep of a dropped system ends, and does not carry on as
 /// the sweep of a later system that claimed the same name: each pair below
 /// leaves exactly one sweep, the later system's.

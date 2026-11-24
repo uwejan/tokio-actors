@@ -26,8 +26,8 @@ jobs:
         features:
           - name: all features
             flag: --all-features
-          - name: no default features
-            flag: --no-default-features
+          - name: default features
+            flag: ""
 
     steps:
       - name: Checkout repository
@@ -114,10 +114,61 @@ jobs:
         env:
           RUSTFLAGS: "-C panic=abort"
 
-      - name: Run the checks that need panic = "abort" (no default features)
-        run: cargo test --no-default-features --target x86_64-unknown-linux-gnu --test abort_profile
+      - name: Run the checks that need panic = "abort" (default features)
+        run: cargo test --target x86_64-unknown-linux-gnu --test abort_profile
         env:
           RUSTFLAGS: "-C panic=abort"
+
+  no-features:
+    name: No Features
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The library with no feature: neither telemetry nor sys nor tracing.
+      - name: Run the library's own tests
+        run: cargo test --no-default-features --no-fail-fast --verbose --lib -- --skip supervision::explore
+
+      - name: Run the integration tests
+        if: ${{ !cancelled() }}
+        run: cargo test --no-default-features --no-fail-fast --verbose --test '*'
+
+      - name: Run the doc tests
+        if: ${{ !cancelled() }}
+        run: cargo test --no-default-features --no-fail-fast --verbose --doc
+
+  feature-sets:
+    name: Feature Sets
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+
+      # Every target, in each of the eight sets of the three features.
+      - name: Run clippy on each feature set
+        shell: bash
+        run: |
+          for set in "" tracing telemetry telemetry,tracing sys sys,tracing telemetry,sys telemetry,sys,tracing; do
+            echo "::group::features: ${set:-none}"
+            cargo clippy --no-default-features ${set:+--features "$set"} --all-targets -- -D warnings || exit 1
+            echo "::endgroup::"
+          done
 
   msrv:
     name: MSRV
@@ -135,6 +186,9 @@ jobs:
 
       - name: Check the library against the minimum supported Rust version
         run: cargo check --lib --all-features --locked
+
+      - name: Check the library with no feature against the minimum supported Rust version
+        run: cargo check --lib --no-default-features --locked
 
   tokio-floor:
     name: Tokio Floor

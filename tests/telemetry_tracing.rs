@@ -431,6 +431,7 @@ fn priority_lane_full() -> Ran {
     Ran { name, system }
 }
 
+#[cfg(feature = "telemetry")]
 fn turn_over_threshold() -> Ran {
     let rt = runtime();
     let (name, system) = (uname("sweep"), uname("sweep-system"));
@@ -556,6 +557,7 @@ fn every_actor_scoped_statement_carries_the_identity_fields_and_its_level() {
             required: ACTOR_FIELDS,
             run: priority_lane_full,
         },
+        #[cfg(feature = "telemetry")]
         Site {
             label: "turn over the threshold",
             text: "actor turn exceeds",

@@ -48,8 +48,8 @@ const REDACTING_CALLS: &[&str] = &[".text(", ".panic_text(", ".reason_text("];
 /// so nothing there is hidden. Every line about an actor's own panic, error or
 /// stop reason names the actor's sensitivity.
 const FOREIGN_TEXT_CALLS: &[(&str, usize)] = &[
-    ("telemetry/handlers.rs", 2),
-    ("actor/panic.rs", 2),
+    ("telemetry/handlers.rs", 1),
+    ("actor/panic.rs", 3),
     ("helper.rs", 1),
 ];
 

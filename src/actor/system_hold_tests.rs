@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! A system is held until the actor that runs in it has sealed its stop lane.
 //!
 //! A handle reaches its system by identity and a `Kill` it raises needs that
@@ -6,13 +7,16 @@
 //! through its registry guard, its context, its system plane and its queue
 //! slots; the queue slot's hold is the one that lasts past the guard's drop.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
+use super::{end_hooks, QueueSlot};
 use crate::actor::{context::ActorContext, Actor, ActorExt};
 use crate::error::ActorResult;
-use crate::system::ActorSystem;
-use crate::types::StopReason;
+use crate::system::{ActorSystem, ShutdownPolicy};
+use crate::types::{ActorId, StopReason};
 
 /// What a hook saw: the point, whether the system was reachable and whether
 /// the lane took a `Kill`.
@@ -66,6 +70,7 @@ impl Actor for Signaller {
     }
 }
 
+#[cfg(feature = "telemetry")]
 /// An exit signal sent through a handle names the handle's own system, found
 /// by identity. When that system is gone and a later system holds the same
 /// name and an actor of the same id, the signal reaches nothing of the later

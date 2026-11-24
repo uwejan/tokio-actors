@@ -1,6 +1,7 @@
 //! The debug bundle of an actor: statistics, the log, the trace and the
 //! installed functions, turned on by a spawn or by a call, on both runtime
 //! flavors.
+#![cfg(feature = "sys")]
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_actors::actor::context::ActorContext;
 use tokio_actors::sys::{DebugEntry, DebugEvent, DebugOptions, Install, DEFAULT_LOG_CAPACITY};
+#[cfg(feature = "telemetry")]
 use tokio_actors::telemetry::{EventKind, KindSet, TelemetryEvent};
 use tokio_actors::{
     Actor, ActorConfig, ActorError, ActorExt, ActorHandle, ActorResult, ActorSystem,
@@ -49,6 +51,7 @@ async fn settled(handle: &ActorHandle<Probe>) {
     handle.sys().statistics().await.unwrap();
 }
 
+#[cfg(feature = "telemetry")]
 async fn wait_for(what: &str, ready: impl Fn() -> bool) {
     let deadline = Instant::now() + HANG_BOUND;
     while !ready() {
@@ -550,8 +553,10 @@ fn installed_functions_on_both_flavors() {
 // Trace
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "telemetry")]
 type Traced = Arc<Mutex<Vec<DebugEntry>>>;
 
+#[cfg(feature = "telemetry")]
 fn attach_trace(system: &ActorSystem, id: &str, kinds: KindSet) -> (Traced, Arc<AtomicUsize>) {
     let traced: Traced = Arc::default();
     let finished = Arc::new(AtomicUsize::new(0));
@@ -568,6 +573,7 @@ fn attach_trace(system: &ActorSystem, id: &str, kinds: KindSet) -> (Traced, Arc<
     (traced, finished)
 }
 
+#[cfg(feature = "telemetry")]
 async fn a_trace_reaches_a_handler_for_each_entry_of_a_turn_that_returned() {
     let system = system();
     let (traced, _) = attach_trace(&system, "trace", KindSet::of(&[EventKind::Trace]));
@@ -615,11 +621,13 @@ async fn a_trace_reaches_a_handler_for_each_entry_of_a_turn_that_returned() {
     assert_eq!(traced.lock().unwrap().len(), 5);
 }
 
+#[cfg(feature = "telemetry")]
 #[test]
 fn a_trace_reaches_a_handler_on_both_flavors() {
     both_flavors(a_trace_reaches_a_handler_for_each_entry_of_a_turn_that_returned);
 }
 
+#[cfg(feature = "telemetry")]
 async fn a_trace_with_the_trace_off_or_the_class_unattached_raises_nothing() {
     let system = system();
     // The handler takes turn events but not the trace.
@@ -646,6 +654,7 @@ async fn a_trace_with_the_trace_off_or_the_class_unattached_raises_nothing() {
     assert!(traced.lock().unwrap().is_empty());
 }
 
+#[cfg(feature = "telemetry")]
 #[test]
 fn a_trace_needs_the_trace_on_and_the_class_attached_on_both_flavors() {
     both_flavors(a_trace_with_the_trace_off_or_the_class_unattached_raises_nothing);

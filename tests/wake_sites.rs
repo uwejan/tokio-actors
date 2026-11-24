@@ -92,7 +92,7 @@ struct Allowed {
 
 const ALLOWED: &[Allowed] = &[
     Allowed {
-        file: "telemetry/mode.rs",
+        file: "actor/incarnation/live_holds.rs",
         line: r#"contain_waker_panic("", None, || self.zero.notify_waiters());"#,
         times: 1,
         why: "the wake of a wait for a system's live holds to reach zero, inside the catch",

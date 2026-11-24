@@ -1,6 +1,7 @@
 //! The public surface of an event subscription: `subscribe` and
 //! `unsubscribe` on a running actor's context, the ids they hand out, and the
 //! end of a subscription with its actor and its system.
+#![cfg(feature = "telemetry")]
 
 use tokio_actors::telemetry::{Filter, Scope, SubscriptionId};
 use tokio_actors::{

@@ -16,6 +16,7 @@
 //! via a drop guard). Tests that only need `turn_elapsed` to report a value
 //! (not `stuck_actors`) use a threshold far longer than anything the test
 //! waits for, so nothing is ever reported stuck by coincidence.
+#![cfg(feature = "telemetry")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

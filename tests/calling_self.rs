@@ -7,6 +7,7 @@
 //! oneself with room is not checked. A cast to oneself that would wait for
 //! room in its own full queue is refused at once with `Full`. A `sys` call is
 //! refused the same way as a request, with `SysError::CallingSelf`.
+#![cfg(feature = "sys")]
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},

@@ -2,6 +2,7 @@
 //! timeout wait on each other for good. With wait-cycle detection on, the
 //! second send to wait closes the cycle and one event reports it; neither
 //! send is touched.
+#![cfg(feature = "telemetry")]
 
 use tokio_actors::{ActorSystem, SystemConfig};
 

@@ -638,6 +638,7 @@ struct World {
     expected_workers: usize,
     /// The incarnation number of P's first incarnation.
     #[cfg(feature = "tracing")]
+    #[cfg(feature = "telemetry")]
     p_first: u64,
 }
 
@@ -707,6 +708,7 @@ async fn start(config: SupervisionConfig, mut top_setup: TopSetup) -> World {
         })
         .await;
     #[cfg(feature = "tracing")]
+    #[cfg(feature = "telemetry")]
     let p_first = sys
         .snapshot()
         .iter()
@@ -721,6 +723,7 @@ async fn start(config: SupervisionConfig, mut top_setup: TopSetup) -> World {
         q_name,
         expected_workers,
         #[cfg(feature = "tracing")]
+        #[cfg(feature = "telemetry")]
         p_first,
     }
 }
@@ -997,6 +1000,7 @@ mod terminate_child_of_a_child_already_down_waits_for_its_old_subtree {
 /// the supervisor, the child and the incarnation; a second route reaching
 /// the same incarnation's verdict logs nothing more.
 #[cfg(feature = "tracing")]
+#[cfg(feature = "telemetry")]
 mod each_subtree_verdict_logs_once {
     use super::*;
 

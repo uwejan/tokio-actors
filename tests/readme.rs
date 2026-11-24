@@ -11,7 +11,6 @@
 //!
 //! Every test is named after its README section and carries the heading it
 //! mirrors, so an edit to a block shows which test to update.
-
 // The README blocks bind values they never read, as examples do.
 #![allow(unused_variables)]
 
@@ -1424,7 +1423,9 @@ fn core_concepts_applications() {
         let apps = Applications::spawn().await?;
         apps.load(Shop).await?;
         apps.start("shop", RestartType::Permanent).await?;
+        #[cfg(feature = "telemetry")]
         let system = ActorSystem::get_named("shop").expect("an own system");
+        #[cfg(feature = "telemetry")]
         assert_eq!(system.snapshot().len(), 3, "the top and its two workers");
         let rows = apps.shutdown().await?;
         assert!(matches!(rows.as_slice(), [(name, Some(stop))] if name == "shop" && !stop.held));
@@ -1622,6 +1623,7 @@ impl Actor for Held {
     }
 }
 
+#[cfg(feature = "telemetry")]
 /// README: "### Turn Watchdog". Stuck-turn semantics are tested in
 /// `tests/turn_watchdog.rs` (`turn_elapsed_reports_a_running_turn`,
 /// `stuck_actors_lists_turns_over_the_threshold`,
@@ -1677,6 +1679,7 @@ fn core_concepts_turn_watchdog() {
 // Core Concepts: Telemetry
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "telemetry")]
 /// README: "### Telemetry". The handler and the subscription are each shown
 /// the end of an actor spawned after them, and the snapshot lists the
 /// subscriber. Handlers, subscriptions, the snapshot and the monitor are

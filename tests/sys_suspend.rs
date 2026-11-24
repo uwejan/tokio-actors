@@ -7,6 +7,7 @@
 //! full passes of the actor's loop, each pass being a status answer, with a
 //! short pause between them. A slow host can only make such a check miss a
 //! fault, never fail a correct run.
+#![cfg(feature = "sys")]
 
 mod common;
 
@@ -207,6 +208,7 @@ struct Rig {
     sys: Arc<ActorSystem>,
     probe: Probe,
     subject: ActorHandle<Subject>,
+    #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
     subject_name: String,
     child_name: String,
 }
@@ -287,6 +289,7 @@ async fn pause() {
     sleep(Duration::from_millis(150)).await;
 }
 
+#[cfg(feature = "telemetry")]
 fn record_of(sys: &ActorSystem, name: &str) -> tokio_actors::telemetry::ActorRecord {
     sys.snapshot()
         .into_iter()
@@ -298,6 +301,7 @@ fn record_of(sys: &ActorSystem, name: &str) -> tokio_actors::telemetry::ActorRec
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "telemetry")]
 /// Rows: an actor with nothing on its priority lane, an actor with one, and
 /// a supervisor with one. Messages sent to a suspended actor wait in the
 /// lanes, the status shows them with `suspended`, the snapshot lists the
