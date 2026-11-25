@@ -27,7 +27,7 @@ pub(crate) mod slot;
 
 pub use model::AutoShutdown;
 pub(crate) use model::{
-    BudgetCharge, ChildLifecycle, DownPending, ManualStop, Origin, ABORT_SETTLE,
+    BudgetCharge, ChildLifecycle, DownPending, IgnoredEnd, ManualStop, Origin, ABORT_SETTLE,
 };
 
 pub(crate) use rules::{
@@ -44,9 +44,15 @@ pub(crate) use slot::{
     OwnStop, Predecessor, SlotCtl, SlotIo, Verdicts,
 };
 
-/// The acknowledgment of one child's initialization, with the child's id and
-/// the incarnation that owes it.
-pub(crate) type StrictAck = (ActorId, u64, oneshot::Receiver<Result<(), ActorError>>);
+/// The acknowledgment of one child's initialization, with the child's id, the
+/// incarnation that owes it and that incarnation's record, which says
+/// whether its start was ignored.
+pub(crate) type StrictAck = (
+    ActorId,
+    u64,
+    IncarnationRef,
+    oneshot::Receiver<Result<(), ActorError>>,
+);
 
 /// Type-erased restart function stored per child.
 ///
@@ -123,6 +129,10 @@ pub(crate) enum RestartOutcome {
         incarnation: u64,
         drop_panic: Option<String>,
     },
+    /// The attempt's incarnation ended because its start was ignored (its
+    /// initialization asked for it), under no order and before it was
+    /// adopted: no death, no restart, no charge, no report.
+    Ignored { child_id: ActorId, incarnation: u64 },
     /// The attempt's wait for the previous incarnation's subtree outlived its
     /// bound: no incarnation existed, and none is started beside the actors
     /// that still run.
@@ -141,10 +151,43 @@ pub(crate) enum RestartOutcome {
 /// no other.
 pub(crate) const DEFAULT_KILL_GRACE: Duration = Duration::from_millis(120);
 
-/// Outcome of one child incarnation's runner task: the child's id, its real
-/// stop reason, and the incarnation token - in the order the run loop's
+/// Outcome of one child incarnation's runner task: the child's id, how its
+/// incarnation ended and the incarnation token - in the order the run loop's
 /// death-plane branch consumes them.
-pub(crate) type DeathOutcome = (ActorId, StopReason, u64);
+pub(crate) type DeathOutcome = (ActorId, RunnerEnd, u64);
+
+/// How a runner reports its incarnation's end: the reason it ended with, or
+/// an ignored start, whose reason is `StopReason::Graceful`. The second case
+/// sits in the room `StopReason` leaves, so the value is the size of a
+/// `StopReason` and the run loop's death event, which it holds across its
+/// waits, keeps its size.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RunnerEnd {
+    /// The incarnation ended with this reason, not by an ignored start.
+    Ended(StopReason),
+    /// The incarnation's start was ignored; it ended with `Graceful`.
+    Ignored,
+}
+
+impl RunnerEnd {
+    /// The end of an incarnation that ended with `reason`, `ignored` telling
+    /// whether that end was its ignored start (whose reason is `Graceful`).
+    pub(crate) fn new(reason: StopReason, ignored: bool) -> Self {
+        if ignored && matches!(reason, StopReason::Graceful) {
+            Self::Ignored
+        } else {
+            Self::Ended(reason)
+        }
+    }
+
+    /// The reason and whether the end was an ignored start.
+    pub(crate) fn into_parts(self) -> (StopReason, bool) {
+        match self {
+            Self::Ended(reason) => (reason, false),
+            Self::Ignored => (StopReason::Graceful, true),
+        }
+    }
+}
 
 /// Synchronous safety net for one child incarnation's runner task.
 ///
@@ -987,9 +1030,10 @@ impl SupervisionState {
         &mut self,
         id: ActorId,
         incarnation: u64,
+        record: IncarnationRef,
         rx: oneshot::Receiver<Result<(), ActorError>>,
     ) {
-        self.strict_acks.push((id, incarnation, rx));
+        self.strict_acks.push((id, incarnation, record, rx));
     }
 
     /// Takes the acknowledgments kept so far, in spawn order.
@@ -1564,12 +1608,19 @@ impl SupervisionState {
                 Some(lost) => {
                     let key = (child_id.clone(), incarnation);
                     let owner = self.registry.owner_record();
+                    let status = lost.status();
                     let task = self.death_set.spawn(async move {
                         let reason = lost.wait().await;
                         if let Some(owner) = &owner {
                             crate::telemetry::death_landed(owner, incarnation);
                         }
-                        (child_id, reason, incarnation)
+                        // The reason is final when the wait returns: the plane
+                        // says whether the end was an ignored start.
+                        (
+                            child_id,
+                            RunnerEnd::new(reason, status.ended_ignored()),
+                            incarnation,
+                        )
                     });
                     self.task_owner
                         .insert(task.id(), (key.0, key.1, TaskPlane::Death));
@@ -1589,7 +1640,8 @@ impl SupervisionState {
                         if let Some(owner) = &owner {
                             crate::telemetry::death_landed(owner, incarnation);
                         }
-                        (child_id, reason, incarnation)
+                        // No incarnation is followed: nothing was ignored.
+                        (child_id, RunnerEnd::Ended(reason), incarnation)
                     });
                     self.task_owner
                         .insert(task.id(), (key.0, key.1, TaskPlane::Death));
@@ -1665,12 +1717,17 @@ impl SupervisionState {
                     &child_id,
                 );
                 let key = (child_id.clone(), incarnation);
+                let status = lost.status();
                 let task = self.death_set.spawn(async move {
                     let reason = lost.wait().await;
                     if let Some(owner) = &owner {
                         crate::telemetry::death_landed(owner, incarnation);
                     }
-                    (child_id, reason, incarnation)
+                    (
+                        child_id,
+                        RunnerEnd::new(reason, status.ended_ignored()),
+                        incarnation,
+                    )
                 });
                 self.task_owner
                     .insert(task.id(), (key.0, key.1, TaskPlane::Death));
@@ -1848,6 +1905,7 @@ impl SupervisionState {
                     child_id: child_id.clone(),
                     reason,
                     incarnation,
+                    ignored: ctl.ended_ignored(),
                 }),
                 slot::FinalDeath::Leave => {}
             }

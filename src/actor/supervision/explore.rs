@@ -1993,6 +1993,10 @@ impl<'a> Ap<'a> {
                         event: AtEvent::Ended {
                             ordered: order.is_some(),
                             timeout_raised: st_fired,
+                            // The explored runs never ignore a start: the
+                            // ignore moves are the table's own moves, pinned
+                            // by the domain checks.
+                            ignored: false,
                         },
                         ladder: ladder_before,
                         kill_stored,
@@ -9436,7 +9440,7 @@ fn check_manual(cfg: &Cfg, pre: &State, step: Step, ap: &Applied, out: &mut Vec<
 
 use std::time::{Duration, Instant as StdInstant};
 
-use super::model::{BudgetState, GuardRest, RestartDecision, StrategyScope};
+use super::model::{BudgetState, GuardRest, IgnoredEnd, RestartDecision, StrategyScope};
 use super::rules::{
     self, Absorption, AttemptAction, AttemptEvent, AttemptLadder, AttemptReport,
     AttemptStage as RAttemptStage, AttemptView, Commit, CommitEffect, GroupMember, GroupMembership,
@@ -9456,6 +9460,7 @@ use std::collections::{HashMap, VecDeque as ProdQueue};
 
 const AUTO_SHUTDOWN_CONFORMANCE: &str =
     "auto_shutdown_only_on_an_unordered_end (conformance of auto_shutdown_due and auto_active)";
+const IGNORED_END_CONFORMANCE: &str = "an_ignored_start_is_no_death (conformance of ignored_end)";
 const STRICT_STEP_CONFORMANCE: &str =
     "a_failed_child_fails_the_strict_start (conformance of strict_step)";
 const LADDER_STEP_CONFORMANCE: &str = "every_wait_is_bounded (conformance of ladder_step)";
@@ -10879,19 +10884,29 @@ enum AtStage {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AtEvent {
-    Begin { ordered: bool },
+    Begin {
+        ordered: bool,
+    },
     Order,
-    Ack { ordered: bool, ended: bool },
+    Ack {
+        ordered: bool,
+        ended: bool,
+    },
     InitEnded,
     StartTimeout,
     LadderSpent,
-    Ended { ordered: bool, timeout_raised: bool },
+    Ended {
+        ordered: bool,
+        timeout_raised: bool,
+        ignored: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AtReport {
     Stopped,
     StartTimeout,
+    Ignored,
     Failed,
 }
 
@@ -12091,9 +12106,11 @@ fn img_at_event(event: AtEvent) -> AttemptEvent {
         AtEvent::Ended {
             ordered,
             timeout_raised,
+            ignored,
         } => AttemptEvent::Ended {
             ordered,
             timeout_raised,
+            ignored,
         },
     }
 }
@@ -12111,6 +12128,7 @@ fn img_at_want(want: AtWant) -> AttemptAction {
         AtWant::Report(AtReport::StartTimeout) => {
             AttemptAction::Report(AttemptReport::StartTimeout)
         }
+        AtWant::Report(AtReport::Ignored) => AttemptAction::Report(AttemptReport::Ignored),
         AtWant::Report(AtReport::Failed) => AttemptAction::Report(AttemptReport::Failed),
     }
 }
@@ -12414,6 +12432,8 @@ fn img_supervision(cfg: &Cfg, pre: &State, kept: &mut Vec<KeptSlot>) -> Supervis
                 io.record_fate(crate::types::ChildFate {
                     reason: img_reason(fate),
                     incarnation: u64::from(occupant),
+                    // No explored end is an ignored start.
+                    ignored: false,
                 });
             }
         }
@@ -12684,6 +12704,40 @@ fn domain_auto_shutdown() -> bool {
     due && active
 }
 
+/// The model's statement of what an ignored start leaves of the spec: a pool
+/// child and a `Temporary` child lose it, every other child stays down with
+/// it, written as a table over both strategy axes and not as the production
+/// expression.
+fn m_ignored_end(strategy: RestartStrategy, restart: Restart) -> IgnoredEnd {
+    match (strategy, restart) {
+        (RestartStrategy::SimpleOneForOne, _) => IgnoredEnd::Remove,
+        (_, Restart::Temporary) => IgnoredEnd::Remove,
+        (
+            RestartStrategy::OneForOne | RestartStrategy::OneForAll | RestartStrategy::RestForOne,
+            Restart::Permanent | Restart::Transient,
+        ) => IgnoredEnd::KeepDown,
+    }
+}
+
+/// Domain conformance of `ignored_end` over every strategy and restart type.
+fn domain_ignored_end() -> bool {
+    [
+        RestartStrategy::OneForOne,
+        RestartStrategy::OneForAll,
+        RestartStrategy::RestForOne,
+        RestartStrategy::SimpleOneForOne,
+    ]
+    .iter()
+    .all(|&strategy| {
+        [Restart::Permanent, Restart::Transient, Restart::Temporary]
+            .iter()
+            .all(|&restart| {
+                rules::ignored_end(strategy, img_restart(restart))
+                    == m_ignored_end(strategy, restart)
+            })
+    })
+}
+
 /// Domain conformance of `strict_step` and `strict_closed_ordered`: a good
 /// acknowledgment goes on, an error fails the start, and a child that ended
 /// before it acknowledged fails it unless the supervisor itself ended it: the
@@ -12696,6 +12750,7 @@ fn domain_strict_step() -> bool {
         (StrictAckKind::Err, StrictStep::Fail),
         (StrictAckKind::Closed { ordered: false }, StrictStep::Fail),
         (StrictAckKind::Closed { ordered: true }, StrictStep::Next),
+        (StrictAckKind::Ignored, StrictStep::Next),
     ];
     let step = rows
         .iter()
@@ -12923,11 +12978,13 @@ fn m_attempt_step(
             AtEvent::Ended {
                 ordered,
                 timeout_raised,
+                ignored,
             },
-        ) => AtWant::Report(match (timeout_raised, ordered) {
-            (true, _) => AtReport::StartTimeout,
-            (false, true) => AtReport::Stopped,
-            (false, false) => AtReport::Failed,
+        ) => AtWant::Report(match (timeout_raised, ordered, ignored) {
+            (true, _, _) => AtReport::StartTimeout,
+            (false, _, true) => AtReport::Ignored,
+            (false, true, false) => AtReport::Stopped,
+            (false, false, false) => AtReport::Failed,
         }),
         _ => AtWant::Nothing,
     }
@@ -12956,10 +13013,13 @@ fn domain_attempt_step() -> bool {
                 ordered: flag,
                 ended: other,
             });
-            events.push(AtEvent::Ended {
-                ordered: flag,
-                timeout_raised: other,
-            });
+            for ignored in [false, true] {
+                events.push(AtEvent::Ended {
+                    ordered: flag,
+                    timeout_raised: other,
+                    ignored,
+                });
+            }
         }
     }
     let mut ok = true;
@@ -13468,6 +13528,9 @@ fn domain_conformance(out: &mut Vec<&'static str>) {
     }
     if !domain_auto_shutdown() {
         out.push(AUTO_SHUTDOWN_CONFORMANCE);
+    }
+    if !domain_ignored_end() {
+        out.push(IGNORED_END_CONFORMANCE);
     }
     if !domain_strict_step() {
         out.push(STRICT_STEP_CONFORMANCE);

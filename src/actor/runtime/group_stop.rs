@@ -301,19 +301,23 @@ pub(super) fn absorb_records(
                         waited_in = report_place_words(place),
                         "an owed report of a group member was absorbed into the group restart"
                     );
-                    deliveries.push_back((
-                        ChildEvent {
-                            child_id: id.clone(),
-                            child_name: name,
-                            reason: report.reason,
-                            action: if prune {
-                                SupervisionAction::Removed
-                            } else {
-                                SupervisionAction::RestartInitiated
+                    // The end of an ignored start is absorbed like any other,
+                    // and is no death to report.
+                    if !report.ignored {
+                        deliveries.push_back((
+                            ChildEvent {
+                                child_id: id.clone(),
+                                child_name: name,
+                                reason: report.reason,
+                                action: if prune {
+                                    SupervisionAction::Removed
+                                } else {
+                                    SupervisionAction::RestartInitiated
+                                },
                             },
-                        },
-                        n,
-                    ));
+                            n,
+                        ));
+                    }
                 }
             }
             rules::Absorption::Snapshot => {
@@ -454,6 +458,9 @@ pub(super) fn owe_deliveries<A: Actor>(
                     child_id: event.child_id,
                     reason: event.reason,
                     incarnation,
+                    // A delivery is owed only for a report that is delivered,
+                    // and an ignored end delivers nothing.
+                    ignored: false,
                 },
                 event.child_name,
             );

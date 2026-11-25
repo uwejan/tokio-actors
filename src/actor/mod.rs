@@ -750,14 +750,13 @@ pub struct LinkedSpawn<'ctx, A: Actor, W: Actor> {
 /// value drop; or the task was aborted, and the plane reads `Kill`: the spawn
 /// is [`SpawnError::Killed`]. The task's own poll unwound outside every catch
 /// during the initialization, and the plane reads that panic as a failure:
-/// the spawn is [`SpawnError::Init`] with it. The wait ends as soon as the
-/// actor's reason is final, so it never waits through those drops.
+/// the spawn is [`SpawnError::Init`] with it. A `pre_start` that called
+/// `ActorContext::ignore` and returned `Ok(())` drops the ack too, and the
+/// plane reads `Graceful` with the ignore mark: the spawn is
+/// [`SpawnError::Ignored`]. The wait ends as soon as the actor's reason is
+/// final, so it never waits through those drops.
 async fn closed_ack_error<A: Actor>(handle: &handle::ActorHandle<A>) -> SpawnError {
-    let mut status_rx = handle.status_rx();
-    match crate::system::wait_final_reason(&mut status_rx).await {
-        StopReason::Failure(err) => SpawnError::Init(Box::new(err)),
-        _ => SpawnError::Killed,
-    }
+    crate::system::closed_start_error(&mut handle.status_rx()).await
 }
 
 // ---------------------------------------------------------------------------

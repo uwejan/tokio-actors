@@ -153,6 +153,88 @@ impl<'a, A: Actor> Sys<'a, A> {
     /// removed; with the `tracing` feature the panic is logged, naming the
     /// actor and the id. With `panic = "abort"` a panic in `f` ends the
     /// process.
+    ///
+    /// # Writing the entries to a file
+    ///
+    /// An installed function runs on the actor's task between turns, so it
+    /// must not write a file itself: a write blocks the worker the actor runs
+    /// on, with no bound. It hands each entry to a bounded
+    /// [`tokio::sync::mpsc`] channel with `try_send` and counts what a full
+    /// channel refused, and a writer task the caller spawns on its own runtime
+    /// appends the lines to the file, with `tokio::task::spawn_blocking` and
+    /// `std::io::Write` or with any writer the caller owns. Erlang/OTP's
+    /// `sys:log_to_file` is this pattern. The writer ends when the installed
+    /// function is dropped (by `remove`, by the function's own
+    /// [`Install::Remove`] or by the actor's end), which closes the channel,
+    /// so awaiting the writer's handle is the point where every line sent is
+    /// in the file.
+    ///
+    /// ```rust
+    /// use std::io::Write;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use tokio::sync::mpsc;
+    /// use tokio_actors::actor::context::ActorContext;
+    /// use tokio_actors::sys::{DebugEvent, Install};
+    /// use tokio_actors::{Actor, ActorExt, ActorResult};
+    ///
+    /// struct Echo;
+    ///
+    /// impl Actor for Echo {
+    ///     type Message = u32;
+    ///     type Response = u32;
+    ///     async fn handle(&mut self, n: u32, _: &mut ActorContext<Self>) -> ActorResult<u32> {
+    ///         Ok(n)
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let path = std::env::temp_dir().join(format!("actor-log-{}.txt", uuid::Uuid::new_v4()));
+    ///
+    /// // The writer: one blocking task that owns the file and the receiving end.
+    /// let (lines, mut queue) = mpsc::channel::<String>(256);
+    /// let target = path.clone();
+    /// let writer = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+    ///     let mut file = std::fs::File::create(target)?;
+    ///     while let Some(line) = queue.blocking_recv() {
+    ///         writeln!(file, "{line}")?;
+    ///     }
+    ///     file.flush()
+    /// });
+    ///
+    /// // The installed function: no I/O, a `try_send` and a count of refusals.
+    /// let refused = Arc::new(AtomicU64::new(0));
+    /// let counter = refused.clone();
+    /// let echo = Echo.spawn().await?;
+    /// echo.sys()
+    ///     .install("log_to_file", move |entry| {
+    ///         if let DebugEvent::MessageIn { .. } = entry.event {
+    ///             let line = format!("{} {:?}", entry.seq, entry.event);
+    ///             if lines.try_send(line).is_err() {
+    ///                 counter.fetch_add(1, Ordering::Relaxed);
+    ///             }
+    ///         }
+    ///         Install::Keep
+    ///     })
+    ///     .await?;
+    ///
+    /// echo.send(1).await?;
+    /// echo.send(2).await?;
+    ///
+    /// // Removing the function drops the sending end, which ends the writer.
+    /// assert!(echo.sys().remove("log_to_file").await?);
+    /// tokio::time::timeout(Duration::from_secs(30), writer).await???;
+    ///
+    /// let text = std::fs::read_to_string(&path)?;
+    /// assert_eq!(text.lines().count(), 2);
+    /// assert_eq!(refused.load(Ordering::Relaxed), 0);
+    /// # std::fs::remove_file(&path)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn install(
         &self,
         id: impl Into<String>,

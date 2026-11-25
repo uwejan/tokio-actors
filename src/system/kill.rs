@@ -533,6 +533,20 @@ pub(crate) async fn wait_final_reason(rx: &mut StatusRx) -> StopReason {
     }
 }
 
+/// The answer to a spawn whose start acknowledgment closed unanswered, read
+/// from the actor's status plane once its reason is final, so every reader
+/// of a closed acknowledgment gives one answer: a `Failure` is
+/// `SpawnError::Init` with it, an ignored start is `SpawnError::Ignored`, and
+/// any other end (a `Kill`, an abort) is `SpawnError::Killed`.
+pub(crate) async fn closed_start_error(rx: &mut StatusRx) -> crate::error::SpawnError {
+    use crate::error::SpawnError;
+    match wait_final_reason(rx).await {
+        StopReason::Failure(err) => SpawnError::Init(Box::new(err)),
+        _ if rx.ended_ignored() => SpawnError::Ignored,
+        _ => SpawnError::Killed,
+    }
+}
+
 /// The step a bounded stop has reached, written by whoever takes its steps
 /// and read by whoever has to classify the call without them: what a
 /// `Stopped` the actor publishes reads as. A bounded stop starts at its

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::actor::supervision::model::{
     AutoShutdown, BudgetCharge, BudgetState, ChildLifecycle, DownPending, GuardFirst, GuardRest,
-    ManualStop, Origin, RestartDecision, StrategyScope, SystemAction, SystemEnd, SystemLadder,
-    SystemSeen, SystemStep, VerdictAct, VerdictSeen, ABORT_SETTLE, FAR_FUTURE,
+    IgnoredEnd, ManualStop, Origin, RestartDecision, StrategyScope, SystemAction, SystemEnd,
+    SystemLadder, SystemSeen, SystemStep, VerdictAct, VerdictSeen, ABORT_SETTLE, FAR_FUTURE,
 };
 use crate::types::{
     ActorId, RestartStrategy, RestartType, Shutdown, StopReason, SupervisionAction,
@@ -998,8 +998,12 @@ pub(crate) enum AttemptEvent {
     LadderSpent,
     /// The incarnation's task ended. `ordered`: the command cell holds an
     /// order. `timeout_raised`: the start timeout's expiry raised the first
-    /// `Kill`.
-    Ended { ordered: bool, timeout_raised: bool },
+    /// `Kill`. `ignored`: the incarnation's start was ignored.
+    Ended {
+        ordered: bool,
+        timeout_raised: bool,
+        ignored: bool,
+    },
 }
 
 /// What an attempt's executor knows besides the event.
@@ -1019,6 +1023,8 @@ pub(crate) enum AttemptReport {
     Stopped,
     /// The start timeout's expiry raised the first `Kill`: the start failed.
     StartTimeout,
+    /// The incarnation's start was ignored, under no order: no failure.
+    Ignored,
     /// The incarnation ended before it was adopted, under no order.
     Failed,
 }
@@ -1060,8 +1066,9 @@ pub(crate) enum AttemptAction {
 /// abort and the settle time itself. A join still running after the ladder's
 /// two waits gets the Unresponsive verdict, never a fate. The end of the task
 /// is reported as a start failure only when the start timeout raised the
-/// first `Kill`, as stopped when it ended under an order, and as failed
-/// otherwise.
+/// first `Kill`, as ignored when its start was ignored (a stop order is
+/// never read during the start, so none outranks the ignore), as stopped when
+/// it ended under an order, and as failed otherwise.
 pub(crate) fn attempt_step(
     stage: AttemptStage,
     event: AttemptEvent,
@@ -1102,9 +1109,12 @@ pub(crate) fn attempt_step(
             AttemptEvent::Ended {
                 ordered,
                 timeout_raised,
+                ignored,
             },
         ) => AttemptAction::Report(if timeout_raised {
             AttemptReport::StartTimeout
+        } else if ignored {
+            AttemptReport::Ignored
         } else if ordered {
             AttemptReport::Stopped
         } else {
@@ -1422,6 +1432,20 @@ pub(crate) fn is_pool(strategy: RestartStrategy) -> bool {
 /// kept: a pool child, and a `Temporary` child.
 pub(crate) fn spec_prunable(strategy: RestartStrategy, restart_type: RestartType) -> bool {
     is_pool(strategy) || restart_type == RestartType::Temporary
+}
+
+/// What becomes of a child's spec when its start was ignored (its
+/// initialization asked to be ignored, as Erlang/OTP's `init/1` returning
+/// `ignore`): a pool child and a `Temporary` child have the spec removed
+/// (supervisor.erl:967, :1023-1024, :1328, :1436-1444), any other keeps it
+/// with the child down (supervisor.erl:1000-1002). Either way the end is no
+/// death: no restart, no budget charge, no report.
+pub(crate) fn ignored_end(strategy: RestartStrategy, restart_type: RestartType) -> IgnoredEnd {
+    if spec_prunable(strategy, restart_type) {
+        IgnoredEnd::Remove
+    } else {
+        IgnoredEnd::KeepDown
+    }
 }
 
 /// Whether a supervisor's teardown stops its children all at once instead
@@ -2442,6 +2466,8 @@ pub(crate) enum StrictAckKind {
     /// The child ended before its initialization finished; `ordered` says
     /// whether the supervisor itself ended it (see [`strict_closed_ordered`]).
     Closed { ordered: bool },
+    /// The child's initialization asked to be ignored: not a failure.
+    Ignored,
 }
 
 /// What the strict start does after one child's acknowledgment.
@@ -2456,13 +2482,15 @@ pub(crate) enum StrictStep {
 /// The strict start's step for one acknowledgment. A child that ended before
 /// its initialization finished fails the start, unless the supervisor itself
 /// ended it (it removed the spec, ordered the stop or replaced the
-/// incarnation), which is not a failure to start.
+/// incarnation), which is not a failure to start, and an ignored start is
+/// none either.
 pub(crate) fn strict_step(ack: StrictAckKind) -> StrictStep {
     match ack {
         StrictAckKind::Ok => StrictStep::Next,
         StrictAckKind::Err => StrictStep::Fail,
         StrictAckKind::Closed { ordered: false } => StrictStep::Fail,
         StrictAckKind::Closed { ordered: true } => StrictStep::Next,
+        StrictAckKind::Ignored => StrictStep::Next,
     }
 }
 

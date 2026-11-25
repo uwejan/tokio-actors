@@ -18,8 +18,9 @@ use crate::actor::incarnation::{StopLane, SubtreeLink};
 use crate::actor::panic::{catch_sync, contain_waker_panic, payload_into_string};
 use crate::actor::supervision::{
     await_predecessor, await_subtree, cancelled_before_factory, rules, run_attempt, slot_pair_for,
-    Attempt, AutoShutdown, ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState, Origin, OwnStop,
-    Predecessor, RestartOutcome, SlotIo, TaskPlane, DEFAULT_KILL_GRACE,
+    Attempt, AutoShutdown, ChildLifecycle, ChildLinkGuard, ChildSpec, ChildState, DownPending,
+    IgnoredEnd, Origin, OwnStop, Predecessor, RestartOutcome, SlotIo, TaskPlane,
+    DEFAULT_KILL_GRACE,
 };
 #[cfg(feature = "sys")]
 use crate::actor::sys::DebugOptions;
@@ -493,7 +494,12 @@ impl<A: Actor> ActorContext<A> {
         sup.registry.register(child_state);
         if strict {
             if let Some(ack) = ack_rx {
-                sup.push_strict_ack(child_id.clone(), incarnation, ack);
+                sup.push_strict_ack(
+                    child_id.clone(),
+                    incarnation,
+                    child_handle.stop_lane().abort_record().clone(),
+                    ack,
+                );
             }
         }
 
@@ -716,19 +722,36 @@ impl<A: Actor> ActorContext<A> {
             InitEnd::TimedOut => SpawnError::StartTimeout,
             InitEnd::Closed => {
                 let mut status = handle.status_rx();
-                match crate::system::wait_final_reason(&mut status).await {
-                    StopReason::Failure(err) => SpawnError::Init(Box::new(err)),
-                    _ => SpawnError::Killed,
-                }
+                crate::system::closed_start_error(&mut status).await
             }
         };
-        // The child keeps no spec and owes no report: its end is dropped when
-        // it arrives. A start under the same id waits for the failed
-        // incarnation's subtree, which the removal keeps under the id.
+        // The child owes no report: its end is dropped when it arrives. A
+        // failed start keeps no spec; an ignored one keeps the spec down or
+        // removes it by the one rule. A start under the same id waits for the
+        // failed incarnation's subtree, which the removal keeps under the id.
+        let ignored = matches!(error, SpawnError::Ignored);
         let mut factory = None;
         if let Some(sup) = self.supervision_mut() {
             sup.silenced.push((child_id.clone(), incarnation));
-            factory = sup.remove_spec(&child_id);
+            let end = if ignored {
+                sup.registry
+                    .get(&child_id)
+                    .map(|child| rules::ignored_end(sup.config.strategy, child.spec.restart_type))
+            } else {
+                Some(IgnoredEnd::Remove)
+            };
+            match end {
+                Some(IgnoredEnd::KeepDown) => {
+                    if let Some(child) = sup.registry.get_mut(&child_id) {
+                        child.transition_expected(ChildLifecycle::Down {
+                            incarnation,
+                            pending: DownPending::None,
+                        });
+                    }
+                }
+                Some(IgnoredEnd::Remove) => factory = sup.remove_spec(&child_id),
+                None => {}
+            }
         }
         // The factory is user code: dropped as the call's last step, a panic
         // in its drop is a panic of the callback that called it.
@@ -1055,8 +1078,17 @@ where
     /// [`SpawnError::Init`] with it and the child is discarded: no spec is
     /// kept, [`on_child_stopped`](crate::actor::Actor::on_child_stopped) is not
     /// called for it and the restart budget is not charged. A child that was
-    /// killed first gives [`SpawnError::Killed`]. A spawn under the same id
-    /// afterwards waits for the failed incarnation's subtree to end, as after
+    /// killed first gives [`SpawnError::Killed`]. A child whose `pre_start`
+    /// called `ActorContext::ignore` gives [`SpawnError::Ignored`] and is not
+    /// discarded: its spec is kept with the child down (removed for a
+    /// `Temporary` child and under `SimpleOneForOne`),
+    /// [`on_child_stopped`](crate::actor::Actor::on_child_stopped) is not called
+    /// and the budget is not charged, so a `spawn_child` under the same id
+    /// answers `DuplicateChild`; start it again with
+    /// [`restart_child`](ActorContext::restart_child), or remove it with
+    /// [`delete_child`](ActorContext::delete_child) and spawn it again. A spawn
+    /// under the same id after a failed initialization waits for the failed
+    /// incarnation's subtree to end, as after
     /// [`delete_child`](ActorContext::delete_child).
     ///
     /// The wait has no bound by default, as Erlang/OTP's start has none;

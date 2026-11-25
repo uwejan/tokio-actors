@@ -93,7 +93,9 @@ impl<A: Actor> End<A> {
     /// The end of the actor's task, one step after the other in the order
     /// each step's comment fixes. Only an actor whose message loop ran closes
     /// it, enters `Stopping`, delivers what it still owes and runs
-    /// `on_stopped`. Returns the reason the task ends with.
+    /// `on_stopped`. An ignored start never runs the loop, so it enters
+    /// neither `Stopping` nor `on_stopped`, and its ack is dropped unanswered
+    /// like a cut init. Returns the reason the task ends with.
     // Not an `async fn`: an `async fn` keeps its parameter twice (the
     // unresumed state's copy and the body's moved-in copy), while the block
     // takes the end's inputs by value and works on them in place, so its
@@ -522,7 +524,9 @@ impl<A: Actor> End<A> {
     /// So does a failed init whose end a `Kill` reached before the seal: the
     /// final reason is `Kill`, the awaited spawn reads `Killed` from the
     /// plane, one answer, and the init's error is logged once with the actor's
-    /// id.
+    /// id. An ignored start (`ActorContext::ignore` called in `pre_start`)
+    /// drops it unanswered as well, like a cut init: the reason is `Graceful`
+    /// and the awaited spawn reads the ignore mark from the plane.
     fn answer_ack(&mut self, owner: &Owner, fields: &EndFields) {
         #[cfg(not(feature = "tracing"))]
         let _ = fields;

@@ -161,6 +161,7 @@ pub mod behavior;
 pub mod error;
 pub mod event;
 mod helper;
+pub mod otp_map;
 pub mod signals;
 pub mod statem;
 pub mod system;

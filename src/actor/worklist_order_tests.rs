@@ -99,11 +99,13 @@ impl Actor for Sup {
             child_id: ActorId::from(stopped.as_str()),
             reason: StopReason::Graceful,
             incarnation: stopped_incarnation,
+            ignored: false,
         };
         let behind = ChildStoppedInternal {
             child_id: ActorId::from(crashed.as_str()),
             reason: StopReason::Failure(ActorError::user("the second worker failed")),
             incarnation: crashed_incarnation,
+            ignored: false,
         };
         let mut work = VecDeque::from([behind]);
         let flow = handle_worklist(self, ctx, Some(first), &mut work).await;

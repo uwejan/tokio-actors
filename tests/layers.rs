@@ -40,6 +40,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("application.rs", 4),
     ("behavior.rs", 4),
     ("event.rs", 4),
+    ("otp_map.rs", 4),
     ("signals.rs", 4),
     ("statem.rs", 4),
     ("actor/", 2),

@@ -173,5 +173,6 @@ fn crash_of(id: &str, incarnation: u64) -> ChildStoppedInternal {
         child_id: ActorId::from(id),
         reason: StopReason::Failure(ActorError::user("crashed")),
         incarnation,
+        ignored: false,
     }
 }

@@ -40,6 +40,12 @@ fn collect_report(
     if !sup.silenced.is_empty() && sup.take_silenced(&report.child_id, report.incarnation) {
         return;
     }
+    // The end of an incarnation whose start was ignored is no death: the
+    // ledger records it as collected and nothing is delivered for it.
+    if report.ignored {
+        record_collected_end(sup, &report.child_id, report.incarnation);
+        return;
+    }
     let name = sup
         .registry
         .get(&report.child_id)
@@ -134,7 +140,8 @@ async fn collect_final<A: Actor>(
         };
         match sup.death_set.join_next_with_id().await {
             None => break,
-            Some(Ok((task, (child_id, reason, incarnation)))) => {
+            Some(Ok((task, (child_id, end, incarnation)))) => {
+                let (reason, ignored) = end.into_parts();
                 sup.task_owner.remove(&task);
                 runners.remove(&task);
                 collect_report(
@@ -144,6 +151,7 @@ async fn collect_final<A: Actor>(
                         child_id,
                         reason,
                         incarnation,
+                        ignored,
                     },
                 );
             }
@@ -312,7 +320,8 @@ async fn collect_final<A: Actor>(
                     None => {
                         adopted.clear();
                     }
-                    Some(Ok((task, (child_id, reason, incarnation)))) => {
+                    Some(Ok((task, (child_id, end, incarnation)))) => {
+                        let (reason, ignored) = end.into_parts();
                         sup.task_owner.remove(&task);
                         adopted.remove(&task);
                         collect_runner(
@@ -323,6 +332,7 @@ async fn collect_final<A: Actor>(
                                 child_id,
                                 reason,
                                 incarnation,
+                                ignored,
                             },
                         );
                     }
@@ -339,7 +349,8 @@ async fn collect_final<A: Actor>(
             };
             match sup.death_set.try_join_next_with_id() {
                 None => break,
-                Some(Ok((task, (child_id, reason, incarnation)))) => {
+                Some(Ok((task, (child_id, end, incarnation)))) => {
+                    let (reason, ignored) = end.into_parts();
                     sup.task_owner.remove(&task);
                     collect_runner(
                         sup,
@@ -349,6 +360,7 @@ async fn collect_final<A: Actor>(
                             child_id,
                             reason,
                             incarnation,
+                            ignored,
                         },
                     );
                 }
@@ -417,6 +429,9 @@ fn collect_restart_outcome(
                 child_id,
                 reason,
                 incarnation,
+                // An attempt's end is never an ignore: that outcome has its
+                // own report.
+                ignored: false,
             },
         );
     }

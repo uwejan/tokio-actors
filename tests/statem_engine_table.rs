@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio_actors::statem::{
     EnterContext, Fired, Harness, ReplyTo, StateMachine, StatemContext, StatemEvent, Step,
-    Transition,
+    TimeoutId, Transition,
 };
 use tokio_actors::StopReason;
 
@@ -70,6 +70,14 @@ impl StateMachine for M {
 
 type Out = (Step<M>, Vec<String>);
 
+/// A harness of a machine whose types are `Sync` can be shared and borrowed
+/// across an await in a `Send` future.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Harness<M>>();
+    send_sync::<Step<M>>();
+};
+
 /// Drives a harness from its drop, which runs while the thread unwinds.
 struct Late<'a>(&'a mut Vec<(usize, Option<u16>)>);
 
@@ -97,6 +105,23 @@ fn fire(h: &mut Harness<M>, kind: Fired<&'static str>) -> Out {
     go(h, |h| h.fire(kind))
 }
 
+fn fire_id(h: &mut Harness<M>, id: &TimeoutId<&'static str>) -> Out {
+    go(h, |h| h.fire_id(id))
+}
+
+/// The kinds of the time-outs a step set, with their durations.
+fn set(step: &Step<M>) -> Vec<(Fired<&'static str>, Duration)> {
+    step.set
+        .iter()
+        .map(|(id, after)| (id.kind().clone(), *after))
+        .collect()
+}
+
+/// The kinds of the time-outs a step cancelled.
+fn cancelled(step: &Step<M>) -> Vec<Fired<&'static str>> {
+    step.cancelled.iter().map(|id| id.kind().clone()).collect()
+}
+
 fn strs(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -122,26 +147,43 @@ fn statem_engine_table() {
 
     // The three time-outs: set, fired once, cancelled by an event, by a state change, by the machine, replaced.
     let mut h = fresh();
-    assert_eq!(cast(&mut h, Ev::Arm).0.set, [(Fired::Event, S), (Fired::State, 2 * S), (Fired::Named("n"), 3 * S)]);
+    assert_eq!(set(&cast(&mut h, Ev::Arm).0), [(Fired::Event, S), (Fired::State, 2 * S), (Fired::Named("n"), 3 * S)]);
     assert_eq!(fire(&mut h, Fired::Event).1, ["to100@0"]);
-    assert!(fire(&mut h, Fired::Event).1.is_empty(), "a fired time-out is not running");
-    assert!(cast(&mut h, Ev::Tag(1)).0.cancelled.is_empty(), "the event time-out already fired");
+    let (step, log) = fire(&mut h, Fired::Event);
+    assert!(log.is_empty() && step.stale, "a fired time-out is not running and its firing reads stale");
+    let step = cast(&mut h, Ev::Tag(1)).0;
+    assert!(step.cancelled.is_empty() && !step.stale, "the event time-out already fired, and a cast step is never stale");
     cast(&mut h, Ev::Arm);
-    assert_eq!(cast(&mut h, Ev::Tag(1)).0.cancelled, [Fired::Event], "an event handled first cancels the event time-out");
+    assert_eq!(cancelled(&cast(&mut h, Ev::Tag(1)).0), [Fired::Event], "an event handled first cancels the event time-out");
     assert!(fire(&mut h, Fired::Event).1.is_empty(), "a cancelled time-out never reaches the handler");
-    assert_eq!(cast(&mut h, Ev::Move(1)).0.cancelled, [Fired::State], "a state change cancels the state time-out");
+    assert_eq!(cancelled(&cast(&mut h, Ev::Move(1)).0), [Fired::State], "a state change cancels the state time-out");
     assert!(fire(&mut h, Fired::State).1.is_empty());
     assert_eq!(fire(&mut h, Fired::Named("n")).1, ["to102@1"], "the named time-out outlives both");
     cast(&mut h, Ev::Arm);
-    assert_eq!(cast(&mut h, Ev::Arm).0.cancelled, [Fired::Event, Fired::State, Fired::Named("n")], "a new time-out replaces the running one");
+    assert_eq!(cancelled(&cast(&mut h, Ev::Arm).0), [Fired::Event, Fired::State, Fired::Named("n")], "a new time-out replaces the running one");
     assert_eq!(fire(&mut h, Fired::State).1, ["to101@1"]);
     assert!(fire(&mut h, Fired::State).1.is_empty(), "one firing per setting, whatever the generation");
+    // A setting has an id of its own: a replaced setting's id fires nothing, and the replacement's cancel names the ended setting.
+    let mut g = fresh();
+    let first = cast(&mut g, Ev::Arm).0;
+    let second = cast(&mut g, Ev::Arm).0;
+    let (old, new) = (first.set[1].0.clone(), second.set[1].0.clone());
+    let (step, log) = fire_id(&mut g, &old);
+    assert!(step.stale && log.is_empty() && step.set.is_empty() && step.cancelled.is_empty(), "an id fires only while it is the running setting of its kind, so the replaced setting's id does nothing");
+    let (step, log) = fire_id(&mut g, &new);
+    assert!(!step.stale && log == ["to101@0"], "the running setting's id fires it");
+    assert!(fire_id(&mut g, &new).0.stale, "one firing per setting");
+    let ended: Vec<_> = first.set.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(second.cancelled, ended, "a replacement cancels the ids of the settings it ended, in order");
+    assert!(second.set.iter().zip(&first.set).all(|(n, o)| n.0 != o.0), "every setting gets a new id, even one that replaces a running setting of its kind");
     cast(&mut h, Ev::Arm);
     let (step, log) = cast(&mut h, Ev::Cancel);
     assert_eq!((log, step.cancelled.len()), (strs(&["(false, true, true)"]), 3));
     assert!(fire(&mut h, Fired::Named("n")).1.is_empty());
     let (step, log) = cast(&mut h, Ev::Zero);
-    assert_eq!((step.set, log), (vec![(Fired::State, Duration::ZERO)], strs(&["to50@1"])));
+    assert_eq!((set(&step), log), (vec![(Fired::State, Duration::ZERO)], strs(&["to50@1"])));
+    let zero = step.set[0].0.clone();
+    assert!(fire_id(&mut h, &zero).0.stale, "a zero time-out is handled in its own step and never held, so its id fires nothing");
 
     // Replies go out before the enter call's, and a call postponed is answered after the change.
     let mut h = fresh();
@@ -149,7 +191,8 @@ fn statem_engine_table() {
     assert_eq!(h.cast(Ev::Move(1)).replies, [(2, Some(508))]);
     assert!(h.call(253).replies.is_empty());
     let step = h.call(252);
-    assert_eq!((step.replies, step.entered, step.set), (vec![(4, Some(1000)), (3, Some(2000))], vec![2], vec![(Fired::State, 5 * S)]));
+    let kinds = set(&step);
+    assert_eq!((step.replies, step.entered, kinds), (vec![(4, Some(1000)), (3, Some(2000))], vec![2], vec![(Fired::State, 5 * S)]));
 
     // An address dropped in a panic the callback catches answers NoReply, and the machine goes on.
     let mut h = fresh();
@@ -169,9 +212,11 @@ fn statem_engine_table() {
     // A stop runs terminate, drops the calls it holds without an entry and ends the harness.
     let mut h = fresh();
     h.call(254);
+    let kept = h.cast(Ev::Arm).set[2].0.clone();
     let step = h.cast(Ev::Stop);
     assert_eq!((step.stopped, step.replies.len(), h.running()), (Some(StopReason::Graceful), 0, false));
     assert_eq!(h.machine().log.last().map(String::as_str), Some("term"));
+    assert!(h.fire_id(&kept).stale, "once the machine has stopped every firing reads stale");
     assert!(h.cast(Ev::Tag(1)).entered.is_empty() && h.stop(StopReason::Graceful).stopped.is_none());
 
     // Repeat runs the enter call again and, like Keep, retries no postponed event.

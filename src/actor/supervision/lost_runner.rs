@@ -25,8 +25,8 @@ use crate::actor::{Actor, ActorExt};
 use crate::error::{ActorError, ActorResult, SupervisionError};
 use crate::system::read_status;
 use crate::types::{
-    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartType, Shutdown, StopReason,
-    StreamEvent, SupervisionAction,
+    ActorId, ActorStatus, ChildEvent, ChildStoppedInternal, RestartStrategy, RestartType, Shutdown,
+    StopReason, StreamEvent, SupervisionAction,
 };
 
 static UNIQ: AtomicUsize = AtomicUsize::new(0);
@@ -70,6 +70,30 @@ struct Probe {
     worker_done: AtomicBool,
     /// Set at the top of each turn the child handles.
     in_turn: AtomicBool,
+    /// When set, the child's `pre_start` waits for a permit of this gate and
+    /// then asks for its start to be ignored.
+    ignore_gate: Mutex<Option<Arc<Notify>>>,
+    /// Notified by each start of the child `Cmd::AddNext` registers.
+    next_started: Notify,
+}
+
+/// A child that notifies the probe at each start.
+struct Starts {
+    probe: Arc<Probe>,
+}
+
+impl Actor for Starts {
+    type Message = ();
+    type Response = ();
+
+    async fn pre_start(&mut self, _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        self.probe.next_started.notify_one();
+        Ok(())
+    }
+
+    async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        Ok(())
+    }
 }
 
 /// A child that vetoes every request to stop and spends `TURN` inside each
@@ -125,6 +149,15 @@ fn stuck_long(rig: &Rig) -> Unsticks {
 impl Actor for Vetoer {
     type Message = ();
     type Response = ();
+
+    async fn pre_start(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+        let gate = self.probe.ignore_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+            ctx.ignore();
+        }
+        Ok(())
+    }
 
     async fn handle(&mut self, _msg: (), _ctx: &mut ActorContext<Self>) -> ActorResult<()> {
         self.probe.in_turn.store(true, Ordering::SeqCst);
@@ -366,6 +399,16 @@ enum Cmd {
     Inspect(String),
     /// Makes the child a member the pending group restart waits for.
     PendGroup(String),
+    /// Starts a `Permanent` child that notifies the probe at each start, then
+    /// terminates it: its spec stays, down, for a group's chain to start.
+    AddNext(String),
+    /// Puts a group restart in its chain with this member as the front and
+    /// the second name queued behind it, the front's attempt being the
+    /// stand-in's incarnation.
+    PendChain(String, String),
+    /// Puts a group restart in its stop phase awaiting this member's attempt,
+    /// with the second name to start once the stop phase is done.
+    PendAwaited(String, String),
     /// `terminate_child`, awaited, and whether the child carries the
     /// verdict when the call returns.
     TerminateThenVerdict(String),
@@ -375,6 +418,12 @@ enum Cmd {
     FailAttemptThenStop,
     /// As `AdoptAttempt`, with an attempt that never ends.
     AdoptHungAttempt(String),
+    /// As `AdoptAttempt`, for a `Permanent` child whose incarnation ignores
+    /// its start once the probe's gate opens.
+    AdoptIgnoringAttempt(String),
+    /// Answers `Ok` when the child is in the ledger, down, with no restart
+    /// pending, else says what it reads.
+    DownKept(String),
     /// Fails the stand-in attempt only.
     FailOnly,
     /// Waits until a child value dropped, then stops the supervisor.
@@ -457,7 +506,11 @@ impl Sup {
                 if std::hint::black_box(true) {
                     panic!("runner failed");
                 }
-                (id, StopReason::Graceful, incarnation)
+                (
+                    id,
+                    crate::actor::supervision::RunnerEnd::Ended(StopReason::Graceful),
+                    incarnation,
+                )
             }
         });
         sup.task_owner
@@ -521,10 +574,25 @@ impl Actor for Sup {
                 )?;
                 Ok(Ok(()))
             }
-            Cmd::AdoptAttempt(_) | Cmd::AdoptHungAttempt(_) => {
-                let (name, hung) = match cmd {
-                    Cmd::AdoptAttempt(name) => (name, false),
-                    Cmd::AdoptHungAttempt(name) => (name, true),
+            Cmd::DownKept(name) => {
+                let info = ctx
+                    .children()
+                    .into_iter()
+                    .find(|info| info.id.as_str() == name);
+                Ok(match info {
+                    Some(info) if !info.is_alive && !info.restart_pending => Ok(()),
+                    other => Err(format!(
+                        "the child reads alive={:?} restart_pending={:?}",
+                        other.as_ref().map(|info| info.is_alive),
+                        other.as_ref().map(|info| info.restart_pending)
+                    )),
+                })
+            }
+            Cmd::AdoptAttempt(_) | Cmd::AdoptHungAttempt(_) | Cmd::AdoptIgnoringAttempt(_) => {
+                let (name, hung, ignoring) = match cmd {
+                    Cmd::AdoptAttempt(name) => (name, false, false),
+                    Cmd::AdoptHungAttempt(name) => (name, true, false),
+                    Cmd::AdoptIgnoringAttempt(name) => (name, false, true),
                     _ => unreachable!(),
                 };
                 let id = ActorId::from(name.clone());
@@ -560,6 +628,7 @@ impl Actor for Sup {
                     .verdicts
                     .clone();
                 let (ctl, io) = slot_pair(verdicts);
+                *self.probe.plane.lock().unwrap() = Some(handle.status_rx());
                 io.publish(
                     handle.stop_lane(),
                     handle.status_rx(),
@@ -611,7 +680,11 @@ impl Actor for Sup {
                     id,
                     name: Some(Arc::from(name)),
                     spec: ChildSpec {
-                        restart_type: RestartType::Temporary,
+                        restart_type: if ignoring {
+                            RestartType::Permanent
+                        } else {
+                            RestartType::Temporary
+                        },
                         shutdown: Shutdown::Timeout(Duration::from_millis(if hung {
                             300
                         } else {
@@ -670,12 +743,13 @@ impl Actor for Sup {
                         child_id: ActorId::from(name.clone()),
                         reason: crash.clone(),
                         incarnation: 1,
+                        ignored: false,
                     });
                 }
                 let id = ActorId::from(first);
                 let task = sup.death_set.spawn({
                     let id = id.clone();
-                    async move { (id, crash, 1) }
+                    async move { (id, crate::actor::supervision::RunnerEnd::Ended(crash), 1) }
                 });
                 sup.task_owner.insert(task.id(), (id, 1, TaskPlane::Death));
                 Ok(Ok(()))
@@ -745,6 +819,57 @@ impl Actor for Sup {
                     ctx.stop_child(name).await.map(|_| ())
                 };
                 Ok(answer.map_err(|err| format!("{err:?}")))
+            }
+            Cmd::AddNext(name) => {
+                let probe = self.probe.clone();
+                ctx.spawn_child(move || Starts {
+                    probe: probe.clone(),
+                })
+                .named(name.clone())
+                .restart_type(RestartType::Permanent)
+                .await_init()
+                .await?;
+                // The first start's notification is spent here, so the next
+                // one is the chain's.
+                self.probe.next_started.notified().await;
+                Ok(ctx
+                    .terminate_child(name)
+                    .await
+                    .map_err(|err| format!("{err:?}")))
+            }
+            Cmd::PendChain(member, next) => {
+                let sup = ctx.supervision_mut().expect("a supervisor");
+                let id = ActorId::from(member);
+                let attempt = sup
+                    .registry
+                    .get(&id)
+                    .map(|child| child.lifecycle.held_token())
+                    .expect("the member's attempt is registered");
+                sup.pending_group = Some(GroupPhase::Restarting {
+                    queue: [id.clone(), ActorId::from(next)].into_iter().collect(),
+                    overrides: Default::default(),
+                    started: [(id, attempt)].into_iter().collect(),
+                    scope: Default::default(),
+                });
+                Ok(Ok(()))
+            }
+            Cmd::PendAwaited(member, next) => {
+                let sup = ctx.supervision_mut().expect("a supervisor");
+                let id = ActorId::from(member);
+                let attempt = sup
+                    .registry
+                    .get(&id)
+                    .map(|child| child.lifecycle.held_token())
+                    .expect("the member's attempt is registered");
+                sup.pending_group = Some(GroupPhase::Stopping(GroupRestart {
+                    awaiting: [(id, attempt)].into_iter().collect(),
+                    stop_queue: Default::default(),
+                    head_reached: false,
+                    restart_order: vec![ActorId::from(next)],
+                    manual_overrides: Default::default(),
+                    scope: Default::default(),
+                }));
+                Ok(Ok(()))
             }
             Cmd::PendGroup(name) => {
                 let sup = ctx.supervision_mut().expect("a supervisor");
@@ -1687,6 +1812,104 @@ async fn a_teardown_of_an_attempt_lost_after_its_spawn_does_not_panic() {
             .any(|p| p.contains("all branches are disabled")),
         "the supervisor's teardown panicked: {panics:?}"
     );
+}
+
+/// An attempt of a group member whose task is lost is followed through the
+/// death plane to its incarnation's end. When that incarnation ended by an
+/// ignored start, the end is no death on either group route: the member is
+/// the chain's own front, or a child the group's stop phase awaits. Nothing
+/// is charged (the budget allows no restart), no callback runs for the
+/// member, it stays down with its spec, and the group goes on to start its
+/// next member.
+async fn a_lost_attempts_ignored_start_is_no_death() {
+    for chain_front in [true, false] {
+        let probe = Arc::new(Probe::default());
+        let gate = Arc::new(Notify::new());
+        *probe.ignore_gate.lock().unwrap() = Some(gate.clone());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Mutex::new(Vec::new()));
+        let sup = Sup {
+            probe: probe.clone(),
+            fail: Arc::new(Notify::new()),
+            reports: reports.clone(),
+            stopped: stopped.clone(),
+            fail_delivery: Arc::new(AtomicBool::new(false)),
+        }
+        .spawn()
+        .named(uname("sup"))
+        .with_supervision(SupervisionConfig {
+            strategy: RestartStrategy::OneForAll,
+            ..SupervisionConfig::default().max_restarts(0, Duration::from_secs(60))
+        })
+        .await
+        .expect("supervisor spawn");
+        let next = uname("next");
+        let member = uname("member");
+        assert_eq!(sup.send(Cmd::AddNext(next.clone())).await.unwrap(), Ok(()));
+        assert_eq!(
+            sup.send(Cmd::AdoptIgnoringAttempt(member.clone()))
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        let pend = if chain_front {
+            Cmd::PendChain(member.clone(), next.clone())
+        } else {
+            Cmd::PendAwaited(member.clone(), next.clone())
+        };
+        assert_eq!(sup.send(pend).await.unwrap(), Ok(()));
+        // The incarnation ignores its start and ends before the attempt's
+        // task is lost.
+        gate.notify_one();
+        let mut plane = probe
+            .plane
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the incarnation's plane");
+        timeout(
+            Duration::from_secs(30),
+            plane.wait_for(|value| value.status == ActorStatus::Stopped),
+        )
+        .await
+        .expect("the incarnation ends")
+        .expect("the plane reads the end");
+        let _ = sup.send(Cmd::FailOnly).await;
+        // The group reaches its next member only after the ignored end was
+        // taken.
+        timeout(Duration::from_secs(30), probe.next_started.notified())
+            .await
+            .expect("the group started its next member");
+        assert_eq!(
+            sup.send(Cmd::DownKept(member.clone()))
+                .await
+                .expect("the supervisor is alive"),
+            Ok(()),
+            "chain_front={chain_front}: the member is down with its spec"
+        );
+        assert!(
+            !reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|report| report.event.child_id.as_str() == member),
+            "chain_front={chain_front}: an ignored start is reported to no callback"
+        );
+        assert!(
+            stopped.lock().unwrap().is_empty(),
+            "chain_front={chain_front}: nothing was charged and the supervisor runs"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_attempts_ignored_start_is_no_death_multi_thread() {
+    a_lost_attempts_ignored_start_is_no_death().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_attempts_ignored_start_is_no_death_current_thread() {
+    a_lost_attempts_ignored_start_is_no_death().await;
 }
 
 async fn a_teardown_of_a_lost_attempt_does_not_wait_on_an_older_siblings_attempt() {

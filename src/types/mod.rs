@@ -1241,6 +1241,9 @@ pub(crate) struct ChildStoppedInternal {
     /// incarnation matches neither the child's current incarnation nor its
     /// pending restart seq are stale (a superseded instance) and are ignored.
     pub incarnation: u64,
+    /// The incarnation's start was ignored: read from its own end, so a
+    /// consumer never looks the incarnation up in a ledger that moved on.
+    pub ignored: bool,
 }
 
 /// Terminal outcome of one child incarnation, written by its runner once the
@@ -1258,4 +1261,7 @@ pub(crate) struct ChildFate {
     pub reason: StopReason,
     /// The incarnation this fate belongs to.
     pub incarnation: u64,
+    /// The incarnation's start was ignored: its task ended by itself with no
+    /// death to report.
+    pub ignored: bool,
 }

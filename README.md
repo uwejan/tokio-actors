@@ -560,7 +560,7 @@ A caller of the message that returned `Next::Stop` still gets the response, afte
 
 ### State Machines
 
-A `StateMachine` is the `gen_statem` behaviour: a plain type with one `handle_event` that cannot await. It gets the state, a `StatemEvent` and a `StatemContext`, and returns a `Transition`. `StatemActor::new(machine, initial)` runs it as an ordinary actor, and a `Harness` runs the same machine in a test with no runtime. Below, `Lock` holds a `code: u32`; clients use `door.cast(code)`, `door.call(())` and `door.call_timeout(call, d)`.
+A `StateMachine` is the `gen_statem` behaviour: a plain type with one `handle_event` that cannot await. It gets the state, a `StatemEvent` and a `StatemContext`, and returns a `Transition`. `StatemActor::new(machine, initial)` runs it as an ordinary actor, and a `Harness` runs the same machine in a test with no runtime. `Harness` is `Send`, and `Sync` when the machine and its associated types are `Sync`. Below, `Lock` holds a `code: u32`; clients use `door.cast(code)`, `door.call(())` and `door.call_timeout(call, d)`.
 
 The events are `Cast`, `Call` with its `ReplyTo`, `Internal` (inserted with `cx.next_event`) and the time-outs `EventTimeout`, `StateTimeout` and `Timeout(name, ..)`. A `Transition` is `Next(state)`, a state change only when the state differs, `Keep`, `Repeat`, which runs `on_enter` again, or `Stop(reason)`. `on_enter` runs once before the first event and after every state change. A call is answered with `cx.reply(from, value)`, at once or after `cx.postpone`, which handles the event again, oldest first, after the next state change; `postpone` and `next_event` refuse, returning the event, once the events the machine holds (postponed, inserted, queued time-out events and a continued event) have reached the mailbox capacity (64 under a `Harness`). A state change cancels the state time-out, any other event handled cancels the event time-out, and under `StatemActor` each time-out setter needs the Tokio time driver and panics without it; a `Harness` needs none. A `ReplyTo` dropped without a reply while the machine runs answers its caller `AskError::Actor(ActorError::NoReply)`; once the machine is stopping or ended, the caller reads `AskError::ResponseDropped` with the machine's final reason. A panic in `handle_event` fails the machine, and the calls it holds then read `AskError::ResponseDropped` with the failure. `Transition::Stop(reason)` handles no further event and sends the replies recorded in that call first; `Stop(StopReason::Kill)` is refused and fails the machine with an error. `terminate` runs once at the stop, unless the machine is killed or its start failed, and has no context, so it cannot reply: a call still held ends with the machine. See `examples/statem_door.rs`.
 
@@ -767,6 +767,8 @@ async fn handle(&mut self, msg: Job, _ctx: &mut ActorContext<Self>) -> ActorResu
 
 Recipes for Erlang/OTP behaviors the crate does not offer directly, built from the API above.
 
+The `otp_map` module page lists the Erlang/OTP facilities with their counterparts here, or the reason one has none.
+
 | To get | Pattern |
 |---|---|
 | `spawn_request` | Spawn without waiting: `tokio::spawn` the spawn future (it is `Send`) and `notify` its result back to the actor that asked. |
@@ -785,7 +787,7 @@ Recipes for Erlang/OTP behaviors the crate does not offer directly, built from t
 | Kill latency, or turn atomicity | `kill_grace(Duration::ZERO)` gives Erlang/OTP's kill latency for a callback that awaits; a grace beyond any practical bound keeps every turn whole, and makes every wait that runs on that grace, its parent's stop budget included, last for the grace, which in practice is as long as under `Shutdown::Infinity`, while `stop_within(StopReason::Kill, d)` still aborts after `d`. |
 | Locality | An actor reaches only the actors whose handles it holds, except through its system, which knows every registered actor by id: `get` and `get_by_id` return a typed handle to a registered actor of the type asked for (`get` only for a named one), `actor_ids`, `registered` and `actor_status` read the registry, `stop` and `kill` act on a named actor, and `kill_by_id` on any registered id. |
 | Address identity | An actor's address is its handle's channels; its `ActorId` and name are aliases a restarted child keeps, so a handle to an ended incarnation and one to its successor compare equal: check `is_alive()` or resolve the id again with `get_by_id`. A caller that talks to a restartable actor resolves it by name (`get`) or by id (`get_by_id`) for each call instead of keeping a handle: a lookup that finds nothing is final for an actor that nothing restarts; for a supervised actor it means either that the next incarnation is not registered yet or that its supervisor will not restart it, so bound the retries, and a handle whose send returned `Closed` belongs to an ending incarnation, so wait for it with `wait_stopped` and look the actor up again. |
-| Postpone, stash | Push the message onto a bounded queue in the actor's own fields and replay it from `handle` once the state allows; the queue sits outside the mailbox bound, so cap it yourself. |
+| Postpone, stash | Push the message onto a bounded queue in the actor's own fields and replay it from `handle` once the state allows; the queue sits outside the mailbox bound, so cap it yourself; see `examples/stash.rs`. |
 | Delivery at the end | A message accepted while the actor runs a supervisor's final deliveries or `on_stopped` is dropped unhandled; from the return of `on_stopped` (the loop's end under a `Kill`) on, sends are refused. |
 | A send that never blocks | `ActorConfig::default().with_mailbox_capacity(usize::MAX)` (clamped to `Semaphore::MAX_PERMITS`) makes `notify` never wait; the queue then grows without bound, so a flood can exhaust memory. |
 | The `gen_server:stop` order | Send a `Stop` message whose handler calls `ctx.self_handle().stop(..)`, so earlier mail is handled first. |
@@ -966,7 +968,7 @@ A spawn waits for `pre_start` and `on_started` before it resolves, so spawning m
 | `postpone(event)`, `next_event(event)` | On `cx`: handle `event` again after the next state change, or insert an event handled before any postponed or mailbox event; each hands the event back when the events the machine holds (postponed, inserted, queued time-out events and a continued event) have reached the mailbox capacity |
 | `event_timeout(d, event)`, `state_timeout(d, event)`, `timeout(name, d, event)` | On `cx` (and `on_enter`'s): start a time-out; each has a `cancel_` form that returns `true` when it was running |
 | `actor()` | On `cx`: the `ActorContext`, `None` under a `Harness`; registrations that do not await are made here: `monitor`, `request`, `subscribe` and `trap_exit` with a map built by `StatemMessage::cast`, `add_stream` with an event type that converts from `StreamEvent`, and `link` and `alias` with no map |
-| `Harness::new(machine, initial)` | Drive a machine with no runtime: `cast`, `call`, `fire(Fired)` and `stop(reason)` each return a `Step` of the replies, time-outs set and cancelled, postponed count, states entered and stop reason |
+| `Harness::new(machine, initial)` | Drive a machine with no runtime: `cast`, `call`, `fire(Fired)`, `fire_id(&TimeoutId)` and `stop(reason)` each return a `Step` of the replies, time-outs set and cancelled, postponed count, states entered and stop reason; `fire` fires the running setting of a kind and `fire_id` only the setting it names; a firing of no running setting reads `stale`; `set` and `cancelled` entries carry a `TimeoutId` |
 
 ### Event Manager Methods
 
@@ -1092,8 +1094,19 @@ Tests cover:
 | `stream_counter` | External stream integration |
 | `supervision` | Parent-child supervision with restart |
 | `statem_door` | State machine with a state time-out |
+| `statem_driver` | A harness whose time-outs run on an actor's timers |
 | `event_alarms` | Event manager with two handlers, one removed |
 | `app_tree` | Application with a top supervisor and two workers |
+| `stash` | Bounded stash replayed when the state allows |
+| `heir_table` | Table held in an actor's fields, handed to an heir |
+| `idle_shrink` | Capacity released when the actor goes idle |
+| `flood_guard` | Guard that polls the system snapshot and stops an actor whose mailbox stays long |
+| `link_monitor` | Links, trapped exits and monitors |
+| `pg_groups` | Process group with a group monitor |
+| `request_continue` | Requests answered as messages, then a continuation |
+| `alias_priority` | Priority alias with the priority gate |
+| `supervisor_ref` | Supervisor reference and auto shutdown |
+| `sys_telemetry` | Debug statistics and a telemetry handler |
 
 Run with:
 ```bash
@@ -1112,6 +1125,7 @@ Multi-agent AI systems need exactly the guarantees described above. Each agent i
 
 - **Remote messaging**: Tokio Actors is explicitly local (in-process)
 - **Distributed systems**: tokio-actors is local-first and has no networking or clustering layer
+- **Selective receive and shared tables**: see the `otp_map` module page for the substitutes
 - **Proc macros**: We keep it simple, just traits
 
 ---

@@ -307,7 +307,12 @@ impl<S: Actor> SupervisorRef<S> {
     /// - [`SupervisorRefError::Spawn`] with the error `spawn_child` has
     ///   ([`SpawnError::DuplicateChild`](crate::error::SpawnError::DuplicateChild) for an id the supervisor holds a
     ///   spec for, [`SpawnError::NotASupervisor`](crate::error::SpawnError::NotASupervisor) for an actor with no
-    ///   supervision configured).
+    ///   supervision configured). With `await_init`, a child whose start was
+    ///   ignored answers `SupervisorRefError::Spawn(SpawnError::Ignored)` and
+    ///   its spec is kept, down, as `supervisor:start_child` keeps it with an
+    ///   undefined pid, except for a `Temporary` child and under
+    ///   `SimpleOneForOne`, whose spec is removed; for a kept spec,
+    ///   `restart_child` or `delete_child` follow.
     ///
     /// # Examples
     /// ```rust

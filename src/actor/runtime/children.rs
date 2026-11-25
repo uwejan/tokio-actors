@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 
 use super::{
     advance_group_stop, fail_with, handle_worklist_with, initiate_restart, settle_barrier,
-    HookOutcome,
+    settle_ignored_attempt, HookOutcome, IgnoredSettle,
 };
 use crate::actor::context::ActorContext;
 use crate::actor::incarnation::turn_clock::push_turn;
@@ -35,6 +35,9 @@ pub(super) enum Routed {
     /// The restart chain's own start failed: the whole group is retried,
     /// charged to the budget once.
     ChainRetry,
+    /// The end of an attempt's incarnation whose start was ignored: the
+    /// ledger is settled and nothing is charged, retried or delivered.
+    Ignored(Box<IgnoredSettle>),
     /// The ordinary death path: the strategy decides.
     Evaluate,
 }
@@ -96,6 +99,12 @@ pub(super) fn route_report(
     };
 
     if attempt {
+        // An attempt whose task was lost is followed to its incarnation's
+        // end through the death plane: an ignored end takes one path for
+        // every route below.
+        if ev.ignored {
+            return Routed::Ignored(Box::new(settle_ignored_attempt(sup, id, incarnation)));
+        }
         // The attempt spawned an incarnation if its cell holds the subtree:
         // the next start for the child waits for it, whether or not the
         // incarnation was adopted.

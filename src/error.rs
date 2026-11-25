@@ -309,6 +309,16 @@ pub enum SpawnError {
     /// reports the same case to the starter as `{error, killed}`.
     #[error("actor was killed before its spawn was answered")]
     Killed,
+    /// The actor's `pre_start` called
+    /// [`ActorContext::ignore`](crate::actor::context::ActorContext::ignore) and
+    /// returned `Ok(())`, so it ran no `on_started`, no message loop and no
+    /// `on_stopped`, and ended with `StopReason::Graceful`; Erlang/OTP's start
+    /// function answers `ignore` in the same case. A supervised child answered
+    /// this way keeps its spec, down, unless it is `Temporary` or a
+    /// `SimpleOneForOne` pool member: `restart_child` starts it again,
+    /// `delete_child` removes it.
+    #[error("the actor's start was ignored")]
+    Ignored,
     /// The actor that asked for a monitored or linked spawn is stopping or has
     /// stopped. Nothing was spawned: a stopping actor takes no new monitor or
     /// link, because the notices it is owed were fixed when its stop began.

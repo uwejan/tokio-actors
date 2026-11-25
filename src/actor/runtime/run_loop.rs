@@ -280,6 +280,10 @@ async fn run_loop<A: Actor>(parts: Box<RunParts<A>>) -> End<A> {
     // start hook, records no failure and sends no ack. A `Kill` raised while
     // `on_started` runs is seen by the message loop before any hook.
     let mut killed_in_init = false;
+    // Set when `pre_start` asked, with `ctx.ignore()`, that the start be
+    // ignored: no other hook runs, no ack is sent, no loop runs, and the end is
+    // `Graceful`.
+    let mut ignored = false;
     let init_result: Result<(), ActorError> = 'init: {
         if init_kill_check(stop_rx.borrow().reason.as_ref()) == InitStep::KillNow {
             killed_in_init = true;
@@ -302,6 +306,11 @@ async fn run_loop<A: Actor>(parts: Box<RunParts<A>>) -> End<A> {
         }
         if init_kill_check(stop_rx.borrow().reason.as_ref()) == InitStep::KillNow {
             killed_in_init = true;
+            break 'init Ok(());
+        }
+        if ctx.take_ignore() {
+            status.mark_ignored();
+            ignored = true;
             break 'init Ok(());
         }
 
@@ -339,7 +348,7 @@ async fn run_loop<A: Actor>(parts: Box<RunParts<A>>) -> End<A> {
 
         Ok(())
     };
-    let started = init_result.is_ok() && !killed_in_init;
+    let started = init_result.is_ok() && !killed_in_init && !ignored;
     // The first panic of a drop before the reason is final that the final
     // collection or the children's teardown meets (a child factory, the
     // supervision state); applied once the children are stopped.
@@ -351,6 +360,8 @@ async fn run_loop<A: Actor>(parts: Box<RunParts<A>>) -> End<A> {
 
     let mut stop_reason = if killed_in_init {
         StopReason::Kill
+    } else if ignored {
+        StopReason::Graceful
     } else {
         match &init_result {
             Ok(()) => {
@@ -927,11 +938,12 @@ async fn run_loop<A: Actor>(parts: Box<RunParts<A>>) -> End<A> {
                                 }
                             }
                         }
-                        Some(SupervisionEvent::Death(Ok((task, (child_id, child_reason, incarnation))))) => {
+                        Some(SupervisionEvent::Death(Ok((task, (child_id, end, incarnation))))) => {
+                            let (child_reason, ignored) = end.into_parts();
                             if let Some(sup) = ctx.supervision_mut() {
                                 sup.task_owner.remove(&task);
                             }
-                            let event = ChildStoppedInternal { child_id, reason: child_reason, incarnation };
+                            let event = ChildStoppedInternal { child_id, reason: child_reason, incarnation, ignored };
                             match Box::pin(handle_child_stopped(actor, ctx, event)).await {
                                 ControlFlow::Continue(()) => {}
                                 ControlFlow::Break(reason) => {

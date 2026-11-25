@@ -668,7 +668,7 @@ pub(super) async fn await_strict_children<A: Actor>(
         None => return StrictOutcome::Done,
     };
     let record = ctx.stop_lane().abort_record().clone();
-    for (child, incarnation, mut ack) in acks {
+    for (child, incarnation, child_record, mut ack) in acks {
         let answer = tokio::select! {
             biased;
             () = KillStored { rx: stop_rx, slot: record.reader() } => {
@@ -679,6 +679,9 @@ pub(super) async fn await_strict_children<A: Actor>(
         let kind = match &answer {
             Ok(Ok(())) => StrictAckKind::Ok,
             Ok(Err(_)) => StrictAckKind::Err,
+            // The acknowledgment closed once the child's reason was final:
+            // an ignored start is no failure to start.
+            Err(_closed) if child_record.ended_ignored() => StrictAckKind::Ignored,
             Err(_closed) => StrictAckKind::Closed {
                 ordered: {
                     let held = ctx

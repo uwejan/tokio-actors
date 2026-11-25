@@ -386,6 +386,62 @@ impl<A: Actor> ActorContext<A> {
         Ok(())
     }
 
+    /// Asks that this start be ignored, as Erlang/OTP's `init/1` returning
+    /// `ignore`: read once, when `pre_start` returns `Ok(())`, after which the
+    /// actor runs no `on_started`, no message loop and no `on_stopped` and
+    /// ends with `StopReason::Graceful`; a call anywhere else, or a
+    /// `pre_start` that returns `Err` or panics, leaves it without effect.
+    ///
+    /// A root spawn of an actor whose start was ignored answers
+    /// [`SpawnError::Ignored`](crate::SpawnError::Ignored). A `Kill` that is
+    /// pending when `pre_start` returns ends the actor as `Kill` and the
+    /// request is never read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio_actors::{
+    ///     actor::{Actor, ActorExt, context::ActorContext},
+    ///     ActorResult, SpawnError,
+    /// };
+    ///
+    /// struct Optional;
+    ///
+    /// impl Actor for Optional {
+    ///     type Message = ();
+    ///     type Response = ();
+    ///
+    ///     async fn pre_start(&mut self, ctx: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         // Nothing to do here, so the actor is not started.
+    ///         ctx.ignore();
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn handle(&mut self, _: (), _: &mut ActorContext<Self>) -> ActorResult<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// assert!(matches!(
+    ///     Optional.spawn().await,
+    ///     Err(SpawnError::Ignored)
+    /// ));
+    /// # }
+    /// ```
+    pub fn ignore(&mut self) {
+        self.ex_mut().ignore_start = true;
+    }
+
+    /// Reads and clears the request of [`ignore`](Self::ignore), creating no
+    /// extras for an actor that never made one.
+    pub(crate) fn take_ignore(&mut self) -> bool {
+        self.extras
+            .as_deref_mut()
+            .is_some_and(|e| std::mem::take(&mut e.ignore_start))
+    }
+
     /// Ends the supervisor's start phase, in which a strict start keeps the
     /// acknowledgment of each child spawned. Tells whether the phase was on.
     pub(crate) fn end_init_phase(&mut self) -> bool {

@@ -156,6 +156,15 @@ pub(crate) enum RestartDecision {
     Remove,
 }
 
+/// What becomes of a child's spec when its start was ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IgnoredEnd {
+    /// The spec is kept and the child stays down.
+    KeepDown,
+    /// The spec is removed.
+    Remove,
+}
+
 /// What a strategy restarts once the budget accepted a charge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrategyScope {

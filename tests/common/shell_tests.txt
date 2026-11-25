@@ -225,6 +225,7 @@ tests/id_reuse.rs	timeout	1	unclassified
 tests/idle_deadline.rs	clock	4	unclassified
 tests/idle_deadline.rs	proxy	7	unclassified
 tests/idle_deadline.rs	timeout	1	unclassified
+tests/ignore_start.rs	proxy	2	an ignored end sends no notice, so the settled child row is read by a bounded poll
 tests/kill_before_the_first_poll_of_a_child.rs	timeout	5	unclassified
 tests/kill_by_id_reports_one_actor.rs	clock	2	unclassified
 tests/kill_by_id_reports_one_actor.rs	timeout	1	unclassified

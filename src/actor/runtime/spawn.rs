@@ -22,7 +22,7 @@ use crate::actor::panic::AnswerHold;
 #[cfg(test)]
 use crate::actor::runtime::end_hooks;
 use crate::actor::supervision::{
-    run_ladder, ChildLinkGuard, DeathOutcome, SlotIo, SupervisionState,
+    run_ladder, ChildLinkGuard, DeathOutcome, RunnerEnd, SlotIo, SupervisionState,
 };
 use crate::actor::sys::SysOptions;
 use crate::actor::Actor;
@@ -676,9 +676,13 @@ pub(crate) fn spawn_runner(
         let mut join = join;
         let mut io = io;
         let reason = run_ladder(&mut join, ended, &lane, &mut io, grace).await;
+        // The ladder returned the incarnation's end: its reason is final, and
+        // the record says whether the end was an ignored start.
+        let ignored = lane.abort_record().ended_ignored();
         io.record_fate(ChildFate {
             reason: reason.clone(),
             incarnation,
+            ignored,
         });
         // The child has terminated and its fate is recorded: the guard has
         // nothing left to force, so its drop below must not raise Kill,
@@ -687,7 +691,7 @@ pub(crate) fn spawn_runner(
         if let Some(owner) = &owner {
             crate::telemetry::death_landed(owner, incarnation);
         }
-        (child_id, reason, incarnation)
+        (child_id, RunnerEnd::new(reason, ignored), incarnation)
     })
 }
 

@@ -19,8 +19,8 @@ use crate::actor::incarnation::StopLane;
 use crate::actor::runtime::end_hooks;
 use crate::actor::supervision::{
     advance_restart_chain, evaluate_strategy_charged, rules, ChainStep, ChildLifecycle,
-    ChildLinkGuard, DownPending, GroupPhase, GroupRestart, GroupScope, Origin, ReportClass,
-    RestartFn, RestartOutcome, SlotIo, StrategyOutcome, SupervisionState, TaskPlane,
+    ChildLinkGuard, DownPending, GroupPhase, GroupRestart, GroupScope, IgnoredEnd, Origin,
+    ReportClass, RestartFn, RestartOutcome, SlotIo, StrategyOutcome, SupervisionState, TaskPlane,
     DEFAULT_KILL_GRACE,
 };
 use crate::actor::Actor;
@@ -144,7 +144,12 @@ pub(super) async fn handle_worklist_with<A: Actor>(
                     advance_and_initiate(ctx, work);
                 }
             }
-            deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
+            // The stop landed after the incarnation had already ended by its
+            // ignored start: the bookkeeping above ran, and the end is no
+            // death to report.
+            if !ev.ignored {
+                deliver_child_event(actor, ctx, &child_event, ev.incarnation).await?;
+            }
             continue;
         }
 
@@ -225,8 +230,16 @@ pub(super) async fn handle_worklist_with<A: Actor>(
                     action = SupervisionAction::Removed;
                 }
                 if let Some(err) = drop_removed(ctx, removed) {
-                    owe_report(ctx, ev, child_name);
+                    // An ignored end owes no report.
+                    if !ev.ignored {
+                        owe_report(ctx, ev, child_name);
+                    }
                     return ControlFlow::Break(StopReason::Failure(err));
+                }
+                // An ignored end is bookkeeping only: the group's chain and
+                // the spec's removal above ran, and no report is made.
+                if ev.ignored {
+                    continue;
                 }
                 let child_event = ChildEvent {
                     child_id: ev.child_id,
@@ -268,7 +281,33 @@ pub(super) async fn handle_worklist_with<A: Actor>(
                 ctx.record_failure(SupervisionError::BudgetExhausted.into());
                 return ControlFlow::Break(StopReason::ParentRequest);
             }
+            Routed::Ignored(settle) => {
+                // A lost attempt's incarnation ended by its ignored start:
+                // no charge, no retry of the group, no report.
+                match carry_out_ignored(ctx, *settle) {
+                    Ok(released) => {
+                        // The reports the chain released join the worklist
+                        // behind what it holds, as on every other route that
+                        // ends a group.
+                        work.extend(released);
+                        continue;
+                    }
+                    Err(reason) => return ControlFlow::Break(reason),
+                }
+            }
             Routed::Evaluate => {}
+        }
+
+        // The end of an incarnation whose start was ignored is no death:
+        // nothing is restarted, charged, reported or delivered, and the spec
+        // is kept down or removed by one rule. The ledger already holds the
+        // end as `Down` with nothing owed.
+        if let Some(end) = ignored_start_end(ctx, &ev) {
+            let removed = settle_ignored_end(ctx, &ev, end);
+            if let Some(err) = drop_removed(ctx, removed) {
+                return ControlFlow::Break(StopReason::Failure(err));
+            }
+            continue;
         }
 
         // Normal path: the ledger holds the end; evaluate the strategy, act.
@@ -548,6 +587,174 @@ fn start_restart_chain<A: Actor>(
     }
 }
 
+/// What the supervisor does with the spec of the child `ev` reports, when the
+/// report is of an incarnation whose start was ignored: `None` for any other
+/// end. The fact is read from the report itself, set from the incarnation's
+/// own end, never from a ledger entry that may have moved past it; an entry
+/// that is gone has nothing left to settle.
+fn ignored_start_end<A: Actor>(
+    ctx: &ActorContext<A>,
+    ev: &ChildStoppedInternal,
+) -> Option<IgnoredEnd> {
+    if !ev.ignored {
+        return None;
+    }
+    Some(
+        ctx.supervision_ref()
+            .and_then(|sup| {
+                let child = sup.registry.get(&ev.child_id)?;
+                Some(rules::ignored_end(
+                    sup.config.strategy,
+                    child.spec.restart_type,
+                ))
+            })
+            .unwrap_or(IgnoredEnd::KeepDown),
+    )
+}
+
+/// Settles the end of an ignored start in the ledger: the entry stays down
+/// with nothing owed (`KeepDown`) or its spec is removed (`Remove`).
+/// Returns the removed factory, for the caller to drop after its last write.
+#[must_use = "the factory is dropped by the caller, after its last write"]
+fn settle_ignored_end<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    ev: &ChildStoppedInternal,
+    end: IgnoredEnd,
+) -> Option<RestartFn> {
+    let sup = ctx.supervision_mut()?;
+    match end {
+        IgnoredEnd::KeepDown => {
+            if let Some(child) = sup.registry.get_mut(&ev.child_id) {
+                child.transition_expected(ChildLifecycle::Down {
+                    incarnation: ev.incarnation,
+                    pending: DownPending::None,
+                });
+            }
+            None
+        }
+        IgnoredEnd::Remove => sup.remove_spec(&ev.child_id),
+    }
+}
+
+/// What the ledger part of an ignored attempt's end leaves for the run loop
+/// to carry out.
+pub(super) struct IgnoredSettle {
+    /// The removed spec's factory, for the caller to drop after its last
+    /// write.
+    removed: Option<RestartFn>,
+    /// The group's stop phase emptied: the chain starts from this.
+    begin_chain: Option<ChainStart>,
+    /// The chain's next step when the member was its front.
+    step: ChainStep,
+    /// The reports the chain released.
+    released: VecDeque<ChildStoppedInternal>,
+}
+
+/// The ledger part of the end of an attempt whose incarnation's start was
+/// ignored: the entry reaches `Down` with nothing owed (kept) or the spec is
+/// removed by `ignored_end`, the group's barrier settles its wait on the
+/// member, and a chain whose front it was moves past it. Nothing is charged,
+/// restarted, reported or delivered. An entry that does not hold the
+/// attempt is left as it is.
+pub(super) fn settle_ignored_attempt(
+    sup: &mut SupervisionState,
+    child_id: &ActorId,
+    incarnation: u64,
+) -> IgnoredSettle {
+    let mut settle = IgnoredSettle {
+        removed: None,
+        begin_chain: None,
+        step: ChainStep::Hold,
+        released: VecDeque::new(),
+    };
+    sup.settle_attempt(child_id, incarnation, || AttemptOutcome::Abandoned);
+    let end = sup.registry.get(child_id).and_then(|child| {
+        matches!(
+            child.lifecycle,
+            ChildLifecycle::Restarting { next, .. } if next == incarnation
+        )
+        .then(|| rules::ignored_end(sup.config.strategy, child.spec.restart_type))
+    });
+    let Some(end) = end else {
+        return settle;
+    };
+    // The incarnation was spawned: the next start for the child waits for
+    // its subtree.
+    if let Some(child) = sup.registry.get_mut(child_id) {
+        child.note_subtree();
+    }
+    let was_front = matches!(
+        sup.pending_group.as_ref(),
+        Some(GroupPhase::Restarting { queue, started, .. })
+            if queue.front() == Some(child_id)
+                && started.get(child_id) == Some(&incarnation)
+    );
+    record_cancelled(sup, child_id, incarnation);
+    match end {
+        IgnoredEnd::KeepDown => {
+            if was_front {
+                if let Some(GroupPhase::Restarting { queue, .. }) = sup.pending_group.as_mut() {
+                    queue.pop_front();
+                }
+            }
+        }
+        IgnoredEnd::Remove => settle.removed = sup.remove_spec(child_id),
+    }
+    if settle_barrier(sup, child_id, incarnation) {
+        settle.begin_chain = advance_group_stop(sup);
+    } else if was_front {
+        settle.step = advance_restart_chain(sup, &mut settle.released);
+    }
+    settle
+}
+
+/// Carries out an [`IgnoredSettle`]: starts the chain or initiates its next
+/// member and drops the removed factory. Returns the reports the chain
+/// released, for the caller to handle; a factory drop panic ends the turn,
+/// with those reports left owed.
+fn carry_out_ignored<A: Actor>(
+    ctx: &mut ActorContext<A>,
+    settle: IgnoredSettle,
+) -> Result<VecDeque<ChildStoppedInternal>, StopReason> {
+    let IgnoredSettle {
+        removed,
+        begin_chain,
+        step,
+        mut released,
+    } = settle;
+    if let Some(start) = begin_chain {
+        start_restart_chain(ctx, start, &mut released);
+    } else if let ChainStep::Initiate(next) = step {
+        initiate_restart(ctx, &next, Origin::Chain);
+    }
+    if let Some(err) = drop_removed(ctx, removed) {
+        if let Some(sup) = ctx.supervision_mut() {
+            sup.owed.extend(released);
+        }
+        return Err(StopReason::Failure(err));
+    }
+    Ok(released)
+}
+
+/// Handles an attempt whose incarnation's start was ignored: no charge, no
+/// restart, no report, and a group's chain goes on to its next member, as
+/// after an adoption.
+async fn handle_ignored_attempt<A: Actor>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    child_id: ActorId,
+    incarnation: u64,
+) -> ControlFlow<StopReason> {
+    let Some(sup) = ctx.supervision_mut() else {
+        return ControlFlow::Continue(());
+    };
+    let settle = settle_ignored_attempt(sup, &child_id, incarnation);
+    match carry_out_ignored(ctx, settle) {
+        Ok(released) => handle_released(actor, ctx, released).await,
+        Err(reason) => ControlFlow::Break(reason),
+    }
+}
+
 /// Dispatches one restart attempt's outcome: an [`RestartOutcome::Adopted`]
 /// value is handed to [`adopt_restart`]; a [`RestartOutcome::Failed`] one is
 /// reported through the ordinary child-death path - budget-charged strategy
@@ -621,13 +828,20 @@ pub(super) async fn handle_restart_outcome<A: Actor>(
             // An attempt's incarnation that ended under a stop order is
             // reported like a failed one: the end of the incarnation the
             // ledger holds as the attempt's.
+            // An attempt that ended by an ignored start is reported as
+            // ignored, never as a failure, so this end is none.
             let event = ChildStoppedInternal {
                 child_id,
                 reason,
                 incarnation,
+                ignored: false,
             };
             handle_child_stopped_with(actor, ctx, event, false).await
         }
+        RestartOutcome::Ignored {
+            child_id,
+            incarnation,
+        } => handle_ignored_attempt(actor, ctx, child_id, incarnation).await,
         RestartOutcome::Cancelled {
             child_id,
             incarnation,
@@ -979,6 +1193,16 @@ pub(super) fn record_restart_outcome(
                 );
             }
             (child_id, incarnation, None, Some(reason))
+        }
+        RestartOutcome::Ignored {
+            child_id,
+            incarnation,
+        } => {
+            // An ignored start is no end to report: the entry is down with
+            // nothing owed, as for an attempt that spawned nothing.
+            sup.settle_attempt(&child_id, incarnation, || AttemptOutcome::Abandoned);
+            record_cancelled(sup, &child_id, incarnation);
+            (child_id, incarnation, None, None)
         }
         RestartOutcome::Cancelled {
             child_id,

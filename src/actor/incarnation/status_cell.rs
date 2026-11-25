@@ -34,7 +34,7 @@
 
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use tokio::task::coop::cooperative;
@@ -106,6 +106,10 @@ pub(crate) struct StatusCell {
     /// value, before that section moves the version, and read without the
     /// lock.
     mirror: AtomicU8,
+    /// Set by the incarnation's own task when its `pre_start` asked for the
+    /// start to be ignored, before its reason is written. Read only through
+    /// [`StatusCell::ended_ignored`], once the reason is final.
+    ignored: AtomicBool,
 }
 
 impl StatusCell {
@@ -115,7 +119,20 @@ impl StatusCell {
             state: AtomicU64::new(0),
             senders: AtomicU32::new(0),
             mirror: AtomicU8::new(encode(ActorStatus::Initializing)),
+            ignored: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the start of this incarnation was ignored: the flag is set and
+    /// the final reason is `Graceful`. Read only once the reason is final; a
+    /// `Kill` or a failure that ended the incarnation instead reads `false`.
+    pub(crate) fn ended_ignored(&self) -> bool {
+        // The reason is read first and the flag second, both under the
+        // value's lock: a caller that has not seen the final reason reads
+        // `false`, and one that sees it finds the flag, which is stored
+        // before the reason is written.
+        let value = self.lock();
+        matches!(value.reason, Some(StopReason::Graceful)) && self.ignored.load(Ordering::Acquire)
     }
 
     /// Whether the plane's status reads `Stopped`: one relaxed load.
@@ -277,6 +294,14 @@ impl StatusValue {
     }
 }
 
+impl IncarnationRef {
+    /// Whether the start of this incarnation was ignored: read only once its
+    /// reason is final (see [`StatusCell::ended_ignored`]).
+    pub(crate) fn ended_ignored(&self) -> bool {
+        self.status_cell().ended_ignored()
+    }
+}
+
 /// The writing half of the plane. Cloning adds a sender; the plane closes
 /// when the last sender drops.
 pub(crate) struct StatusTx {
@@ -293,6 +318,16 @@ impl StatusTx {
     /// The abort record of the incarnation whose plane this is.
     pub(crate) fn abort_record(&self) -> &IncarnationRef {
         &self.record
+    }
+
+    /// Records that the start of this incarnation was ignored. Called by the
+    /// incarnation's own task before its reason is written, so a reader that
+    /// finds the reason final also finds the flag.
+    pub(crate) fn mark_ignored(&self) {
+        self.record
+            .status_cell()
+            .ignored
+            .store(true, Ordering::Release);
     }
 }
 
@@ -446,6 +481,12 @@ impl StatusRx {
     /// public name that live beside the plane.
     pub(crate) fn record(&self) -> &crate::actor::incarnation::IncarnationRef {
         &self.record
+    }
+
+    /// Whether the start of this incarnation was ignored: read only once its
+    /// reason is final (see [`StatusCell::ended_ignored`]).
+    pub(crate) fn ended_ignored(&self) -> bool {
+        self.record.status_cell().ended_ignored()
     }
 
     /// The plane's value. It never marks a version seen. See [`StatusRef`]

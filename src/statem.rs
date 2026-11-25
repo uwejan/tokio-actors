@@ -12,7 +12,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -1347,8 +1347,8 @@ impl<M: StateMachine> ActorHandle<StatemActor<M>> {
     }
 }
 
-/// A time-out a [`Harness`] can fire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A kind of time-out a [`Harness`] can fire; the kind of a [`TimeoutId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Fired<N> {
     /// The event time-out.
     Event,
@@ -1358,16 +1358,41 @@ pub enum Fired<N> {
     Named(N),
 }
 
+/// The id of one setting of a time-out under a [`Harness`]; [`Step::set`] and
+/// [`Step::cancelled`] carry it. Every setting gets an id of its own, so a
+/// second setting of the same kind, or a setting after a cancel, has an id
+/// unequal to the first. An id names a setting of the harness whose step
+/// reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TimeoutId<N> {
+    kind: Fired<N>,
+    generation: u64,
+}
+
+impl<N> TimeoutId<N> {
+    /// The kind of time-out this id names.
+    pub fn kind(&self) -> &Fired<N> {
+        &self.kind
+    }
+}
+
 /// What one step of a [`Harness`] did.
 pub struct Step<M: StateMachine> {
     /// The calls answered in this step, in order: the number of the call
     /// (calls are numbered from 0 in the order of [`Harness::call`]) and its
     /// reply, or `None` when its [`ReplyTo`] was dropped unanswered.
     pub replies: Vec<(usize, Option<M::Reply>)>,
-    /// The time-outs set in this step, each with its duration.
-    pub set: Vec<(Fired<M::TimerName>, Duration)>,
-    /// The time-outs cancelled in this step, by the machine or by the engine.
-    pub cancelled: Vec<Fired<M::TimerName>>,
+    /// The time-outs set in this step, in order, each with its duration. An
+    /// entry with a zero duration is not held: its event is handled in this
+    /// step, and a firing of its id does nothing.
+    pub set: Vec<(TimeoutId<M::TimerName>, Duration)>,
+    /// The time-outs cancelled in this step, by the machine or by the engine,
+    /// in order. A setting can be both set and cancelled in one step.
+    pub cancelled: Vec<TimeoutId<M::TimerName>>,
+    /// True when this step was a firing that named no running time-out: the
+    /// setting was fired, cancelled or replaced already, or the machine has
+    /// stopped. Such a step does nothing else.
+    pub stale: bool,
     /// How many events are postponed after this step.
     pub postponed: usize,
     /// The states entered in this step, one per enter call, in order.
@@ -1385,6 +1410,7 @@ impl<M: StateMachine> fmt::Debug for Step<M> {
             .field("postponed", &self.postponed)
             .field("entered", &self.entered.len())
             .field("stopped", &self.stopped)
+            .field("stale", &self.stale)
             .finish()
     }
 }
@@ -1402,23 +1428,37 @@ struct Armed<M: StateMachine> {
 ///
 /// The harness runs the same engine as [`StatemActor`], with these differences:
 /// `init` is not run; the context's `actor()` answers `None`, so a registration
-/// made through it leaves no trace; a time-out with a duration fires only
-/// through [`Self::fire`], and a zero duration time-out fires inside the step
-/// that sets it; the time-out setters make no time-driver check; the held
-/// events are bounded by a fixed 64; a panic of a callback unwinds into the
-/// test. Its return
+/// made through it leaves no trace; a time-out with a duration fires only when
+/// the caller fires it, by [`Self::fire`] (the running setting of a kind) or
+/// by [`Self::fire_id`] (only the setting an id names), and a zero duration
+/// time-out fires inside the step that sets it; the time-out setters make no
+/// time-driver check; the held events are bounded by a fixed 64; a panic of a
+/// callback unwinds into the test. Its return
 /// addresses follow the rule of [`ReplyTo`]: one dropped in a step is answered
 /// `None` when the step ends, one dropped in a panic the callback itself
 /// catches included, and one dropped in a step that unwinds has no entry. A
 /// machine that stops runs `terminate`, unless it is stopped with
 /// `StopReason::Kill`, and a step fed after that does nothing.
+///
+/// A driver that runs the time-outs on real timers starts one timer for each
+/// entry of [`Step::set`] with a non-zero duration, carrying its
+/// [`TimeoutId`], and fires it with [`Self::fire_id`]. The timer of a setting
+/// that was cancelled, replaced or already fired gives a step that reads
+/// `stale` and does nothing else. To cancel timers, handle `set` first, then
+/// `cancelled`, since one setting can be in both. Once the machine stops,
+/// every firing reads `stale`. An id names a setting of the harness whose step
+/// reported it.
+///
+/// `Harness` is `Send`, and `Sync` when the machine and its associated types
+/// are `Sync`.
 pub struct Harness<M: StateMachine> {
     core: Core<M>,
     /// False once the machine has stopped; every return address reads it.
     alive: Arc<AtomicBool>,
     calls: usize,
     log_tx: mpsc::Sender<(usize, Option<M::Reply>)>,
-    log: mpsc::Receiver<(usize, Option<M::Reply>)>,
+    /// The reply log; the lock is never taken, it makes the harness `Sync`.
+    log: Mutex<mpsc::Receiver<(usize, Option<M::Reply>)>>,
     armed: Vec<Armed<M>>,
 }
 
@@ -1437,7 +1477,7 @@ impl<M: StateMachine> Harness<M> {
             alive: Arc::new(AtomicBool::new(true)),
             calls: 0,
             log_tx,
-            log,
+            log: Mutex::new(log),
             armed: Vec::new(),
         };
         harness.core.key = Arc::as_ptr(&harness.alive) as usize;
@@ -1469,10 +1509,28 @@ impl<M: StateMachine> Harness<M> {
         self.run(Queued::plain(StatemEvent::Call(call, to)))
     }
 
-    /// Fires a running time-out; a time-out that is not running does nothing.
+    /// Fires the running time-out of this kind, whichever setting it is; a
+    /// kind with no running time-out does nothing, and the step reads `stale`.
     pub fn fire(&mut self, timeout: Fired<M::TimerName>) -> Step<M> {
-        let Some(at) = self.armed.iter().position(|armed| armed.kind == timeout) else {
+        let at = self.armed.iter().position(|armed| armed.kind == timeout);
+        self.fire_at(at)
+    }
+
+    /// Fires the time-out of this setting while it is the running one; a
+    /// setting that is not the running one does nothing, and the step reads
+    /// `stale`.
+    pub fn fire_id(&mut self, id: &TimeoutId<M::TimerName>) -> Step<M> {
+        let at = self
+            .armed
+            .iter()
+            .position(|armed| armed.generation == id.generation && armed.kind == id.kind);
+        self.fire_at(at)
+    }
+
+    fn fire_at(&mut self, at: Option<usize>) -> Step<M> {
+        let Some(at) = at else {
             let mut step = self.blank();
+            step.stale = true;
             self.close(&mut step);
             return step;
         };
@@ -1521,6 +1579,7 @@ impl<M: StateMachine> Harness<M> {
             postponed: 0,
             entered: Vec::new(),
             stopped: None,
+            stale: false,
         }
     }
 
@@ -1596,7 +1655,13 @@ impl<M: StateMachine> Harness<M> {
                     after,
                     event,
                 } => {
-                    step.set.push((kind.clone(), after));
+                    step.set.push((
+                        TimeoutId {
+                            kind: kind.clone(),
+                            generation,
+                        },
+                        after,
+                    ));
                     if let Some(event) = event {
                         self.armed.push(Armed {
                             kind,
@@ -1606,7 +1671,7 @@ impl<M: StateMachine> Harness<M> {
                     }
                 }
                 Effect::Cancel { kind, generation } => {
-                    step.cancelled.push(kind);
+                    step.cancelled.push(TimeoutId { kind, generation });
                     self.armed.retain(|armed| armed.generation != generation);
                 }
             }
@@ -1614,7 +1679,8 @@ impl<M: StateMachine> Harness<M> {
         if self.core.ended {
             self.armed.clear();
         }
-        step.replies.extend(self.log.try_iter());
+        let log = self.log.get_mut().unwrap_or_else(PoisonError::into_inner);
+        step.replies.extend(log.try_iter());
         step.postponed = self.core.postponed.len();
     }
 }

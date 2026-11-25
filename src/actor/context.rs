@@ -249,6 +249,9 @@ struct Extras {
     /// installed functions. It sits here, created with the first use of the
     /// bundle, so an actor that uses none of it holds no field for it.
     debug: Option<Box<DebugState>>,
+    /// Set by `ignore`, read and cleared once by the run loop when
+    /// `pre_start` returns `Ok(())`.
+    ignore_start: bool,
 }
 
 impl Extras {
@@ -266,6 +269,7 @@ impl Extras {
             forwarders_taken: 0,
             forwarders_unpolled: false,
             debug: None,
+            ignore_start: false,
         }
     }
 }

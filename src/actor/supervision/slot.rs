@@ -737,6 +737,16 @@ impl SlotCtl {
         }
     }
 
+    /// Whether the ended incarnation's start was ignored: the fate's flag, or
+    /// for a closed cell the flag the incarnation's status plane holds. Read
+    /// only once its task ended.
+    pub(crate) fn ended_ignored(&self) -> bool {
+        self.fate().map_or_else(
+            || self.status().is_some_and(|status| status.ended_ignored()),
+            |fate| fate.ignored,
+        )
+    }
+
     /// How an ended task ended: the fate's reason, or for a closed cell the
     /// reason the incarnation's status plane holds.
     pub(crate) fn end_reason(&self) -> StopReason {
@@ -880,6 +890,12 @@ fn lost_end_bound(own: OwnStop) -> Duration {
 }
 
 impl LostEnd {
+    /// The incarnation's status plane, a clone: read once the wait returned,
+    /// it says whether the end was an ignored start.
+    pub(crate) fn status(&self) -> StatusRx {
+        self.status.clone()
+    }
+
     /// Waits until the incarnation's task ended (status `Stopped`, or the
     /// status sender dropped) and returns the reason it ended with, the one
     /// its status plane carries. The guard that fires together with a failed
@@ -1011,9 +1027,14 @@ async fn closed_cell(watch: &CellWatch, incarnation: u64) -> CellOutcome {
                 // The reason the plane carries: the one written at the
                 // incarnation's seal, or `Kill` for a plane closed without one.
                 let reason = status.reason_or_kill();
+                // The record is read once the plane's reason is final; a closed
+                // cell that never held a lane has no record and no ignored
+                // start.
+                let ignored = record.is_some_and(IncarnationRef::ended_ignored);
                 return CellOutcome::Fate(ChildFate {
                     reason,
                     incarnation,
+                    ignored,
                 });
             }
             VerdictAct::Unresponsive { write } => {
@@ -1763,17 +1784,22 @@ pub(crate) async fn run_attempt(attempt: Attempt) -> RestartOutcome {
                     }
                 }
                 advance_attempt(step, LadderEvent::TaskEnded, grace, (&join, &lane, &io));
+                // The task ended and its reason is final: the record says
+                // whether the end was an ignored start.
+                let ignored = lane.abort_record().ended_ignored();
                 let outcome = ended_outcome(
                     child_id,
                     incarnation,
                     reason.clone(),
                     ordered || io.order().is_some(),
                     io.timeout_cut(),
+                    ignored,
                     view!(),
                 );
                 io.record_fate(ChildFate {
                     reason,
                     incarnation,
+                    ignored,
                 });
                 // The incarnation ended and its fate is recorded: the guard
                 // has nothing left to force.
@@ -1827,18 +1853,21 @@ pub(crate) async fn run_attempt(attempt: Attempt) -> RestartOutcome {
 /// incarnation, `timeout_cut` whether the attempt's start timeout raised
 /// `Kill` on it. The attempt itself and a supervisor that reports the
 /// attempt from the incarnation's status plane both classify through here,
-/// so one end gets one outcome.
+/// so one end gets one outcome. `ignored` is whether the incarnation's start
+/// was ignored.
 pub(crate) fn ended_outcome(
     child_id: ActorId,
     incarnation: u64,
     reason: StopReason,
     ordered: bool,
     timeout_cut: bool,
+    ignored: bool,
     view: AttemptView,
 ) -> RestartOutcome {
     let event = AttemptEvent::Ended {
         ordered,
         timeout_raised: timeout_cut,
+        ignored,
     };
     let report = match attempt_step(AttemptStage::Init, event, view) {
         AttemptAction::Report(report) => report,
@@ -1854,6 +1883,10 @@ pub(crate) fn ended_outcome(
             child_id,
             incarnation,
             reason: StopReason::Failure(ActorError::Spawn(SpawnError::StartTimeout)),
+        },
+        AttemptReport::Ignored => RestartOutcome::Ignored {
+            child_id,
+            incarnation,
         },
         AttemptReport::Failed => RestartOutcome::Failed {
             child_id,
@@ -1946,6 +1979,7 @@ fn reported_attempt(
         reason,
         ctl.has_order(),
         ctl.timeout_cut(),
+        ctl.status().is_some_and(|status| status.ended_ignored()),
         view,
     )
 }
@@ -2305,7 +2339,8 @@ mod tests {
         let mut cell = rig.ctl.watch();
         let waited = timeout(Duration::from_millis(20), await_cell(&mut cell, 1)).await;
         assert!(waited.is_err(), "the caller's wait was dropped");
-        let (_, reason, incarnation) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let (_, end, incarnation) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = end.into_parts().0;
         let took = t0.elapsed();
         assert!(matches!(reason, StopReason::Kill), "{reason:?}");
         assert_eq!(incarnation, 1);
@@ -2351,7 +2386,13 @@ mod tests {
             took >= Duration::from_millis(50) + DEFAULT_KILL_GRACE,
             "Timeout, then Kill (ignored mid-turn), then the abort: {took:?}"
         );
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = bounded(rig.death_set.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .into_parts()
+            .0;
         assert!(matches!(reason, StopReason::Kill));
         assert!(
             !rig.ctl.is_unresponsive(),
@@ -2389,7 +2430,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(12)).await;
         let t0 = Instant::now();
         rig.ctl.order_stop(Shutdown::Kill, true);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = bounded(rig.death_set.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .into_parts()
+            .0;
         assert!(matches!(reason, StopReason::Kill));
         // The `Kill` is observed at the next turn boundary, well inside a
         // window of 400 ms on the paused clock.
@@ -2430,7 +2477,13 @@ mod tests {
         assert!(rig.child.vetoed.load(Ordering::SeqCst) >= 1);
         // The child obeys at last: the fate is recorded.
         rig.child.lane.raise(StopReason::Kill);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = bounded(rig.death_set.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .into_parts()
+            .0;
         assert!(matches!(reason, StopReason::Kill));
         assert!(rig.ctl.fate().is_some());
     }
@@ -2450,7 +2503,13 @@ mod tests {
         );
         let started = Instant::now();
         let mut rig = rig_over(child, ctl, io, DEFAULT_KILL_GRACE);
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = bounded(rig.death_set.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .into_parts()
+            .0;
         assert!(matches!(reason, StopReason::Kill));
         assert!(
             started.elapsed() >= Duration::from_millis(200),
@@ -2534,7 +2593,8 @@ mod tests {
             bounded(waiter).await.unwrap(),
             CellOutcome::Fate(ChildFate {
                 reason: StopReason::Kill,
-                incarnation: 4
+                incarnation: 4,
+                ..
             })
         ));
 
@@ -2990,7 +3050,13 @@ mod tests {
         assert!(rig.ctl.fate().is_none());
         // After the turn the abort lands and the fate is recorded.
         open_gate.send(()).expect("the turn waits at its gate");
-        let (_, reason, _) = bounded(rig.death_set.join_next()).await.unwrap().unwrap();
+        let reason = bounded(rig.death_set.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .into_parts()
+            .0;
         assert!(matches!(reason, StopReason::Kill));
         assert!(matches!(
             rig.ctl.fate().map(|fate| fate.reason),
@@ -3038,7 +3104,11 @@ mod tests {
             if std::hint::black_box(true) {
                 panic!("runner failed");
             }
-            (ActorId::from("lost"), StopReason::Graceful, 5)
+            (
+                ActorId::from("lost"),
+                crate::actor::supervision::RunnerEnd::Ended(StopReason::Graceful),
+                5,
+            )
         });
         sup.task_owner
             .insert(task.id(), (ActorId::from("lost"), 5, TaskPlane::Death));
@@ -3072,7 +3142,8 @@ mod tests {
         // One report after it ends; a status sender dropped without
         // `Stopped` reads as an abort.
         drop(status_tx);
-        let (id, reason, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let (id, end, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let reason = end.into_parts().0;
         assert_eq!(id.as_str(), "lost");
         assert_eq!(incarnation, 5);
         assert!(matches!(reason, StopReason::Kill), "{reason:?}");
@@ -3093,7 +3164,11 @@ mod tests {
             if std::hint::black_box(true) {
                 panic!("attempt failed");
             }
-            (ActorId::from("early"), StopReason::Graceful, 6)
+            (
+                ActorId::from("early"),
+                crate::actor::supervision::RunnerEnd::Ended(StopReason::Graceful),
+                6,
+            )
         });
         sup.task_owner
             .insert(task.id(), (ActorId::from("early"), 6, TaskPlane::Death));
@@ -3105,12 +3180,12 @@ mod tests {
             .expect_err("the task failed");
         let (panic, _) = sup.lost_death_task(err);
         assert!(matches!(&panic, Some(ActorError::Panic(text)) if text == "attempt failed"));
-        let (id, reason, incarnation) =
-            timeout(Duration::from_millis(50), sup.death_set.join_next())
-                .await
-                .expect("reported at once")
-                .unwrap()
-                .unwrap();
+        let (id, end, incarnation) = timeout(Duration::from_millis(50), sup.death_set.join_next())
+            .await
+            .expect("reported at once")
+            .unwrap()
+            .unwrap();
+        let reason = end.into_parts().0;
         assert_eq!((id.as_str(), incarnation), ("early", 6));
         assert!(
             matches!(&reason, StopReason::Failure(ActorError::Panic(text)) if text == "attempt failed"),
@@ -3218,7 +3293,8 @@ mod tests {
         // Exactly one report after it ends: a status sender dropped without
         // `Stopped` reads as an abort.
         drop(status_tx);
-        let (id, reason, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let (id, end, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let reason = end.into_parts().0;
         assert_eq!((id.as_str(), incarnation), ("attempt-lost", 8));
         assert!(matches!(reason, StopReason::Kill), "{reason:?}");
         assert!(
@@ -3703,7 +3779,11 @@ mod tests {
             if std::hint::black_box(true) {
                 panic!("runner failed");
             }
-            (ActorId::from("lost-stuck"), StopReason::Graceful, 5)
+            (
+                ActorId::from("lost-stuck"),
+                crate::actor::supervision::RunnerEnd::Ended(StopReason::Graceful),
+                5,
+            )
         });
         sup.task_owner.insert(
             task.id(),
@@ -3752,7 +3832,8 @@ mod tests {
         // After the turn the incarnation reads the guard's `Kill`: exactly
         // one report, with `Kill`.
         turn.open.send(()).expect("the turn waits at its gate");
-        let (id, reason, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let (id, end, incarnation) = bounded(sup.death_set.join_next()).await.unwrap().unwrap();
+        let reason = end.into_parts().0;
         assert_eq!((id.as_str(), incarnation), ("lost-stuck", 5));
         assert!(matches!(reason, StopReason::Kill), "{reason:?}");
         assert!(

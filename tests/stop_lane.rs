@@ -399,6 +399,7 @@ const SCANNED: &[(&str, [usize; 3])] = &[
     ("event.rs", [0, 0, 0]),
     ("helper.rs", [0, 0, 0]),
     ("lib.rs", [0, 0, 0]),
+    ("otp_map.rs", [0, 0, 0]),
     ("signals.rs", [0, 0, 0]),
     ("statem.rs", [0, 0, 0]),
     ("system.rs", [0, 6, 3]),
